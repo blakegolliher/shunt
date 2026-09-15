@@ -35,6 +35,7 @@ clusters:
     endpoints: ["10.9.0.11:80"]
     region: us-east-1
     credentials: { access_key: AKIAVASTFAB, secret_ref: env:VAST_FAB_SECRET }
+    capabilities: { enforces_sha256: false, unsigned_trailer: true }
   minio-1:
     type: minio
     scheme: https

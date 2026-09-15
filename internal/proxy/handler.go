@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/s3"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -26,6 +28,15 @@ type Handler struct {
 	MetadataTimeout time.Duration // metadata ops: total deadline
 	Via             string        // e.g. "1.1 shunt/0.1.0"
 
+	// Resign mode (ADR-0001). Store, ClusterCreds, and Capabilities are used only when Mode is
+	// ModeResign; ClockSkew defaults to 15 minutes.
+	Mode         Mode
+	Store        sigv4.CredentialStore
+	ClusterCreds sigv4.Credentials
+	Capabilities Capabilities
+	ClockSkew    time.Duration
+	Log          *slog.Logger // compensation alerts (ADR-0002); nil means no alert log
+
 	pool *bufPool
 }
 
@@ -34,6 +45,12 @@ func New(h Handler, copyBufferBytes int) *Handler {
 	h.pool = newBufPool(copyBufferBytes)
 	if h.Via == "" {
 		h.Via = "1.1 shunt"
+	}
+	if h.ClockSkew == 0 {
+		h.ClockSkew = 15 * time.Minute
+	}
+	if h.Mode == ModePassthrough {
+		h.Capabilities = Capabilities{EnforcesSHA256: true, UnsignedTrailer: true}
 	}
 	return &h
 }
@@ -55,6 +72,7 @@ type outcome struct {
 	tParsed    time.Time
 	upstreamID string
 	recorded   bool
+	tenant     string
 }
 
 // ServeHTTP is the pipeline. It panics with http.ErrAbortHandler when a body was cut short,
@@ -87,28 +105,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	endpoint := h.Cluster.Next()
 	o.upstream = endpoint
 
-	// Upstream request: same method, same raw path and query, Host preserved (passthrough).
 	var body io.Reader
 	var inBody *progressReader
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
 		inBody = &progressReader{r: r.Body, wd: wd, rc: rc, idle: h.IdleTimeout}
 		body = inBody
 	}
-	out, err := http.NewRequestWithContext(ctx, r.Method, h.Cluster.Scheme+"://"+endpoint+r.URL.RequestURI(), body) //nolint:gosec // G704: forwarding to a configured cluster endpoint is the proxy's purpose; scheme and host come from config, only path and query from the client
-	if err != nil {
-		o.status = http.StatusBadRequest
-		o.err = "build upstream request: " + err.Error()
-		writeError(w, s3.InvalidURI, o.status, r.URL.Path, o.rid)
-		return
+	var out *http.Request
+	var plan *bodyPlan
+	if h.Mode == ModeResign {
+		var aerr *sigv4.AuthError
+		out, plan, aerr = h.resign(ctx, r, o, inBody, endpoint)
+		if aerr != nil {
+			o.status = aerr.Err.Status
+			o.err = "auth: " + string(aerr.Reason)
+			writeAuthError(w, aerr, r.URL.Path, o.rid)
+			return
+		}
+	} else {
+		// Passthrough: same method, same raw path and query, Host preserved.
+		var err error
+		out, err = http.NewRequestWithContext(ctx, r.Method, h.Cluster.Scheme+"://"+endpoint+r.URL.RequestURI(), body) //nolint:gosec // G704: forwarding to a configured cluster endpoint is the proxy's purpose; scheme and host come from config, only path and query from the client
+		if err != nil {
+			o.status = http.StatusBadRequest
+			o.err = "build upstream request: " + err.Error()
+			writeError(w, s3.InvalidURI, o.status, r.URL.Path, o.rid)
+			return
+		}
+		out.Host = r.Host
+		out.ContentLength = r.ContentLength // Transport writes Content-Length from this, never from the header map
+		copyHeaders(out.Header, r.Header)
+		if _, ok := r.Header["User-Agent"]; !ok {
+			out.Header.Set("User-Agent", "") // suppress the Transport's default UA; the client sent none
+		}
+		appendVia(out.Header, h.Via)
+		out.Header.Set(telemetry.HeaderRequestID, o.rid)
 	}
-	out.Host = r.Host
-	out.ContentLength = r.ContentLength // Transport writes Content-Length from this, never from the header map
-	copyHeaders(out.Header, r.Header)
-	if _, ok := r.Header["User-Agent"]; !ok {
-		out.Header.Set("User-Agent", "") // suppress the Transport's default UA; the client sent none
-	}
-	appendVia(out.Header, h.Via)
-	out.Header.Set(telemetry.HeaderRequestID, o.rid)
 
 	// One trace struct per request: the only per-request allocation beyond net/http's own,
 	// justified because connect time and TTFB are catalog signals (docs/DESIGN.md §2.7).
@@ -135,10 +167,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		o.bytesIn = inBody.n
 	}
 	if err != nil {
+		var derr s3.Error
+		if plan != nil && plan.decoder != nil && errors.As(err, &derr) {
+			// The decoder rejected the client's body (chunk signature, trailer, length): a client
+			// error, answered as such. If every decoded byte had already gone upstream the backend
+			// may have committed the object: ADR-0002 log-and-alert.
+			reason := sigv4.ReasonChunkSignature
+			if derr.Code == s3.BadDigest || derr.Code == s3.MalformedTrailerError {
+				reason = sigv4.ReasonTrailer
+			}
+			h.Metrics.AuthFailures.WithLabelValues(string(reason)).Inc()
+			if plan.decoder.DataRead() >= plan.decodedLen && plan.decodedLen > 0 {
+				h.compensate("trailer", r, o, derr.Error())
+			}
+			o.status = derr.Status
+			o.err = "auth: " + string(reason)
+			writeAuthError(w, &sigv4.AuthError{Reason: reason, Err: derr}, r.URL.Path, o.rid)
+			return
+		}
 		h.upstreamError(w, r, o, err)
 		return
 	}
 	defer resp.Body.Close() //nolint:errcheck // drained or aborted below
+	if plan != nil && plan.sha != nil && resp.StatusCode < 300 {
+		if got := hexSum(plan.sha); got != plan.expectHex {
+			h.compensate("sha256", r, o, "x-amz-content-sha256 "+plan.expectHex+" does not match body "+got)
+		}
+	}
 
 	o.upstreamID = resp.Header.Get("X-Amz-Request-Id")
 	copyHeaders(w.Header(), resp.Header)
@@ -167,6 +222,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return // client-side write error after a complete body; nothing to hide
 		}
 		panic(http.ErrAbortHandler)
+	}
+}
+
+// compensate records a late payload-check failure (ADR-0002). The POC only logs and counts;
+// the compensating delete is P2 work.
+func (h *Handler) compensate(reason string, r *http.Request, o *outcome, detail string) {
+	h.Metrics.Compensation.WithLabelValues(reason, "logged").Inc()
+	if h.Log != nil {
+		h.Log.Error("compensation needed: upstream write completed with a payload mismatch (ADR-0002, log-and-alert only)",
+			"reason", reason, "request_id", o.rid, "method", r.Method, "bucket", o.info.Bucket, "op", o.info.Op.String(),
+			"upstream", o.upstream, "cluster", h.Cluster.Name, "detail", detail)
 	}
 }
 

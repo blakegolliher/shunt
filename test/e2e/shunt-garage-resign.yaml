@@ -1,0 +1,28 @@
+# shunt fronting the e2e Garage (resign). Run: make run-garage-resign
+listener:
+  address: "127.0.0.1:8443"
+  domains: ["*.shunt.example.com"]
+  tls:
+    cert: test/e2e/certs/wildcard.crt
+    key: test/e2e/certs/wildcard.key
+admin:
+  address: "127.0.0.1:9900"
+auth:
+  mode: resign
+  credentials_file: test/e2e/data/credentials.yaml
+proxy:
+  cluster: garage
+  copy_buffer_bytes: 262144
+  idle_timeout: 60s
+  metadata_timeout: 30s
+  drain_timeout: 30s
+clusters:
+  garage:
+    type: s3
+    scheme: http
+    region: garage
+    endpoints: ["127.0.0.1:3900"]
+    credentials: { access_key: GK_SET_BY_E2E, secret_ref: env:GARAGE_SECRET }
+telemetry:
+  access_log: { enabled: true, path: test/e2e/data/shunt-garage-resign.access.jsonl }
+  slow: { ring_size: 100, threshold: 500ms }

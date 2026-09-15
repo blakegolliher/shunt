@@ -43,6 +43,9 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	m.BytesIn.WithLabelValues("GetObject").Add(1)
 	m.BytesOut.WithLabelValues("GetObject").Add(1)
 	m.Inflight.WithLabelValues("GetObject").Set(1)
+	m.AuthFailures.WithLabelValues("signature").Inc()
+	m.AuthDuration.WithLabelValues("header").Observe(0.0001)
+	m.Compensation.WithLabelValues("sha256", "logged").Inc()
 	families, err := m.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +66,7 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 			t.Logf("catalog row %s has no registered metric yet", name)
 		}
 	}
-	if len(registered) != 6 {
-		t.Errorf("POC-1 registers exactly six shunt_ metrics, got %d: %v", len(registered), registered)
+	if len(registered) != 9 {
+		t.Errorf("POC-2 registers exactly nine shunt_ metrics, got %d: %v", len(registered), registered)
 	}
 }

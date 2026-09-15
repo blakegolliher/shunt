@@ -6,8 +6,13 @@ are merely linked are listed in docs/deps.md with their licenses.
 
 ================================================================================
 versitygw — github.com/versity/versitygw, commit 4dc0debf8f79e0e0b099b9766a66b40b316dee7e
-Files copied: s3response/s3response.go → internal/s3/s3response/s3response.go (modified; see
-the "Modified by" line under the file header).
+Files copied (each modified; see the "Modified by" line under the file header):
+  s3response/s3response.go            → internal/s3/s3response/s3response.go
+  s3api/utils/chunk-reader.go          → internal/sigv4/chunked/chunk-reader.go
+  s3api/utils/signed-chunk-reader.go   → internal/sigv4/chunked/signed-chunk-reader.go
+  s3api/utils/unsigned-chunk-reader.go → internal/sigv4/chunked/unsigned-chunk-reader.go
+  s3api/utils/chunk-reader_test.go     → internal/sigv4/chunked/chunk-reader_test.go
+  s3api/utils/unsigned-chunk-reader_test.go → internal/sigv4/chunked/unsigned-chunk-reader_test.go
 License: Apache-2.0. NOTICE and LICENSE follow verbatim.
 ================================================================================
 

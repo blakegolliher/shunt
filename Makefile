@@ -33,7 +33,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio s3diff bench-e2e help
+.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign s3diff bench-e2e help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 
@@ -119,6 +119,12 @@ s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio)
 bench-e2e: ## direct vs via bench (BACKEND=garage|minio), prints a markdown table
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
 	  $(GO) run ./test/bench/s3bench -backend $(BACKEND) -region $(S3_REGION) -direct-addr $(S3_ADDR) $(BENCH_ARGS)
+
+run-garage-resign: build ## run shunt in resign mode in front of the e2e Garage (foreground)
+	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-garage-resign.yaml
+
+run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (foreground)
+	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-minio-resign.yaml
 
 e2e-down: ## tear down the e2e backends and their data
 	cd $(E2E_DIR) && $(COMPOSE) down -v --remove-orphans

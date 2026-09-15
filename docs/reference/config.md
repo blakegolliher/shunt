@@ -23,7 +23,7 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 | Key | Type | Rule |
 |---|---|---|
 | `mode` | `passthrough` / `resign` | Required. `resign` requires `credentials_file`; `passthrough` forbids it |
-| `credentials_file` | path | POC-2 |
+| `credentials_file` | path | Required with `mode: resign`. YAML: `credentials: [{access_key, secret | secret_ref, tenant, buckets?}]`; inline `secret` is allowed because this file is the secret store (mode must be 0600; encrypted at rest is P3c) |
 | `clock_skew` | duration | Default 15m |
 
 ## `proxy`
@@ -52,6 +52,8 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 | `credentials.secret_ref` | `env:NAME` / `file:/path` | Required; secrets are never inlined |
 | `storage_classes` | `native` / `emulated` | |
 | `storage_class` + `access` | class + `instant` / `restore-required` | Set together; `restore-required` only with `GLACIER` or `DEEP_ARCHIVE`; not on a `storage_classes: native` cluster |
+| `capabilities.enforces_sha256` | bool | Default true. False means the backend does not reject a wrong hex `x-amz-content-sha256`; shunt then hashes the body itself and logs a mismatch (ADR-0002, POC: log-and-alert). Fill from `shunt probe` |
+| `capabilities.unsigned_trailer` | bool | Default true. False means the backend rejects `STREAMING-UNSIGNED-PAYLOAD-TRAILER`; shunt then verifies the trailer checksum itself and forwards `UNSIGNED-PAYLOAD`. Fill from `shunt probe` |
 
 ## `tenants.<name>`, `placements.<tenant>/<bucket>`
 

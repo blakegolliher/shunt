@@ -70,17 +70,42 @@ type Proxy struct {
 
 // Cluster is one backend (docs/DESIGN.md §2.3).
 type Cluster struct {
-	Type           string      `yaml:"type"`   // vast | minio | aws | s3
-	Scheme         string      `yaml:"scheme"` // https | http — required, never defaulted
-	Region         string      `yaml:"region"`
-	EndpointMode   string      `yaml:"endpoint_mode"` // static (default) | dns
-	Endpoints      []string    `yaml:"endpoints"`     // static mode
-	Endpoint       string      `yaml:"endpoint"`      // dns mode
-	TLS            ClusterTLS  `yaml:"tls"`
-	Credentials    Credentials `yaml:"credentials"`
-	StorageClasses string      `yaml:"storage_classes"` // native | emulated
-	StorageClass   string      `yaml:"storage_class"`   // emulated cold clusters only
-	Access         string      `yaml:"access"`          // instant | restore-required
+	Type           string       `yaml:"type"`   // vast | minio | aws | s3
+	Scheme         string       `yaml:"scheme"` // https | http — required, never defaulted
+	Region         string       `yaml:"region"`
+	EndpointMode   string       `yaml:"endpoint_mode"` // static (default) | dns
+	Endpoints      []string     `yaml:"endpoints"`     // static mode
+	Endpoint       string       `yaml:"endpoint"`      // dns mode
+	TLS            ClusterTLS   `yaml:"tls"`
+	Credentials    Credentials  `yaml:"credentials"`
+	StorageClasses string       `yaml:"storage_classes"` // native | emulated
+	StorageClass   string       `yaml:"storage_class"`   // emulated cold clusters only
+	Access         string       `yaml:"access"`          // instant | restore-required
+	Capabilities   Capabilities `yaml:"capabilities"`
+}
+
+// Capabilities is the hand-written capability profile of a cluster, filled from `shunt probe`
+// output (docs/DESIGN.md decision 3; auto-emit is P3b). Unset booleans default to true, the
+// safe assumption that the backend enforces its own checks.
+type Capabilities struct {
+	EnforcesSHA256  *bool `yaml:"enforces_sha256"`  // rejects a hex x-amz-content-sha256 that does not match the body
+	UnsignedTrailer *bool `yaml:"unsigned_trailer"` // accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+}
+
+// EnforcesSHA256Or reports the capability with the default applied.
+func (c Capabilities) EnforcesSHA256Or(def bool) bool {
+	if c.EnforcesSHA256 == nil {
+		return def
+	}
+	return *c.EnforcesSHA256
+}
+
+// UnsignedTrailerOr reports the capability with the default applied.
+func (c Capabilities) UnsignedTrailerOr(def bool) bool {
+	if c.UnsignedTrailer == nil {
+		return def
+	}
+	return *c.UnsignedTrailer
 }
 
 // ClusterTLS is the upstream TLS configuration for an https cluster.

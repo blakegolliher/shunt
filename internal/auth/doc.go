@@ -1,3 +1,4 @@
-// Package auth defines CredentialStore, one of the two named interface seams allowed by
-// CLAUDE.md, and its static YAML implementation (docs/DESIGN.md §1.2). Built in POC-2.
+// Package auth holds the static YAML CredentialStore (docs/DESIGN.md §1.2). The interface itself,
+// sigv4.CredentialStore, is one of the two named seams in CLAUDE.md and lives next to the
+// verifier that consumes it. Hot reload is deferred (docs/POC.md); STS is v2.
 package auth

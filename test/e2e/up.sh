@@ -70,9 +70,22 @@ sk=$(echo "$info" | awk '/^Secret key:/ {print $3}')
 if [[ -z "$ak" || -z "$sk" ]]; then
   echo "e2e-up: could not read garage key (output was: $info)" >&2; exit 1
 fi
-printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\n' "$ak" "$sk" > data/garage.env
+# shunt-issued client credentials for resign mode: generated once, never committed.
+if [[ ! -s data/credentials.yaml ]]; then
+  cak="SHUNT$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
+  csk="$(head -c 30 /dev/urandom | base64 | tr -d '\n/+=')"
+  printf 'credentials:\n  - access_key: %s\n    secret: %s\n    tenant: e2e\n' "$cak" "$csk" > data/credentials.yaml
+  chmod 600 data/credentials.yaml
+  echo "e2e-up: shunt client credentials written to test/e2e/data/credentials.yaml"
+fi
+cak=$(awk '/access_key:/ {print $3; exit}' data/credentials.yaml)
+csk=$(awk '/ secret:/ {print $2; exit}' data/credentials.yaml)
+printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\nexport SHUNT_ACCESS_KEY=%s\nexport SHUNT_SECRET=%s\n' "$ak" "$sk" "$cak" "$csk" > data/garage.env
 chmod 600 data/garage.env
 echo "e2e-up: credentials written to test/e2e/data/garage.env"
+sed "s/GK_SET_BY_E2E/$ak/" shunt-garage-resign.yaml > data/shunt-garage-resign.yaml
+cp shunt-minio-resign.yaml data/shunt-minio-resign.yaml
+echo "e2e-up: resign configs written to test/e2e/data/shunt-{garage,minio}-resign.yaml"
 
 # S3-level readiness: any HTTP status from an unsigned GET / counts (403 is fine, refused is not).
 wait_for_any garage-s3 "http://127.0.0.1:3900/"

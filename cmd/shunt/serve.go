@@ -15,10 +15,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/blakegolliher/shunt/internal/admin"
+	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/listener"
 	"github.com/blakegolliher/shunt/internal/proxy"
 	"github.com/blakegolliher/shunt/internal/s3"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -72,11 +74,30 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		access = telemetry.NewAccessLogger(nil)
 	}
 
-	h := proxy.New(proxy.Handler{
+	hcfg := proxy.Handler{
 		Cluster: cl, Domains: s3.NewDomains(cfg.Listener.Domains), Metrics: metrics, Access: access, Slow: slow,
 		IdleTimeout: cfg.Proxy.IdleTimeout, MetadataTimeout: cfg.Proxy.MetadataTimeout,
-		Via: "1.1 shunt/" + version,
-	}, cfg.Proxy.CopyBufferBytes)
+		Via: "1.1 shunt/" + version, Log: log,
+	}
+	if cfg.Auth.Mode == "resign" {
+		store, lerr := auth.Load(cfg.Auth.CredentialsFile)
+		if lerr != nil {
+			return lerr
+		}
+		ccfg := cfg.Clusters[cfg.Proxy.Cluster]
+		secret, serr := config.ResolveSecret(ccfg.Credentials.SecretRef)
+		if serr != nil {
+			return fmt.Errorf("cluster %s: %w", cfg.Proxy.Cluster, serr)
+		}
+		hcfg.Mode = proxy.ModeResign
+		hcfg.Store = store
+		hcfg.ClusterCreds = sigv4.Credentials{AccessKey: ccfg.Credentials.AccessKey, Secret: secret}
+		hcfg.Capabilities = proxy.Capabilities{EnforcesSHA256: ccfg.Capabilities.EnforcesSHA256Or(true), UnsignedTrailer: ccfg.Capabilities.UnsignedTrailerOr(true)}
+		hcfg.ClockSkew = cfg.Auth.ClockSkew
+		log.Info("resign mode", "credentials", store.Len(), "cluster_access_key", ccfg.Credentials.AccessKey,
+			"enforces_sha256", hcfg.Capabilities.EnforcesSHA256, "unsigned_trailer", hcfg.Capabilities.UnsignedTrailer)
+	}
+	h := proxy.New(hcfg, cfg.Proxy.CopyBufferBytes)
 
 	ln, err := listener.Listen(cfg.Listener)
 	if err != nil {
