@@ -28,3 +28,5 @@ Files:
   docs/CONTEXT.md             template — fill before POC-0
   docs/validation-report.md   every assumption checked
   docs/prompts/POC-0.md       the first prompt, ready to paste
+
+After cloning: git config core.hooksPath scripts/githooks
