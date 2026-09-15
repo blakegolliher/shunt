@@ -1,0 +1,70 @@
+// Command shunt is the S3 front-end proxy. POC-0 ships only `version` and `check-config`;
+// the other subcommands from docs/DESIGN.md §2.10 arrive with their phases.
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+
+	"github.com/spf13/cobra"
+
+	"github.com/blakegolliher/shunt/internal/config"
+)
+
+// Set via -ldflags "-X main.version=… -X main.commit=… -X main.date=…" (see Makefile).
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
+func main() {
+	if err := newRoot().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRoot() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "shunt",
+		Short:         "S3 front-end proxy",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
+	root.AddCommand(newVersion(), newCheckConfig())
+	return root
+}
+
+func newVersion() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version, commit, and build date",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "shunt %s (commit %s, built %s, %s %s/%s)\n",
+				version, commit, date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			return err
+		},
+	}
+}
+
+func newCheckConfig() *cobra.Command {
+	return &cobra.Command{
+		Use:   "check-config <file>",
+		Short: "Parse and validate a config file; unknown keys are errors",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := config.Load(args[0])
+			if err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: invalid\n%v\n", args[0], err)
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ok (auth %s, %d clusters, %d tenants, %d placements)\n",
+				args[0], c.Auth.Mode, len(c.Clusters), len(c.Tenants), len(c.Placements))
+			return err
+		},
+	}
+}

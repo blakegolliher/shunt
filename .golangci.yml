@@ -1,0 +1,59 @@
+# P0 linter set (docs/DESIGN.md §7 P0 item 5). No disabled checks without a comment.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosec
+    - revive
+    - gocritic
+    - bodyclose
+    - noctx
+    - prealloc
+    - unconvert
+    - misspell
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment reorders structs for padding; config structs are ordered for readability.
+        - fieldalignment
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: unused-parameter
+        - name: error-strings
+        - name: error-return
+        - name: errorf
+        - name: var-naming
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # hugeParam flags every pass-by-value config struct in tests; benchmarks cover the real cost.
+        - hugeParam
+    gosec:
+      excludes:
+        # G304: check-config opens the file path the operator passed on the command line; that is its job.
+        - G304
+    misspell:
+      locale: US
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

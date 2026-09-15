@@ -1,0 +1,3 @@
+# expect: clusters
+listener: { address: ":8443", tls: { cert: c.pem, key: k.pem } }
+auth: { mode: passthrough }

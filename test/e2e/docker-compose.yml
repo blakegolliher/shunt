@@ -1,0 +1,37 @@
+# e2e backends for the POC: Garage and MinIO. Both are AGPL tools; they are run, never copied.
+# Bring up with `make e2e-up` (generates the cert, waits for health, applies Garage's layout).
+services:
+  garage:
+    image: docker.io/dxflrs/garage:v1.0.1
+    container_name: shunt-e2e-garage
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro,z
+      - ./data/garage/meta:/var/lib/garage/meta:z
+      - ./data/garage/data:/var/lib/garage/data:z
+    ports:
+      - "127.0.0.1:3900:3900"   # S3 API
+      - "127.0.0.1:3903:3903"   # admin API (health)
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: shunt-e2e-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DOMAIN: minio.${DOMAIN:-shunt.example.com}
+    volumes:
+      - ./data/minio:/data:z
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

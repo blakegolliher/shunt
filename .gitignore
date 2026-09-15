@@ -1,0 +1,10 @@
+/bin/
+/dist/
+/shunt
+*.test
+*.out
+*.prof
+/test/e2e/certs/
+/test/e2e/data/
+/test/bench/new.txt
+testdata/fuzz/*/[0-9a-f]*

@@ -1,0 +1,9 @@
+shunt — S3 front-end proxy
+Copyright 2026 Blake Golliher
+
+This product includes software developed by Blake Golliher and
+contributors (https://github.com/blakegolliher/shunt).
+
+Third-party code copied into this repository, if any, carries its own
+license header and is listed in THIRD_PARTY_NOTICES and docs/deps.md.
+Module dependencies and their licenses are listed in docs/deps.md.

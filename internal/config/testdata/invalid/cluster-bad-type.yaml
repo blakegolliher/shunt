@@ -1,0 +1,5 @@
+# expect: clusters.garage.type
+listener: { address: ":8443", tls: { cert: c.pem, key: k.pem } }
+auth: { mode: passthrough }
+clusters:
+  garage: { type: ceph, scheme: http, region: garage, endpoints: ["127.0.0.1:3900"], credentials: { access_key: GK, secret_ref: env:S } }

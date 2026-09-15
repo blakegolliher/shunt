@@ -1,0 +1,144 @@
+package config
+
+import (
+	"bufio"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// expectedKey reads the `# expect: <key>` header of an invalid sample.
+func expectedKey(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	sc := bufio.NewScanner(f)
+	if !sc.Scan() {
+		t.Fatalf("%s: empty", path)
+	}
+	line := sc.Text()
+	const prefix = "# expect: "
+	if !strings.HasPrefix(line, prefix) {
+		t.Fatalf("%s: first line must be %q<key>, got %q", path, prefix, line)
+	}
+	return strings.TrimPrefix(line, prefix)
+}
+
+func TestValidSamples(t *testing.T) {
+	files, err := filepath.Glob("testdata/valid/*.yaml")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no valid samples: %v", err)
+	}
+	for _, f := range files {
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			if _, err := Load(f); err != nil {
+				t.Fatalf("expected valid, got:\n%v", err)
+			}
+		})
+	}
+}
+
+func TestInvalidSamplesNameTheKey(t *testing.T) {
+	files, err := filepath.Glob("testdata/invalid/*.yaml")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no invalid samples: %v", err)
+	}
+	for _, f := range files {
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			want := expectedKey(t, f)
+			_, err := Load(f)
+			if err == nil {
+				t.Fatalf("expected an error naming %q, got nil", want)
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error does not name %q:\n%v", want, err)
+			}
+		})
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	c, err := Load("testdata/valid/poc.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Proxy.DrainTimeout != DefaultDrainTimeout {
+		t.Errorf("drain_timeout default: got %v", c.Proxy.DrainTimeout)
+	}
+	if c.Auth.ClockSkew != DefaultClockSkew {
+		t.Errorf("clock_skew default: got %v", c.Auth.ClockSkew)
+	}
+	if c.Listener.TLS.MinVersion != "1.2" {
+		t.Errorf("min_version default: got %q", c.Listener.TLS.MinVersion)
+	}
+	if c.Clusters["garage"].EndpointMode != "static" {
+		t.Errorf("endpoint_mode default: got %q", c.Clusters["garage"].EndpointMode)
+	}
+	if c.Telemetry.Slow.Threshold != 500*time.Millisecond {
+		t.Errorf("explicit threshold lost: got %v", c.Telemetry.Slow.Threshold)
+	}
+}
+
+func TestMixedSampleShape(t *testing.T) {
+	c, err := Load("testdata/valid/mixed.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(c.Clusters); got != 6 {
+		t.Errorf("clusters: got %d", got)
+	}
+	if got := len(c.Placements); got != 7 {
+		t.Errorf("placements: got %d", got)
+	}
+	p := c.Placements["acme/runs"]
+	if p.State != StateRamping || p.Ramp == nil || len(p.Ramp.Prefixes) != 1 {
+		t.Errorf("acme/runs ramp not parsed: %+v", p)
+	}
+	if c.Clusters["aws-use1"].EndpointMode != "dns" {
+		t.Errorf("aws-use1 endpoint_mode: %q", c.Clusters["aws-use1"].EndpointMode)
+	}
+}
+
+func TestEmpty(t *testing.T) {
+	for _, in := range []string{"", "   \n", "# only a comment\n"} {
+		if _, err := Parse([]byte(in)); !errors.Is(err, ErrEmpty) {
+			t.Errorf("Parse(%q): want ErrEmpty, got %v", in, err)
+		}
+	}
+}
+
+func TestAllErrorsReported(t *testing.T) {
+	// A cluster missing all three required fields reports all three in one pass.
+	in := []byte(`
+listener: { address: ":1", tls: { cert: c, key: k } }
+auth: { mode: passthrough }
+clusters:
+  x: { endpoints: ["h:1"], credentials: { access_key: a, secret_ref: env:S } }
+`)
+	_, err := Parse(in)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, key := range []string{"clusters.x.type", "clusters.x.scheme", "clusters.x.region"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("missing %s in:\n%v", key, err)
+		}
+	}
+}
+
+func TestErrorType(t *testing.T) {
+	_, err := Parse([]byte("listener: { address: \":1\", tls: { cert: c, key: k } }\nauth: { mode: passthrough }\n"))
+	var ve *Error
+	if !errors.As(err, &ve) {
+		t.Fatalf("want *Error in chain, got %T: %v", err, err)
+	}
+	if ve.Key != "clusters" {
+		t.Errorf("key: got %q", ve.Key)
+	}
+}

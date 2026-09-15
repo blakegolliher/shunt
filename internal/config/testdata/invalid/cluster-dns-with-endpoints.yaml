@@ -1,0 +1,5 @@
+# expect: clusters.aws.endpoints
+listener: { address: ":8443", tls: { cert: c.pem, key: k.pem } }
+auth: { mode: passthrough }
+clusters:
+  aws: { type: aws, scheme: https, region: us-east-1, endpoint_mode: dns, endpoint: s3.amazonaws.com, endpoints: ["1.2.3.4:443"], credentials: { access_key: GK, secret_ref: env:S } }

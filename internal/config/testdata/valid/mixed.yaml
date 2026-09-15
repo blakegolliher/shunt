@@ -1,0 +1,82 @@
+# Every feature of the §2.3 example: mixed backends, tenants, all four states, tiering, SNI.
+listener:
+  address: ":443"
+  domains: ["*.shunt.example.com", "*.s3.example.net"]
+  tls:
+    cert: /etc/shunt/wildcard.crt
+    key: /etc/shunt/wildcard.key
+    min_version: "1.3"
+    sni:
+      "*.s3.example.net": { cert: /etc/shunt/example.crt, key: /etc/shunt/example.key }
+admin:
+  address: "127.0.0.1:9900"
+auth:
+  mode: resign
+  credentials_file: /etc/shunt/credentials.yaml
+  clock_skew: 15m
+proxy:
+  copy_buffer_bytes: 262144
+  idle_timeout: 60s
+  metadata_timeout: 30s
+  drain_timeout: 30s
+clusters:
+  vast-a:
+    type: vast
+    scheme: https
+    endpoints: ["10.1.0.11:443", "10.1.0.12:443"]
+    tls: { ca: /etc/shunt/vast-a.pem }
+    region: us-east-1
+    credentials: { access_key: AKIAVASTA, secret_ref: env:VAST_A_SECRET }
+    storage_classes: emulated
+  vast-fab:
+    type: vast
+    scheme: http
+    endpoints: ["10.9.0.11:80"]
+    region: us-east-1
+    credentials: { access_key: AKIAVASTFAB, secret_ref: env:VAST_FAB_SECRET }
+  minio-1:
+    type: minio
+    scheme: https
+    endpoints: ["minio-1.lab:9000"]
+    tls: { ca: /etc/shunt/minio.pem }
+    region: us-east-1
+    credentials: { access_key: minioadmin, secret_ref: file:/etc/shunt/minio.secret }
+  aws-use1:
+    type: aws
+    scheme: https
+    endpoint_mode: dns
+    endpoint: s3.us-east-1.amazonaws.com
+    region: us-east-1
+    credentials: { access_key: AKIAAWS, secret_ref: env:AWS_SECRET }
+    storage_classes: native
+  vast-cold:
+    type: vast
+    scheme: https
+    endpoints: ["10.2.0.11:443"]
+    region: us-east-1
+    credentials: { access_key: AKIACOLD, secret_ref: env:VAST_COLD_SECRET }
+    storage_class: GLACIER_IR
+    access: instant
+  vault:
+    type: vast
+    scheme: https
+    endpoints: ["10.3.0.11:443"]
+    region: us-east-1
+    credentials: { access_key: AKIAVAULT, secret_ref: env:VAULT_SECRET }
+    storage_class: DEEP_ARCHIVE
+    access: restore-required
+tenants:
+  acme: { default_cluster: vast-a }
+  zed:  { default_cluster: minio-1 }
+placements:
+  acme/training-sets: { state: ACTIVE,    primary: vast-a,   names: { vast-a: training-sets } }
+  acme/checkpoints:   { state: RAMPING,   primary: vast-fab, source: vast-a, ramp: { ratio: 0.05 }, names: { vast-a: checkpoints, vast-fab: checkpoints } }
+  acme/runs:          { state: RAMPING,   primary: aws-use1, source: vast-a, ramp: { prefixes: ["2026-09/"] }, names: { vast-a: runs, aws-use1: acme-7f3a-runs } }
+  zed/data:           { state: MIGRATING, primary: minio-1,  source: aws-use1, names: { aws-use1: zed-91c0-data, minio-1: data } }
+  zed/done:           { state: CUTOVER,   primary: minio-1,  source: vast-a, names: { vast-a: done, minio-1: done } }
+  acme/archive:       { state: ACTIVE,    primary: vast-a,   cold: vault, tier: emulated, lifecycle: "<LifecycleConfiguration/>", names: { vast-a: archive, vault: archive } }
+  zed/logs:           { state: ACTIVE,    primary: aws-use1, tier: native, names: { aws-use1: zed-91c0-logs } }
+telemetry:
+  access_log: { enabled: true, path: /var/log/shunt/access.jsonl }
+  slow: { ring_size: 100, threshold: 500ms }
+features: {}

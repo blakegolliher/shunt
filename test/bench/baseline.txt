@@ -1,0 +1,36 @@
+PASS
+ok  	github.com/blakegolliher/shunt/cmd/shunt	0.008s
+?   	github.com/blakegolliher/shunt/internal/admin	[no test files]
+?   	github.com/blakegolliher/shunt/internal/auth	[no test files]
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/config
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkParse/poc-16   	    8373	    134090 ns/op	   23877 B/op	     419 allocs/op
+BenchmarkParse/poc-16   	   10000	    119213 ns/op	   23872 B/op	     419 allocs/op
+BenchmarkParse/poc-16   	   10000	    113528 ns/op	   23872 B/op	     419 allocs/op
+BenchmarkParse/poc-16   	    9693	    121660 ns/op	   23873 B/op	     419 allocs/op
+BenchmarkParse/poc-16   	   10000	    116179 ns/op	   23872 B/op	     419 allocs/op
+BenchmarkParse/poc-16   	    9808	    111670 ns/op	   23872 B/op	     419 allocs/op
+BenchmarkParse/mixed-16 	    2500	    530645 ns/op	   96263 B/op	    1935 allocs/op
+BenchmarkParse/mixed-16 	    2476	    513242 ns/op	   96261 B/op	    1935 allocs/op
+BenchmarkParse/mixed-16 	    2257	    529867 ns/op	   96260 B/op	    1935 allocs/op
+BenchmarkParse/mixed-16 	    2065	    529676 ns/op	   96260 B/op	    1935 allocs/op
+BenchmarkParse/mixed-16 	    2450	    551365 ns/op	   96261 B/op	    1935 allocs/op
+BenchmarkParse/mixed-16 	    2041	    582618 ns/op	   96262 B/op	    1935 allocs/op
+BenchmarkValidate-16    	   98826	     12516 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkValidate-16    	  102228	     12648 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkValidate-16    	   91996	     12634 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkValidate-16    	   81364	     12435 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkValidate-16    	  101336	     12409 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkValidate-16    	   91252	     13072 ns/op	    2680 B/op	      79 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/config	21.517s
+?   	github.com/blakegolliher/shunt/internal/directory	[no test files]
+?   	github.com/blakegolliher/shunt/internal/listener	[no test files]
+?   	github.com/blakegolliher/shunt/internal/migrate	[no test files]
+?   	github.com/blakegolliher/shunt/internal/proxy	[no test files]
+?   	github.com/blakegolliher/shunt/internal/s3	[no test files]
+?   	github.com/blakegolliher/shunt/internal/sigv4	[no test files]
+?   	github.com/blakegolliher/shunt/internal/telemetry	[no test files]
+?   	github.com/blakegolliher/shunt/internal/upstream	[no test files]
