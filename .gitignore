@@ -7,6 +7,5 @@
 /test/e2e/certs/
 /test/e2e/data/
 /test/bench/new.txt
-testdata/fuzz/*/[0-9a-f]*
 /s3diff
 /s3bench
