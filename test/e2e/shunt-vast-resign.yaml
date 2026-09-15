@@ -1,0 +1,36 @@
+# shunt in resign mode fronting the VAST lab cluster from docs/CONTEXT.md. Run: make run-vast-resign
+# The access key is filled from $VAST_ACCESS_KEY_ID into test/e2e/data/shunt-vast-resign.yaml
+# (never committed); the secret is read from $VAST_SECRET_ACCESS_KEY at startup.
+#
+# TEMPORARY: tls.insecure_skip_verify is on because the cluster serves VAST's factory self-signed
+# certificate (CN vms.example.com), which does not cover the endpoint hostname. Remove it once a
+# certificate for vast02.example.com is installed and set tls.ca instead.
+listener:
+  address: "127.0.0.1:8443"
+  domains: ["*.shunt.example.com"]
+  tls:
+    cert: test/e2e/certs/wildcard.crt
+    key: test/e2e/certs/wildcard.key
+admin:
+  address: "127.0.0.1:9900"
+auth:
+  mode: resign
+  credentials_file: test/e2e/data/credentials.yaml
+proxy:
+  cluster: vast
+  copy_buffer_bytes: 262144
+  idle_timeout: 60s
+  metadata_timeout: 30s
+  drain_timeout: 30s
+clusters:
+  vast:
+    type: vast
+    scheme: https
+    region: us-east-1
+    endpoints: ["vast02.example.com:443"]
+    tls: { insecure_skip_verify: true }
+    credentials: { access_key: VAST_ACCESS_KEY_SET_BY_ENV, secret_ref: env:VAST_SECRET_ACCESS_KEY }
+    capabilities: { enforces_sha256: true, unsigned_trailer: true }
+telemetry:
+  access_log: { enabled: true, path: test/e2e/data/shunt-vast-resign.access.jsonl }
+  slow: { ring_size: 100, threshold: 500ms }

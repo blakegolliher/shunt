@@ -7,10 +7,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -35,6 +37,7 @@ var headerAllow = map[string]bool{
 	"Date": true, "Server": true, "X-Amz-Request-Id": true, "X-Amz-Id-2": true,
 	"Via": true, "X-Shunt-Request-Id": true, "Connection": true, "Keep-Alive": true,
 	"X-Amz-Version-Id": true, // each side does its own PUT; versioned backends mint a new id per write
+	"X-Vast-Rcf-Id":    true, // VAST's per-request trace id, the equivalent of x-amz-request-id
 }
 
 // xmlNoise strips per-request values from XML bodies before comparing them.
@@ -118,23 +121,26 @@ func (b *hashBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// target is one side of the comparison.
+// target is one side of the comparison: an SDK client and a raw client sharing one recorder.
 type target struct {
 	name     string
 	client   *s3.Client
 	rec      *recorder
-	pathOnly bool
+	httpc    *http.Client
+	endpoint string
+	ak, sk   string
+	region   string
 }
 
-// newTarget builds an SDK client whose every *.domain / domain host dials addr.
-func newTarget(name, endpoint, addr, domain, region, ak, sk, caFile string, pathStyle bool) (*target, error) {
+// newTarget builds the clients. When addr is set, every *.domain / domain host dials addr.
+func newTarget(name, endpoint, addr, domain, region, ak, sk, caFile string, pathStyle, insecure bool) (*target, error) {
 	tr := &http.Transport{
 		DisableCompression: true,
 		ForceAttemptHTTP2:  false,
 		TLSNextProto:       map[string]func(string, *tls.Conn) http.RoundTripper{},
 		DialContext: func(ctx context.Context, network, host string) (net.Conn, error) {
 			h, _, err := net.SplitHostPort(host)
-			if err == nil && (h == domain || strings.HasSuffix(h, "."+domain)) {
+			if addr != "" && err == nil && (h == domain || strings.HasSuffix(h, "."+domain)) {
 				host = addr
 			}
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, host)
@@ -148,6 +154,12 @@ func newTarget(name, endpoint, addr, domain, region, ak, sk, caFile string, path
 		pool := x509.NewCertPool()
 		pool.AppendCertsFromPEM(pem)
 		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	if insecure {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		tr.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // explicit -direct-insecure opt-in, temporary
 	}
 	rec := &recorder{rt: tr}
 	cfg := aws.Config{
@@ -163,7 +175,7 @@ func newTarget(name, endpoint, addr, domain, region, ak, sk, caFile string, path
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = pathStyle
 	})
-	return &target{name: name, client: c, rec: rec}, nil
+	return &target{name: name, client: c, rec: rec, httpc: &http.Client{Transport: rec}, endpoint: endpoint, ak: ak, sk: sk, region: region}, nil
 }
 
 type result struct {
@@ -172,6 +184,7 @@ type result struct {
 	direct []*probe
 	via    []*probe
 	diffs  []string
+	gap    bool // the backend rejected the direct request that shunt accepted: a backend gap, not a shunt diff
 }
 
 func (r *result) compare(compareBody bool) {
@@ -198,6 +211,12 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 	}
 	if d.status != v.status {
 		add("status: direct=%d via=%d", d.status, v.status)
+		if len(d.body) > 0 {
+			add("direct body: %s", trunc(string(d.body)))
+		}
+		if len(v.body) > 0 {
+			add("via body: %s", trunc(string(v.body)))
+		}
 	}
 	keys := map[string]bool{}
 	for k := range d.headers {
@@ -216,6 +235,9 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 	for _, k := range sorted {
 		if k == "Content-Length" && (d.body != nil || v.body != nil) {
 			continue // XML bodies are compared after normalisation; their length follows
+		}
+		if k == "Content-Length" && d.status == http.StatusNoContent && v.status == http.StatusNoContent {
+			continue // RFC 9110 §8.6: a 204 must not carry Content-Length; Go's server drops a backend's "0"
 		}
 		if a, b := strings.Join(d.headers[k], ","), strings.Join(v.headers[k], ","); a != b {
 			add("header %s: direct=%q via=%q", k, a, b)
@@ -238,7 +260,24 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 
 func normalise(body []byte) string {
 	out := xmlNoise.ReplaceAllString(string(body), "<$1>*</")
-	return locationPort.ReplaceAllString(out, "$1")
+	out = locationPort.ReplaceAllString(out, "$1")
+	return sortBuckets(out)
+}
+
+// bucketEntry matches one <Bucket> of a ListBuckets response. Backends are not required to return
+// buckets in a stable order (Garage does not), so the comparison sorts them; shunt forwards the
+// backend's bytes unchanged either way.
+var bucketEntry = regexp.MustCompile(`<Bucket>.*?</Bucket>`)
+
+func sortBuckets(body string) string {
+	i, j := strings.Index(body, "<Buckets>"), strings.Index(body, "</Buckets>")
+	if i < 0 || j < i {
+		return body
+	}
+	inner := body[i+len("<Buckets>") : j]
+	entries := bucketEntry.FindAllString(inner, -1)
+	sort.Strings(entries)
+	return body[:i+len("<Buckets>")] + strings.Join(entries, "") + body[j:]
 }
 
 func trunc(s string) string {
@@ -277,13 +316,41 @@ func main() {
 		bucket    = flag.String("bucket", "s3diff", "bucket name (created and deleted)")
 		sizesFlag = flag.String("sizes", "0,1,4096,1048576,67108864", "object sizes")
 		keep      = flag.Bool("keep", false, "keep the bucket afterwards")
+		mode      = flag.String("mode", "passthrough", "passthrough|resign; resign signs the via side with shunt-issued credentials")
+		dAKEnv    = flag.String("direct-access-key-env", "AWS_ACCESS_KEY_ID", "env var with the backend access key")
+		dSKEnv    = flag.String("direct-secret-env", "AWS_SECRET_ACCESS_KEY", "env var with the backend secret")
+		vAKEnv    = flag.String("via-access-key-env", "", "env var with the via-side access key (default SHUNT_ACCESS_KEY in resign mode, else the direct one)")
+		vSKEnv    = flag.String("via-secret-env", "", "env var with the via-side secret (default SHUNT_SECRET in resign mode, else the direct one)")
+		viaRegion = flag.String("via-region", "", "via-side signing region (default us-east-1 in resign mode, else -region)")
+		dInsecure = flag.Bool("direct-insecure", false, "skip TLS verification on the direct side (temporary, for backends without a valid certificate)")
+		stylesArg = flag.String("styles", "path,vhost", "addressing styles to run")
+		existing  = flag.String("existing-bucket", "", "use this existing bucket; nothing is created or deleted except keys under a unique prefix")
+		sigModes  = flag.Bool("signing-modes", true, "run the signing-mode dimension (raw client, every payload mode)")
 	)
 	flag.Parse()
-	ak, sk := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
-	if ak == "" || sk == "" {
-		fmt.Fprintln(os.Stderr, "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY required")
+	if *vAKEnv == "" {
+		*vAKEnv, *vSKEnv = *dAKEnv, *dSKEnv
+		if *mode == "resign" {
+			*vAKEnv, *vSKEnv = "SHUNT_ACCESS_KEY", "SHUNT_SECRET"
+		}
+	}
+	if *viaRegion == "" {
+		*viaRegion = *region
+		if *mode == "resign" {
+			*viaRegion = "us-east-1" // client scope region differs from the cluster region on purpose (ADR-0001)
+		}
+	}
+	ak, sk := os.Getenv(*dAKEnv), os.Getenv(*dSKEnv)
+	vak, vsk := os.Getenv(*vAKEnv), os.Getenv(*vSKEnv)
+	if ak == "" || sk == "" || vak == "" || vsk == "" {
+		fmt.Fprintf(os.Stderr, "credentials required: %s, %s, %s, %s\n", *dAKEnv, *dSKEnv, *vAKEnv, *vSKEnv)
 		os.Exit(2)
 	}
+	if *dInsecure {
+		fmt.Fprintln(os.Stderr, "WARNING: -direct-insecure: TLS certificate verification is disabled for", *directEP)
+	}
+	var runID [4]byte
+	_, _ = rand.Read(runID[:])
 	sizeStrs := strings.Split(*sizesFlag, ",")
 	sizes := make([]int, 0, len(sizeStrs))
 	for _, s := range sizeStrs {
@@ -297,39 +364,56 @@ func main() {
 
 	ctx := context.Background()
 	var results []result
-	failed := 0
-	for _, style := range []string{"path", "vhost"} {
+	failed, gaps := 0, 0
+	for _, style := range strings.Split(*stylesArg, ",") {
 		pathStyle := style == "path"
-		direct, err := newTarget("direct", *directEP, *directAd, *domain, *region, ak, sk, "", pathStyle)
+		direct, err := newTarget("direct", *directEP, *directAd, *domain, *region, ak, sk, "", pathStyle, *dInsecure)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		via, err := newTarget("via", *viaEP, *viaAd, *domain, *region, ak, sk, *caFile, pathStyle)
+		via, err := newTarget("via", *viaEP, *viaAd, *domain, *viaRegion, vak, vsk, *caFile, pathStyle, false)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		bkt := *bucket + "-" + style
+		prefix := ""
+		if *existing != "" {
+			bkt = *existing
+			prefix = "s3diff/" + hex.EncodeToString(runID[:]) + "/" + style + "/"
+		}
 		run := func(name, op string, body bool, f func(*target) error) {
 			r := result{name: style + "/" + name, op: op}
-			_ = f(direct)
+			ed := f(direct)
 			r.direct = direct.rec.take()
-			_ = f(via)
+			ev := f(via)
 			r.via = via.rec.take()
 			r.compare(body)
-			if len(r.diffs) > 0 {
+			if errors.Is(ed, errContent) {
+				r.diffs = append(r.diffs, "direct: "+errContent.Error())
+			}
+			if errors.Is(ev, errContent) {
+				r.diffs = append(r.diffs, "via: "+errContent.Error())
+			}
+			if strings.HasPrefix(name, "sig/") && op == "PutObject" && len(r.diffs) > 0 &&
+				r.direct[len(r.direct)-1].status >= 400 && r.via[len(r.via)-1].status/100 == 2 {
+				r.gap = true
+				gaps++
+			} else if len(r.diffs) > 0 {
 				failed++
 			}
 			results = append(results, r)
 		}
 
 		// Bucket lifecycle: create direct, list via both, delete at the end via both (second is 404).
-		if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
-			fmt.Fprintf(os.Stderr, "create bucket %s: %v\n", bkt, err)
-			os.Exit(2)
+		if *existing == "" {
+			if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
+				fmt.Fprintf(os.Stderr, "create bucket %s: %v\n", bkt, err)
+				os.Exit(2)
+			}
+			direct.rec.take() // CreateBucket above is setup, not a compared step
 		}
-		direct.rec.take() // CreateBucket above is setup, not a compared step
 		run("bucket", "HeadBucket", false, func(t *target) error {
 			_, err := t.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bkt})
 			return err
@@ -340,6 +424,10 @@ func main() {
 		})
 
 		for kname, key := range trickyKeys {
+			if kname == "long" {
+				key = strings.Repeat("k", 1024-len(prefix)-len("-1048576"))
+			}
+			key = prefix + key
 			for _, size := range sizes {
 				if kname != "plain" && size > 4096 {
 					continue // tricky keys are about naming; sizes are about streaming
@@ -370,7 +458,7 @@ func main() {
 					got, _ := io.ReadAll(out.Body)
 					_ = out.Body.Close()
 					if sha256.Sum256(got) != sum {
-						return fmt.Errorf("content mismatch")
+						return errContent
 					}
 					return nil
 				})
@@ -386,21 +474,50 @@ func main() {
 				}
 			}
 		}
+		// The signing-mode dimension runs once, path-style, after the SDK matrix's PUTs.
+		if *sigModes && pathStyle {
+			for _, m := range signingModes() {
+				for _, size := range []int{1, 200 << 10} {
+					payload := deterministic(size)
+					sum := sha256.Sum256(payload)
+					k := prefix + fmt.Sprintf("sig/%s-%d", m.name, size)
+					label := fmt.Sprintf("sig/%s/%d", m.name, size)
+					run(label, "PutObject", false, func(t *target) error { return t.rawPut(ctx, bkt, k, payload, m) })
+					if m.payload == "presigned" {
+						run(label, "GetObject(presigned)", true, func(t *target) error { return t.rawPresignedGet(ctx, bkt, k, sum) })
+						continue
+					}
+					run(label, "GetObject", true, func(t *target) error {
+						out, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: &k})
+						if err != nil {
+							return err
+						}
+						got, _ := io.ReadAll(out.Body)
+						_ = out.Body.Close()
+						if sha256.Sum256(got) != sum {
+							return errContent
+						}
+						return nil
+					})
+				}
+			}
+		}
+
 		run("list", "ListObjectsV2", true, func(t *target) error {
-			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Prefix: aws.String("dir")})
+			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Prefix: aws.String(prefix + "dir")})
 			return err
 		})
 		run("list", "ListObjectsV2(delim)", true, func(t *target) error {
-			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Delimiter: aws.String("/"), MaxKeys: aws.Int32(3)})
+			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Prefix: aws.String(prefix), Delimiter: aws.String("/"), MaxKeys: aws.Int32(3)})
 			return err
 		})
 		run("list", "ListObjects", true, func(t *target) error {
-			_, err := t.client.ListObjects(ctx, &s3.ListObjectsInput{Bucket: &bkt, Prefix: aws.String("dir/")})
+			_, err := t.client.ListObjects(ctx, &s3.ListObjectsInput{Bucket: &bkt, Prefix: aws.String(prefix + "dir/")})
 			return err
 		})
 
 		// Multipart: 2 parts of 5 MiB + 1 MiB, same key sequentially on both sides.
-		mpKey := "dir/multipart.bin"
+		mpKey := prefix + "dir/multipart.bin"
 		part1, part2 := deterministic(5<<20), deterministic(1<<20)
 		run("multipart", "CreateMultipartUpload", true, func(t *target) error {
 			out, err := t.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bkt, Key: &mpKey})
@@ -429,17 +546,17 @@ func main() {
 			return err
 		})
 		run("multipart", "AbortMultipartUpload", false, func(t *target) error {
-			out, err := t.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bkt, Key: aws.String("dir/aborted.bin")})
+			out, err := t.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bkt, Key: aws.String(prefix + "dir/aborted.bin")})
 			if err != nil {
 				return err
 			}
-			_, err = t.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bkt, Key: aws.String("dir/aborted.bin"), UploadId: out.UploadId})
+			_, err = t.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bkt, Key: aws.String(prefix + "dir/aborted.bin"), UploadId: out.UploadId})
 			return err
 		})
 
 		// Errors: the proxy must relay them unchanged.
 		run("errors", "GetObject(404)", true, func(t *target) error {
-			_, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: aws.String("does/not/exist")})
+			_, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: aws.String(prefix + "does/not/exist")})
 			return err
 		})
 		run("errors", "HeadBucket(404)", false, func(t *target) error {
@@ -448,7 +565,7 @@ func main() {
 		})
 
 		// Deletes: put direct, delete via each side in turn (the second sees the object again).
-		delKey := "dir/todelete.bin"
+		delKey := prefix + "dir/todelete.bin"
 		run("delete", "DeleteObject", false, func(t *target) error {
 			if _, err := direct.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bkt, Key: &delKey, Body: bytes.NewReader([]byte("x"))}); err != nil {
 				return err
@@ -460,7 +577,7 @@ func main() {
 		run("delete", "DeleteObjects", true, func(t *target) error {
 			var ids []types.ObjectIdentifier
 			for i := 0; i < 3; i++ {
-				k := fmt.Sprintf("dir/batch-%d", i)
+				k := fmt.Sprintf("%sdir/batch-%d", prefix, i)
 				if _, err := direct.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bkt, Key: &k, Body: bytes.NewReader([]byte("x"))}); err != nil {
 					return err
 				}
@@ -472,13 +589,24 @@ func main() {
 		})
 
 		if !*keep {
-			// Empty and delete the bucket through shunt; a second delete must 404 identically.
-			list, err := direct.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt})
-			if err == nil {
+			// Remove everything this run wrote (only the run's prefix in an existing bucket).
+			var token *string
+			for {
+				list, err := direct.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Prefix: aws.String(prefix), ContinuationToken: token})
+				if err != nil {
+					break
+				}
 				for _, o := range list.Contents {
 					_, _ = direct.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bkt, Key: o.Key})
 				}
+				if list.IsTruncated == nil || !*list.IsTruncated {
+					break
+				}
+				token = list.NextContinuationToken
 			}
+			direct.rec.take()
+		}
+		if !*keep && *existing == "" {
 			run("bucket", "DeleteBucket", false, func(t *target) error {
 				if _, err := direct.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bkt}); err != nil {
 					if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
@@ -493,18 +621,48 @@ func main() {
 	}
 
 	// Report.
-	fmt.Printf("%-28s %-26s %-9s %-9s %s\n", "case", "op", "direct", "via", "result")
+	fmt.Printf("%-44s %-22s %-9s %-9s %s\n", "case", "op", "direct", "via", "result")
+	type tally struct{ cases, ok, diff, gap int }
+	groups := map[string]*tally{}
+	var order []string
 	for _, r := range results {
 		res := "ok"
-		if len(r.diffs) > 0 {
+		switch {
+		case r.gap:
+			res = "GAP(backend)"
+		case len(r.diffs) > 0:
 			res = "DIFF"
 		}
-		fmt.Printf("%-28s %-26s %-9s %-9s %s\n", r.name, r.op, st(r.direct), st(r.via), res)
+		fmt.Printf("%-44s %-22s %-9s %-9s %s\n", r.name, r.op, st(r.direct), st(r.via), res)
 		for _, d := range r.diffs {
 			fmt.Printf("    %s\n", d)
 		}
+		g := "sdk matrix (" + strings.SplitN(r.name, "/", 2)[0] + ")"
+		if parts := strings.Split(r.name, "/"); len(parts) > 2 && parts[1] == "sig" {
+			g = "signing mode " + parts[2]
+		}
+		if groups[g] == nil {
+			groups[g] = &tally{}
+			order = append(order, g)
+		}
+		t := groups[g]
+		t.cases++
+		switch {
+		case r.gap:
+			t.gap++
+		case len(r.diffs) > 0:
+			t.diff++
+		default:
+			t.ok++
+		}
 	}
-	fmt.Printf("\n%d cases, %d diffs\n", len(results), failed)
+	fmt.Printf("\nmode=%s direct=%s via=%s (via region %s)\n", *mode, *directEP, *viaEP, *viaRegion)
+	fmt.Printf("%-48s %6s %6s %6s %6s\n", "group", "cases", "ok", "diff", "gap")
+	for _, g := range order {
+		t := groups[g]
+		fmt.Printf("%-48s %6d %6d %6d %6d\n", g, t.cases, t.ok, t.diff, t.gap)
+	}
+	fmt.Printf("\n%d cases, %d diffs, %d backend gaps\n", len(results), failed, gaps)
 	if failed > 0 {
 		os.Exit(1)
 	}

@@ -67,6 +67,11 @@ linters:
       # revive unused-parameter) stay on for non-test code.
       - path: _test\.go
         linters: [noctx, bodyclose, gosec, gocritic]
+      # test/ holds main packages (s3diff, s3bench) whose job is to send requests to operator-given
+      # endpoints; gosec's SSRF taint analysis flags exactly that.
+      - path: ^test/
+        linters: [gosec]
+        text: "G704"
       - path: _test\.go
         linters: [errcheck]
         text: "Close|Fprint"

@@ -117,6 +117,9 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		"version", version, "listen", cfg.Listener.Address, "admin", cfg.Admin.Address,
 		"auth", cfg.Auth.Mode, "cluster", cl.Name, "cluster_type", cl.Type,
 		"scheme", cl.Scheme, "endpoints", cl.Endpoints, "domains", cfg.Listener.Domains)
+	if cc := cfg.Clusters[cfg.Proxy.Cluster]; cc.TLS.InsecureSkipVerify {
+		log.Warn("upstream TLS certificate verification is DISABLED (tls.insecure_skip_verify); temporary until the backend has a valid certificate", "cluster", cl.Name)
+	}
 	if cl.Scheme == "http" {
 		log.Warn("upstream scheme is http: bytes to the backend are plaintext (per-site decision, docs/DESIGN.md §2.9)", "cluster", cl.Name)
 	}

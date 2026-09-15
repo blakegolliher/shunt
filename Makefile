@@ -33,7 +33,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign s3diff bench-e2e help
+.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign s3diff bench-e2e probe help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 
@@ -97,34 +97,59 @@ run-garage: build ## run shunt in front of the e2e Garage (foreground)
 run-minio: build ## run shunt in front of the e2e MinIO (foreground)
 	$(BIN)/shunt serve --config $(E2E_DIR)/shunt-minio.yaml
 
-# s3diff and the e2e bench need shunt running (`make run-garage` / `run-minio`) and credentials
-# from test/e2e/data/garage.env (written by e2e-up). BACKEND=garage|minio.
-BACKEND ?= garage
+# s3diff, bench-e2e, and probe take BACKEND=garage|minio|vast and MODE=passthrough|resign.
+# garage/minio need `make e2e-up` (credentials in test/e2e/data/garage.env) and shunt running in
+# front of that backend (`make run-<backend>` or `make run-<backend>-resign`). vast needs
+# VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY exported and `make run-vast-resign`.
+BACKEND      ?= garage
+MODE         ?= passthrough
+VAST_ENDPOINT ?= https://vast02.example.com:443
+VAST_BUCKET   ?= demo-dest
 ifeq ($(BACKEND),garage)
 S3_REGION := garage
 S3_ADDR   := 127.0.0.1:3900
 S3_AK     := $$GARAGE_ACCESS_KEY
 S3_SK     := $$GARAGE_SECRET
-else
+S3_BACKEND_ARGS := -direct-addr $(S3_ADDR)
+PROBE_ARGS := --endpoint http://127.0.0.1:3900 --region garage --bucket probe-garage
+else ifeq ($(BACKEND),minio)
 S3_REGION := us-east-1
 S3_ADDR   := 127.0.0.1:9000
 S3_AK     := minioadmin
 S3_SK     := minioadmin
+S3_BACKEND_ARGS := -direct-addr $(S3_ADDR)
+PROBE_ARGS := --endpoint http://127.0.0.1:9000 --region us-east-1 --bucket probe-minio
+else ifeq ($(BACKEND),vast)
+# TEMPORARY -direct-insecure / --insecure: the VAST lab cluster serves a self-signed factory certificate.
+S3_REGION := us-east-1
+S3_AK     := $$VAST_ACCESS_KEY_ID
+S3_SK     := $$VAST_SECRET_ACCESS_KEY
+S3_BACKEND_ARGS := -direct $(VAST_ENDPOINT) -direct-addr "" -direct-insecure -styles path -existing-bucket $(VAST_BUCKET)
+PROBE_ARGS := --insecure --endpoint $(VAST_ENDPOINT) --region us-east-1 --bucket $(VAST_BUCKET)
 endif
 
-s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio)
+s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio|vast MODE=passthrough|resign)
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
-	  $(GO) run ./test/s3diff -region $(S3_REGION) -direct-addr $(S3_ADDR) $(S3DIFF_ARGS)
+	  $(GO) run ./test/s3diff -mode $(MODE) -region $(S3_REGION) $(S3_BACKEND_ARGS) $(S3DIFF_ARGS)
 
-bench-e2e: ## direct vs via bench (BACKEND=garage|minio), prints a markdown table
+bench-e2e: ## direct vs via bench (BACKEND=garage|minio MODE=passthrough|resign), prints a markdown table
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
-	  $(GO) run ./test/bench/s3bench -backend $(BACKEND) -region $(S3_REGION) -direct-addr $(S3_ADDR) $(BENCH_ARGS)
+	  $(GO) run ./test/bench/s3bench -mode $(MODE) -backend $(BACKEND) -region $(S3_REGION) $(S3_BACKEND_ARGS) $(BENCH_ARGS)
+
+probe: build ## shunt probe against BACKEND=garage|minio|vast
+	. $(E2E_DIR)/data/garage.env 2>/dev/null; AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
+	  $(BIN)/shunt probe $(PROBE_ARGS) $(PROBE_FLAGS)
 
 run-garage-resign: build ## run shunt in resign mode in front of the e2e Garage (foreground)
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-garage-resign.yaml
 
 run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (foreground)
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-minio-resign.yaml
+
+run-vast-resign: build ## run shunt in resign mode in front of the VAST lab cluster (foreground)
+	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
+	@sed "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" $(E2E_DIR)/shunt-vast-resign.yaml > $(E2E_DIR)/data/shunt-vast-resign.yaml
+	$(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-vast-resign.yaml
 
 e2e-down: ## tear down the e2e backends and their data
 	cd $(E2E_DIR) && $(COMPOSE) down -v --remove-orphans

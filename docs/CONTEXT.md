@@ -43,22 +43,22 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 
 | Item | Answer |
 |---|---|
-| VAST lab endpoint(s), scheme, port | unknown — fill before POC-2 |
-| Scratch bucket name Claude Code may create/delete objects in | unknown — fill before POC-2 |
-| Env var names holding access key / secret | unknown — fill before POC-2 |
-| VAST version; virtual-host style domain configured? (which) | unknown |
-| Second cluster available for multi-cluster tests later? | unknown |
+| VAST lab endpoint(s), scheme, port |  https://vast02.example.com:443 |
+| Scratch bucket name Claude Code may create/delete objects in | demo-dest |
+| Env var names holding access key / secret | VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY |
+| VAST version; virtual-host style domain configured? (which) | 5.x; no virtual-host domai |
+| Second cluster available for multi-cluster tests later? | https://vast03.example.com:443 |
 | Garage / versitygw already installed locally? paths/ports | Garage `docker.io/dxflrs/garage:v2.3.0` via test/e2e compose only: S3 127.0.0.1:3900, admin 127.0.0.1:3903 (`/health` unauthenticated, other endpoints `/v2/*` with bearer token), region `garage`. No versitygw |
 
 ## Known VAST compatibility findings (pre-seed backend-compat.md)
 
 | Behavior | Known answer |
 |---|---|
-| Enforces `x-amz-content-sha256` mismatch? | unknown |
-| Accepts `STREAMING-UNSIGNED-PAYLOAD-TRAILER`? | unknown |
-| Checksum headers honored (CRC32 / CRC32C / SHA1 / SHA256 / CRC64NVME) | unknown |
-| `If-None-Match: *` on PUT? `If-Match` on PUT? | unknown |
-| Unsigned `GET /` returns (status)? | unknown |
+| Enforces `x-amz-content-sha256` mismatch? | yes, `400 XAmzContentSHA256Mismatch` (shunt probe, 2026-09-15, vast02) |
+| Accepts `STREAMING-UNSIGNED-PAYLOAD-TRAILER`? | yes, and validates the trailer checksum (`400 BadDigest` on mismatch) |
+| Checksum headers honored (CRC32 / CRC32C / SHA1 / SHA256 / CRC64NVME) | all five validated (`400 BadDigest` on mismatch) |
+| `If-None-Match: *` on PUT? `If-Match` on PUT? | `If-None-Match: *` yes (412); `If-Match` **no**, a mismatched ETag is accepted |
+| Unsigned `GET /` returns (status)? | 200, empty `ListAllMyBucketsResult` owned by `Anonymous`. Also: the signing region is not enforced (a `nowhere-1` scope is accepted). TLS: self-signed factory cert (CN vms.example.com) that does not cover the endpoint name; POC-2 runs with verification disabled until a proper cert is installed. Full table: docs/reference/backend-compat.md |
 | GetObjectAttributes, HeadObject/GetObject `--part-number` known issues (Jira IDs) | unknown |
 | CORS, presigned URL, multipart edge cases already documented | unknown |
 

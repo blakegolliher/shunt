@@ -30,7 +30,7 @@ type side struct {
 	client *s3.Client
 }
 
-func newSide(name, endpoint, addr, domain, region, ak, sk, caFile string, conns int) (*side, error) {
+func newSide(name, endpoint, addr, domain, region, ak, sk, caFile string, conns int, insecure bool) (*side, error) {
 	tr := &http.Transport{
 		DisableCompression:  true,
 		ForceAttemptHTTP2:   false,
@@ -39,7 +39,7 @@ func newSide(name, endpoint, addr, domain, region, ak, sk, caFile string, conns 
 		MaxIdleConns:        conns * 2,
 		DialContext: func(ctx context.Context, network, host string) (net.Conn, error) {
 			h, _, err := net.SplitHostPort(host)
-			if err == nil && (h == domain || strings.HasSuffix(h, "."+domain)) {
+			if addr != "" && err == nil && (h == domain || strings.HasSuffix(h, "."+domain)) {
 				host = addr
 			}
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, host)
@@ -53,6 +53,12 @@ func newSide(name, endpoint, addr, domain, region, ak, sk, caFile string, conns 
 		pool := x509.NewCertPool()
 		pool.AppendCertsFromPEM(pem)
 		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	if insecure {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		tr.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // explicit -direct-insecure opt-in, temporary
 	}
 	cfg := aws.Config{
 		Region: region, Credentials: credentials.NewStaticCredentialsProvider(ak, sk, ""),
@@ -162,23 +168,29 @@ func main() {
 		matrix   = flag.String("matrix", "4096:1:400,4096:64:3200,1048576:1:200,1048576:64:640,1073741824:1:3", "size:conns:ops entries")
 		runs     = flag.Int("runs", 3, "runs per cell; the median is reported")
 		backend  = flag.String("backend", "garage", "backend label for the report")
+		mode     = flag.String("mode", "passthrough", "passthrough|resign; resign signs the via side with SHUNT_ACCESS_KEY/SHUNT_SECRET")
+		insecure = flag.Bool("direct-insecure", false, "skip TLS verification on the direct side (temporary)")
 	)
 	flag.Parse()
 	ak, sk := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
+	vak, vsk, vregion := ak, sk, *region
+	if *mode == "resign" {
+		vak, vsk, vregion = os.Getenv("SHUNT_ACCESS_KEY"), os.Getenv("SHUNT_SECRET"), "us-east-1"
+	}
 	ctx := context.Background()
-	direct, err := newSide("direct", *directEP, *directAd, *domain, *region, ak, sk, "", 64)
+	direct, err := newSide("direct", *directEP, *directAd, *domain, *region, ak, sk, "", 64, *insecure)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	via, err := newSide("via", *viaEP, *viaAd, *domain, *region, ak, sk, *caFile, 64)
+	via, err := newSide("via", *viaEP, *viaAd, *domain, vregion, vak, vsk, *caFile, 64, false)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	_, _ = direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: bucket})
 
-	fmt.Printf("backend=%s runs=%d (median reported)\n\n", *backend, *runs)
+	fmt.Printf("backend=%s mode=%s runs=%d (median reported)\n\n", *backend, *mode, *runs)
 	fmt.Printf("| size | conns | op | direct p50 | direct p99 | via p50 | via p99 | added p50 | added p99 | direct MiB/s | via MiB/s | ratio | proxy CPU s/GiB | proxy CPU µs/op |\n")
 	fmt.Printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, cell := range strings.Split(*matrix, ",") {
