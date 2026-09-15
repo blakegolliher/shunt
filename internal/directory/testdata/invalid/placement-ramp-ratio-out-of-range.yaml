@@ -1,0 +1,5 @@
+# expect: placements.acme/data.ramp.ratio
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: RAMPING, primary: minio, source: garage, ramp: { ratio: 1.5 }, names: { garage: data, minio: data } }

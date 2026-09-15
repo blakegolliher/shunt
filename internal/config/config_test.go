@@ -93,15 +93,31 @@ func TestMixedSampleShape(t *testing.T) {
 	if got := len(c.Clusters); got != 6 {
 		t.Errorf("clusters: got %d", got)
 	}
-	if got := len(c.Placements); got != 7 {
-		t.Errorf("placements: got %d", got)
+	if c.Directory.File != "internal/directory/testdata/valid/mixed.yaml" || c.Directory.PollInterval != 2*time.Second {
+		t.Errorf("directory: %+v", c.Directory)
 	}
-	p := c.Placements["acme/runs"]
-	if p.State != StateRamping || p.Ramp == nil || len(p.Ramp.Prefixes) != 1 {
-		t.Errorf("acme/runs ramp not parsed: %+v", p)
+	if !c.Features.XMLRewriteOn() {
+		t.Error("features.xml_rewrite: true not parsed")
 	}
 	if c.Clusters["aws-use1"].EndpointMode != "dns" {
 		t.Errorf("aws-use1 endpoint_mode: %q", c.Clusters["aws-use1"].EndpointMode)
+	}
+}
+
+func TestFeatureDefaults(t *testing.T) {
+	c, err := Load("testdata/valid/poc.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Features.XMLRewriteOn() {
+		t.Error("xml_rewrite must default to true (approved exception to default-off, POC-3)")
+	}
+	if c.Directory.PollInterval != 0 {
+		t.Errorf("poll_interval defaulted without a directory file: %v", c.Directory.PollInterval)
+	}
+	off := false
+	if (Features{XMLRewrite: &off}).XMLRewriteOn() {
+		t.Error("xml_rewrite: false ignored")
 	}
 }
 

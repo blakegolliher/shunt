@@ -1,0 +1,4 @@
+# expect: placements.acme/data
+version: 1
+placements:
+  acme/data: { state: ACTIVE, primary: garage, names: { garage: data } }

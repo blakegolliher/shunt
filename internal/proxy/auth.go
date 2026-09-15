@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -13,12 +12,11 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/sigv4/chunked"
-	"github.com/blakegolliher/shunt/internal/telemetry"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
 // Mode is the auth mode (ADR-0001).
@@ -29,12 +27,6 @@ const (
 	ModePassthrough Mode = iota
 	ModeResign
 )
-
-// Capabilities is the subset of the cluster capability profile the resign path consults.
-type Capabilities struct {
-	EnforcesSHA256  bool // backend rejects a wrong hex x-amz-content-sha256 itself
-	UnsignedTrailer bool // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
-}
 
 // presignParams are stripped from the upstream URL after a presigned request is verified.
 var presignParams = []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token"}
@@ -56,71 +48,8 @@ type bodyPlan struct {
 	decodedLen    int64
 }
 
-// resign verifies the client request and builds the upstream request per the §2.2 table.
-// It returns an *sigv4.AuthError (already counted) for the caller to render.
-func (h *Handler) resign(ctx context.Context, r *http.Request, o *outcome, inBody *progressReader, endpoint string) (*http.Request, *bodyPlan, *sigv4.AuthError) {
-	t0 := time.Now()
-	id, aerr := sigv4.Verify(ctx, r, h.Store, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
-	if aerr != nil {
-		h.Metrics.AuthFailures.WithLabelValues(string(aerr.Reason)).Inc()
-		return nil, nil, aerr
-	}
-	mode := "header"
-	if id.Presigned {
-		mode = "presigned"
-	}
-	h.Metrics.AuthDuration.WithLabelValues(mode).Observe(time.Since(t0).Seconds())
-	o.tenant = id.Credential.Tenant
-
-	// Upstream target: always path-style with Host = endpoint (decision 1).
-	rawPath := sigv4.RawPath(r)
-	if o.info.Style == s3.StyleVirtualHost {
-		rawPath = "/" + o.info.Bucket + rawPath
-	}
-	rawQuery := r.URL.RawQuery
-	if id.Presigned {
-		rawQuery = stripPresign(rawQuery)
-	}
-	target := h.Cluster.Scheme + "://" + endpoint + rawPath
-	if rawQuery != "" {
-		target += "?" + rawQuery
-	}
-
-	plan, perr := h.planBody(r, id, inBody)
-	if perr != nil {
-		h.Metrics.AuthFailures.WithLabelValues(string(perr.Reason)).Inc()
-		return nil, nil, perr
-	}
-	out, err := http.NewRequestWithContext(ctx, r.Method, target, plan.body) //nolint:gosec // G704: scheme and host come from config
-	if err != nil {
-		return nil, nil, &sigv4.AuthError{Reason: sigv4.ReasonMalformed, Err: s3.Lookup(s3.InvalidURI)}
-	}
-	out.Host = endpoint
-	out.ContentLength = plan.contentLength
-	copyHeaders(out.Header, r.Header)
-	for _, hname := range clientAuthHeaders {
-		out.Header.Del(hname)
-	}
-	if plan.stripEncoding {
-		stripAWSChunked(out.Header)
-		out.Header.Del("X-Amz-Decoded-Content-Length")
-		out.Header.Del("X-Amz-Trailer")
-	}
-	if plan.keepTrailer {
-		out.Header.Set("Content-Encoding", "aws-chunked")
-		out.Header.Set("X-Amz-Decoded-Content-Length", strconv.FormatInt(plan.decodedLen, 10))
-	}
-	if _, ok := r.Header["User-Agent"]; !ok {
-		out.Header.Set("User-Agent", "")
-	}
-	appendVia(out.Header, h.Via)
-	out.Header.Set(telemetry.HeaderRequestID, o.rid)
-	sigv4.Sign(out, h.ClusterCreds, h.Cluster.Region, plan.payloadHash, time.Now())
-	return out, plan, nil
-}
-
-// planBody applies the §2.2 payload table.
-func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressReader) (*bodyPlan, *sigv4.AuthError) {
+// planBody applies the §2.2 payload table against the target cluster's capability profile.
+func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressReader, cl *upstream.Cluster) (*bodyPlan, *sigv4.AuthError) {
 	var src io.Reader
 	if inBody != nil {
 		src = inBody
@@ -140,7 +69,7 @@ func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressR
 		}
 		return plan, nil // body untouched, header verbatim
 	case sigv4.PayloadSHA256:
-		if !h.Capabilities.EnforcesSHA256 {
+		if !cl.EnforcesSHA256 {
 			// The backend will not check; hash in the copy loop and log a mismatch (amendment 5).
 			plan.sha = sha256.New()
 			plan.expectHex = id.PayloadHash
@@ -179,7 +108,7 @@ func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressR
 	plan.decodedLen = decodedLen
 	plan.stripEncoding = true
 	switch {
-	case withTrailer && h.Capabilities.UnsignedTrailer:
+	case withTrailer && cl.UnsignedTrailer:
 		// Re-frame as an unsigned trailer so the backend validates the checksum itself.
 		algo := chunked.Algorithm(trailerType)
 		plan.body = chunked.NewEncoder(dec, decodedLen, string(trailerType), dec, chunked.DefaultChunkSize)

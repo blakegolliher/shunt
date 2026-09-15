@@ -1,0 +1,5 @@
+# expect: placements.acme/data.names.vast-a
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, primary: garage, names: { garage: data, vast-a: data } }

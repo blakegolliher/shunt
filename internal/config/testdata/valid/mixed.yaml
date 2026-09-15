@@ -1,4 +1,4 @@
-# Every feature of the §2.3 example: mixed backends, tenants, all four states, tiering, SNI.
+# Every feature of the §2.3 example: mixed backends, SNI; tenants and placements are in the directory file.
 listener:
   address: ":443"
   domains: ["*.shunt.example.com", "*.s3.example.net"]
@@ -15,7 +15,6 @@ auth:
   credentials_file: /etc/shunt/credentials.yaml
   clock_skew: 15m
 proxy:
-  cluster: vast-a
   copy_buffer_bytes: 262144
   idle_timeout: 60s
   metadata_timeout: 30s
@@ -67,18 +66,10 @@ clusters:
     credentials: { access_key: AKIAVAULT, secret_ref: env:VAULT_SECRET }
     storage_class: DEEP_ARCHIVE
     access: restore-required
-tenants:
-  acme: { default_cluster: vast-a }
-  zed:  { default_cluster: minio-1 }
-placements:
-  acme/training-sets: { state: ACTIVE,    primary: vast-a,   names: { vast-a: training-sets } }
-  acme/checkpoints:   { state: RAMPING,   primary: vast-fab, source: vast-a, ramp: { ratio: 0.05 }, names: { vast-a: checkpoints, vast-fab: checkpoints } }
-  acme/runs:          { state: RAMPING,   primary: aws-use1, source: vast-a, ramp: { prefixes: ["2026-09/"] }, names: { vast-a: runs, aws-use1: acme-7f3a-runs } }
-  zed/data:           { state: MIGRATING, primary: minio-1,  source: aws-use1, names: { aws-use1: zed-91c0-data, minio-1: data } }
-  zed/done:           { state: CUTOVER,   primary: minio-1,  source: vast-a, names: { vast-a: done, minio-1: done } }
-  acme/archive:       { state: ACTIVE,    primary: vast-a,   cold: vault, tier: emulated, lifecycle: "<LifecycleConfiguration/>", names: { vast-a: archive, vault: archive } }
-  zed/logs:           { state: ACTIVE,    primary: aws-use1, tier: native, names: { aws-use1: zed-91c0-logs } }
+directory:
+  file: internal/directory/testdata/valid/mixed.yaml
+  poll_interval: 2s
 telemetry:
   access_log: { enabled: true, path: /var/log/shunt/access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }
-features: {}
+features: { xml_rewrite: true }

@@ -1,0 +1,5 @@
+# expect: placements.acme/data.source
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: MIGRATING, primary: garage, names: { garage: data } }

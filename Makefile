@@ -33,7 +33,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign s3diff bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed s3diff s3diff-mixed bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -132,6 +132,9 @@ S3_BACKEND_ARGS := -direct $(VAST_ENDPOINT) -direct-addr "" -direct-insecure -st
 PROBE_ARGS := --insecure --endpoint $(VAST_ENDPOINT) --region us-east-1 --bucket $(VAST_BUCKET)
 endif
 
+s3diff-mixed: ## POC-3: mixed-backend differential test through one shunt (needs make e2e-up and make run-mixed)
+	. $(E2E_DIR)/data/garage.env && $(GO) run ./test/s3diff -mixed -config $(E2E_DIR)/data/shunt-mixed.yaml $(S3DIFF_ARGS)
+
 s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio|vast MODE=passthrough|resign)
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
 	  $(GO) run ./test/s3diff -mode $(MODE) -region $(S3_REGION) $(S3_BACKEND_ARGS) $(S3DIFF_ARGS)
@@ -144,15 +147,23 @@ probe: build ## shunt probe against BACKEND=garage|minio|vast
 	. $(E2E_DIR)/data/garage.env 2>/dev/null; AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
 	  $(BIN)/shunt probe $(PROBE_ARGS) $(PROBE_FLAGS)
 
-run-garage-resign: build ## run shunt in resign mode in front of the e2e Garage (foreground)
+run-garage-resign: build ## run shunt in resign mode in front of the e2e Garage (foreground; resets its directory)
+	cp $(E2E_DIR)/directory-garage.yaml $(E2E_DIR)/data/directory-garage.yaml
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-garage-resign.yaml
 
-run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (foreground)
+run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (foreground; resets its directory)
+	cp $(E2E_DIR)/directory-minio.yaml $(E2E_DIR)/data/directory-minio.yaml
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-minio-resign.yaml
+
+run-mixed: build ## POC-3: one shunt in resign mode over the e2e Garage and MinIO (foreground; resets the mixed directory)
+	cp $(E2E_DIR)/directory-mixed.yaml $(E2E_DIR)/data/directory-mixed.yaml
+	rm -f $(E2E_DIR)/data/directory-mixed.yaml.changes.jsonl
+	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-mixed.yaml
 
 run-vast-resign: build ## run shunt in resign mode in front of the VAST lab cluster (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
 	@sed "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" $(E2E_DIR)/shunt-vast-resign.yaml > $(E2E_DIR)/data/shunt-vast-resign.yaml
+	cp $(E2E_DIR)/directory-vast.yaml $(E2E_DIR)/data/directory-vast.yaml
 	$(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-vast-resign.yaml
 
 e2e-down: ## tear down the e2e backends and their data

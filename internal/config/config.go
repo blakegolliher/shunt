@@ -14,15 +14,22 @@ import (
 
 // Config is the root of the shunt configuration file.
 type Config struct {
-	Listener   Listener             `yaml:"listener"`
-	Admin      Admin                `yaml:"admin"`
-	Auth       Auth                 `yaml:"auth"`
-	Proxy      Proxy                `yaml:"proxy"`
-	Clusters   map[string]Cluster   `yaml:"clusters"`
-	Tenants    map[string]Tenant    `yaml:"tenants"`
-	Placements map[string]Placement `yaml:"placements"`
-	Telemetry  Telemetry            `yaml:"telemetry"`
-	Features   Features             `yaml:"features"`
+	Listener  Listener           `yaml:"listener"`
+	Admin     Admin              `yaml:"admin"`
+	Auth      Auth               `yaml:"auth"`
+	Proxy     Proxy              `yaml:"proxy"`
+	Clusters  map[string]Cluster `yaml:"clusters"`
+	Directory Directory          `yaml:"directory"`
+	Telemetry Telemetry          `yaml:"telemetry"`
+	Features  Features           `yaml:"features"`
+}
+
+// Directory points at the directory file: tenants and placements (docs/DESIGN.md §2.3, ADR-0005).
+// It lives in its own file because shunt writes it (CreateBucket, DeleteBucket, set-state) and
+// must never rewrite the operator's config. Required in resign mode, forbidden in passthrough.
+type Directory struct {
+	File         string        `yaml:"file"`
+	PollInterval time.Duration `yaml:"poll_interval"` // how often serve checks the file for other writers' changes
 }
 
 // Listener is the client-facing TLS listener (docs/DESIGN.md §2.9).
@@ -58,10 +65,10 @@ type Auth struct {
 	ClockSkew       time.Duration `yaml:"clock_skew"`
 }
 
-// Proxy holds data-path tunables and, until the directory arrives (POC-3), the one cluster
-// every request is forwarded to.
+// Proxy holds data-path tunables and, in passthrough mode, the one cluster every request is
+// forwarded to. Resign mode routes by placement (directory.file) instead.
 type Proxy struct {
-	Cluster         string        `yaml:"cluster"` // name of the clusters: entry to forward to (passthrough mode)
+	Cluster         string        `yaml:"cluster"` // passthrough only: the clusters: entry to forward to
 	CopyBufferBytes int           `yaml:"copy_buffer_bytes"`
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`     // data ops: no progress for this long → abort
 	MetadataTimeout time.Duration `yaml:"metadata_timeout"` // metadata ops: total deadline
@@ -120,29 +127,6 @@ type Credentials struct {
 	SecretRef string `yaml:"secret_ref"` // env:NAME or file:/path
 }
 
-// Tenant is a customer namespace.
-type Tenant struct {
-	DefaultCluster string `yaml:"default_cluster"`
-}
-
-// Placement maps a (tenant, bucket) to clusters and a state (docs/DESIGN.md §2.3, §2.5).
-type Placement struct {
-	State     string            `yaml:"state"`
-	Primary   string            `yaml:"primary"`
-	Source    string            `yaml:"source"`
-	Ramp      *Ramp             `yaml:"ramp"`
-	Names     map[string]string `yaml:"names"` // cluster → backend bucket name
-	Cold      string            `yaml:"cold"`
-	Tier      string            `yaml:"tier"` // native | emulated
-	Lifecycle string            `yaml:"lifecycle"`
-}
-
-// Ramp is the deterministic write shift during RAMPING (decision 15).
-type Ramp struct {
-	Ratio    float64  `yaml:"ratio"`
-	Prefixes []string `yaml:"prefixes"`
-}
-
 // Telemetry configures the access log and slow ring.
 type Telemetry struct {
 	AccessLog AccessLog `yaml:"access_log"`
@@ -161,18 +145,6 @@ type Slow struct {
 	Threshold time.Duration `yaml:"threshold"`
 }
 
-// Features holds feature flags. All default off; each has a removal criterion in its comment.
-// None exist yet; the struct is here so `features:` is a known key and any flag name is an error.
-type Features struct{}
-
-// Placement states (docs/DESIGN.md §2.5).
-const (
-	StateActive    = "ACTIVE"
-	StateRamping   = "RAMPING"
-	StateMigrating = "MIGRATING"
-	StateCutover   = "CUTOVER"
-)
-
 // Defaults applied before validation. Everything that is safe to default is here; scheme is not.
 const (
 	DefaultListenerAddress = ":443"
@@ -185,6 +157,7 @@ const (
 	DefaultSlowRingSize    = 100
 	DefaultSlowThreshold   = 500 * time.Millisecond
 	DefaultMinTLSVersion   = "1.2"
+	DefaultPollInterval    = time.Second
 )
 
 // ErrEmpty is returned when the input has no YAML document.
@@ -230,16 +203,19 @@ func Parse(data []byte) (*Config, error) {
 	return &c, nil
 }
 
-// decodeError turns the YAML library's positional errors into errors that name the key path
-// (e.g. `proxy.idle_timeout`), so check-config output points at the offending key, not a line number.
-func decodeError(data []byte, err error) error {
+func decodeError(data []byte, err error) error { return KeyedDecodeError("config", data, err) }
+
+// KeyedDecodeError turns the YAML library's positional errors into errors that name the key path
+// (e.g. `proxy.idle_timeout`), so check-config output points at the offending key, not a line
+// number. what prefixes errors that carry no position. The directory file uses it too.
+func KeyedDecodeError(what string, data []byte, err error) error {
 	var le *yaml.LoadErrors
 	if !errors.As(err, &le) || len(le.Errors) == 0 {
-		return fmt.Errorf("config: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	var root yaml.Node
 	if yaml.Unmarshal(data, &root) != nil {
-		return fmt.Errorf("config: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	out := make([]error, 0, len(le.Errors))
 	for _, e := range le.Errors {
@@ -332,6 +308,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Proxy.DrainTimeout == 0 {
 		c.Proxy.DrainTimeout = DefaultDrainTimeout
+	}
+	if c.Directory.File != "" && c.Directory.PollInterval == 0 {
+		c.Directory.PollInterval = DefaultPollInterval
 	}
 	if c.Telemetry.Slow.RingSize == 0 {
 		c.Telemetry.Slow.RingSize = DefaultSlowRingSize

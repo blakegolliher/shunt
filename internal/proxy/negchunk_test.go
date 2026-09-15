@@ -15,7 +15,7 @@ import (
 func TestResignNegativeChunkSizeIsRejected(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{EnforcesSHA256: true, UnsignedTrailer: true})
-	req, _ := signedChunkRequest(t, r.front.URL+"/b/k", bytes.Repeat([]byte("n"), 99), "")
+	req, _ := signedChunkRequest(t, r.front.URL+"/bbb/k", bytes.Repeat([]byte("n"), 99), "")
 	wire := "-1;chunk-signature=" + strings.Repeat("0", 64) + "\r\n"
 	req.Body = io.NopCloser(strings.NewReader(wire))
 	req.ContentLength = int64(len(wire))
@@ -23,8 +23,8 @@ func TestResignNegativeChunkSizeIsRejected(t *testing.T) {
 	if resp.StatusCode/100 != 4 {
 		t.Fatalf("negative chunk size: status %d, body %s", resp.StatusCode, body)
 	}
-	if rec.bodyLen > 0 {
-		t.Fatalf("upstream received %d body bytes from a malformed chunk stream", rec.bodyLen)
+	if got := rec.snap().bodyLen; got > 0 {
+		t.Fatalf("upstream received %d body bytes from a malformed chunk stream", got)
 	}
 }
 

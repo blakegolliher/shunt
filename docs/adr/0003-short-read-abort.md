@@ -17,6 +17,10 @@ shunt streams bodies with `io.CopyBuffer`; nothing is buffered, so an upstream c
 
 The idle-progress watchdog (data ops) and the metadata deadline (docs/DESIGN.md §2.8) produce the same abort when they fire mid-body.
 
+## Amendment (POC-3)
+
+A rewritten response (ADR-0006) is streamed through the XML rewriter into a 64 KiB scratch buffer, so the bytes written to the client no longer match the bytes read from upstream. The rule that tolerates a client-side write error after a complete body therefore compares **upstream bytes read** against the upstream `Content-Length`, not bytes written. An upstream body cut short still aborts; when it is cut short before the scratch has spilled, no response header has been written yet and the client sees the connection close, which is an error in every client. Tested by `TestShortReadThroughRewriterIsNeverSilent`.
+
 ## Consequences
 
 - A client can never cache or checksum a truncated object as if it were whole. That is the whole point.

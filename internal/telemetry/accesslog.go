@@ -23,7 +23,10 @@ type Access struct {
 	Duration          time.Duration
 	TTFB              time.Duration // upstream time to first header byte; 0 if none
 	Upstream          string        // endpoint host:port
-	Cluster           string
+	Cluster           string        // "none" when shunt answered without an upstream request
+	ClusterType       string
+	Tenant            string // resign mode: the verified credential's tenant
+	BackendBucket     string // resign mode: the bucket name on the cluster
 	TLS               string // e.g. "1.3", "" for plaintext
 	Error             string // "" on success
 }
@@ -73,6 +76,9 @@ func (a *AccessLogger) Log(r *Access) {
 		slog.Float64("ttfb_ms", ms(r.TTFB)),
 		slog.String("upstream", r.Upstream),
 		slog.String("cluster", r.Cluster),
+		slog.String("cluster_type", r.ClusterType),
+		slog.String("tenant", r.Tenant),
+		slog.String("backend_bucket", r.BackendBucket),
 		slog.String("tls", r.TLS),
 		slog.String("error", r.Error),
 	)

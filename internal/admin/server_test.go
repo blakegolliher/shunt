@@ -36,11 +36,11 @@ func get(t *testing.T, url string) (int, string) {
 
 func TestEndpoints(t *testing.T) {
 	s, ts, m := newSrv(t)
-	m.RequestsTotal.WithLabelValues("GetObject", "2xx").Inc()
+	m.RequestsTotal.WithLabelValues("GetObject", "2xx", "garage", "s3").Inc()
 	if code, body := get(t, ts.URL+"/-/healthz"); code != 200 || body != "ok\n" {
 		t.Fatalf("healthz %d %q", code, body)
 	}
-	if code, body := get(t, ts.URL+"/-/metrics"); code != 200 || !strings.Contains(body, `shunt_requests_total{op="GetObject",status_class="2xx"} 1`) || !strings.Contains(body, "process_cpu_seconds_total") {
+	if code, body := get(t, ts.URL+"/-/metrics"); code != 200 || !strings.Contains(body, `shunt_requests_total{cluster="garage",cluster_type="s3",op="GetObject",status_class="2xx"} 1`) || !strings.Contains(body, "process_cpu_seconds_total") {
 		t.Fatalf("metrics %d\n%s", code, body[:min(600, len(body))])
 	}
 	code, body := get(t, ts.URL+"/-/slow")

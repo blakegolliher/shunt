@@ -1,0 +1,7 @@
+# Seed directory for the single-backend resign run against the VAST lab cluster (make run-vast-resign
+# copies it to test/e2e/data/). demo-dest is the existing scratch bucket from docs/CONTEXT.md.
+version: 1
+tenants:
+  e2e: { default_cluster: vast }
+placements:
+  e2e/demo-dest: { state: ACTIVE, primary: vast, names: { vast: demo-dest } }

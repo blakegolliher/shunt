@@ -12,7 +12,7 @@ import (
 type Metrics struct {
 	Registry *prometheus.Registry
 
-	RequestsTotal   *prometheus.CounterVec   // shunt_requests_total{op,status_class}
+	RequestsTotal   *prometheus.CounterVec   // shunt_requests_total{op,status_class,cluster,cluster_type}
 	RequestDuration *prometheus.HistogramVec // shunt_request_duration_seconds{op}
 	UpstreamTTFB    *prometheus.HistogramVec // shunt_upstream_ttfb_seconds{op,cluster}
 	BytesIn         *prometheus.CounterVec   // shunt_bytes_in_total{op}
@@ -53,8 +53,8 @@ func NewMetrics() *Metrics {
 	m := &Metrics{
 		Registry: reg,
 		RequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "shunt_requests_total", Help: "Requests completed, by S3 operation and response status class.",
-		}, []string{"op", "status_class"}),
+			Name: "shunt_requests_total", Help: "Requests completed, by S3 operation, response status class, and the cluster that served them (\"none\" when shunt answered itself).",
+		}, []string{"op", "status_class", "cluster", "cluster_type"}),
 		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "shunt_request_duration_seconds", Help: "Client-observed request duration, first byte in to last byte out.",
 			Buckets: durationBuckets,

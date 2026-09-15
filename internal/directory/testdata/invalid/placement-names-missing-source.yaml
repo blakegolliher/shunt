@@ -1,0 +1,5 @@
+# expect: placements.acme/data.names
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: MIGRATING, primary: minio, source: garage, names: { minio: data } }

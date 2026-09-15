@@ -46,6 +46,9 @@ linters:
       excludes:
         # G304: check-config opens the file path the operator passed on the command line; that is its job.
         - G304
+        # G703: same rationale for the directory file (ADR-0005). Its path comes from the validated
+        # config, and shunt opens, replaces, and locks exactly that path plus two fixed suffixes.
+        - G703
     misspell:
       locale: US
   exclusions:
@@ -78,6 +81,11 @@ linters:
       - path: _test\.go
         linters: [revive]
         text: "unused-parameter"
+      # Table-driven tests shadow err and the response value inside loops and if-statements on
+      # purpose; the outer value is never read afterwards. Production code keeps the shadow check.
+      - path: _test\.go
+        linters: [govet]
+        text: "shadow"
 
 formatters:
   enable:

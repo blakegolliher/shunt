@@ -9,7 +9,40 @@ import (
 	"testing"
 )
 
-const testdata = "../../internal/config/testdata"
+// Tests run from the repository root so config samples resolve their relative paths (the
+// directory file, certificates) the way `shunt` does when started from a checkout.
+const testdata = "internal/config/testdata"
+
+func TestMain(m *testing.M) {
+	if err := os.Chdir("../.."); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
+func TestCheckConfigInvalidDirectoryNamesKey(t *testing.T) {
+	dir := t.TempDir()
+	dfile := filepath.Join(dir, "directory.yaml")
+	cfile := filepath.Join(dir, "shunt.yaml")
+	if err := os.WriteFile(dfile, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: MOVING, primary: garage, names: { garage: data } }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "listener: { address: \":8443\", tls: { cert: c.pem, key: k.pem } }\nauth: { mode: resign, credentials_file: creds.yaml }\ndirectory: { file: " + dfile + " }\n" +
+		"clusters:\n  garage: { type: s3, scheme: http, region: garage, endpoints: [\"127.0.0.1:3900\"], credentials: { access_key: GK, secret_ref: env:S } }\n"
+	if err := os.WriteFile(cfile, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, err := run(t, "check-config", cfile)
+	if err == nil || !strings.Contains(stderr, "placements.acme/data.state") {
+		t.Fatalf("err=%v stderr=%s", err, stderr)
+	}
+	if err := os.Remove(dfile); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err = run(t, "check-config", cfile); err == nil || !strings.Contains(stderr, "no such file") {
+		t.Fatalf("missing directory file accepted: err=%v stderr=%s", err, stderr)
+	}
+}
 
 func run(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()

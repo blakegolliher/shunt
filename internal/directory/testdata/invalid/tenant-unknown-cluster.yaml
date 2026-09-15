@@ -1,0 +1,4 @@
+# expect: tenants.acme.default_cluster
+version: 1
+tenants:
+  acme: { default_cluster: vast-a }

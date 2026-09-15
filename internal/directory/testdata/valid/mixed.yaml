@@ -1,0 +1,13 @@
+# Directory for internal/config/testdata/valid/mixed.yaml: every §2.3 feature, all four states, tiering.
+version: 7
+tenants:
+  acme: { default_cluster: vast-a }
+  zed:  { default_cluster: minio-1 }
+placements:
+  acme/training-sets: { state: ACTIVE,    primary: vast-a,   names: { vast-a: training-sets }, created: 2026-09-15T18:00:00Z }
+  acme/checkpoints:   { state: RAMPING,   primary: vast-fab, source: vast-a, ramp: { ratio: 0.05 }, names: { vast-a: checkpoints, vast-fab: checkpoints } }
+  acme/runs:          { state: RAMPING,   primary: aws-use1, source: vast-a, ramp: { prefixes: ["2026-09/"] }, names: { vast-a: runs, aws-use1: acme-7f3a-runs } }
+  zed/data:           { state: MIGRATING, primary: minio-1,  source: aws-use1, names: { aws-use1: zed-91c0-data, minio-1: data } }
+  zed/done:           { state: CUTOVER,   primary: minio-1,  source: vast-a, names: { vast-a: done, minio-1: done } }
+  acme/archive:       { state: ACTIVE,    primary: vast-a,   cold: vault, tier: emulated, lifecycle: "<LifecycleConfiguration/>", names: { vast-a: archive, vault: archive } }
+  zed/logs:           { state: ACTIVE,    primary: aws-use1, tier: native, names: { aws-use1: zed-91c0-logs } }

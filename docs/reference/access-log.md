@@ -19,12 +19,15 @@ One JSON object per request on stdout (or `telemetry.access_log.path`), written 
 | `duration_ms` | float | Request start to record time |
 | `ttfb_ms` | float | Upstream headers written to first response byte; `0` if none |
 | `upstream` | string | Endpoint `host:port` the request went to |
-| `cluster` | string | Cluster name |
+| `cluster` | string | Cluster name, `none` when shunt answered without an upstream request (ListBuckets, a refusal, an auth failure) |
+| `cluster_type` | string | Cluster type (`vast`, `minio`, `aws`, `s3`), `none` with `cluster` |
+| `tenant` | string | Resign mode: the verified credential's tenant; empty in passthrough |
+| `backend_bucket` | string | Resign mode: the bucket's name on that cluster; empty when there was no upstream request |
 | `tls` | string | Client TLS version (`1.2`, `1.3`), empty for plaintext |
 | `error` | string | Empty on success; `upstream: …` when no upstream response, `body: …` when a body copy failed (see ADR-0003) |
 
 Example:
 
 ```json
-{"ts":"2026-09-15T06:11:37.441-07:00","request_id":"dd8d08e6b0f0b17f187cc6cc02214839","upstream_request_id":"","client":"127.0.0.1:49194","method":"GET","host":"127.0.0.1:8443","style":"path","bucket":"smoke","op":"GetObject","status":200,"bytes_in":0,"bytes_out":5000000,"duration_ms":41.2,"ttfb_ms":1.9,"upstream":"127.0.0.1:3900","cluster":"garage","tls":"1.3","error":""}
+{"ts":"2026-09-15T06:11:37.441-07:00","request_id":"dd8d08e6b0f0b17f187cc6cc02214839","upstream_request_id":"","client":"127.0.0.1:49194","method":"GET","host":"127.0.0.1:8443","style":"path","bucket":"smoke","op":"GetObject","status":200,"bytes_in":0,"bytes_out":5000000,"duration_ms":41.2,"ttfb_ms":1.9,"upstream":"127.0.0.1:3900","cluster":"garage","cluster_type":"s3","tenant":"e2e-a","backend_bucket":"e2e-a-3f9c-smoke","tls":"1.3","error":""}
 ```

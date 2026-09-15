@@ -1,27 +1,38 @@
 package upstream
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 )
 
-// Cluster is one backend with its endpoints and transport.
+// Cluster is one backend with its endpoints, transport, and, in resign mode, the credentials and
+// capability profile shunt signs and plans request bodies with.
 type Cluster struct {
 	Name      string
 	Type      string
 	Scheme    string
 	Region    string
+	ID        string   // opaque, stable id: the uploadId prefix (docs/DESIGN.md §2.4)
 	Endpoints []string // host:port
 	Transport *http.Transport
+
+	Creds           sigv4.Credentials // set by NewSet when secrets are resolved (resign mode)
+	EnforcesSHA256  bool              // backend rejects a wrong hex x-amz-content-sha256 itself
+	UnsignedTrailer bool              // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
 
 	next atomic.Uint64
 }
@@ -36,6 +47,13 @@ type Options struct {
 
 // ErrNoEndpoints is returned by New for a cluster with an empty endpoint list.
 var ErrNoEndpoints = errors.New("upstream: cluster has no endpoints")
+
+// ClusterID derives a cluster's opaque id: the first 6 hex characters of SHA-256 over its name.
+// It is stable across restarts and reveals neither the name nor the backend type.
+func ClusterID(name string) string {
+	sum := sha256.Sum256([]byte("shunt-cluster:" + name))
+	return hex.EncodeToString(sum[:3])
+}
 
 // New builds a Cluster from config. dns endpoint mode is deferred (POC.md); a dns-mode cluster
 // is treated as a one-entry static list, which is what POC-3 specifies for AWS.
@@ -87,7 +105,11 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 		}
 		tr.TLSClientConfig = tc
 	}
-	return &Cluster{Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: eps, Transport: tr}, nil
+	return &Cluster{
+		Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: ClusterID(name), Endpoints: eps, Transport: tr,
+		Creds:          sigv4.Credentials{AccessKey: c.Credentials.AccessKey},
+		EnforcesSHA256: c.Capabilities.EnforcesSHA256Or(true), UnsignedTrailer: c.Capabilities.UnsignedTrailerOr(true),
+	}, nil
 }
 
 // Next returns the next endpoint, round-robin. Health and ejection are P3a.
@@ -98,3 +120,69 @@ func (c *Cluster) Next() string {
 
 // Close releases idle connections.
 func (c *Cluster) Close() { c.Transport.CloseIdleConnections() }
+
+// IsConnectError reports whether err is a failure to connect to an endpoint: no request byte was
+// sent, so the request may be retried on another endpoint.
+func IsConnectError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
+// Set is every configured cluster, by name and by opaque id.
+type Set struct {
+	byName map[string]*Cluster
+	byID   map[string]*Cluster
+	names  []string
+}
+
+// NewSet builds every cluster. resolve turns a secret_ref into the secret (config.ResolveSecret);
+// nil leaves Creds.Secret empty, for passthrough mode, which never signs.
+func NewSet(clusters map[string]config.Cluster, o Options, resolve func(ref string) (string, error)) (*Set, error) {
+	s := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}}
+	for _, name := range slices.Sorted(maps.Keys(clusters)) {
+		cc := clusters[name]
+		s.names = append(s.names, name)
+		cl, err := New(name, cc, o)
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("cluster %s: %w", name, err)
+		}
+		if resolve != nil {
+			secret, err := resolve(cc.Credentials.SecretRef)
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
+			}
+			cl.Creds.Secret = secret
+		}
+		if other, dup := s.byID[cl.ID]; dup {
+			s.Close()
+			return nil, fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID)
+		}
+		s.byName[name], s.byID[cl.ID] = cl, cl
+	}
+	slices.Sort(s.names)
+	return s, nil
+}
+
+// Get returns a cluster by name.
+func (s *Set) Get(name string) (*Cluster, bool) {
+	c, ok := s.byName[name]
+	return c, ok
+}
+
+// ByID returns a cluster by opaque id.
+func (s *Set) ByID(id string) (*Cluster, bool) {
+	c, ok := s.byID[id]
+	return c, ok
+}
+
+// Names lists cluster names, sorted.
+func (s *Set) Names() []string { return s.names }
+
+// Close releases every cluster's idle connections.
+func (s *Set) Close() {
+	for _, c := range s.byName {
+		c.Close()
+	}
+}

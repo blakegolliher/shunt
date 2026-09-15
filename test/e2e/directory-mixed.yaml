@@ -1,0 +1,10 @@
+# Seed directory for the POC-3 mixed run (make run-mixed copies it to test/e2e/data/ before every run).
+# e2e-a creates buckets on Garage, e2e-b on MinIO. e2e-a/archive is pre-seeded on MinIO so one tenant
+# spans both clusters; s3diff creates its backend bucket (e2e-a-seed-archive) if it is missing.
+version: 1
+tenants:
+  e2e-a: { default_cluster: garage }
+  e2e-b: { default_cluster: minio }
+placements:
+  e2e-a/archive: { state: ACTIVE, primary: minio, names: { minio: e2e-a-seed-archive }, created: 2026-09-15T00:00:00Z }
+  e2e-b/archive: { state: ACTIVE, primary: garage, names: { garage: e2e-b-seed-archive }, created: 2026-09-15T00:00:00Z }

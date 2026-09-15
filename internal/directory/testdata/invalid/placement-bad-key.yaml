@@ -1,0 +1,4 @@
+# expect: placements.data
+version: 1
+placements:
+  data: { state: ACTIVE, primary: garage, names: { garage: data } }

@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/sigv4/chunked"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -42,9 +45,8 @@ func (m mapStore) Lookup(_ context.Context, ak string) (sigv4.Credential, error)
 	return c, nil
 }
 
-// seen is what the backend recorded about the upstream request.
-type seen struct {
-	mu            sync.Mutex
+// seenData is what the backend recorded about the upstream request.
+type seenData struct {
 	method, uri   string
 	host          string
 	header        http.Header
@@ -52,6 +54,20 @@ type seen struct {
 	bodyLen       int64
 	bodySHA       string
 	verified      *sigv4.AuthError // result of verifying the upstream signature with the cluster creds
+}
+
+// seen guards seenData: the backend handler can still be writing when the client already has its
+// response (a mid-stream rejection returns before the backend finishes), so tests read a copy.
+type seen struct {
+	mu sync.Mutex
+	seenData
+}
+
+// snap returns what the backend has recorded so far.
+func (s *seen) snap() seenData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seenData
 }
 
 // backend records the request, verifies its signature with the cluster credentials, and answers.
@@ -84,16 +100,48 @@ type rrig struct {
 	errLog *syncBuf
 }
 
+// Capabilities is the test shorthand for a cluster capability profile.
+type Capabilities struct{ EnforcesSHA256, UnsignedTrailer bool }
+
+// resignParts builds a one-cluster set ("test", region garage, the cluster key) and a directory in
+// which tenant owns buckets b and bkt on that cluster under the same backend names, so the POC-2
+// resign tests keep their upstream paths.
+func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string) (*upstream.Set, *directory.FileDir) {
+	t.Helper()
+	sha, trailer := caps.EnforcesSHA256, caps.UnsignedTrailer
+	clusters := map[string]config.Cluster{"test": {
+		Type: "s3", Scheme: "http", Region: clusterRegion, EndpointMode: "static", Endpoints: []string{endpoint},
+		Credentials:  config.Credentials{AccessKey: clusterAK, SecretRef: "env:UNUSED"},
+		Capabilities: config.Capabilities{EnforcesSHA256: &sha, UnsignedTrailer: &trailer},
+	}}
+	set, err := upstream.NewSet(clusters, upstream.Options{}, func(string) (string, error) { return clusterSecret, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(set.Close)
+	path := filepath.Join(t.TempDir(), "directory.yaml")
+	body := "version: 1\ntenants: { " + tenant + ": { default_cluster: test } }\nplacements:\n" +
+		"  " + tenant + "/bbb: { state: ACTIVE, primary: test, names: { test: bbb } }\n" +
+		"  " + tenant + "/bkt: { state: ACTIVE, primary: test, names: { test: bkt } }\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := directory.Open(path, clusters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set, dir
+}
+
 func newResignRig(t *testing.T, be http.Handler, caps Capabilities) *rrig {
 	t.Helper()
 	r := newRig(t, be, time.Second)
 	errLog := &syncBuf{}
+	set, dir := resignParts(t, strings.TrimPrefix(r.backend.URL, "http://"), caps, "acme")
 	r.h.Mode = ModeResign
 	r.h.Store = mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "acme"}}
-	r.h.ClusterCreds = sigv4.Credentials{AccessKey: clusterAK, Secret: clusterSecret}
-	r.h.Capabilities = caps
+	r.h.Clusters, r.h.Dir, r.h.Rewrite = set, dir, true
 	r.h.Log = slog.New(slog.NewJSONHandler(errLog, nil))
-	r.h.Cluster.Region = clusterRegion
 	return &rrig{rig: r, errLog: errLog}
 }
 
@@ -127,23 +175,23 @@ func TestResignUnsignedPayloadRow(t *testing.T) {
 	if resp.StatusCode != 200 || string(b) != "ok" {
 		t.Fatalf("%d %s", resp.StatusCode, b)
 	}
-	if rec.verified != nil {
-		t.Fatalf("upstream signature invalid: %v\n%v", rec.verified, rec.header)
+	if rec.snap().verified != nil {
+		t.Fatalf("upstream signature invalid: %v\n%v", rec.snap().verified, rec.snap().header)
 	}
-	if rec.uri != "/bkt/b/dir/k%20ey?x=1" || rec.host != strings.TrimPrefix(r.backend.URL, "http://") {
-		t.Errorf("upstream target: %s %s", rec.uri, rec.host)
+	if rec.snap().uri != "/bkt/b/dir/k%20ey?x=1" || rec.snap().host != strings.TrimPrefix(r.backend.URL, "http://") {
+		t.Errorf("upstream target: %s %s", rec.snap().uri, rec.snap().host)
 	}
-	if rec.header.Get("X-Amz-Content-Sha256") != sigv4.UnsignedPayload || rec.header.Get("X-Amz-Meta-Keep") != "yes" || rec.header.Get("Content-Type") != "text/plain" {
-		t.Errorf("headers: %v", rec.header)
+	if rec.snap().header.Get("X-Amz-Content-Sha256") != sigv4.UnsignedPayload || rec.snap().header.Get("X-Amz-Meta-Keep") != "yes" || rec.snap().header.Get("Content-Type") != "text/plain" {
+		t.Errorf("headers: %v", rec.snap().header)
 	}
-	if rec.header.Get("X-Amz-Security-Token") != "" || strings.Contains(rec.header.Get("Authorization"), clientAK) {
-		t.Errorf("client auth leaked upstream: %v", rec.header)
+	if rec.snap().header.Get("X-Amz-Security-Token") != "" || strings.Contains(rec.snap().header.Get("Authorization"), clientAK) {
+		t.Errorf("client auth leaked upstream: %v", rec.snap().header)
 	}
-	if !strings.Contains(rec.header.Get("Authorization"), clusterAK+"/") || !strings.Contains(rec.header.Get("Authorization"), "/"+clusterRegion+"/s3/") {
-		t.Errorf("upstream not signed with cluster creds and region: %s", rec.header.Get("Authorization"))
+	if !strings.Contains(rec.snap().header.Get("Authorization"), clusterAK+"/") || !strings.Contains(rec.snap().header.Get("Authorization"), "/"+clusterRegion+"/s3/") {
+		t.Errorf("upstream not signed with cluster creds and region: %s", rec.snap().header.Get("Authorization"))
 	}
-	if rec.bodyLen != int64(len(body)) || rec.contentLength != int64(len(body)) {
-		t.Errorf("body %d content-length %d", rec.bodyLen, rec.contentLength)
+	if rec.snap().bodyLen != int64(len(body)) || rec.snap().contentLength != int64(len(body)) {
+		t.Errorf("body %d content-length %d", rec.snap().bodyLen, rec.snap().contentLength)
 	}
 }
 
@@ -152,12 +200,12 @@ func TestResignSHA256RowPassesHeaderVerbatim(t *testing.T) {
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{true, true})
 	body := []byte("payload")
 	sum := sha256.Sum256(body)
-	req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/b/k", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/bbb/k", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	clientSign(req, hex.EncodeToString(sum[:]))
 	resp, _ := do(t, req)
-	if resp.StatusCode != 200 || rec.header.Get("X-Amz-Content-Sha256") != hex.EncodeToString(sum[:]) || rec.verified != nil {
-		t.Fatalf("%d %v %v", resp.StatusCode, rec.header.Get("X-Amz-Content-Sha256"), rec.verified)
+	if resp.StatusCode != 200 || rec.snap().header.Get("X-Amz-Content-Sha256") != hex.EncodeToString(sum[:]) || rec.snap().verified != nil {
+		t.Fatalf("%d %v %v", resp.StatusCode, rec.snap().header.Get("X-Amz-Content-Sha256"), rec.snap().verified)
 	}
 }
 
@@ -166,7 +214,7 @@ func TestResignSHA256CompensationWhenBackendDoesNotEnforce(t *testing.T) {
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{EnforcesSHA256: false, UnsignedTrailer: true})
 	body := []byte("payload")
 	wrong := strings.Repeat("0", 64)
-	req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/b/k", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/bbb/k", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	clientSign(req, wrong)
 	resp, _ := do(t, req)
@@ -217,16 +265,16 @@ func TestResignStreamingSignedRowDecodes(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{true, true})
 	payload := bytes.Repeat([]byte("q"), 20000)
-	req, _ := signedChunkRequest(t, r.front.URL+"/b/k", payload, "")
+	req, _ := signedChunkRequest(t, r.front.URL+"/bbb/k", payload, "")
 	resp, b := do(t, req)
 	if resp.StatusCode != 200 {
 		t.Fatalf("%d %s log=%s", resp.StatusCode, b, r.log.String())
 	}
 	sum := sha256.Sum256(payload)
-	if rec.verified != nil || rec.bodySHA != hex.EncodeToString(sum[:]) || rec.contentLength != int64(len(payload)) {
-		t.Fatalf("upstream got verified=%v len=%d sha ok=%v", rec.verified, rec.contentLength, rec.bodySHA == hex.EncodeToString(sum[:]))
+	if rec.snap().verified != nil || rec.snap().bodySHA != hex.EncodeToString(sum[:]) || rec.snap().contentLength != int64(len(payload)) {
+		t.Fatalf("upstream got verified=%v len=%d sha ok=%v", rec.snap().verified, rec.snap().contentLength, rec.snap().bodySHA == hex.EncodeToString(sum[:]))
 	}
-	h := rec.header
+	h := rec.snap().header
 	if h.Get("X-Amz-Content-Sha256") != sigv4.UnsignedPayload || h.Get("Content-Encoding") != "" || h.Get("X-Amz-Decoded-Content-Length") != "" || h.Get("X-Amz-Trailer") != "" || h.Get("X-Amz-Meta-Keep") != "1" {
 		t.Errorf("header rewrite (amendment 4): %v", h)
 	}
@@ -236,27 +284,27 @@ func TestResignStreamingSignedTrailerRowReencodes(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{true, true})
 	payload := bytes.Repeat([]byte("t"), 150000)
-	req, _ := signedChunkRequest(t, r.front.URL+"/b/k", payload, "x-amz-checksum-crc32")
+	req, _ := signedChunkRequest(t, r.front.URL+"/bbb/k", payload, "x-amz-checksum-crc32")
 	resp, b := do(t, req)
 	if resp.StatusCode != 200 {
 		t.Fatalf("%d %s\nlog=%s", resp.StatusCode, b, r.waitLog(t, "GetObject"))
 	}
-	h := rec.header
+	h := rec.snap().header
 	if h.Get("X-Amz-Content-Sha256") != sigv4.StreamingUnsignedPayloadTrailer || h.Get("Content-Encoding") != "aws-chunked" ||
 		h.Get("X-Amz-Trailer") != "x-amz-checksum-crc32" || h.Get("X-Amz-Decoded-Content-Length") != strconv.Itoa(len(payload)) {
 		t.Errorf("unsigned-trailer headers: %v", h)
 	}
-	if rec.verified != nil {
-		t.Errorf("upstream signature: %v", rec.verified)
+	if rec.snap().verified != nil {
+		t.Errorf("upstream signature: %v", rec.snap().verified)
 	}
 	// Amendment 2: the upstream received exactly the declared Content-Length, never chunked TE.
-	if rec.contentLength <= 0 || rec.bodyLen != rec.contentLength || h.Get("Transfer-Encoding") != "" {
-		t.Errorf("content-length %d received %d te=%q", rec.contentLength, rec.bodyLen, h.Get("Transfer-Encoding"))
+	if rec.snap().contentLength <= 0 || rec.snap().bodyLen != rec.snap().contentLength || h.Get("Transfer-Encoding") != "" {
+		t.Errorf("content-length %d received %d te=%q", rec.snap().contentLength, rec.snap().bodyLen, h.Get("Transfer-Encoding"))
 	}
 	// And the frame decodes to the payload with a valid crc32 trailer.
 	want := chunked.EncodedLength(int64(len(payload)), chunked.DefaultChunkSize, "x-amz-checksum-crc32", 8)
-	if rec.contentLength != want {
-		t.Errorf("content-length %d, precomputed %d", rec.contentLength, want)
+	if rec.snap().contentLength != want {
+		t.Errorf("content-length %d, precomputed %d", rec.snap().contentLength, want)
 	}
 }
 
@@ -264,10 +312,10 @@ func TestResignStreamingSignedTrailerRowWithoutBackendSupport(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{EnforcesSHA256: true, UnsignedTrailer: false})
 	payload := bytes.Repeat([]byte("u"), 5000)
-	req, _ := signedChunkRequest(t, r.front.URL+"/b/k", payload, "x-amz-checksum-crc32")
+	req, _ := signedChunkRequest(t, r.front.URL+"/bbb/k", payload, "x-amz-checksum-crc32")
 	resp, _ := do(t, req)
-	if resp.StatusCode != 200 || rec.header.Get("X-Amz-Content-Sha256") != sigv4.UnsignedPayload || rec.contentLength != int64(len(payload)) {
-		t.Fatalf("%d %v len=%d", resp.StatusCode, rec.header.Get("X-Amz-Content-Sha256"), rec.contentLength)
+	if resp.StatusCode != 200 || rec.snap().header.Get("X-Amz-Content-Sha256") != sigv4.UnsignedPayload || rec.snap().contentLength != int64(len(payload)) {
+		t.Fatalf("%d %v len=%d", resp.StatusCode, rec.snap().header.Get("X-Amz-Content-Sha256"), rec.snap().contentLength)
 	}
 }
 
@@ -275,7 +323,7 @@ func TestResignChunkSignatureTamperMidStream(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{true, true})
 	payload := bytes.Repeat([]byte("z"), 30000)
-	req, wire := signedChunkRequest(t, r.front.URL+"/b/k", payload, "")
+	req, wire := signedChunkRequest(t, r.front.URL+"/bbb/k", payload, "")
 	// Flip a payload byte in the second chunk.
 	i := bytes.Index(wire[9000:], []byte("\r\n")) + 9000 + 2 + 100
 	wire[i] ^= 0xff
@@ -284,8 +332,8 @@ func TestResignChunkSignatureTamperMidStream(t *testing.T) {
 	if resp.StatusCode != 403 || !strings.Contains(string(b), "SignatureDoesNotMatch") {
 		t.Fatalf("%d %s", resp.StatusCode, b)
 	}
-	if rec.bodyLen >= int64(len(payload)) {
-		t.Errorf("upstream received the full body (%d) despite the tamper", rec.bodyLen)
+	if rec.snap().bodyLen >= int64(len(payload)) {
+		t.Errorf("upstream received the full body (%d) despite the tamper", rec.snap().bodyLen)
 	}
 	if v := metric(t, r.h.Metrics, "shunt_auth_failures_total", `reason="chunk_signature"`); v != 1 {
 		t.Errorf("metric %v", v)
@@ -296,7 +344,7 @@ func TestResignTrailerChecksumMismatch(t *testing.T) {
 	rec := &seen{}
 	r := newResignRig(t, backend(t, rec, 200, ""), Capabilities{EnforcesSHA256: true, UnsignedTrailer: false})
 	payload := bytes.Repeat([]byte("c"), 4000)
-	req, wire := signedChunkRequest(t, r.front.URL+"/b/k", payload, "x-amz-checksum-crc32")
+	req, wire := signedChunkRequest(t, r.front.URL+"/bbb/k", payload, "x-amz-checksum-crc32")
 	// Replace the checksum value with a valid-looking but wrong one; the trailer signature then
 	// also fails, so the decoder rejects before the trailer signature check.
 	s := string(wire)
@@ -320,18 +368,18 @@ func TestResignPresigned(t *testing.T) {
 	q := "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=" + clientAK + "%2F" + scope.String() + "&X-Amz-Date=" + now.Format(sigv4.TimeFormat) + "&X-Amz-Expires=60&X-Amz-SignedHeaders=host&versionId=7"
 	q = strings.ReplaceAll(q, "/", "%2F")
 	q = strings.Replace(q, "X-Amz-Credential="+clientAK+"%2F", "X-Amz-Credential="+clientAK+"%2F", 1)
-	target := r.front.URL + "/b/k%20ey?" + q
+	target := r.front.URL + "/bbb/k%20ey?" + q
 	req, _ := http.NewRequest(http.MethodGet, target, nil)
 	host := strings.TrimPrefix(r.front.URL, "http://")
-	canon := sigv4.CanonicalRequest("GET", "/b/k%20ey", sigv4.RawQuery(req), req.Header, host, 0, []string{"host"}, sigv4.UnsignedPayload)
+	canon := sigv4.CanonicalRequest("GET", "/bbb/k%20ey", sigv4.RawQuery(req), req.Header, host, 0, []string{"host"}, sigv4.UnsignedPayload)
 	sig := sigv4.Signature(sigv4.SigningKey(clientSecret, scope), sigv4.StringToSign(now, scope, canon))
 	req, _ = http.NewRequest(http.MethodGet, target+"&X-Amz-Signature="+sig, nil)
 	resp, b := do(t, req)
 	if resp.StatusCode != 200 || string(b) != "data" {
 		t.Fatalf("%d %s\nlog=%s", resp.StatusCode, b, r.log.String())
 	}
-	if rec.verified != nil || strings.Contains(rec.uri, "X-Amz-") || !strings.Contains(rec.uri, "versionId=7") || rec.header.Get("Authorization") == "" {
-		t.Fatalf("upstream: verified=%v uri=%s auth=%q", rec.verified, rec.uri, rec.header.Get("Authorization"))
+	if rec.snap().verified != nil || strings.Contains(rec.uri, "X-Amz-") || !strings.Contains(rec.uri, "versionId=7") || rec.snap().header.Get("Authorization") == "" {
+		t.Fatalf("upstream: verified=%v uri=%s auth=%q", rec.snap().verified, rec.snap().uri, rec.snap().header.Get("Authorization"))
 	}
 	// Expired.
 	old := strings.Replace(target, "X-Amz-Expires=60", "X-Amz-Expires=1", 1)
@@ -353,19 +401,19 @@ func TestResignRejectsBeforeBodyOn100Continue(t *testing.T) {
 		inner.ServeHTTP(w, req)
 	})
 	c := rawDial(t, r.front)
-	req, _ := http.NewRequest(http.MethodPut, "http://h/b/huge", nil)
+	req, _ := http.NewRequest(http.MethodPut, "http://h/bbb/huge", nil)
 	req.Host = "h"
 	req.ContentLength = 5 << 30
 	req.Body = http.NoBody
 	sigv4.Sign(req, sigv4.Credentials{AccessKey: clientAK, Secret: "WRONG"}, "us-east-1", sigv4.UnsignedPayload, time.Now())
-	fmt.Fprintf(c, "PUT /b/huge HTTP/1.1\r\nHost: h\r\nContent-Length: 5368709120\r\nExpect: 100-continue\r\nAuthorization: %s\r\nX-Amz-Date: %s\r\nX-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n",
+	fmt.Fprintf(c, "PUT /bbb/huge HTTP/1.1\r\nHost: h\r\nContent-Length: 5368709120\r\nExpect: 100-continue\r\nAuthorization: %s\r\nX-Amz-Date: %s\r\nX-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n",
 		req.Header.Get("Authorization"), req.Header.Get("X-Amz-Date"))
 	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 403 || reads != 0 || rec.method != "" {
-		t.Fatalf("status %d reads %d upstream touched=%v", resp.StatusCode, reads, rec.method != "")
+	if resp.StatusCode != 403 || reads != 0 || rec.snap().method != "" {
+		t.Fatalf("status %d reads %d upstream touched=%v", resp.StatusCode, reads, rec.snap().method != "")
 	}
 }
 
@@ -384,7 +432,7 @@ func TestResignErrorsCountedAndSecretsNeverLeak(t *testing.T) {
 	panicked := false
 	inner := r.h
 	r.front.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/b/panic" && !panicked {
+		if req.URL.Path == "/bbb/panic" && !panicked {
 			panicked = true
 			defer func() {
 				if p := recover(); p != nil {
@@ -398,7 +446,7 @@ func TestResignErrorsCountedAndSecretsNeverLeak(t *testing.T) {
 	})
 	send := func(mutate func(*http.Request)) {
 		body := []byte("x")
-		req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/b/k", bytes.NewReader(body))
+		req, _ := http.NewRequest(http.MethodPut, r.front.URL+"/bbb/k", bytes.NewReader(body))
 		req.ContentLength = 1
 		clientSign(req, strings.Repeat("0", 64)) // wrong sha256 → compensation path logs
 		mutate(req)
@@ -412,8 +460,8 @@ func TestResignErrorsCountedAndSecretsNeverLeak(t *testing.T) {
 	})
 	send(func(q *http.Request) { q.Header.Del("Authorization") })
 	send(func(q *http.Request) { q.Header.Set("X-Amz-Security-Token", clientSecret) })
-	send(func(q *http.Request) { q.URL.Path = "/b/panic" })
-	req, _ := signedChunkRequest(t, r.front.URL+"/b/k", bytes.Repeat([]byte("p"), 3000), "x-amz-checksum-crc32")
+	send(func(q *http.Request) { q.URL.Path = "/bbb/panic" })
+	req, _ := signedChunkRequest(t, r.front.URL+"/bbb/k", bytes.Repeat([]byte("p"), 3000), "x-amz-checksum-crc32")
 	resp, _ := do(t, req)
 	resp.Body.Close() //nolint:errcheck // test
 	r.backend.Close() // upstream down path
@@ -474,13 +522,12 @@ func BenchmarkResignSmallGET(b *testing.B) {
 		_, _ = w.Write(make([]byte, 4096))
 	}))
 	defer be.Close()
-	cl, _ := upstream.New("b", config.Cluster{Scheme: "http", Region: "r", Endpoints: []string{strings.TrimPrefix(be.URL, "http://")}}, upstream.Options{})
-	h := New(Handler{Cluster: cl, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
+	set, dir := resignParts(b, strings.TrimPrefix(be.URL, "http://"), Capabilities{true, true}, "t")
+	h := New(Handler{Clusters: set, Dir: dir, Rewrite: true, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
 		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign,
-		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}, ClusterCreds: sigv4.Credentials{AccessKey: clusterAK, Secret: clusterSecret},
-		Capabilities: Capabilities{true, true}}, 256<<10)
-	req := httptest.NewRequest(http.MethodGet, "/b/k", nil)
-	req.RequestURI = "/b/k"
+		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}}, 256<<10)
+	req := httptest.NewRequest(http.MethodGet, "/bbb/k", nil)
+	req.RequestURI = "/bbb/k"
 	clientSign(req, sigv4.UnsignedPayload)
 	b.ReportAllocs()
 	for b.Loop() {
@@ -498,15 +545,14 @@ func BenchmarkResignSignedChunkPUT1MiB(b *testing.B) {
 		w.WriteHeader(200)
 	}))
 	defer be.Close()
-	cl, _ := upstream.New("b", config.Cluster{Scheme: "http", Region: "r", Endpoints: []string{strings.TrimPrefix(be.URL, "http://")}}, upstream.Options{})
-	h := New(Handler{Cluster: cl, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
+	set, dir := resignParts(b, strings.TrimPrefix(be.URL, "http://"), Capabilities{true, true}, "t")
+	h := New(Handler{Clusters: set, Dir: dir, Rewrite: true, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
 		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign,
-		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}, ClusterCreds: sigv4.Credentials{AccessKey: clusterAK, Secret: clusterSecret},
-		Capabilities: Capabilities{true, true}}, 256<<10)
+		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}}, 256<<10)
 	payload := make([]byte, 1<<20)
 	tt := &testing.T{}
-	req, wire := signedChunkRequest(tt, "http://h/b/k", payload, "")
-	req.RequestURI = "/b/k"
+	req, wire := signedChunkRequest(tt, "http://h/bbb/k", payload, "")
+	req.RequestURI = "/bbb/k"
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for b.Loop() {

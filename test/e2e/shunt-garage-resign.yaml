@@ -10,8 +10,9 @@ admin:
 auth:
   mode: resign
   credentials_file: test/e2e/data/credentials.yaml
+directory:
+  file: test/e2e/data/directory-garage.yaml
 proxy:
-  cluster: garage
   copy_buffer_bytes: 262144
   idle_timeout: 60s
   metadata_timeout: 30s

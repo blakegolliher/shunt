@@ -22,6 +22,10 @@ Probe run 2026-09-15 with shunt at POC-2.
 | Enforces the signing region | yes (`garage`) | yes (`us-east-1`) | **no**: a signature scoped to `nowhere-1` is accepted |
 | TLS certificate | n/a, plaintext in e2e | n/a, plaintext in e2e | **self-signed factory certificate** (CN `vms.example.com`, SAN `*.example.com`), does not cover the endpoint name; probed and tested with verification disabled |
 
+## What shunt hides, and what it does not
+
+shunt hides **which cluster serves a bucket and under which name**: bucket names, cluster endpoints, and uploadIds are rewritten in every response (ADR-0006), and s3diff's mixed mode fails the run if one appears. shunt does **not** hide **which kind of backend** is serving: `Server`, `X-Minio-*`, `X-Vast-*`, MinIO's `<HostId>`, Garage's `<Region>`, GetBucketLocation, backend owner ids, and backend uploadId formats pass through, so vendor trace ids stay usable for support (decision of 2026-09-15). Bucket policy bodies pass through unrewritten as well: an ARN in a policy may name the backend bucket, which a client can then read.
+
 ## Consequences for shunt
 
 - **Capability profile.** All three enforce the hex SHA-256 and accept and validate unsigned trailers, so `enforces_sha256: true` and `unsigned_trailer: true` (the defaults) are correct for all three. With these profiles shunt's ADR-0002 log-and-alert path is never reached on these backends; it stays for backends that fail the probe.
@@ -99,10 +103,11 @@ Every client payload mode was sent both directly to the backend (signed with the
 | Finding | Backend | Cause | Owner |
 |---|---|---|---|
 | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` rejected directly with `400 InvalidRequest "Invalid payload signature"`, all five checksum algorithms; the same bytes through shunt succeed | Garage 2.3.0 | Garage does not verify signed trailers. The client encoding is valid: MinIO and VAST accept it directly, and it reproduces AWS's published streaming vectors. shunt decodes and verifies the signed trailer itself, then forwards an unsigned trailer Garage accepts | **Backend gap** (s3diff `GAP(backend)`) |
-| `<Location>` in CompleteMultipartUpload shows the upstream endpoint (`http://127.0.0.1/…`) instead of the client-facing host | MinIO | Resign mode sends upstream path-style to the endpoint address, and MinIO echoes the request Host into `<Location>`. **This leaks the backend address to the client.** `shunt serve` warns at startup in resign mode for this cluster type. VAST may do the same: s3diff cannot tell, because its direct and via requests both address the VAST host | shunt, closed by POC-3's XML rewriting (DESIGN §9 item 11) |
-| Error bodies for virtual-host requests carry a path-style `<Resource>` (`/bucket/key`), and a HEAD error's `Content-Length` changes with it | Garage, MinIO | Same path-style upstream (ADR-0001 amendment) | shunt, closed by POC-3 |
+| `<Location>` in CompleteMultipartUpload shows the upstream endpoint (`http://127.0.0.1/…`) instead of the client-facing host | MinIO | Resign mode sends upstream path-style to the endpoint address, and MinIO echoes the request Host into `<Location>`. **Closed in POC-3:** the rewriter replaces `<Location>` with the client-facing URL, and both a unit test and the mixed s3diff run assert its contents. It returns only if `features.xml_rewrite` is turned off, which `shunt serve` warns about | closed (ADR-0006) |
+| Error bodies for virtual-host requests carry a path-style `<Resource>` (`/bucket/key`), and a HEAD error's `Content-Length` changes with it | Garage, MinIO | Same path-style upstream (ADR-0001 amendment) | closed in POC-3: `<Resource>` is rewritten to the client's own path, path-style or virtual-host (ADR-0006) |
 | 204 responses: backend sends `Content-Length: 0`, shunt's response has none | VAST | RFC 9110 §8.6 forbids `Content-Length` on 204; Go's server enforces it. Not a defect; s3diff skips the header on 204 | none |
 | ListBuckets returns the same buckets in a different order on consecutive calls | Garage | Garage's listing order is not stable; seen in passthrough too. s3diff now compares bucket entries order-insensitively | none |
+| `<Location>` on CompleteMultipartUpload comes back with a doubled dot: `https://bucket..shunt.example.com/key` | Garage 2.3.0 | Garage builds it as `<bucket>.<root_domain>`, and `root_domain` in `garage.toml` is written with its leading dot (`.shunt.example.com`), as Garage's own documentation shows. The two dots meet. Harmless through shunt, which replaces `<Location>` with the client-facing URL; a client talking to Garage directly gets a URL whose host does not resolve | none (backend cosmetic) |
 | `X-Vast-Rcf-Id` differs on every response | VAST | Per-request trace id, like `x-amz-request-id`; allowlisted | none |
 
 Final per-backend counts are in docs/STATUS.md.

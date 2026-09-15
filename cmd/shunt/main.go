@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/directory"
 )
 
 // Set via -ldflags "-X main.version=… -X main.commit=… -X main.date=…" (see Makefile).
@@ -35,7 +36,7 @@ func newRoot() *cobra.Command {
 	}
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
-	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe())
+	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory())
 	return root
 }
 
@@ -55,7 +56,7 @@ func newVersion() *cobra.Command {
 func newCheckConfig() *cobra.Command {
 	return &cobra.Command{
 		Use:   "check-config <file>",
-		Short: "Parse and validate a config file; unknown keys are errors",
+		Short: "Parse and validate a config file and its directory file; unknown keys are errors",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := config.Load(args[0])
@@ -63,8 +64,16 @@ func newCheckConfig() *cobra.Command {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: invalid\n%v\n", args[0], err)
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ok (auth %s, %d clusters, %d tenants, %d placements)\n",
-				args[0], c.Auth.Mode, len(c.Clusters), len(c.Tenants), len(c.Placements))
+			summary := fmt.Sprintf("auth %s, %d clusters", c.Auth.Mode, len(c.Clusters))
+			if c.Directory.File != "" {
+				f, derr := directory.Load(c.Directory.File, c.Clusters)
+				if derr != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: invalid directory\n%v\n", args[0], derr)
+					return derr
+				}
+				summary += fmt.Sprintf("; directory %s version %d: %d tenants, %d placements", c.Directory.File, f.Version, len(f.Tenants), len(f.Placements))
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ok (%s)\n", args[0], summary)
 			return err
 		},
 	}

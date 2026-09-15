@@ -1,0 +1,5 @@
+# expect: placements.acme/data.cold
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, primary: garage, cold: minio, tier: emulated, names: { garage: data, minio: data } }

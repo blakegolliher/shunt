@@ -41,7 +41,7 @@ func TestAccessLogSchema(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
 		t.Fatalf("%v: %s", err, buf.String())
 	}
-	for _, k := range []string{"ts", "request_id", "upstream_request_id", "client", "method", "host", "style", "bucket", "op", "status", "bytes_in", "bytes_out", "duration_ms", "ttfb_ms", "upstream", "cluster", "tls", "error"} {
+	for _, k := range []string{"ts", "request_id", "upstream_request_id", "client", "method", "host", "style", "bucket", "op", "status", "bytes_in", "bytes_out", "duration_ms", "ttfb_ms", "upstream", "cluster", "cluster_type", "tenant", "backend_bucket", "tls", "error"} {
 		if _, ok := rec[k]; !ok {
 			t.Errorf("missing field %s in %s", k, buf.String())
 		}

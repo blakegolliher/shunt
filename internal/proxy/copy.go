@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,13 +26,18 @@ func (bp *bufPool) put(b *[]byte) { bp.p.Put(b) }
 
 // progressReader resets the idle watchdog on every successful read and counts bytes.
 // Used on the upstream response body and on the client request body (as seen by the Transport).
+// A request body is read by net/http's transport write loop, a different goroutine from the one
+// that reads the count afterwards, so the counter is atomic.
 type progressReader struct {
 	r    io.Reader
 	wd   *watchdog
-	n    int64
+	n    atomic.Int64
 	rc   *http.ResponseController // set for the client request body: refresh the server read deadline
 	idle time.Duration
 }
+
+// count reports the bytes read so far.
+func (p *progressReader) count() int64 { return p.n.Load() }
 
 func (p *progressReader) Read(b []byte) (int, error) {
 	if p.rc != nil {
@@ -39,7 +45,7 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	}
 	n, err := p.r.Read(b)
 	if n > 0 {
-		p.n += int64(n)
+		p.n.Add(int64(n))
 		if p.wd != nil {
 			p.wd.kick()
 		}

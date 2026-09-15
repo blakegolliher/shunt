@@ -6,7 +6,7 @@ Prefix: `shunt_`. Phase column is the full-design phase; the POC column says whi
 
 | Name | Type | Labels | Unit | Buckets | Description | Phase | POC |
 |---|---|---|---|---|---|---|---|
-| `shunt_requests_total` | counter | `op`, `status_class` (+ `cluster`, `cluster_type` from POC-3 / P3b) | requests | — | Requests completed, by S3 operation and response status class | P1 | POC-1 |
+| `shunt_requests_total` | counter | `op`, `status_class`, `cluster`, `cluster_type` | requests | — | Requests completed, by S3 operation, response status class, and the cluster that served them. `cluster` and `cluster_type` are `none` when shunt answered without an upstream request (synthesized ListBuckets, a refusal, an auth failure) | P1 | POC-1 (labels POC-3) |
 | `shunt_request_duration_seconds` | histogram | `op` | seconds | 1ms … 60s, log-spaced, 16 buckets | Client-observed request duration, first byte in to last byte out | P1 | POC-1 |
 | `shunt_upstream_ttfb_seconds` | histogram | `op`, `cluster` | seconds | 1ms … 60s, log-spaced, 16 buckets | Time from upstream request sent to first response header byte | P1 | POC-1 |
 | `shunt_bytes_in_total` | counter | `op` | bytes | — | Request body bytes received from clients | P1 | POC-1 |

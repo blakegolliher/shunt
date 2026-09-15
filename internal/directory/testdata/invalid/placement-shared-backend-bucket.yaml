@@ -1,0 +1,6 @@
+# expect: placements.zed/data.names.garage
+version: 1
+tenants: { acme: { default_cluster: garage }, zed: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, primary: garage, names: { garage: shared } }
+  zed/data: { state: ACTIVE, primary: garage, names: { garage: shared } }

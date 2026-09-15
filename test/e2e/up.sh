@@ -70,22 +70,35 @@ sk=$(echo "$info" | awk '/^Secret key:/ {print $3}')
 if [[ -z "$ak" || -z "$sk" ]]; then
   echo "e2e-up: could not read garage key (output was: $info)" >&2; exit 1
 fi
-# shunt-issued client credentials for resign mode: generated once, never committed.
-if [[ ! -s data/credentials.yaml ]]; then
-  cak="SHUNT$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
-  csk="$(head -c 30 /dev/urandom | base64 | tr -d '\n/+=')"
-  printf 'credentials:\n  - access_key: %s\n    secret: %s\n    tenant: e2e\n' "$cak" "$csk" > data/credentials.yaml
+# shunt-issued client credentials for resign mode: generated once, never committed. Tenant e2e is
+# used by the single-backend resign runs; e2e-a and e2e-b are the two tenants of the POC-3 mixed run.
+gen_key() { echo "SHUNT$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"; }
+gen_secret() { head -c 30 /dev/urandom | base64 | tr -d '\n/+='; }
+if [[ ! -s data/credentials.yaml ]] || ! grep -q 'tenant: e2e-b$' data/credentials.yaml; then
+  {
+    echo "credentials:"
+    for tenant in e2e e2e-a e2e-b; do
+      printf '  - access_key: %s\n    secret: %s\n    tenant: %s\n' "$(gen_key)" "$(gen_secret)" "$tenant"
+    done
+  } > data/credentials.yaml
   chmod 600 data/credentials.yaml
   echo "e2e-up: shunt client credentials written to test/e2e/data/credentials.yaml"
 fi
-cak=$(awk '/access_key:/ {print $3; exit}' data/credentials.yaml)
-csk=$(awk '/ secret:/ {print $2; exit}' data/credentials.yaml)
-printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\nexport SHUNT_ACCESS_KEY=%s\nexport SHUNT_SECRET=%s\n' "$ak" "$sk" "$cak" "$csk" > data/garage.env
+cred() { # cred <tenant> <access_key|secret>
+  awk -v t="$1" -v f="$2" '/access_key:/ {ak=$3} /^ +secret:/ {sk=$2} /tenant:/ { if ($2 == t) { print (f == "access_key" ? ak : sk); exit } }' data/credentials.yaml
+}
+{
+  printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\n' "$ak" "$sk"
+  printf 'export SHUNT_ACCESS_KEY=%s\nexport SHUNT_SECRET=%s\n' "$(cred e2e access_key)" "$(cred e2e secret)"
+  printf 'export SHUNT_A_ACCESS_KEY=%s\nexport SHUNT_A_SECRET=%s\n' "$(cred e2e-a access_key)" "$(cred e2e-a secret)"
+  printf 'export SHUNT_B_ACCESS_KEY=%s\nexport SHUNT_B_SECRET=%s\n' "$(cred e2e-b access_key)" "$(cred e2e-b secret)"
+} > data/garage.env
 chmod 600 data/garage.env
 echo "e2e-up: credentials written to test/e2e/data/garage.env"
 sed "s/GK_SET_BY_E2E/$ak/" shunt-garage-resign.yaml > data/shunt-garage-resign.yaml
+sed "s/GK_SET_BY_E2E/$ak/" shunt-mixed.yaml > data/shunt-mixed.yaml
 cp shunt-minio-resign.yaml data/shunt-minio-resign.yaml
-echo "e2e-up: resign configs written to test/e2e/data/shunt-{garage,minio}-resign.yaml"
+echo "e2e-up: resign configs written to test/e2e/data/shunt-{garage,minio}-resign.yaml and shunt-mixed.yaml"
 
 # S3-level readiness: any HTTP status from an unsigned GET / counts (403 is fine, refused is not).
 wait_for_any garage-s3 "http://127.0.0.1:3900/"

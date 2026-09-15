@@ -1,0 +1,9 @@
+# Seed directory for the single-backend resign runs against minio (make run-minio-resign copies it to
+# test/e2e/data/ before every run). Backend names equal client names, so s3diff can address the same
+# bucket directly and through shunt; its final DeleteBucket removes the placements, hence the reset.
+version: 1
+tenants:
+  e2e: { default_cluster: minio }
+placements:
+  e2e/s3diff-path:  { state: ACTIVE, primary: minio, names: { minio: s3diff-path } }
+  e2e/s3diff-vhost: { state: ACTIVE, primary: minio, names: { minio: s3diff-vhost } }

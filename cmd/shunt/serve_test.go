@@ -111,7 +111,7 @@ telemetry: { access_log: { enabled: false } }
 	}
 	mb, _ := io.ReadAll(m.Body)
 	m.Body.Close() //nolint:errcheck // test
-	if !strings.Contains(string(mb), `shunt_requests_total{op="GetObject",status_class="2xx"} 1`) {
+	if !strings.Contains(string(mb), `shunt_requests_total{cluster="be",cluster_type="s3",op="GetObject",status_class="2xx"} 1`) {
 		t.Fatalf("metrics missing the proxied request:\n%s", mb[:min(800, len(mb))])
 	}
 

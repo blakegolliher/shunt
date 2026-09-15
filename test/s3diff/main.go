@@ -41,7 +41,7 @@ var headerAllow = map[string]bool{
 }
 
 // xmlNoise strips per-request values from XML bodies before comparing them.
-var xmlNoise = regexp.MustCompile(`<(UploadId|RequestId|HostId|LastModified|CreationDate|Date|VersionId|DeleteMarkerVersionId)>[^<]*</`)
+var xmlNoise = regexp.MustCompile(`<(UploadId|RequestId|HostId|LastModified|CreationDate|Initiated|Date|VersionId|DeleteMarkerVersionId)>[^<]*</`)
 
 // locationPort strips the port from <Location>: backends echo the Host header into it, and
 // shunt's listener port differs from the backend's. Passthrough preserves Host by design.
@@ -185,6 +185,10 @@ type result struct {
 	via    []*probe
 	diffs  []string
 	gap    bool // the backend rejected the direct request that shunt accepted: a backend gap, not a shunt diff
+	// statusOnly compares the status and nothing else: from POC-3 shunt answers some requests from
+	// the directory instead of forwarding them (ListBuckets, a bucket it does not know), so the
+	// backend's headers and body are legitimately absent.
+	statusOnly bool
 }
 
 func (r *result) compare(compareBody bool) {
@@ -206,6 +210,12 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 	if d.err != "" || v.err != "" {
 		if d.err != v.err {
 			add("error: direct=%q via=%q", d.err, v.err)
+		}
+		return
+	}
+	if r.statusOnly {
+		if d.status != v.status {
+			add("status: direct=%d via=%d", d.status, v.status)
 		}
 		return
 	}
@@ -239,7 +249,7 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 		if k == "Content-Length" && d.status == http.StatusNoContent && v.status == http.StatusNoContent {
 			continue // RFC 9110 §8.6: a 204 must not carry Content-Length; Go's server drops a backend's "0"
 		}
-		if a, b := strings.Join(d.headers[k], ","), strings.Join(v.headers[k], ","); a != b {
+		if a, b := mixedNames(strings.Join(d.headers[k], ",")), mixedNames(strings.Join(v.headers[k], ",")); a != b {
 			add("header %s: direct=%q via=%q", k, a, b)
 		}
 	}
@@ -258,10 +268,53 @@ func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
 	}
 }
 
+// owned reports whether a CreateBucket failed only because the bucket is already ours.
+func owned(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "BucketAlreadyOwnedByYou") || strings.Contains(msg, "BucketAlreadyExists")
+}
+
+// parseSizes reads the -sizes list.
+func parseSizes(list string) ([]int, error) {
+	parts := strings.Split(list, ",")
+	sizes := make([]int, 0, len(parts))
+	for _, s := range parts {
+		var n int
+		if _, err := fmt.Sscan(s, &n); err != nil {
+			return nil, fmt.Errorf("bad size %q: %w", s, err)
+		}
+		sizes = append(sizes, n)
+	}
+	return sizes, nil
+}
+
+// rewritesLocation is set in resign and mixed modes, where shunt replaces <Location> with the
+// client-facing URL (ADR-0006) while each backend builds its own: Garage from its root_domain,
+// MinIO from the request Host. Its contents are asserted directly instead of being compared.
+var rewritesLocation bool
+
+// mixedLocation blanks <Location> in those modes: the two sides address different clusters, and
+// backends build it differently (Garage from its root_domain, MinIO from the request Host), so the
+// value is asserted explicitly instead (leakCheck) rather than compared.
+var mixedLocation = regexp.MustCompile(`<Location>[^<]*</Location>`)
+
 func normalise(body []byte) string {
-	out := xmlNoise.ReplaceAllString(string(body), "<$1>*</")
+	out := mixedNames(string(body))
+	if rewritesLocation {
+		out = mixedLocation.ReplaceAllString(out, "<Location>*</Location>")
+	}
+	out = xmlNoise.ReplaceAllString(out, "<$1>*</")
 	out = locationPort.ReplaceAllString(out, "$1")
 	return sortBuckets(out)
+}
+
+// mixedNames maps backend bucket names and cluster endpoints to what a client sees. It is a no-op
+// outside -mixed mode.
+func mixedNames(s string) string {
+	if mixedNormalise == nil {
+		return s
+	}
+	return mixedNormalise.Replace(s)
 }
 
 // bucketEntry matches one <Bucket> of a ListBuckets response. Backends are not required to return
@@ -280,9 +333,20 @@ func sortBuckets(body string) string {
 	return body[:i+len("<Buckets>")] + strings.Join(entries, "") + body[j:]
 }
 
+// truncLen caps the diff detail printed per body; S3DIFF_TRUNC raises it while investigating one.
+var truncLen = func() int {
+	if v := os.Getenv("S3DIFF_TRUNC"); v != "" {
+		var n int
+		if _, err := fmt.Sscan(v, &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 300
+}()
+
 func trunc(s string) string {
-	if len(s) > 300 {
-		return s[:300] + "…"
+	if len(s) > truncLen {
+		return s[:truncLen] + "…"
 	}
 	return s
 }
@@ -326,8 +390,19 @@ func main() {
 		stylesArg = flag.String("styles", "path,vhost", "addressing styles to run")
 		existing  = flag.String("existing-bucket", "", "use this existing bucket; nothing is created or deleted except keys under a unique prefix")
 		sigModes  = flag.Bool("signing-modes", true, "run the signing-mode dimension (raw client, every payload mode)")
+		mixed     = flag.Bool("mixed", false, "POC-3 mixed-backend mode: compare every bucket against the cluster that holds it")
+		cfgPath   = flag.String("config", "test/e2e/data/shunt-mixed.yaml", "with -mixed: the shunt config naming the clusters, directory, and credentials")
 	)
 	flag.Parse()
+	rewritesLocation = *mixed || *mode == "resign"
+	if *mixed {
+		sizes, err := parseSizes(*sizesFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		os.Exit(runMixed(context.Background(), *cfgPath, *viaEP, *viaAd, *domain, *caFile, sizes))
+	}
 	if *vAKEnv == "" {
 		*vAKEnv, *vSKEnv = *dAKEnv, *dSKEnv
 		if *mode == "resign" {
@@ -351,15 +426,10 @@ func main() {
 	}
 	var runID [4]byte
 	_, _ = rand.Read(runID[:])
-	sizeStrs := strings.Split(*sizesFlag, ",")
-	sizes := make([]int, 0, len(sizeStrs))
-	for _, s := range sizeStrs {
-		var n int
-		if _, err := fmt.Sscan(s, &n); err != nil {
-			fmt.Fprintf(os.Stderr, "bad size %q: %v\n", s, err)
-			os.Exit(2)
-		}
-		sizes = append(sizes, n)
+	sizes, err := parseSizes(*sizesFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 
 	ctx := context.Background()
@@ -383,8 +453,10 @@ func main() {
 			bkt = *existing
 			prefix = "s3diff/" + hex.EncodeToString(runID[:]) + "/" + style + "/"
 		}
-		run := func(name, op string, body bool, f func(*target) error) {
-			r := result{name: style + "/" + name, op: op}
+		var runMode func(name, op string, body, statusOnly bool, f func(*target) error)
+		run := func(name, op string, body bool, f func(*target) error) { runMode(name, op, body, false, f) }
+		runMode = func(name, op string, body, statusOnly bool, f func(*target) error) {
+			r := result{name: style + "/" + name, op: op, statusOnly: statusOnly}
 			ed := f(direct)
 			r.direct = direct.rec.take()
 			ev := f(via)
@@ -408,7 +480,9 @@ func main() {
 
 		// Bucket lifecycle: create direct, list via both, delete at the end via both (second is 404).
 		if *existing == "" {
-			if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
+			// A bucket left by an interrupted run is reused: its keys are the same on both sides,
+			// so they cannot produce a diff, and the run cleans up what it writes.
+			if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil && !owned(err) {
 				fmt.Fprintf(os.Stderr, "create bucket %s: %v\n", bkt, err)
 				os.Exit(2)
 			}
@@ -418,7 +492,10 @@ func main() {
 			_, err := t.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bkt})
 			return err
 		})
-		run("bucket", "ListBuckets", true, func(t *target) error {
+		// In resign mode shunt answers ListBuckets from the directory, so its body is the tenant's
+		// bucket set, not the backend's account: only the status is comparable. Mixed mode asserts
+		// the contents against the directory instead.
+		runMode("bucket", "ListBuckets", *mode != "resign", *mode == "resign", func(t *target) error {
 			_, err := t.client.ListBuckets(ctx, &s3.ListBucketsInput{})
 			return err
 		})
@@ -559,7 +636,9 @@ func main() {
 			_, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: aws.String(prefix + "does/not/exist")})
 			return err
 		})
-		run("errors", "HeadBucket(404)", false, func(t *target) error {
+		// A bucket the directory does not name never reaches a backend in resign mode: shunt answers
+		// it with its own error body and none of the backend's headers.
+		runMode("errors", "HeadBucket(404)", false, *mode == "resign", func(t *target) error {
 			_, err := t.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bkt + "-nope")})
 			return err
 		})

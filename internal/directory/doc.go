@@ -1,4 +1,5 @@
-// Package directory defines Directory, the second named interface seam: (tenant, bucket) →
-// placement with clusters, backend bucket names, state, and ramp rules (docs/DESIGN.md §2.3).
-// POC scope: the file backend only; the control-snapshot backend is P3c. Built in POC-3.
+// Package directory maps (tenant, bucket) to a placement: which clusters hold the bucket, under
+// which backend bucket names, and in which migration state (docs/DESIGN.md §2.3, §2.5).
+// Directory is one of the two named interface seams; FileDir is the file backend used by the POC
+// and single-site deployments (ADR-0005). Postgres behind shunt-control replaces it in P3c.
 package directory

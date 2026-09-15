@@ -37,7 +37,7 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	cat := catalogNames(t)
 	m := NewMetrics()
 	// Touch each vec so it gathers with at least one series.
-	m.RequestsTotal.WithLabelValues("GetObject", "2xx").Inc()
+	m.RequestsTotal.WithLabelValues("GetObject", "2xx", "garage", "s3").Inc()
 	m.RequestDuration.WithLabelValues("GetObject").Observe(0.01)
 	m.UpstreamTTFB.WithLabelValues("GetObject", "garage").Observe(0.01)
 	m.BytesIn.WithLabelValues("GetObject").Add(1)

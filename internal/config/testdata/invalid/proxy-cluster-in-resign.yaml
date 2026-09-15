@@ -1,9 +1,7 @@
-# expect: placements.acme/data.names.vast-a
+# expect: proxy.cluster
 listener: { address: ":8443", tls: { cert: c.pem, key: k.pem } }
-auth: { mode: passthrough }
+auth: { mode: resign, credentials_file: creds.yaml }
 proxy: { cluster: garage }
+directory: { file: d.yaml }
 clusters:
   garage: { type: s3, scheme: http, region: garage, endpoints: ["127.0.0.1:3900"], credentials: { access_key: GK, secret_ref: env:S } }
-tenants: { acme: { default_cluster: garage } }
-placements:
-  acme/data: { state: ACTIVE, primary: garage, names: { garage: data, vast-a: data } }

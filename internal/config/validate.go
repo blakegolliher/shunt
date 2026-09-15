@@ -15,9 +15,7 @@ var (
 	endpointModes  = []string{"static", "dns"}
 	storageClasses = []string{"native", "emulated"}
 	accessModes    = []string{"instant", "restore-required"}
-	tierModes      = []string{"native", "emulated"}
 	tlsVersions    = []string{"1.2", "1.3"}
-	states         = []string{StateActive, StateRamping, StateMigrating, StateCutover}
 	// archiveClasses are the only storage classes that may pair with access: restore-required (§2.6).
 	archiveClasses = []string{"GLACIER", "DEEP_ARCHIVE"}
 )
@@ -49,17 +47,16 @@ func (e *errs) oneOf(key, val string, allowed []string) bool {
 }
 
 // Validate checks structure and references. It returns every failure joined, each naming its key.
-// State-transition legality (e.g. refusing MIGRATING on a versioned source) is checked at
-// transition time by the directory, not here: the validator only sees structure.
+// Tenants and placements live in the directory file and are validated by internal/directory
+// against these clusters (check-config does both).
 func (c *Config) Validate() error {
 	var e errs
 	c.validateListener(&e)
 	c.validateAuth(&e)
 	c.validateProxy(&e)
+	c.validateDirectory(&e)
 	c.validateTelemetry(&e)
 	c.validateClusters(&e)
-	c.validateTenants(&e)
-	c.validatePlacements(&e)
 	if len(e) == 0 {
 		return nil
 	}
@@ -111,8 +108,11 @@ func (c *Config) validateAuth(e *errs) {
 func (c *Config) validateProxy(e *errs) {
 	p := c.Proxy
 	switch {
+	case c.Auth.Mode == "resign" && p.Cluster != "":
+		e.add("proxy.cluster", "not used in resign mode; placements in directory.file choose the cluster per bucket")
+	case c.Auth.Mode == "resign":
 	case p.Cluster == "":
-		e.add("proxy.cluster", "required; the name of the clusters: entry to forward to")
+		e.add("proxy.cluster", "required in passthrough mode; the name of the clusters: entry to forward to")
 	case len(c.Clusters) > 0:
 		if _, ok := c.Clusters[p.Cluster]; !ok {
 			e.add("proxy.cluster", "unknown cluster %q", p.Cluster)
@@ -129,6 +129,23 @@ func (c *Config) validateProxy(e *errs) {
 	}
 	if p.DrainTimeout <= 0 {
 		e.add("proxy.drain_timeout", "must be positive")
+	}
+}
+
+func (c *Config) validateDirectory(e *errs) {
+	d := c.Directory
+	switch c.Auth.Mode {
+	case "resign":
+		if d.File == "" {
+			e.add("directory.file", "required in resign mode: the tenants and placements that route each bucket")
+		}
+	case "passthrough":
+		if d.File != "" {
+			e.add("directory.file", "not used in passthrough mode (the client's signature fixes the bucket name); remove it")
+		}
+	}
+	if d.PollInterval < 0 {
+		e.add("directory.poll_interval", "must not be negative")
 	}
 }
 
@@ -218,126 +235,6 @@ func validateStorageClassPairing(e *errs, k string, cl Cluster) {
 	if cl.StorageClasses == "native" {
 		e.add(k+".storage_class", "not allowed on a storage_classes: native cluster; the backend owns its classes")
 	}
-}
-
-func (c *Config) validateTenants(e *errs) {
-	for _, name := range sortedKeys(c.Tenants) {
-		k := "tenants." + name
-		t := c.Tenants[name]
-		if t.DefaultCluster == "" {
-			e.add(k+".default_cluster", "required")
-		} else if _, ok := c.Clusters[t.DefaultCluster]; !ok {
-			e.add(k+".default_cluster", "unknown cluster %q", t.DefaultCluster)
-		}
-	}
-}
-
-func (c *Config) validatePlacements(e *errs) {
-	for _, key := range sortedKeys(c.Placements) {
-		k := "placements." + key
-		p := c.Placements[key]
-		tenant, bucket, ok := strings.Cut(key, "/")
-		if !ok || tenant == "" || bucket == "" {
-			e.add(k, "key must be <tenant>/<bucket>")
-		} else if _, found := c.Tenants[tenant]; !found {
-			e.add(k, "unknown tenant %q", tenant)
-		}
-		if !e.oneOf(k+".state", p.State, states) {
-			continue
-		}
-		c.ref(e, k+".primary", p.Primary, true)
-		migrating := p.State != StateActive
-		switch {
-		case migrating && p.Source == "":
-			e.add(k+".source", "required in state %s", p.State)
-		case !migrating && p.Source != "":
-			e.add(k+".source", "not allowed in state ACTIVE")
-		case p.Source != "":
-			c.ref(e, k+".source", p.Source, true)
-			if p.Source == p.Primary {
-				e.add(k+".source", "must differ from primary")
-			}
-		}
-		if p.Ramp != nil {
-			if p.State != StateRamping {
-				e.add(k+".ramp", "only allowed in state RAMPING")
-			}
-			if p.Ramp.Ratio < 0 || p.Ramp.Ratio > 1 {
-				e.add(k+".ramp.ratio", "must be within [0, 1], got %v", p.Ramp.Ratio)
-			}
-			if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 {
-				e.add(k+".ramp", "needs a ratio or at least one prefix")
-			}
-		} else if p.State == StateRamping {
-			e.add(k+".ramp", "required in state RAMPING")
-		}
-		for _, cl := range sortedKeys(p.Names) {
-			c.ref(e, k+".names."+cl, cl, true)
-			if p.Names[cl] == "" {
-				e.add(k+".names."+cl, "backend bucket name is empty")
-			}
-		}
-		for _, cl := range []string{p.Primary, p.Source, p.Cold} {
-			if cl == "" {
-				continue
-			}
-			if _, ok := c.Clusters[cl]; !ok {
-				continue // already reported
-			}
-			if _, ok := p.Names[cl]; !ok {
-				e.add(k+".names", "missing backend bucket name for cluster %q", cl)
-			}
-		}
-		c.validateTier(e, k, p)
-	}
-}
-
-func (c *Config) validateTier(e *errs, k string, p Placement) {
-	if p.Tier != "" && !e.oneOf(k+".tier", p.Tier, tierModes) {
-		return
-	}
-	switch p.Tier {
-	case "":
-		if p.Cold != "" {
-			e.add(k+".tier", "required when cold is set; one of %s", strings.Join(tierModes, "|"))
-		}
-		if p.Lifecycle != "" {
-			e.add(k+".tier", "required when lifecycle is set")
-		}
-	case "native":
-		if p.Cold != "" {
-			e.add(k+".cold", "not allowed with tier: native; the backend owns its classes")
-		}
-		if cl, ok := c.Clusters[p.Primary]; ok && cl.StorageClasses != "native" {
-			e.add(k+".tier", "native requires clusters.%s.storage_classes: native", p.Primary)
-		}
-	case "emulated":
-		if p.Cold == "" {
-			e.add(k+".cold", "required with tier: emulated")
-		} else if c.ref(e, k+".cold", p.Cold, true) {
-			if cl := c.Clusters[p.Cold]; cl.StorageClass == "" {
-				e.add(k+".cold", "cluster %q has no storage_class; an emulated cold cluster must state one", p.Cold)
-			}
-			if p.Cold == p.Primary {
-				e.add(k+".cold", "must differ from primary")
-			}
-		}
-	}
-}
-
-// ref reports an error unless name references a known cluster. Returns true when it resolves.
-func (c *Config) ref(e *errs, key, name string, required bool) bool {
-	if name == "" {
-		if required {
-			e.add(key, "required")
-		}
-		return false
-	}
-	if _, ok := c.Clusters[name]; !ok {
-		e.add(key, "unknown cluster %q", name)
-		return false
-	}
-	return true
 }
 
 func sortedKeys[V any](m map[string]V) []string {
