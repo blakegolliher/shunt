@@ -1,17 +1,22 @@
 package config
 
-// Features holds every feature flag (CLAUDE.md: flags live in one file, each with a removal
-// criterion). Flags default off, with one exception approved with POC-3 on 2026-09-15 and noted on
-// the flag.
-type Features struct {
-	// XMLRewrite rewrites backend bucket names, cluster endpoint hosts, and uploadIds in resign-mode
-	// response bodies (ADR-0006). Default TRUE, the one exception to default-off: turning it off
-	// exposes backend names and endpoint addresses to clients, and `shunt serve` warns at startup
-	// naming the clusters whose <Location> will leak. It exists to take the rewriter out of the
-	// path if it misbehaves in production.
-	// Removal: one full phase after P3b with no rewriter overflow or leak report.
-	XMLRewrite *bool `yaml:"xml_rewrite"`
-}
+// Features holds feature flags: behavior that is off until an operator turns it on. Every flag
+// defaults off and carries a removal criterion (CLAUDE.md). None exist yet; the empty struct keeps
+// `features:` a known key, so an unknown flag name is still an error.
+type Features struct{}
 
-// XMLRewriteOn reports the xml_rewrite flag with its default (true) applied.
-func (f Features) XMLRewriteOn() bool { return f.XMLRewrite == nil || *f.XMLRewrite }
+// KillSwitches turn off behavior that is normally on, for an operator who hits a bug in it while
+// shunt is serving. A kill switch is not a feature flag: it defaults to the normal behavior
+// (false), it has no removal criterion, and it documents what breaks when it is flipped
+// (CLAUDE.md). It is removed when the behavior it guards no longer needs a switch.
+type KillSwitches struct {
+	// XMLRewriteDisable stops shunt rewriting backend bucket names, cluster endpoint hosts, and
+	// uploadIds in resign-mode responses (ADR-0006).
+	//
+	// Flipping it hands clients the backend's names: a bucket name the client cannot address, the
+	// cluster's own address in CompleteMultipartUpload's <Location>, and backend uploadIds that
+	// stop working as soon as a bucket's placement moves. `shunt serve` warns at startup and names
+	// the clusters whose <Location> will leak. Turn it on only to get past a bug in the rewriter,
+	// and only in front of clients that may see backend names.
+	XMLRewriteDisable bool `yaml:"xml_rewrite_disable"`
+}

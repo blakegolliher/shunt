@@ -85,6 +85,8 @@ Two placements may never share a backend bucket on one cluster: that would make 
 | `capabilities.enforces_sha256` | bool | Default true. False means the backend does not reject a wrong hex `x-amz-content-sha256`; shunt then hashes the body itself and logs a mismatch (ADR-0002, POC: log-and-alert). Fill from `shunt probe` |
 | `capabilities.unsigned_trailer` | bool | Default true. False means the backend rejects `STREAMING-UNSIGNED-PAYLOAD-TRAILER`; shunt then verifies the trailer checksum itself and forwards `UNSIGNED-PAYLOAD`. Fill from `shunt probe` |
 
+`capabilities` are measured facts about a backend, filled from `shunt probe`, not switches over shunt's behavior: the feature-flag and kill-switch rules (CLAUDE.md) do not apply to them. Each default states what a conformant S3 backend does; a backend that differs gets a profile, and shunt compensates for the difference (ADR-0002).
+
 ## `tenants`, `placements`
 
 Moved out of the config into the directory file in POC-3 (see `directory` above and ADR-0005). Samples: `internal/directory/testdata/`.
@@ -100,8 +102,12 @@ Moved out of the config into the directory file in POC-3 (see `directory` above 
 
 ## `features`
 
-Every flag carries a removal criterion in `internal/config/features.go`; any other key is an error.
+Feature flags: behavior that is off until it is turned on. Each defaults off and carries a removal criterion in `internal/config/features.go`. None exist yet, and any key here is an error.
 
-| Key | Type | Default | Meaning |
+## `kill_switches`
+
+Switches that turn off behavior which is normally on, for an operator who hits a bug in it. Each defaults to `false`, the normal behavior, and says what breaks when flipped. They are not feature flags.
+
+| Key | Type | Default | What flipping it does |
 |---|---|---|---|
-| `xml_rewrite` | bool | **true** | Rewrite backend bucket names, cluster endpoints, and uploadIds in resign-mode responses (ADR-0006). The one flag that defaults on: with it off, those names reach clients and `serve` warns at startup naming the clusters whose `<Location>` leaks. |
+| `xml_rewrite_disable` | bool | false | Stops rewriting backend bucket names, cluster endpoints, and uploadIds in resign-mode responses (ADR-0006). Clients then see a bucket name they cannot address, the cluster's address in `<Location>`, and backend uploadIds that break when a placement moves. `serve` warns at startup and names the clusters whose `<Location>` will leak. |

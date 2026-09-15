@@ -72,4 +72,5 @@ directory:
 telemetry:
   access_log: { enabled: true, path: /var/log/shunt/access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }
-features: { xml_rewrite: true }
+features: {}
+kill_switches: { xml_rewrite_disable: false }

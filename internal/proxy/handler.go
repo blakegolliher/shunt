@@ -27,7 +27,7 @@ type Handler struct {
 
 	// Resign mode (ADR-0001): the client signature is verified against Store, the request is
 	// routed by its placement in Dir to one of Clusters under that cluster's backend bucket name,
-	// and re-signed with the cluster's credentials. Rewrite (features.xml_rewrite) rewrites the
+	// and re-signed with the cluster's credentials. Rewrite (off by kill_switches.xml_rewrite_disable) rewrites the
 	// response echoes of backend names, endpoints, and uploadIds (ADR-0006).
 	Mode      Mode
 	Store     sigv4.CredentialStore

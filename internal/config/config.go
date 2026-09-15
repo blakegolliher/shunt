@@ -22,6 +22,8 @@ type Config struct {
 	Directory Directory          `yaml:"directory"`
 	Telemetry Telemetry          `yaml:"telemetry"`
 	Features  Features           `yaml:"features"`
+	// KillSwitches turn off behavior that is normally on; they are not feature flags (CLAUDE.md).
+	KillSwitches KillSwitches `yaml:"kill_switches"`
 }
 
 // Directory points at the directory file: tenants and placements (docs/DESIGN.md §2.3, ADR-0005).

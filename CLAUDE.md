@@ -11,6 +11,7 @@ Read docs/DESIGN.md before every task. docs/CONTEXT.md is ground truth about the
 - Any buffering of a request or response body requires an ADR and a benchmark. (`io.CopyBuffer` through a pooled fixed-size buffer is streaming, not buffering.)
 - Every package has tests and at least one benchmark; `-race` in CI; fuzz targets for every parser (op classifier, SigV4 canonicalization, aws-chunked decoder, XML rewriters, lifecycle XML, continuation tokens).
 - Feature flags default off, live in one file, and each has a removal criterion.
+- Kill switches are not feature flags: they turn off behavior that is normally on, so they default to the normal behavior (`false`) and each documents what breaks when it is flipped. They live in the same file and are removed when the behavior they guard no longer needs a switch. A flag whose safe value is "on" is a kill switch stated backwards; name it so the default is `false`.
 - Config is validated at startup and by `check-config`; unknown keys are errors.
 - ADRs in `docs/adr/` for every decision in Section 2 and any that overrides it.
 - Nothing in the code or docs assumes a NIC, a CPU model, or a kernel feature beyond what `doctor` checks and a fallback covers.

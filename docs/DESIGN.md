@@ -202,6 +202,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 - Any buffering of a request or response body requires an ADR and a benchmark. (`io.CopyBuffer` through a pooled fixed-size buffer is streaming, not buffering.)
 - Every package has tests and at least one benchmark; `-race` in CI; fuzz targets for every parser (op classifier, SigV4 canonicalization, aws-chunked decoder, XML rewriters, lifecycle XML, continuation tokens).
 - Feature flags default off, live in one file, and each has a removal criterion.
+- Kill switches are not feature flags: they turn off behavior that is normally on, so they default to the normal behavior (`false`) and each documents what breaks when it is flipped. They live in the same file and are removed when the behavior they guard no longer needs a switch. A flag whose safe value is "on" is a kill switch stated backwards; name it so the default is `false`.
 - Config is validated at startup and by `check-config`; unknown keys are errors.
 - ADRs in `docs/adr/` for every decision in Section 2 and any that overrides it.
 - Nothing in the code or docs assumes a NIC, a CPU model, or a kernel feature beyond what `doctor` checks and a fallback covers.
@@ -507,7 +508,7 @@ Simplicity review for the phase just completed.
 1. List every exported type, interface, and function added this phase. For each, name its second caller. Delete or unexport anything with only one, except the two named seams in CLAUDE.md.
 2. List every dependency added this phase with its docs/deps.md line and its license. Remove any that the standard library could replace in under 100 lines.
 3. Search for any place a request or response body is buffered (bytes.Buffer, io.ReadAll, []byte body copies). Each one needs an ADR or must go. io.CopyBuffer through the pool is not buffering.
-4. Find every feature flag; confirm each is default off and has a removal criterion.
+4. Find every feature flag; confirm each is default off and has a removal criterion. Find every kill switch; confirm each defaults to the normal behavior and says what breaks when flipped.
 5. Search for anything that assumes a NIC, CPU model, or kernel feature without a doctor check and a fallback. Remove it.
 6. Report LOC added, LOC deleted, and test-to-code ratio. If the ratio dropped, explain why.
 Make the deletions, then show me the diff summary.

@@ -44,8 +44,8 @@ func newServe() *cobra.Command {
 }
 
 // locationLeaks names the cluster types whose CompleteMultipartUpload <Location> echoes the host the
-// request was sent to. In resign mode that host is the backend endpoint, so with features.xml_rewrite
-// off the backend address reaches the client. With the rewriter on (the default) nothing leaks.
+// request was sent to. In resign mode that host is the backend endpoint, so with the rewriter
+// switched off the backend address reaches the client. With it on (the default) nothing leaks.
 var locationLeaks = map[string]string{
 	"minio": "verified: s3diff resign run 2026-09-15 returned <Location>http://127.0.0.1/…",
 	"aws":   "AWS builds <Location> from the endpoint host it was addressed by",
@@ -104,7 +104,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Error("directory change log append failed; the placement change itself is committed", "change_log", dir.ChangeLogPath(), "err", err.Error())
 		}
 		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, set, dir
-		hcfg.Rewrite, hcfg.ClockSkew = cfg.Features.XMLRewriteOn(), cfg.Auth.ClockSkew
+		hcfg.Rewrite, hcfg.ClockSkew = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew
 		for _, name := range set.Names() {
 			cl, _ := set.Get(name)
 			clusters = append(clusters, cl)
@@ -112,10 +112,10 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		log.Info("resign mode", "credentials", store.Len(), "clusters", set.Names(), "directory", cfg.Directory.File,
 			"directory_version", dir.Snapshot().Version(), "poll_interval", cfg.Directory.PollInterval.String(), "xml_rewrite", hcfg.Rewrite)
 		if !hcfg.Rewrite {
-			log.Warn("features.xml_rewrite is off: responses carry backend bucket names, cluster endpoints, and backend uploadIds to clients (ADR-0006)")
+			log.Warn("kill_switches.xml_rewrite_disable is set: responses carry backend bucket names, cluster endpoints, and backend uploadIds to clients (ADR-0006)")
 			for _, cl := range clusters {
 				if evidence, leaks := locationLeaks[cl.Type]; leaks {
-					log.Warn("CompleteMultipartUpload <Location> will expose the upstream endpoint to clients while features.xml_rewrite is off (docs/reference/backend-compat.md)",
+					log.Warn("CompleteMultipartUpload <Location> will expose the upstream endpoint to clients while kill_switches.xml_rewrite_disable is set (docs/reference/backend-compat.md)",
 						"cluster", cl.Name, "type", cl.Type, "endpoints", cl.Endpoints, "evidence", evidence)
 				}
 			}

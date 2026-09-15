@@ -935,7 +935,7 @@ func TestRewriteFlagOffLeavesEchoes(t *testing.T) {
 	m.h.Rewrite = false
 	r := m.acme(t, "GET", "/data/nokey", nil)
 	if !strings.Contains(string(r.body), "acme-1111-data") {
-		t.Fatalf("with features.xml_rewrite off the backend echo is relayed as is; got %s", r.body)
+		t.Fatalf("with the rewriter switched off the backend echo is relayed as is; got %s", r.body)
 	}
 }
 

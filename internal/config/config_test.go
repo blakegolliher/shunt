@@ -96,28 +96,31 @@ func TestMixedSampleShape(t *testing.T) {
 	if c.Directory.File != "internal/directory/testdata/valid/mixed.yaml" || c.Directory.PollInterval != 2*time.Second {
 		t.Errorf("directory: %+v", c.Directory)
 	}
-	if !c.Features.XMLRewriteOn() {
-		t.Error("features.xml_rewrite: true not parsed")
-	}
 	if c.Clusters["aws-use1"].EndpointMode != "dns" {
 		t.Errorf("aws-use1 endpoint_mode: %q", c.Clusters["aws-use1"].EndpointMode)
 	}
 }
 
-func TestFeatureDefaults(t *testing.T) {
+// A kill switch defaults to the normal behavior: unset means the rewriter runs.
+func TestKillSwitchDefaults(t *testing.T) {
 	c, err := Load("testdata/valid/poc.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Features.XMLRewriteOn() {
-		t.Error("xml_rewrite must default to true (approved exception to default-off, POC-3)")
+	if c.KillSwitches.XMLRewriteDisable {
+		t.Error("xml_rewrite_disable must default to false, so rewriting is on unless it is switched off")
 	}
 	if c.Directory.PollInterval != 0 {
 		t.Errorf("poll_interval defaulted without a directory file: %v", c.Directory.PollInterval)
 	}
-	off := false
-	if (Features{XMLRewrite: &off}).XMLRewriteOn() {
-		t.Error("xml_rewrite: false ignored")
+	on, err := Parse([]byte("listener: { address: \":1\", tls: { cert: c, key: k } }\nauth: { mode: passthrough }\nproxy: { cluster: x }\n" +
+		"kill_switches: { xml_rewrite_disable: true }\n" +
+		"clusters:\n  x: { type: s3, scheme: http, region: r, endpoints: [\"h:1\"], credentials: { access_key: a, secret_ref: env:S } }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on.KillSwitches.XMLRewriteDisable {
+		t.Error("kill_switches.xml_rewrite_disable: true not parsed")
 	}
 }
 
