@@ -33,9 +33,13 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign s3diff bench-e2e probe help
+.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign s3diff bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
+	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
+
+check-tls-verify: ## fail if any committed config or make target disables TLS verification (POC-3 preflight)
+	@scripts/check-tls-verify.sh
 
 build: ## compile ./cmd/shunt into ./bin/shunt
 	@mkdir -p $(BIN)

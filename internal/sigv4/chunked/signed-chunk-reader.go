@@ -14,7 +14,8 @@
 // Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-15: package renamed to chunked;
 // debuglogger calls removed; secureCompare replaced by crypto/subtle; s3err replaced by the shunt
 // s3 error table (SignatureDoesNotMatch no longer echoes the string-to-sign); aws-sdk types replaced by string;
-// Read never returns more decoded bytes than x-amz-decoded-content-length (found by fuzzing).
+// Read never returns more decoded bytes than x-amz-decoded-content-length, and negative chunk sizes are
+// rejected instead of panicking as a slice bound (both found by fuzzing; the second also exists upstream).
 
 package chunked
 
@@ -507,7 +508,8 @@ func (cr *ChunkReader) parseChunkSize(rdr *bufio.Reader, header []byte) (int64, 
 		return 0, err
 	}
 	chunkSize, err := strconv.ParseInt(chunkSizeStr, 16, 64)
-	if err != nil {
+	if err != nil || chunkSize < 0 {
+		// A negative size would be used as a slice bound below (shunt hardening, found by fuzzing).
 		return 0, s3.Lookup(s3.IncompleteBody)
 	}
 

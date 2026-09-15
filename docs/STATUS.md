@@ -1,6 +1,6 @@
 # STATUS
 
-Current phase: **POC-2 built and validated; tag `poc-2` blocked on a VAST certificate that covers `vast02.example.com`** (see the VAST TLS gap below). POC-3 next. Track: docs/POC.md. Full design: docs/DESIGN.md.
+Current phase: **POC-2 tagged `poc-2` (2026-09-15) with two carried gaps: VAST TLS verification is off, and resign mode can leak the backend address in `<Location>`.** POC-3 next; its multi-cluster work must not start until `make check-tls-verify` passes.
 
 ## POC track
 
@@ -8,7 +8,7 @@ Current phase: **POC-2 built and validated; tag `poc-2` blocked on a VAST certif
 |---|---|---|
 | POC-0 | `make all` green on clean checkout; `check-config` rejects every invalid sample naming the key; `make e2e-up` leaves Garage and MinIO healthy | done 2026-09-14 |
 | POC-1 | s3diff clean on Garage and MinIO (passthrough); unauthorized 5 GiB PUT fails before body bytes; mid-GET backend kill never a silent short read; bench in docs/bench/poc1.md | done 2026-09-15 |
-| POC-2 | s3diff clean across signing modes on every backend or a documented gap each; secret-leak test green; fuzz 30s clean; resign overhead in docs/bench/poc2.md | gate met 2026-09-15 (VAST 0 diffs; Garage and MinIO diffs all documented path-style echoes owned by POC-3; Garage signed-trailer backend gap); tag pending |
+| POC-2 | s3diff clean across signing modes on every backend or a documented gap each; secret-leak test green; fuzz 30s clean; resign overhead in docs/bench/poc2.md | gate met 2026-09-15 (VAST 0 diffs; Garage and MinIO diffs all documented path-style echoes owned by POC-3; Garage signed-trailer backend gap); tagged `poc-2` with carried gaps |
 | POC-3 | mixed-backend s3diff clean; same bucket name under two tenants isolated; ListBuckets spans clusters; no backend name leaks; uploadId round-trip | not started |
 | POC-4 | demo.sh green Garage → MinIO and VAST → MinIO/AWS; property test green; docs/bench/poc4.md | not started |
 
@@ -35,6 +35,10 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 - Makefile targets: build, test, race, lint, fuzz, bench, bench-compare, e2e-up, e2e-down, all.
 - test/e2e: Garage + MinIO compose, wildcard cert script, health wait.
 
+## Found and fixed at the POC-2 tag gate
+
+- **Crash: negative chunk size in a signed-chunk upload.** `make all`'s fuzz run found `-1;chunk-signature=…` panicking the lifted signed-chunk reader with a negative slice bound. The decoder runs inside net/http's transport write loop, which does not recover panics, so a regression test against the unfixed code showed **one request from any client holding a valid shunt key terminated the whole process** in resign mode. Passthrough mode was not affected. Fixed twice: the reader now rejects negative sizes with `400 IncompleteBody`, and the resign path wraps every decoded body in a guard that turns any decoder panic into a 400 with an error log. Regression tests: `internal/sigv4/chunked/negsize_test.go`, `internal/proxy/negchunk_test.go`, and the fuzz corpus entry `e5db5b318681f792`. Upstream versitygw at `4dc0debf` has the same parse; not yet reported upstream.
+
 ## POC-2 s3diff results (2026-09-15)
 
 | Backend | Mode | Cases | Diffs | Backend gaps | Notes |
@@ -50,9 +54,17 @@ Every remaining diff traces to one cause, path-style upstream in resign mode, an
 ## Known gaps carried forward
 
 - Credentials file inline secrets; encrypted at rest is P3c.
-- **VAST TLS verification is disabled (temporary).** The lab cluster serves a self-signed factory certificate (CN `vms.example.com`, SAN `*.example.com`, `vms.example.com`, 33 IPs in 10.0.0.3 and 100.64.0–1.x) that does not cover `vast02.example.com` or its current address. The lab wildcard on the dev box, `/path/to/lab-wildcard.crt` (Sectigo, `*.lab.example.com`), does not cover it either (one label only) and expired 2026-09-02. Checked 2026-09-15. `tls.insecure_skip_verify` in test/e2e/shunt-vast-resign.yaml, `--insecure` on probe, `-direct-insecure` on s3diff, all in `make … BACKEND=vast`. Remove when a valid certificate is installed.
+- **CARRIED GAP from POC-2: TLS verification is off for VAST.** Three switches disable it:
+  - `test/e2e/shunt-vast-resign.yaml:31`, `tls: { insecure_skip_verify: true }` on the cluster record (shunt logs a warning at startup)
+  - `Makefile:131`, `-direct-insecure` in the `BACKEND=vast` s3diff and bench arguments
+  - `Makefile:132`, `--insecure` in the `BACKEND=vast` probe arguments
+
+  **Blocker: the lab certificate.** VAST serves its factory certificate, CN `vms.example.com`, whose SAN is `*.example.com`, `vms.example.com`, and 33 IP addresses. A wildcard matches exactly one label, so `*.example.com` cannot match the four-label host `vast02.example.com`, and the host's address (10.0.0.2 on 2026-09-15) is not in the IP list. The lab wildcard on the dev box (`/path/to/lab-wildcard.crt`, `*.lab.example.com`) covers only one label below `lab.example.com` and expired 2026-09-02. The fix is a certificate whose SAN includes `vast02.example.com` or `*.vast02.example.com`, then `tls.ca` if it is not publicly issued.
+
+  **Rule for POC-3: multi-cluster work must not start with verification still off.** `make check-tls-verify` (scripts/check-tls-verify.sh) fails while any committed cluster config or make target disables verification and prints each location; `make all` prints a warning on every run until it passes. Make it pass before adding a second cluster, then re-run `make probe BACKEND=vast` and `make s3diff BACKEND=vast MODE=resign` with verification on.
 - Resign mode sends upstream path-style, so error bodies for virtual-host requests carry a path-style `<Resource>`; POC-3's XML rewriting closes it (ADR-0001 amendment).
 - **Backend address leak in resign mode:** MinIO echoes the upstream Host into CompleteMultipartUpload `<Location>`, so a client sees `http://127.0.0.1/…` (the cluster endpoint). POC-3 rewrites every XML echo (DESIGN §9 item 11); until then resign mode must not front MinIO for untrusted clients. `shunt serve` logs a startup warning in resign mode naming the cluster when its type is minio (verified), aws (known), or vast / s3 (unverified, assumed).
+- **s3diff cannot detect the `<Location>` leak on VAST.** Its direct and proxied requests both address the VAST endpoint host, so both responses carry the same `<Location>` and the diff is empty whether or not VAST echoes the host. The leak was only visible on MinIO because the direct side used the client-facing name. POC-3's XML rewrite tests must assert on `<Location>` contents explicitly, that it names the client-facing host and never a cluster endpoint, rather than relying on s3diff to show a difference.
 - Garage 2.3.0 rejects signed trailers directly; through shunt they work because shunt verifies them and forwards an unsigned trailer.
 - Garage ignores `If-None-Match: *` on PUT (docs/reference/backend-compat.md): not usable as a POC-4 migration target without a guard.
 - ADR-0002 compensation is log-and-alert only (`sha256`, `trailer` reasons); the compensating delete is P2.

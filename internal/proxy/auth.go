@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -190,7 +193,30 @@ func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressR
 		plan.contentLength = decodedLen
 		plan.payloadHash = sigv4.UnsignedPayload
 	}
+	plan.body = &guardReader{r: plan.body, log: h.Log}
 	return plan, nil
+}
+
+// guardReader turns a panic inside a body decoder into a read error. Decoders run in net/http's
+// transport write loop, which does not recover panics, so without this guard one malformed body
+// from an authenticated client terminates the whole process (a negative chunk size did, found by
+// fuzzing at the POC-2 gate). The request fails with 400 IncompleteBody and the panic is logged.
+type guardReader struct {
+	r   io.Reader
+	log *slog.Logger
+}
+
+func (g *guardReader) Read(p []byte) (n int, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			if g.log != nil {
+				g.log.Error("request body decoder panicked; request aborted instead of crashing the process",
+					"panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+			}
+			n, err = 0, s3.Lookup(s3.IncompleteBody)
+		}
+	}()
+	return g.r.Read(p)
 }
 
 // asS3 converts a chunked-package error into an s3.Error for rendering.
