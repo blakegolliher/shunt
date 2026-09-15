@@ -110,6 +110,14 @@ func (c *Config) validateAuth(e *errs) {
 
 func (c *Config) validateProxy(e *errs) {
 	p := c.Proxy
+	switch {
+	case p.Cluster == "":
+		e.add("proxy.cluster", "required; the name of the clusters: entry to forward to")
+	case len(c.Clusters) > 0:
+		if _, ok := c.Clusters[p.Cluster]; !ok {
+			e.add("proxy.cluster", "unknown cluster %q", p.Cluster)
+		}
+	}
 	if p.CopyBufferBytes < 4096 {
 		e.add("proxy.copy_buffer_bytes", "must be at least 4096, got %d", p.CopyBufferBytes)
 	}

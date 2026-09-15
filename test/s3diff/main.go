@@ -1,0 +1,535 @@
+// Command s3diff runs an S3 operation matrix against a backend directly and through shunt and
+// diffs status, headers (minus an allowlist), and body (docs/DESIGN.md §6). The proxy's core
+// property is transparency; this measures it. Test tool only: it imports aws-sdk-go-v2
+// (Apache-2.0, docs/deps.md) and never links into the proxy binary.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"hash"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+)
+
+// headerAllow lists headers that legitimately differ between direct and proxied responses.
+var headerAllow = map[string]bool{
+	"Date": true, "Server": true, "X-Amz-Request-Id": true, "X-Amz-Id-2": true,
+	"Via": true, "X-Shunt-Request-Id": true, "Connection": true, "Keep-Alive": true,
+	"X-Amz-Version-Id": true, // each side does its own PUT; versioned backends mint a new id per write
+}
+
+// xmlNoise strips per-request values from XML bodies before comparing them.
+var xmlNoise = regexp.MustCompile(`<(UploadId|RequestId|HostId|LastModified|CreationDate|Date|VersionId|DeleteMarkerVersionId)>[^<]*</`)
+
+// locationPort strips the port from <Location>: backends echo the Host header into it, and
+// shunt's listener port differs from the backend's. Passthrough preserves Host by design.
+var locationPort = regexp.MustCompile(`(<Location>[a-z]+://[^:/<]+):\d+`)
+
+// probe is what we compare: the last HTTP response seen by a client.
+type probe struct {
+	status  int
+	headers http.Header
+	bodyLen int64
+	bodySum string
+	body    []byte // kept for XML normalisation only (small responses)
+	err     string
+}
+
+// recorder captures every response on a transport since the last take(). Bodies are hashed as
+// the SDK reads them, so a multi-step case (multipart) compares each step in order.
+type recorder struct {
+	rt   http.RoundTripper
+	mu   sync.Mutex
+	seen []*probe
+}
+
+func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := r.rt.RoundTrip(req)
+	p := &probe{}
+	if err != nil {
+		p.err = err.Error()
+		r.set(p)
+		return resp, err
+	}
+	p.status = resp.StatusCode
+	p.headers = resp.Header.Clone()
+	hb := &hashBody{ReadCloser: resp.Body, h: sha256.New(), p: p}
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "xml") || ct == "" {
+		hb.keep = &bytes.Buffer{} // XML, or unlabelled (Garage sends XML with no Content-Type)
+	}
+	resp.Body = hb
+	r.set(p)
+	return resp, nil
+}
+
+func (r *recorder) set(p *probe) { r.mu.Lock(); r.seen = append(r.seen, p); r.mu.Unlock() }
+func (r *recorder) take() []*probe {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.seen
+	r.seen = nil
+	if len(out) == 0 {
+		out = []*probe{{err: "no response recorded"}}
+	}
+	return out
+}
+
+type hashBody struct {
+	io.ReadCloser
+	h    hash.Hash
+	p    *probe
+	keep *bytes.Buffer
+}
+
+func (b *hashBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.h.Write(p[:n])
+		b.p.bodyLen += int64(n)
+		if b.keep != nil && b.keep.Len() < 1<<20 {
+			b.keep.Write(p[:n])
+		}
+	}
+	if err == io.EOF {
+		b.p.bodySum = hex.EncodeToString(b.h.Sum(nil))
+		if b.keep != nil {
+			b.p.body = b.keep.Bytes()
+		}
+	}
+	return n, err
+}
+
+// target is one side of the comparison.
+type target struct {
+	name     string
+	client   *s3.Client
+	rec      *recorder
+	pathOnly bool
+}
+
+// newTarget builds an SDK client whose every *.domain / domain host dials addr.
+func newTarget(name, endpoint, addr, domain, region, ak, sk, caFile string, pathStyle bool) (*target, error) {
+	tr := &http.Transport{
+		DisableCompression: true,
+		ForceAttemptHTTP2:  false,
+		TLSNextProto:       map[string]func(string, *tls.Conn) http.RoundTripper{},
+		DialContext: func(ctx context.Context, network, host string) (net.Conn, error) {
+			h, _, err := net.SplitHostPort(host)
+			if err == nil && (h == domain || strings.HasSuffix(h, "."+domain)) {
+				host = addr
+			}
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, host)
+		},
+	}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(pem)
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	rec := &recorder{rt: tr}
+	cfg := aws.Config{
+		Region:      region,
+		Credentials: credentials.NewStaticCredentialsProvider(ak, sk, ""),
+		HTTPClient:  &http.Client{Transport: rec},
+		// POC-1 compares one signing mode; aws-chunked trailers are POC-2's dimension.
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+		RetryMaxAttempts:           1,
+	}
+	c := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = pathStyle
+	})
+	return &target{name: name, client: c, rec: rec}, nil
+}
+
+type result struct {
+	name   string
+	op     string
+	direct []*probe
+	via    []*probe
+	diffs  []string
+}
+
+func (r *result) compare(compareBody bool) {
+	if len(r.direct) != len(r.via) {
+		r.diffs = append(r.diffs, fmt.Sprintf("step count: direct=%d via=%d", len(r.direct), len(r.via)))
+		return
+	}
+	for i := range r.direct {
+		r.compareStep(i, r.direct[i], r.via[i], compareBody)
+	}
+}
+
+func (r *result) compareStep(i int, d, v *probe, compareBody bool) {
+	prefix := ""
+	if len(r.direct) > 1 {
+		prefix = fmt.Sprintf("step %d: ", i+1)
+	}
+	add := func(format string, a ...any) { r.diffs = append(r.diffs, prefix+fmt.Sprintf(format, a...)) }
+	if d.err != "" || v.err != "" {
+		if d.err != v.err {
+			add("error: direct=%q via=%q", d.err, v.err)
+		}
+		return
+	}
+	if d.status != v.status {
+		add("status: direct=%d via=%d", d.status, v.status)
+	}
+	keys := map[string]bool{}
+	for k := range d.headers {
+		keys[k] = true
+	}
+	for k := range v.headers {
+		keys[k] = true
+	}
+	var sorted []string
+	for k := range keys {
+		if !headerAllow[k] {
+			sorted = append(sorted, k)
+		}
+	}
+	sort.Strings(sorted)
+	for _, k := range sorted {
+		if k == "Content-Length" && (d.body != nil || v.body != nil) {
+			continue // XML bodies are compared after normalisation; their length follows
+		}
+		if a, b := strings.Join(d.headers[k], ","), strings.Join(v.headers[k], ","); a != b {
+			add("header %s: direct=%q via=%q", k, a, b)
+		}
+	}
+	if !compareBody {
+		return
+	}
+	if d.body != nil || v.body != nil {
+		a, b := normalise(d.body), normalise(v.body)
+		if a != b {
+			add("xml body differs (normalised):\n  direct: %s\n  via:    %s", trunc(a), trunc(b))
+		}
+		return
+	}
+	if d.bodyLen != v.bodyLen || d.bodySum != v.bodySum {
+		add("body: direct=%d/%s via=%d/%s", d.bodyLen, short(d.bodySum), v.bodyLen, short(v.bodySum))
+	}
+}
+
+func normalise(body []byte) string {
+	out := xmlNoise.ReplaceAllString(string(body), "<$1>*</")
+	return locationPort.ReplaceAllString(out, "$1")
+}
+
+func trunc(s string) string {
+	if len(s) > 300 {
+		return s[:300] + "…"
+	}
+	return s
+}
+func short(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+var trickyKeys = map[string]string{
+	"plain":    "dir/plain.bin",
+	"spaces":   "dir with space/file name.bin",
+	"unicode":  "dir/ünïcödé-日本語.bin",
+	"plus":     "dir/a+b.bin",
+	"percent":  "dir/100%.bin",
+	"dslash":   "dir//double.bin",
+	"trailing": "dir/trailing/",
+	"long":     strings.Repeat("k", 1024),
+}
+
+func main() {
+	var (
+		directEP  = flag.String("direct", "http://shunt.example.com", "backend endpoint URL (host is rewritten to -direct-addr)")
+		directAd  = flag.String("direct-addr", "127.0.0.1:3900", "backend host:port")
+		viaEP     = flag.String("via", "https://shunt.example.com:8443", "shunt endpoint URL")
+		viaAd     = flag.String("via-addr", "127.0.0.1:8443", "shunt host:port")
+		domain    = flag.String("domain", "shunt.example.com", "wildcard base domain")
+		region    = flag.String("region", "garage", "signing region")
+		caFile    = flag.String("ca", "test/e2e/certs/wildcard.crt", "CA for the shunt endpoint")
+		bucket    = flag.String("bucket", "s3diff", "bucket name (created and deleted)")
+		sizesFlag = flag.String("sizes", "0,1,4096,1048576,67108864", "object sizes")
+		keep      = flag.Bool("keep", false, "keep the bucket afterwards")
+	)
+	flag.Parse()
+	ak, sk := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if ak == "" || sk == "" {
+		fmt.Fprintln(os.Stderr, "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY required")
+		os.Exit(2)
+	}
+	sizeStrs := strings.Split(*sizesFlag, ",")
+	sizes := make([]int, 0, len(sizeStrs))
+	for _, s := range sizeStrs {
+		var n int
+		if _, err := fmt.Sscan(s, &n); err != nil {
+			fmt.Fprintf(os.Stderr, "bad size %q: %v\n", s, err)
+			os.Exit(2)
+		}
+		sizes = append(sizes, n)
+	}
+
+	ctx := context.Background()
+	var results []result
+	failed := 0
+	for _, style := range []string{"path", "vhost"} {
+		pathStyle := style == "path"
+		direct, err := newTarget("direct", *directEP, *directAd, *domain, *region, ak, sk, "", pathStyle)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		via, err := newTarget("via", *viaEP, *viaAd, *domain, *region, ak, sk, *caFile, pathStyle)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		bkt := *bucket + "-" + style
+		run := func(name, op string, body bool, f func(*target) error) {
+			r := result{name: style + "/" + name, op: op}
+			_ = f(direct)
+			r.direct = direct.rec.take()
+			_ = f(via)
+			r.via = via.rec.take()
+			r.compare(body)
+			if len(r.diffs) > 0 {
+				failed++
+			}
+			results = append(results, r)
+		}
+
+		// Bucket lifecycle: create direct, list via both, delete at the end via both (second is 404).
+		if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
+			fmt.Fprintf(os.Stderr, "create bucket %s: %v\n", bkt, err)
+			os.Exit(2)
+		}
+		direct.rec.take() // CreateBucket above is setup, not a compared step
+		run("bucket", "HeadBucket", false, func(t *target) error {
+			_, err := t.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bkt})
+			return err
+		})
+		run("bucket", "ListBuckets", true, func(t *target) error {
+			_, err := t.client.ListBuckets(ctx, &s3.ListBucketsInput{})
+			return err
+		})
+
+		for kname, key := range trickyKeys {
+			for _, size := range sizes {
+				if kname != "plain" && size > 4096 {
+					continue // tricky keys are about naming; sizes are about streaming
+				}
+				payload := deterministic(size)
+				sum := sha256.Sum256(payload)
+				k := key
+				if size > 0 || kname == "plain" {
+					k = fmt.Sprintf("%s-%d", key, size)
+					if kname == "trailing" {
+						k = key + fmt.Sprint(size) + "/"
+					}
+				}
+				label := fmt.Sprintf("%s/%d", kname, size)
+				run(label, "PutObject", false, func(t *target) error {
+					_, err := t.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bkt, Key: &k, Body: bytes.NewReader(payload), ContentLength: aws.Int64(int64(size))})
+					return err
+				})
+				run(label, "HeadObject", false, func(t *target) error {
+					_, err := t.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bkt, Key: &k})
+					return err
+				})
+				run(label, "GetObject", true, func(t *target) error {
+					out, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: &k})
+					if err != nil {
+						return err
+					}
+					got, _ := io.ReadAll(out.Body)
+					_ = out.Body.Close()
+					if sha256.Sum256(got) != sum {
+						return fmt.Errorf("content mismatch")
+					}
+					return nil
+				})
+				if size > 100 {
+					run(label, "GetObject(range)", true, func(t *target) error {
+						out, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: &k, Range: aws.String("bytes=1-100")})
+						if err != nil {
+							return err
+						}
+						_, _ = io.Copy(io.Discard, out.Body)
+						return out.Body.Close()
+					})
+				}
+			}
+		}
+		run("list", "ListObjectsV2", true, func(t *target) error {
+			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Prefix: aws.String("dir")})
+			return err
+		})
+		run("list", "ListObjectsV2(delim)", true, func(t *target) error {
+			_, err := t.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt, Delimiter: aws.String("/"), MaxKeys: aws.Int32(3)})
+			return err
+		})
+		run("list", "ListObjects", true, func(t *target) error {
+			_, err := t.client.ListObjects(ctx, &s3.ListObjectsInput{Bucket: &bkt, Prefix: aws.String("dir/")})
+			return err
+		})
+
+		// Multipart: 2 parts of 5 MiB + 1 MiB, same key sequentially on both sides.
+		mpKey := "dir/multipart.bin"
+		part1, part2 := deterministic(5<<20), deterministic(1<<20)
+		run("multipart", "CreateMultipartUpload", true, func(t *target) error {
+			out, err := t.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bkt, Key: &mpKey})
+			if err != nil {
+				return err
+			}
+			uid := out.UploadId
+			p1, err := t.client.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bkt, Key: &mpKey, UploadId: uid, PartNumber: aws.Int32(1), Body: bytes.NewReader(part1), ContentLength: aws.Int64(int64(len(part1)))})
+			if err != nil {
+				return err
+			}
+			p2, err := t.client.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bkt, Key: &mpKey, UploadId: uid, PartNumber: aws.Int32(2), Body: bytes.NewReader(part2), ContentLength: aws.Int64(int64(len(part2)))})
+			if err != nil {
+				return err
+			}
+			_, err = t.client.ListParts(ctx, &s3.ListPartsInput{Bucket: &bkt, Key: &mpKey, UploadId: uid})
+			if err != nil {
+				return err
+			}
+			_, err = t.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &bkt, Key: &mpKey, UploadId: uid,
+				MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{ETag: p1.ETag, PartNumber: aws.Int32(1)}, {ETag: p2.ETag, PartNumber: aws.Int32(2)}}}})
+			return err
+		})
+		run("multipart", "HeadObject", false, func(t *target) error {
+			_, err := t.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bkt, Key: &mpKey})
+			return err
+		})
+		run("multipart", "AbortMultipartUpload", false, func(t *target) error {
+			out, err := t.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bkt, Key: aws.String("dir/aborted.bin")})
+			if err != nil {
+				return err
+			}
+			_, err = t.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bkt, Key: aws.String("dir/aborted.bin"), UploadId: out.UploadId})
+			return err
+		})
+
+		// Errors: the proxy must relay them unchanged.
+		run("errors", "GetObject(404)", true, func(t *target) error {
+			_, err := t.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bkt, Key: aws.String("does/not/exist")})
+			return err
+		})
+		run("errors", "HeadBucket(404)", false, func(t *target) error {
+			_, err := t.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bkt + "-nope")})
+			return err
+		})
+
+		// Deletes: put direct, delete via each side in turn (the second sees the object again).
+		delKey := "dir/todelete.bin"
+		run("delete", "DeleteObject", false, func(t *target) error {
+			if _, err := direct.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bkt, Key: &delKey, Body: bytes.NewReader([]byte("x"))}); err != nil {
+				return err
+			}
+			direct.rec.take() // setup
+			_, err := t.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bkt, Key: &delKey})
+			return err
+		})
+		run("delete", "DeleteObjects", true, func(t *target) error {
+			var ids []types.ObjectIdentifier
+			for i := 0; i < 3; i++ {
+				k := fmt.Sprintf("dir/batch-%d", i)
+				if _, err := direct.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bkt, Key: &k, Body: bytes.NewReader([]byte("x"))}); err != nil {
+					return err
+				}
+				ids = append(ids, types.ObjectIdentifier{Key: aws.String(k)})
+			}
+			direct.rec.take() // setup
+			_, err := t.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &bkt, Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(false)}})
+			return err
+		})
+
+		if !*keep {
+			// Empty and delete the bucket through shunt; a second delete must 404 identically.
+			list, err := direct.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bkt})
+			if err == nil {
+				for _, o := range list.Contents {
+					_, _ = direct.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bkt, Key: o.Key})
+				}
+			}
+			run("bucket", "DeleteBucket", false, func(t *target) error {
+				if _, err := direct.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bkt}); err != nil {
+					if _, err := direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bkt}); err != nil {
+						return err
+					}
+				}
+				direct.rec.take() // setup traffic is not part of the comparison
+				_, err := t.client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: &bkt})
+				return err
+			})
+		}
+	}
+
+	// Report.
+	fmt.Printf("%-28s %-26s %-9s %-9s %s\n", "case", "op", "direct", "via", "result")
+	for _, r := range results {
+		res := "ok"
+		if len(r.diffs) > 0 {
+			res = "DIFF"
+		}
+		fmt.Printf("%-28s %-26s %-9s %-9s %s\n", r.name, r.op, st(r.direct), st(r.via), res)
+		for _, d := range r.diffs {
+			fmt.Printf("    %s\n", d)
+		}
+	}
+	fmt.Printf("\n%d cases, %d diffs\n", len(results), failed)
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func st(ps []*probe) string {
+	p := ps[len(ps)-1]
+	if p.err != "" && p.status == 0 {
+		return "ERR"
+	}
+	if len(ps) > 1 {
+		return fmt.Sprintf("%d(%d)", p.status, len(ps))
+	}
+	return fmt.Sprint(p.status)
+}
+
+// deterministic returns n bytes that differ across positions so truncation and reordering show.
+func deterministic(n int) []byte {
+	b := make([]byte, n)
+	var x uint32 = 2463534242
+	for i := range b {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		b[i] = byte(x) //nolint:gosec // G115: the low byte is the intent
+	}
+	return b
+}

@@ -133,7 +133,7 @@ clusters:
 }
 
 func TestErrorType(t *testing.T) {
-	_, err := Parse([]byte("listener: { address: \":1\", tls: { cert: c, key: k } }\nauth: { mode: passthrough }\n"))
+	_, err := Parse([]byte("listener: { address: \":1\", tls: { cert: c, key: k } }\nauth: { mode: passthrough }\nproxy: { cluster: x }\n"))
 	var ve *Error
 	if !errors.As(err, &ve) {
 		t.Fatalf("want *Error in chain, got %T: %v", err, err)

@@ -58,8 +58,10 @@ type Auth struct {
 	ClockSkew       time.Duration `yaml:"clock_skew"`
 }
 
-// Proxy holds data-path tunables.
+// Proxy holds data-path tunables and, until the directory arrives (POC-3), the one cluster
+// every request is forwarded to.
 type Proxy struct {
+	Cluster         string        `yaml:"cluster"` // name of the clusters: entry to forward to (passthrough mode)
 	CopyBufferBytes int           `yaml:"copy_buffer_bytes"`
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`     // data ops: no progress for this long → abort
 	MetadataTimeout time.Duration `yaml:"metadata_timeout"` // metadata ops: total deadline

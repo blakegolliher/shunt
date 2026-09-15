@@ -1,4 +1,4 @@
-// Command shunt is the S3 front-end proxy. POC-0 ships only `version` and `check-config`;
+// Command shunt is the S3 front-end proxy. POC-1 ships `serve`, `version`, and `check-config`;
 // the other subcommands from docs/DESIGN.md §2.10 arrive with their phases.
 package main
 
@@ -34,7 +34,7 @@ func newRoot() *cobra.Command {
 	}
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
-	root.AddCommand(newVersion(), newCheckConfig())
+	root.AddCommand(newVersion(), newCheckConfig(), newServe())
 	return root
 }
 

@@ -1,36 +1,164 @@
 PASS
-ok  	github.com/blakegolliher/shunt/cmd/shunt	0.008s
-?   	github.com/blakegolliher/shunt/internal/admin	[no test files]
+ok  	github.com/blakegolliher/shunt/cmd/shunt	0.018s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/admin
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkHealthz-16    	  709060	      1982 ns/op	    1011 B/op	      10 allocs/op
+BenchmarkHealthz-16    	  523237	      2006 ns/op	    1011 B/op	      10 allocs/op
+BenchmarkHealthz-16    	  660691	      1940 ns/op	    1011 B/op	      10 allocs/op
+BenchmarkHealthz-16    	  604520	      1893 ns/op	    1011 B/op	      10 allocs/op
+BenchmarkHealthz-16    	  662749	      1859 ns/op	    1011 B/op	      10 allocs/op
+BenchmarkHealthz-16    	  646694	      1829 ns/op	    1011 B/op	      10 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/admin	7.337s
 ?   	github.com/blakegolliher/shunt/internal/auth	[no test files]
 goos: linux
 goarch: amd64
 pkg: github.com/blakegolliher/shunt/internal/config
 cpu: AMD EPYC 7402P 24-Core Processor               
-BenchmarkParse/poc-16   	    8373	    134090 ns/op	   23877 B/op	     419 allocs/op
-BenchmarkParse/poc-16   	   10000	    119213 ns/op	   23872 B/op	     419 allocs/op
-BenchmarkParse/poc-16   	   10000	    113528 ns/op	   23872 B/op	     419 allocs/op
-BenchmarkParse/poc-16   	    9693	    121660 ns/op	   23873 B/op	     419 allocs/op
-BenchmarkParse/poc-16   	   10000	    116179 ns/op	   23872 B/op	     419 allocs/op
-BenchmarkParse/poc-16   	    9808	    111670 ns/op	   23872 B/op	     419 allocs/op
-BenchmarkParse/mixed-16 	    2500	    530645 ns/op	   96263 B/op	    1935 allocs/op
-BenchmarkParse/mixed-16 	    2476	    513242 ns/op	   96261 B/op	    1935 allocs/op
-BenchmarkParse/mixed-16 	    2257	    529867 ns/op	   96260 B/op	    1935 allocs/op
-BenchmarkParse/mixed-16 	    2065	    529676 ns/op	   96260 B/op	    1935 allocs/op
-BenchmarkParse/mixed-16 	    2450	    551365 ns/op	   96261 B/op	    1935 allocs/op
-BenchmarkParse/mixed-16 	    2041	    582618 ns/op	   96262 B/op	    1935 allocs/op
-BenchmarkValidate-16    	   98826	     12516 ns/op	    2680 B/op	      79 allocs/op
-BenchmarkValidate-16    	  102228	     12648 ns/op	    2680 B/op	      79 allocs/op
-BenchmarkValidate-16    	   91996	     12634 ns/op	    2680 B/op	      79 allocs/op
-BenchmarkValidate-16    	   81364	     12435 ns/op	    2680 B/op	      79 allocs/op
-BenchmarkValidate-16    	  101336	     12409 ns/op	    2680 B/op	      79 allocs/op
-BenchmarkValidate-16    	   91252	     13072 ns/op	    2680 B/op	      79 allocs/op
+BenchmarkParse/poc-16   	    7833	    132975 ns/op	   24311 B/op	     415 allocs/op
+BenchmarkParse/poc-16   	    9541	    123879 ns/op	   24306 B/op	     415 allocs/op
+BenchmarkParse/poc-16   	   10000	    125736 ns/op	   24306 B/op	     415 allocs/op
+BenchmarkParse/poc-16   	    9333	    121772 ns/op	   24306 B/op	     415 allocs/op
+BenchmarkParse/poc-16   	   10000	    125430 ns/op	   24307 B/op	     415 allocs/op
+BenchmarkParse/poc-16   	   10000	    126409 ns/op	   24306 B/op	     415 allocs/op
+BenchmarkParse/mixed-16 	    1939	    603163 ns/op	   96432 B/op	    1896 allocs/op
+BenchmarkParse/mixed-16 	    2262	    530507 ns/op	   96429 B/op	    1896 allocs/op
+BenchmarkParse/mixed-16 	    2061	    602098 ns/op	   96428 B/op	    1896 allocs/op
+BenchmarkParse/mixed-16 	    2359	    529542 ns/op	   96428 B/op	    1896 allocs/op
+BenchmarkParse/mixed-16 	    2311	    597200 ns/op	   96429 B/op	    1896 allocs/op
+BenchmarkParse/mixed-16 	    2198	    572915 ns/op	   96428 B/op	    1896 allocs/op
+BenchmarkValidate-16    	   93712	     11849 ns/op	    2440 B/op	      70 allocs/op
+BenchmarkValidate-16    	   95323	     12837 ns/op	    2440 B/op	      70 allocs/op
+BenchmarkValidate-16    	   89062	     12232 ns/op	    2440 B/op	      70 allocs/op
+BenchmarkValidate-16    	  107137	     11816 ns/op	    2440 B/op	      70 allocs/op
+BenchmarkValidate-16    	   98389	     12239 ns/op	    2440 B/op	      70 allocs/op
+BenchmarkValidate-16    	   93036	     12057 ns/op	    2440 B/op	      70 allocs/op
 PASS
-ok  	github.com/blakegolliher/shunt/internal/config	21.517s
+ok  	github.com/blakegolliher/shunt/internal/config	21.714s
 ?   	github.com/blakegolliher/shunt/internal/directory	[no test files]
-?   	github.com/blakegolliher/shunt/internal/listener	[no test files]
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/listener
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkGetCertificate-16    	 9584149	       121.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetCertificate-16    	 9643057	       114.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetCertificate-16    	10448847	       120.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetCertificate-16    	 8664331	       130.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetCertificate-16    	 9076470	       122.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetCertificate-16    	 9477913	       117.6 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/listener	6.928s
 ?   	github.com/blakegolliher/shunt/internal/migrate	[no test files]
-?   	github.com/blakegolliher/shunt/internal/proxy	[no test files]
-?   	github.com/blakegolliher/shunt/internal/s3	[no test files]
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/proxy
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkSmallGET-16    	    2565	    473321 ns/op	   30027 B/op	     106 allocs/op
+BenchmarkSmallGET-16    	    2844	    438366 ns/op	   30798 B/op	     106 allocs/op
+BenchmarkSmallGET-16    	    2613	    432476 ns/op	   27843 B/op	     106 allocs/op
+BenchmarkSmallGET-16    	    2302	    466155 ns/op	   29780 B/op	     106 allocs/op
+BenchmarkSmallGET-16    	    2808	    420619 ns/op	   30119 B/op	     106 allocs/op
+BenchmarkSmallGET-16    	    2853	    416314 ns/op	   28861 B/op	     106 allocs/op
+BenchmarkPUT1MiB-16     	     543	   2066949 ns/op	 507.31 MB/s	   72022 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16     	     474	   2238846 ns/op	 468.36 MB/s	   74947 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16     	     520	   2283430 ns/op	 459.21 MB/s	   61119 B/op	     178 allocs/op
+BenchmarkPUT1MiB-16     	     547	   2240404 ns/op	 468.03 MB/s	   71619 B/op	     178 allocs/op
+BenchmarkPUT1MiB-16     	     496	   2346392 ns/op	 446.89 MB/s	   69390 B/op	     178 allocs/op
+BenchmarkPUT1MiB-16     	     546	   2196011 ns/op	 477.49 MB/s	   68195 B/op	     178 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/proxy	14.049s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/s3
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkClassify-16             	 1628245	       702.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16             	 1479943	       787.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16             	 1520180	       758.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16             	 1616019	       725.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16             	 1603935	       723.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16             	 1682319	       766.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 2482470	       435.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 2634808	       437.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 2783034	       413.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 2684211	       444.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 2513572	       474.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16    	 3142765	       380.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRender-16               	  178690	      6924 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16               	  154917	      7204 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16               	  186205	      6400 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16               	  203500	      6200 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16               	  153660	      6644 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16               	  169554	      6673 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkLookup-16               	42404455	        30.34 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16               	39554164	        28.26 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16               	40046733	        30.64 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16               	40302433	        28.50 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16               	40901779	        30.27 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16               	41667296	        28.77 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParse-16                	  606624	      1909 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                	  692365	      1840 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                	  660880	      1774 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                	  690469	      1844 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                	  567352	      1939 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                	  670320	      1820 ns/op	     432 B/op	       4 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/s3	35.497s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/s3/s3response
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkMarshalListObjectsV2-16      	     270	   4435926 ns/op	  669675 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     271	   4433865 ns/op	  669502 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     270	   4615983 ns/op	  669500 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     282	   4589092 ns/op	  669503 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     270	   4761140 ns/op	  669503 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     290	   4295333 ns/op	  669500 B/op	    4023 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      70	  15867470 ns/op	 2439813 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      78	  15194863 ns/op	 2439747 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      68	  15045581 ns/op	 2439742 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      86	  16530793 ns/op	 2439746 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      73	  16383872 ns/op	 2439746 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      78	  15580024 ns/op	 2439739 B/op	   66069 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/s3/s3response	14.702s
 ?   	github.com/blakegolliher/shunt/internal/sigv4	[no test files]
-?   	github.com/blakegolliher/shunt/internal/telemetry	[no test files]
-?   	github.com/blakegolliher/shunt/internal/upstream	[no test files]
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/telemetry
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkSlowRingRecord-16    	71473312	        16.67 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlowRingRecord-16    	69224676	        17.82 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlowRingRecord-16    	73212726	        17.49 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlowRingRecord-16    	69296455	        17.21 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlowRingRecord-16    	69751236	        17.16 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlowRingRecord-16    	70318010	        16.92 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAccessLog-16         	  208616	      5629 ns/op	    1469 B/op	       4 allocs/op
+BenchmarkAccessLog-16         	  203390	      5745 ns/op	    1494 B/op	       4 allocs/op
+BenchmarkAccessLog-16         	  184101	      6401 ns/op	    1597 B/op	       4 allocs/op
+BenchmarkAccessLog-16         	  195632	      6149 ns/op	    1533 B/op	       4 allocs/op
+BenchmarkAccessLog-16         	  205395	      6010 ns/op	    1484 B/op	       4 allocs/op
+BenchmarkAccessLog-16         	  177482	      6564 ns/op	    1638 B/op	       4 allocs/op
+BenchmarkRequestID-16         	 1295452	       921.9 ns/op	      32 B/op	       1 allocs/op
+BenchmarkRequestID-16         	 1362754	       889.2 ns/op	      32 B/op	       1 allocs/op
+BenchmarkRequestID-16         	 1226390	       957.1 ns/op	      32 B/op	       1 allocs/op
+BenchmarkRequestID-16         	 1328254	       893.5 ns/op	      32 B/op	       1 allocs/op
+BenchmarkRequestID-16         	 1298967	       916.9 ns/op	      32 B/op	       1 allocs/op
+BenchmarkRequestID-16         	 1282453	       937.0 ns/op	      32 B/op	       1 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/telemetry	21.643s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/upstream
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkNext-16    	146168994	         8.244 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16    	148152834	         8.290 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16    	137313759	         8.693 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16    	132509188	         8.826 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16    	150113400	         8.075 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16    	140891252	         8.448 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/upstream	7.223s
+?   	github.com/blakegolliher/shunt/test/bench/s3bench	[no test files]
+?   	github.com/blakegolliher/shunt/test/s3diff	[no test files]

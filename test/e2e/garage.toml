@@ -11,7 +11,7 @@ rpc_secret = "1799bccfd7411eddcf9ebd316bc1f5287ad12a68094e1c6ac6abde7e6feae1ec"
 [s3_api]
 s3_region = "garage"
 api_bind_addr = "[::]:3900"
-root_domain = ".garage.shunt.example.com"
+root_domain = ".shunt.example.com"   # passthrough: shunt preserves Host, so the backend must own the shunt domain
 
 [admin]
 api_bind_addr = "[::]:3903"

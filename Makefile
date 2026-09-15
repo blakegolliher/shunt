@@ -26,12 +26,14 @@ LDFLAGS   := -s -w \
   -X main.commit=$(COMMIT) \
   -X main.date=$(BUILD_DATE)
 
-# e2e
-COMPOSE      ?= docker compose
+# e2e. COMPOSE is detected: docker compose (Docker Desktop, OrbStack, podman's docker shim),
+# then podman compose, then podman-compose. Override with COMPOSE="..." if needed.
+COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || \
+                  (podman compose version >/dev/null 2>&1 && echo "podman compose" || echo "podman-compose"))
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert help
+.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio s3diff bench-e2e help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 
@@ -88,6 +90,35 @@ e2e-cert: ## generate a self-signed wildcard cert for $(DOMAIN) into test/e2e/ce
 
 e2e-up: e2e-cert ## bring up Garage and MinIO and wait until both are healthy
 	COMPOSE="$(COMPOSE)" $(E2E_DIR)/up.sh
+
+run-garage: build ## run shunt in front of the e2e Garage (foreground)
+	$(BIN)/shunt serve --config $(E2E_DIR)/shunt-garage.yaml
+
+run-minio: build ## run shunt in front of the e2e MinIO (foreground)
+	$(BIN)/shunt serve --config $(E2E_DIR)/shunt-minio.yaml
+
+# s3diff and the e2e bench need shunt running (`make run-garage` / `run-minio`) and credentials
+# from test/e2e/data/garage.env (written by e2e-up). BACKEND=garage|minio.
+BACKEND ?= garage
+ifeq ($(BACKEND),garage)
+S3_REGION := garage
+S3_ADDR   := 127.0.0.1:3900
+S3_AK     := $$GARAGE_ACCESS_KEY
+S3_SK     := $$GARAGE_SECRET
+else
+S3_REGION := us-east-1
+S3_ADDR   := 127.0.0.1:9000
+S3_AK     := minioadmin
+S3_SK     := minioadmin
+endif
+
+s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio)
+	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
+	  $(GO) run ./test/s3diff -region $(S3_REGION) -direct-addr $(S3_ADDR) $(S3DIFF_ARGS)
+
+bench-e2e: ## direct vs via bench (BACKEND=garage|minio), prints a markdown table
+	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
+	  $(GO) run ./test/bench/s3bench -backend $(BACKEND) -region $(S3_REGION) -direct-addr $(S3_ADDR) $(BENCH_ARGS)
 
 e2e-down: ## tear down the e2e backends and their data
 	cd $(E2E_DIR) && $(COMPOSE) down -v --remove-orphans

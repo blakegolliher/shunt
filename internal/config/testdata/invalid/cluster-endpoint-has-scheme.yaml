@@ -1,5 +1,6 @@
 # expect: clusters.garage.endpoints[0]
 listener: { address: ":8443", tls: { cert: c.pem, key: k.pem } }
 auth: { mode: passthrough }
+proxy: { cluster: garage }
 clusters:
   garage: { type: s3, scheme: http, region: garage, endpoints: ["http://127.0.0.1:3900"], credentials: { access_key: GK, secret_ref: env:S } }

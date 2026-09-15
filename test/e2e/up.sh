@@ -57,6 +57,23 @@ else
 fi
 wait_for garage "$GARAGE_ADMIN/health"
 
+# Garage credentials for the tests: one key allowed to create buckets. Idempotent; the secret is
+# written to data/garage.env for `source`-ing (GARAGE_ACCESS_KEY / GARAGE_SECRET).
+if ! $COMPOSE exec -T garage /garage key info shunt-e2e >/dev/null 2>&1; then
+  $COMPOSE exec -T garage /garage key create shunt-e2e >/dev/null 2>&1
+  $COMPOSE exec -T garage /garage key allow --create-bucket shunt-e2e >/dev/null 2>&1
+  echo "e2e-up: garage key shunt-e2e created"
+fi
+info=$($COMPOSE exec -T garage /garage key info --show-secret shunt-e2e 2>/dev/null)
+ak=$(echo "$info" | awk '/^Key ID:/ {print $3}')
+sk=$(echo "$info" | awk '/^Secret key:/ {print $3}')
+if [[ -z "$ak" || -z "$sk" ]]; then
+  echo "e2e-up: could not read garage key (output was: $info)" >&2; exit 1
+fi
+printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\n' "$ak" "$sk" > data/garage.env
+chmod 600 data/garage.env
+echo "e2e-up: credentials written to test/e2e/data/garage.env"
+
 # S3-level readiness: any HTTP status from an unsigned GET / counts (403 is fine, refused is not).
 wait_for_any garage-s3 "http://127.0.0.1:3900/"
 wait_for_any minio-s3  "http://127.0.0.1:9000/"

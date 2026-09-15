@@ -1,4 +1,4 @@
-// Package upstream owns per-endpoint connection pools, health, load balancing, retries, and
-// timeouts (docs/DESIGN.md §2.8). POC scope: static endpoints, round-robin, skip-on-connect-error.
-// P2C/EWMA, ejection, and dns mode are P3a/P3b. Built in POC-1 and POC-3.
+// Package upstream owns the connection to backend clusters: one http.Transport per cluster,
+// endpoint selection, and (from P3a) health, load balancing, retries, and ejection
+// (docs/DESIGN.md §2.8). POC-1 scope: one static cluster, round-robin over its endpoints.
 package upstream

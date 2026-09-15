@@ -30,3 +30,5 @@ Files:
   docs/prompts/POC-0.md       the first prompt, ready to paste
 
 After cloning: git config core.hooksPath scripts/githooks
+
+On a Mac: docs/getting-started-mac.md has the copy-paste path from clone to a green make all and a running proxy.

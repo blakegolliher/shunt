@@ -55,6 +55,17 @@ linters:
       # a gratuitous modification of a file we must mark as modified. Every other linter still runs.
       - path: internal/s3/s3response/s3response\.go
         linters: [revive]
+      # Tests hand-write HTTP over raw sockets and ignore Close errors on purpose. The
+      # production rules (noctx, bodyclose, gosec taint/G104, errcheck on Close, gocritic style,
+      # revive unused-parameter) stay on for non-test code.
+      - path: _test\.go
+        linters: [noctx, bodyclose, gosec, gocritic]
+      - path: _test\.go
+        linters: [errcheck]
+        text: "Close|Fprint"
+      - path: _test\.go
+        linters: [revive]
+        text: "unused-parameter"
 
 formatters:
   enable:
