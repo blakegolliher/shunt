@@ -1,6 +1,6 @@
 # STATUS
 
-Current phase: **POC-2 built and validated; awaiting approval to tag `poc-2`.** POC-3 next. Track: docs/POC.md. Full design: docs/DESIGN.md.
+Current phase: **POC-2 built and validated; tag `poc-2` blocked on a VAST certificate that covers `vast02.example.com`** (see the VAST TLS gap below). POC-3 next. Track: docs/POC.md. Full design: docs/DESIGN.md.
 
 ## POC track
 
@@ -50,9 +50,9 @@ Every remaining diff traces to one cause, path-style upstream in resign mode, an
 ## Known gaps carried forward
 
 - Credentials file inline secrets; encrypted at rest is P3c.
-- **VAST TLS verification is disabled (temporary).** The lab cluster serves a self-signed factory certificate that does not cover `vast02.example.com`. `tls.insecure_skip_verify` in test/e2e/shunt-vast-resign.yaml, `--insecure` on probe, `-direct-insecure` on s3diff, all in `make … BACKEND=vast`. Remove when a valid certificate is installed.
+- **VAST TLS verification is disabled (temporary).** The lab cluster serves a self-signed factory certificate (CN `vms.example.com`, SAN `*.example.com`, `vms.example.com`, 33 IPs in 10.0.0.3 and 100.64.0–1.x) that does not cover `vast02.example.com` or its current address. The lab wildcard on the dev box, `/path/to/lab-wildcard.crt` (Sectigo, `*.lab.example.com`), does not cover it either (one label only) and expired 2026-09-02. Checked 2026-09-15. `tls.insecure_skip_verify` in test/e2e/shunt-vast-resign.yaml, `--insecure` on probe, `-direct-insecure` on s3diff, all in `make … BACKEND=vast`. Remove when a valid certificate is installed.
 - Resign mode sends upstream path-style, so error bodies for virtual-host requests carry a path-style `<Resource>`; POC-3's XML rewriting closes it (ADR-0001 amendment).
-- **Backend address leak in resign mode:** MinIO echoes the upstream Host into CompleteMultipartUpload `<Location>`, so a client sees `http://127.0.0.1/…` (the cluster endpoint). POC-3 rewrites every XML echo (DESIGN §9 item 11); until then resign mode must not front MinIO for untrusted clients.
+- **Backend address leak in resign mode:** MinIO echoes the upstream Host into CompleteMultipartUpload `<Location>`, so a client sees `http://127.0.0.1/…` (the cluster endpoint). POC-3 rewrites every XML echo (DESIGN §9 item 11); until then resign mode must not front MinIO for untrusted clients. `shunt serve` logs a startup warning in resign mode naming the cluster when its type is minio (verified), aws (known), or vast / s3 (unverified, assumed).
 - Garage 2.3.0 rejects signed trailers directly; through shunt they work because shunt verifies them and forwards an unsigned trailer.
 - Garage ignores `If-None-Match: *` on PUT (docs/reference/backend-compat.md): not usable as a POC-4 migration target without a guard.
 - ADR-0002 compensation is log-and-alert only (`sha256`, `trailer` reasons); the compensating delete is P2.

@@ -43,6 +43,16 @@ func newServe() *cobra.Command {
 	return cmd
 }
 
+// locationLeaks names the cluster types whose CompleteMultipartUpload <Location> echoes the host the
+// request was sent to. In resign mode that host is the backend endpoint, not the client-facing name,
+// so the backend address reaches the client. POC-3 rewrites every XML echo and removes this table.
+var locationLeaks = map[string]string{
+	"minio": "verified: s3diff resign run 2026-09-15 returned <Location>http://127.0.0.1/…",
+	"aws":   "AWS builds <Location> from the endpoint host it was addressed by",
+	"vast":  "unverified: s3diff cannot see it because its direct and via requests share the VAST endpoint host; assume it leaks",
+	"s3":    "unverified for generic S3 backends; assume it leaks (Garage builds <Location> from its root_domain and does not)",
+}
+
 // serve runs the proxy and admin servers until SIGTERM/SIGINT or ctx cancellation, then drains.
 func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
@@ -96,6 +106,10 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		hcfg.ClockSkew = cfg.Auth.ClockSkew
 		log.Info("resign mode", "credentials", store.Len(), "cluster_access_key", ccfg.Credentials.AccessKey,
 			"enforces_sha256", hcfg.Capabilities.EnforcesSHA256, "unsigned_trailer", hcfg.Capabilities.UnsignedTrailer)
+		if evidence, leaks := locationLeaks[ccfg.Type]; leaks {
+			log.Warn("resign mode: CompleteMultipartUpload <Location> will expose the upstream endpoint to clients until POC-3 rewrites XML echoes (docs/reference/backend-compat.md)",
+				"cluster", cfg.Proxy.Cluster, "type", ccfg.Type, "endpoints", ccfg.Endpoints, "evidence", evidence)
+		}
 	}
 	h := proxy.New(hcfg, cfg.Proxy.CopyBufferBytes)
 

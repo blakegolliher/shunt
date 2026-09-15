@@ -580,6 +580,7 @@ Close the phase: update docs/STATUS.md with what shipped, what was cut and why, 
 10. **Postgres as a dependency.** Shunt's data path never touches it, but the control plane does; a long outage freezes bucket creation and migrations. The snapshot-age gauge and the 503 contract make that visible and bounded; HA is the deployer's job and the runbook says which options are known to work.
 11. **Backend-name rewriting surface.** Every response that echoes a bucket name must be rewritten; missing one leaks a backend name to a client. s3diff's header and body diff is the catch; the op classifier's table is where the list lives.
 12. **Capability drift.** A backend upgrade can change what it enforces. Re-run `shunt probe` on a schedule and alert when a profile changes.
+13. **Garage rejects signed-trailer uploads.** Garage 2.3.0 answers `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` with "Invalid payload signature" for every checksum algorithm. Through shunt in resign mode these uploads succeed, because shunt verifies the chunk and trailer signatures itself and forwards an unsigned trailer Garage accepts. The same client pointed at Garage directly, or at shunt in passthrough mode, fails; a migration off shunt or a switch to passthrough breaks those clients (docs/reference/backend-compat.md).
 
 ---
 

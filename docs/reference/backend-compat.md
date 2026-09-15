@@ -31,6 +31,12 @@ Probe run 2026-09-15 with shunt at POC-2.
 - **Region.** VAST accepts any scope region, so the cluster record's `region` only matters for backends that enforce it. The resign path signs with the cluster's configured region regardless (ADR-0001 amendment).
 - **TLS on VAST is TEMPORARY-insecure.** `tls.insecure_skip_verify: true` in `test/e2e/shunt-vast-resign.yaml`, `--insecure` on the probe, `-direct-insecure` on s3diff. Remove all three once the cluster has a certificate for `vast02.example.com` and set `tls.ca`.
 
+## VAST specifics
+
+- **Signing region is not enforced.** A request signed for `nowhere-1` is accepted as readily as `us-east-1`. The cluster record's `region` is still what shunt signs with upstream.
+- **Unsigned `GET /` answers 200** with an empty `ListAllMyBucketsResult` owned by `Anonymous`, not 403. Health checks that treat any response as alive work; nothing about credentials can be inferred from it.
+- **TLS (checked 2026-09-15).** The cluster serves VAST's self-signed factory certificate: CN `vms.example.com`, SAN `*.example.com`, `vms.example.com`, and 33 IPs (10.0.0.3, 100.64.0.1–16, 100.64.1.1–16), valid to 2036. It covers neither `vast02.example.com` nor the address that name resolves to. A wildcard matches one label, so `*.example.com` cannot match it. The lab wildcard `*.lab.example.com` on the dev box would not match it either, and it expired 2026-09-02. Verification stays off until the cluster serves a certificate for its hostname.
+
 ## Raw probe output
 
 ### Garage
@@ -93,7 +99,7 @@ Every client payload mode was sent both directly to the backend (signed with the
 | Finding | Backend | Cause | Owner |
 |---|---|---|---|
 | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` rejected directly with `400 InvalidRequest "Invalid payload signature"`, all five checksum algorithms; the same bytes through shunt succeed | Garage 2.3.0 | Garage does not verify signed trailers. The client encoding is valid: MinIO and VAST accept it directly, and it reproduces AWS's published streaming vectors. shunt decodes and verifies the signed trailer itself, then forwards an unsigned trailer Garage accepts | **Backend gap** (s3diff `GAP(backend)`) |
-| `<Location>` in CompleteMultipartUpload shows the upstream endpoint (`http://127.0.0.1/…`) instead of the client-facing host | MinIO | Resign mode sends upstream path-style to the endpoint address, and MinIO echoes the request Host into `<Location>`. **This leaks the backend address to the client.** | shunt, closed by POC-3's XML rewriting (DESIGN §9 item 11) |
+| `<Location>` in CompleteMultipartUpload shows the upstream endpoint (`http://127.0.0.1/…`) instead of the client-facing host | MinIO | Resign mode sends upstream path-style to the endpoint address, and MinIO echoes the request Host into `<Location>`. **This leaks the backend address to the client.** `shunt serve` warns at startup in resign mode for this cluster type. VAST may do the same: s3diff cannot tell, because its direct and via requests both address the VAST host | shunt, closed by POC-3's XML rewriting (DESIGN §9 item 11) |
 | Error bodies for virtual-host requests carry a path-style `<Resource>` (`/bucket/key`), and a HEAD error's `Content-Length` changes with it | Garage, MinIO | Same path-style upstream (ADR-0001 amendment) | shunt, closed by POC-3 |
 | 204 responses: backend sends `Content-Length: 0`, shunt's response has none | VAST | RFC 9110 §8.6 forbids `Content-Length` on 204; Go's server enforces it. Not a defect; s3diff skips the header on 204 | none |
 | ListBuckets returns the same buckets in a different order on consecutive calls | Garage | Garage's listing order is not stable; seen in passthrough too. s3diff now compares bucket entries order-insensitively | none |
