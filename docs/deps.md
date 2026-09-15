@@ -13,8 +13,8 @@ One line per dependency saying why the stdlib wasn't enough (CLAUDE.md). Tool bi
 
 | Tool | Version | License | Why |
 |---|---|---|---|
-| `golangci-lint` | v2.8.0 | GPL-3.0 (tool only, not linked) | The P0 linter set. Newest release that builds on Go 1.24. |
-| `benchstat` (`golang.org/x/perf`) | v0.0.0-20251208221838-04cf7a2dca90 | BSD-3 | `make bench-compare`. |
+| `golangci-lint` | v2.13.2 | GPL-3.0 (tool only, not linked) | The P0 linter set. |
+| `benchstat` (`golang.org/x/perf`) | v0.0.0-20260908200009-22c9c6c9d4da | BSD-3 | `make bench-compare`. |
 
 ## Lifted code
 

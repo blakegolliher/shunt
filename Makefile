@@ -13,9 +13,10 @@ FUZZ_TIME     ?= 30s
 BENCH_TIME    ?= 1s
 BENCH_COUNT   ?= 6
 
-# golangci-lint v2.9+ requires Go 1.26; v2.8.0 is the newest release that builds on Go 1.24 (docs/CONTEXT.md).
-GOLANGCI_LINT_VERSION ?= v2.8.0
-BENCHSTAT             ?= golang.org/x/perf/cmd/benchstat@v0.0.0-20251208221838-04cf7a2dca90
+# Current releases as of 2026-09-14 (Go 1.27.1 on the dev box; both need Go >= 1.26).
+GOLANGCI_LINT_VERSION ?= v2.13.2
+BENCHSTAT             ?= golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
+GOLANGCI_LINT         := $(BIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -44,8 +45,8 @@ test: ## unit tests
 race: ## unit tests under the race detector
 	$(GO) test -race $(PKGS)
 
-lint: $(BIN)/golangci-lint ## golangci-lint with .golangci.yml
-	$(BIN)/golangci-lint run $(PKGS)
+lint: $(GOLANGCI_LINT) ## golangci-lint with .golangci.yml
+	$(GOLANGCI_LINT) run $(PKGS)
 	$(GO) vet $(PKGS)
 
 # Runs every Fuzz* function in the tree for FUZZ_TIME each. Seed corpus only; no corpus is committed.
@@ -67,11 +68,13 @@ bench: ## run all benchmarks, write test/bench/new.txt
 bench-compare: bench ## compare test/bench/new.txt against test/bench/baseline.txt with benchstat
 	$(GO) run $(BENCHSTAT) test/bench/baseline.txt test/bench/new.txt
 
-tools: $(BIN)/golangci-lint ## install pinned tool binaries into ./bin
+tools: $(GOLANGCI_LINT) ## install pinned tool binaries into ./bin
 
-$(BIN)/golangci-lint:
+# The binary is named by version so a pin bump reinstalls it.
+$(GOLANGCI_LINT):
 	@mkdir -p $(BIN)
 	GOBIN=$(BIN) $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv $(BIN)/golangci-lint $(GOLANGCI_LINT)
 
 tidy: ## go mod tidy and verify nothing changed
 	$(GO) mod tidy

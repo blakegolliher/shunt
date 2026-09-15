@@ -2,7 +2,7 @@
 # Bring up with `make e2e-up` (generates the cert, waits for health, applies Garage's layout).
 services:
   garage:
-    image: docker.io/dxflrs/garage:v1.0.1
+    image: docker.io/dxflrs/garage:v2.3.0
     container_name: shunt-e2e-garage
     volumes:
       - ./garage.toml:/etc/garage.toml:ro,z

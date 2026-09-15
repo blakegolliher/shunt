@@ -1,6 +1,6 @@
 module github.com/blakegolliher/shunt
 
-go 1.24.6
+go 1.27
 
 require (
 	github.com/spf13/cobra v1.10.2

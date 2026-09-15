@@ -195,7 +195,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 
 ### 2.10 Simplicity rules (these go into `CLAUDE.md` verbatim)
 
-- One binary, subcommands: `serve`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version`.
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version`; `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.

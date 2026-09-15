@@ -4,7 +4,7 @@ Read docs/DESIGN.md before every task. docs/CONTEXT.md is ground truth about the
 
 ## Simplicity rules (docs/DESIGN.md §2.10, verbatim)
 
-- One binary, subcommands: `serve`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version`.
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version`; `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.
@@ -24,6 +24,7 @@ Read docs/DESIGN.md before every task. docs/CONTEXT.md is ground truth about the
 - Every new dependency gets a line in docs/deps.md.
 - Every body buffer needs an ADR.
 - Nothing assumes hardware.
+- Commit messages carry no tool attribution: no Co-Authored-By, no Generated-with, no Claude-Session trailer. Check `git log -1 --format=%B` after every commit.
 
 ## Lift procedure (copying third-party code in; from docs/reuse.md)
 

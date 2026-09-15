@@ -20,7 +20,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 | Item | Answer |
 |---|---|
 | Dev box distro + kernel (`uname -r`) | RHEL 9.6, `5.14.0-570.17.1.el9_6.x86_64` |
-| Go version (`go version`) — pin it in go.mod | `go1.24.6` (Red Hat build), `GOTOOLCHAIN=local`; go.mod says `go 1.24.6`. Consequence: golangci-lint pinned to v2.8.0 (v2.9+ needs Go 1.26) |
+| Go version (`go version`) — pin it in go.mod | `go1.27.1` at /usr/local/go (not on the default PATH; `export PATH=/usr/local/go/bin:$PATH`), `GOTOOLCHAIN=auto`; go.mod says `go 1.27` |
 | Container runtime on dev box (docker / podman / none) | podman 5.4.0; `docker` is the podman shim and `docker compose` runs `~/.local/bin/podman-compose`. Makefile `COMPOSE ?= docker compose` |
 | Root or CAP_BPF available on dev box? BTF present (`ls /sys/kernel/btf/vmlinux`)? | unknown |
 | Egress for `go get` / module proxy? Any GOPROXY/GONOSUMDB settings? | yes; `GOPROXY=https://proxy.golang.org,direct`, no GONOSUMDB, no GOFLAGS |
@@ -48,7 +48,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 | Env var names holding access key / secret | unknown — fill before POC-2 |
 | VAST version; virtual-host style domain configured? (which) | unknown |
 | Second cluster available for multi-cluster tests later? | unknown |
-| Garage / versitygw already installed locally? paths/ports | Garage via test/e2e compose only: S3 127.0.0.1:3900, admin 127.0.0.1:3903, region `garage`. No versitygw |
+| Garage / versitygw already installed locally? paths/ports | Garage `docker.io/dxflrs/garage:v2.3.0` via test/e2e compose only: S3 127.0.0.1:3900, admin 127.0.0.1:3903 (`/health` unauthenticated, other endpoints `/v2/*` with bearer token), region `garage`. No versitygw |
 
 ## Known VAST compatibility findings (pre-seed backend-compat.md)
 

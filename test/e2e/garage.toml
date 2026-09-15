@@ -1,4 +1,4 @@
-# Single-node Garage for e2e. Keys below are test-only.
+# Single-node Garage for e2e (validated on v2.3.0; no 1.x → 2.x key changes needed). Keys below are test-only.
 metadata_dir = "/var/lib/garage/meta"
 data_dir = "/var/lib/garage/data"
 db_engine = "sqlite"

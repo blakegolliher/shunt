@@ -25,6 +25,5 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 ## Known gaps carried forward
 
 - docs/CONTEXT.md VAST rows are `unknown`; required before POC-2.
-- golangci-lint is pinned to v2.8.0 because newer releases need Go ≥ 1.26 and the dev box has Go 1.24.6.
 - go.yaml.in/yaml/v4 is at a release candidate (v4.0.0-rc.6); bump when v4.0.0 ships.
 - ADR-0002 compensation is log-and-alert in the POC (POC-2 cut).
