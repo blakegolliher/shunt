@@ -620,7 +620,7 @@ The reference scenario: clients already use bucket `data01` on vast01 through `s
 | 4 | `shunt expand acme/data01 --to vast02` | ACTIVE, target recorded | vast02 probe ≥ vast01 profile; versioning off; `data01-001` created; canary write/read/delete |
 | 5 | `shunt ramp acme/data01 --ratio 0.05 --require-healthy` | RAMPING 0.05 | vast02 health green for the window; keys in range write to vast02, read vast02-then-vast01 |
 | 6 | `--ratio 0.25`, `--ratio 1.0` as the hold policy allows | RAMPING → ratio 1 | target vs source error rate, p99, TTFB on the same op mix; hold on breach |
-| 7 | `shunt migrate start acme/data01` | MIGRATING | ratio is 1; mover (Chorus worker or test/mover) copies vast01 → vast02 under the §2.5 contract |
+| 7 | `shunt migrate start acme/data01` | MIGRATING | ratio is 1; mover (test/mover) copies vast01 → vast02 under the §2.5 contract |
 | 8 | `shunt cutover acme/data01` | CUTOVER → ACTIVE on vast02 | listing diff empty; fallback reads zero for the comfort window |
 
 Rollback at steps 2–3 is a DNS flip back. From step 5 on, rollback is a reconcile (target → source for the ramped key range), never just lowering the ratio.

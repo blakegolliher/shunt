@@ -18,7 +18,10 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 - `cmd/shunt`: `version`, `check-config`.
 - `internal/config`: schema, validator, 2 valid and 39 invalid samples, fuzz target, benchmarks.
-- Skeleton packages with doc.go only: listener, s3, sigv4, auth, directory, upstream, proxy, migrate, telemetry, admin.
+- `internal/s3`: `errors.go`, shunt's own S3 error table (code, status, AWS message) and XML renderer.
+- `internal/s3/s3response`: S3 XML structs lifted from versitygw (THIRD_PARTY_NOTICES, docs/deps.md) with local types replacing the SDK; tested against gofakes3 in-process.
+- R0 reuse audit done: docs/reuse-findings.md. Chunk readers are copied at the start of POC-2; the eBPF example at P4.
+- Skeleton packages with doc.go only: listener, sigv4, auth, directory, upstream, proxy, migrate, telemetry, admin.
 - Makefile targets: build, test, race, lint, fuzz, bench, bench-compare, e2e-up, e2e-down, all.
 - test/e2e: Garage + MinIO compose, wildcard cert script, health wait.
 

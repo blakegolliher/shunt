@@ -155,7 +155,11 @@ MIT, holder matches. `go.mod` requires aws-sdk-go-v2 (service/s3 v1.97.3), afero
 - versitygw `s3api` router and Chorus `service/proxy/router`: "reference, then write" — to be used as the op-table checklist in POC-1, nothing copied.
 - versitygw `tests/`: `tests/test_rest_chunked.sh` and `tests/rest_scripts/put_object_openssl_chunked_example.sh` exist and generate aws-chunked payloads with openssl; they are the source for s3diff's signing-mode cases in POC-2 (run as tools).
 
-## Copy list (proposed; nothing copied yet)
+## Copy list
+
+Approved 2026-09-14 with changes: **s3err is not copied**; `internal/s3/errors.go` is written by shunt with the AWS wire values and its own renderer. Items 1–2 below are therefore void. Item 3 and gofakes3 were done in the same commit as this note; items 4–7 are copied at the start of POC-2 after re-checking the SHA; item 8 at P4 with the BSD-2-Clause headers notice.
+
+Original proposal follows.
 
 Two lifts are due now for POC-1; the third is POC-2; the fourth is P4. Each file keeps its original header verbatim and gets this line directly beneath it:
 

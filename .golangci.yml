@@ -48,6 +48,13 @@ linters:
         - G304
     misspell:
       locale: US
+  exclusions:
+    rules:
+      # Lifted third-party files (see THIRD_PARTY_NOTICES) keep their upstream doc-comment style and
+      # S3 wire field names (UploadId, VersionId); adding sixty comments and renaming fields would be
+      # a gratuitous modification of a file we must mark as modified. Every other linter still runs.
+      - path: internal/s3/s3response/s3response\.go
+        linters: [revive]
 
 formatters:
   enable:
