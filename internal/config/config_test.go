@@ -90,14 +90,11 @@ func TestMixedSampleShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(c.Clusters); got != 6 {
-		t.Errorf("clusters: got %d", got)
+	if got := len(c.Clusters); got != 0 {
+		t.Errorf("a resign config holds no clusters (they are directory state): got %d", got)
 	}
 	if c.Directory.File != "internal/directory/testdata/valid/mixed.yaml" || c.Directory.PollInterval != 2*time.Second {
 		t.Errorf("directory: %+v", c.Directory)
-	}
-	if c.Clusters["aws-use1"].EndpointMode != "dns" {
-		t.Errorf("aws-use1 endpoint_mode: %q", c.Clusters["aws-use1"].EndpointMode)
 	}
 }
 

@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"go.yaml.in/yaml/v4"
+
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/s3"
@@ -469,6 +471,24 @@ placements:
   zed/logs:  { state: ACTIVE, primary: minio,  names: { minio: zed-4444-logs } }
 `
 
+// writeDirectory writes a directory file: body (starting with its version line) with clusters,
+// which are directory state since POC-5.
+func writeDirectory(t testing.TB, path, body string, clusters map[string]config.Cluster) {
+	t.Helper()
+	block, err := yaml.Dump(map[string]map[string]config.Cluster{"clusters": clusters}, yaml.WithIndent(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, rest, _ := strings.Cut(body, "\n")
+	if err := os.WriteFile(path, []byte(version+"\n"+string(block)+rest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rigDebugRoute turns features.debug_route_header on for rigs built while it is set. Proxy tests
+// do not run in parallel.
+var rigDebugRoute bool
+
 type mixedRig struct {
 	front             *httptest.Server
 	h                 *Handler
@@ -501,23 +521,26 @@ func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.
 		f(m.clusters)
 	}
 	secrets := map[string]string{"env:G": "garage-cluster-secret", "env:M": "minio-cluster-secret"}
-	set, err := upstream.NewSet(m.clusters, upstream.Options{DialTimeout: time.Second}, func(ref string) (string, error) { return secrets[ref], nil })
-	if err != nil {
-		t.Fatal(err)
-	}
+	set := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, func(ref string) (string, error) { return secrets[ref], nil })
 	t.Cleanup(set.Close)
 	m.dirPath = filepath.Join(t.TempDir(), "directory.yaml")
-	if err := os.WriteFile(m.dirPath, []byte(mixedDirectory), 0o644); err != nil {
+	writeDirectory(t, m.dirPath, mixedDirectory, m.clusters)
+	var err error
+	if m.dir, err = directory.Open(m.dirPath); err != nil {
 		t.Fatal(err)
 	}
-	if m.dir, err = directory.Open(m.dirPath, m.clusters); err != nil {
+	if _, _, err := set.Apply(m.dir.Snapshot().File().Clusters); err != nil {
 		t.Fatal(err)
+	}
+	m.dir.Prepare = func(f *directory.File) error {
+		_, _, aerr := set.Apply(f.Clusters)
+		return aerr
 	}
 	if store == nil {
 		store = mapStore{acmeAK: {AccessKey: acmeAK, Secret: acmeSK, Tenant: "acme"}, zedAK: {AccessKey: zedAK, Secret: zedSK, Tenant: "zed"}}
 	}
 	m.h = New(Handler{
-		Mode: ModeResign, Store: store, Clusters: set, Dir: m.dir, Rewrite: true,
+		Mode: ModeResign, Store: store, Clusters: set, Dir: m.dir, Rewrite: true, DebugRoute: rigDebugRoute,
 		Domains: s3.NewDomains([]string{"*.shunt.example.com"}), Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(m.accessLog),
 		Slow: telemetry.NewSlowRing(10, time.Hour), IdleTimeout: 2 * time.Second, MetadataTimeout: 5 * time.Second, Via: "1.1 shunt/test",
 		Log: slog.New(slog.NewJSONHandler(m.alerts, nil)),
@@ -852,7 +875,7 @@ func TestUploadIDRoundTripAcrossDirectoryReload(t *testing.T) {
 	m.noLeak(t, "InitiateMultipartUpload", r)
 
 	// Another writer moves acme/data to minio; this proxy picks the change up on reload.
-	other, err := directory.Open(m.dirPath, m.clusters)
+	other, err := directory.Open(m.dirPath)
 	if err != nil {
 		t.Fatal(err)
 	}

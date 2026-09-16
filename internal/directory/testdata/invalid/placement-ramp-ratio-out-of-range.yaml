@@ -2,4 +2,4 @@
 version: 1
 tenants: { acme: { default_cluster: garage } }
 placements:
-  acme/data: { state: RAMPING, primary: minio, source: garage, ramp: { ratio: 1.5 }, names: { garage: data, minio: data } }
+  acme/data: { state: RAMPING, primary: minio, source: garage, ramp: { hash: fnv1a-fmix64-v1, ratio: 1.5 }, names: { garage: data, minio: data } }

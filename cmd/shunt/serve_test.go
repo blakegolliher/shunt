@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,4 +129,78 @@ telemetry: { access_log: { enabled: false } }
 		h.Body.Close() //nolint:errcheck // test
 		t.Fatal("admin still up after drain")
 	}
+}
+
+// A lab listener on plaintext http: requests are served without TLS, and every line serve logs
+// carries the plaintext marker so it cannot be missed in a startup banner.
+func TestServePlaintextListenerMarksEveryLine(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+	listen, adminAddr := freePort(t), freePort(t)
+	cfg, err := config.Parse([]byte(`
+listener: { address: "` + listen + `", plaintext: true }
+admin: { address: "` + adminAddr + `" }
+auth: { mode: passthrough }
+proxy: { cluster: be, drain_timeout: 2s }
+clusters:
+  be: { type: s3, scheme: http, region: r, endpoints: ["` + strings.TrimPrefix(backend.URL, "http://") + `"], credentials: { access_key: a, secret_ref: env:S } }
+telemetry: { access_log: { enabled: false } }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, cfg, logs) }()
+	var resp *http.Response
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		resp, err = http.Get("http://" + listen + "/bkt/key") //nolint:noctx // test
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close() //nolint:errcheck // test
+	if resp.StatusCode != 200 || resp.TLS != nil {
+		t.Fatalf("plaintext request: %d tls=%v", resp.StatusCode, resp.TLS)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("too few log lines:\n%s", logs.String())
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, `"client_listener":"PLAINTEXT http`) {
+			t.Errorf("startup line without the plaintext marker: %s", line)
+		}
+	}
+	if !strings.Contains(logs.String(), `"level":"WARN","msg":"the client listener is PLAINTEXT http`) {
+		t.Errorf("no plaintext warning:\n%s", logs.String())
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

@@ -24,7 +24,7 @@ func Sign(req *http.Request, creds Credentials, region, payloadHash string, now 
 
 	signed := make([]string, 0, 8)
 	signed = append(signed, "host")
-	if req.ContentLength >= 0 && req.Method != http.MethodGet && req.Method != http.MethodHead && (req.Body != nil || req.ContentLength > 0) {
+	if sendsContentLength(req) {
 		signed = append(signed, "content-length")
 	}
 	for name := range req.Header {
@@ -48,4 +48,24 @@ func Sign(req *http.Request, creds Credentials, region, payloadHash string, now 
 	names := normalizeSignedHeaders(signed)
 	req.Header.Set("Authorization", Algorithm+" Credential="+creds.AccessKey+"/"+scope.String()+
 		", SignedHeaders="+strings.Join(names, ";")+", Signature="+sig)
+}
+
+// sendsContentLength reports whether content-length should be signed: only when net/http's client
+// will put the header on req. A positive length always goes out; a zero length only with a body on
+// the methods that carry one (PUT, POST, PATCH). A DELETE with http.NoBody sends none, and Garage
+// refuses a signature that lists a header the request does not carry. A request with no Body yet
+// (signed before its body is built, as aws-chunked seeds are) is not signed for it either: signing
+// fewer headers than are sent is valid, signing one that is not sent is not.
+func sendsContentLength(req *http.Request) bool {
+	switch {
+	case req.ContentLength > 0:
+		return true
+	case req.ContentLength < 0, req.Body == nil:
+		return false
+	}
+	switch req.Method {
+	case http.MethodPut, http.MethodPost, http.MethodPatch:
+		return true
+	}
+	return false
 }

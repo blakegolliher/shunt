@@ -47,15 +47,12 @@ func expectLine(t *testing.T, path string) string {
 }
 
 func TestValidSample(t *testing.T) {
-	cfg, err := config.Load("../config/testdata/valid/mixed.yaml")
+	f, err := Load("testdata/valid/mixed.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := Load("testdata/valid/mixed.yaml", cfg.Clusters)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.Version != 7 || len(f.Placements) != 7 || len(f.Tenants) != 2 {
+	if f.Version != 7 || len(f.Placements) != 7 || len(f.Tenants) != 2 || len(f.Clusters) != 6 ||
+		f.Clusters["vast-a"].EndpointMode != "static" || f.Clusters["aws-use1"].EndpointMode != "dns" {
 		t.Fatalf("shape: version %d, %d placements, %d tenants", f.Version, len(f.Placements), len(f.Tenants))
 	}
 	s := newSnapshot(f)
@@ -80,7 +77,7 @@ func TestInvalidSamplesNameTheKey(t *testing.T) {
 	for _, f := range files {
 		t.Run(filepath.Base(f), func(t *testing.T) {
 			want := expectLine(t, f)
-			_, err := Load(f, clusters)
+			_, err := loadSample(t, f, clusters)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("want an error naming %q, got %v", want, err)
 			}
@@ -108,7 +105,7 @@ func active(primary string) Placement {
 func TestTransitionMatrix(t *testing.T) {
 	placements := map[string]Placement{
 		StateActive:    active("garage"),
-		StateRamping:   {State: StateRamping, Primary: "minio", Source: "garage", Ramp: &Ramp{Ratio: 0.1}, Names: map[string]string{"garage": "data", "minio": "data2"}},
+		StateRamping:   {State: StateRamping, Primary: "minio", Source: "garage", Ramp: &Ramp{Hash: RampHash, Ratio: 0.1}, Names: map[string]string{"garage": "data", "minio": "data2"}},
 		StateMigrating: {State: StateMigrating, Primary: "minio", Source: "garage", Names: map[string]string{"garage": "data", "minio": "data2"}},
 		StateCutover:   {State: StateCutover, Primary: "minio", Source: "garage", Names: map[string]string{"garage": "data", "minio": "data2"}},
 	}
@@ -140,8 +137,8 @@ func TestTransitionMatrix(t *testing.T) {
 				t.Errorf("%s -> %s: %v", from, to, err)
 				continue
 			}
-			f := &File{Version: 1, Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{"acme/data": np}}
-			if err := validate(f, clusters); err != nil {
+			f := &File{Version: 1, Clusters: clusters, Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{"acme/data": np}}
+			if err := validate(f); err != nil {
 				t.Errorf("%s -> %s produced an invalid placement: %v\n%+v", from, to, err, np)
 			}
 		}
@@ -172,6 +169,17 @@ func TestTransitionDetails(t *testing.T) {
 	r2, err := Apply(r, Transition{To: StateRamping, Ratio: 0.3, Prefixes: []string{"2026-10/"}})
 	if err != nil || r2.Ramp.Ratio != 0.3 || len(r2.Ramp.Prefixes) != 2 || len(r.Ramp.Prefixes) != 1 {
 		t.Fatalf("ramp step: %+v %v", r2.Ramp, err)
+	}
+	if r.Ramp.Hash != RampHash || r2.Ramp.Hash != RampHash {
+		t.Errorf("the ramp hash is written at RAMPING start and kept: %q %q", r.Ramp.Hash, r2.Ramp.Hash)
+	}
+	foreign := r2
+	foreign.Ramp = &Ramp{Hash: "fnv1a-v0", Ratio: 0.3}
+	if _, err := Apply(foreign, Transition{To: StateRamping, Ratio: 0.5}); err == nil || !strings.Contains(err.Error(), `"fnv1a-v0"`) {
+		t.Errorf("extending a ramp split by an unknown hash: %v", err)
+	}
+	if _, err := Apply(foreign, Transition{To: StateMigrating}); err != nil {
+		t.Errorf("an unknown-hash ramp can still finish to MIGRATING, where the hash no longer matters: %v", err)
 	}
 	if _, err := Apply(r2, Transition{To: StateRamping, Ratio: 0.2}); err == nil || !strings.Contains(err.Error(), "only grows") {
 		t.Errorf("shrinking ramp: %v", err)
@@ -229,15 +237,38 @@ func TestBackendName(t *testing.T) {
 	}
 }
 
-// writeDir writes a directory file with tenants acme and zed and returns its path.
-func writeDir(t *testing.T, version int64) string {
+// writeDir writes a directory file with the sample clusters and tenants acme and zed, and returns
+// its path.
+func writeDir(t testing.TB, version int64) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "directory.yaml")
-	body := fmt.Sprintf("version: %d\ntenants:\n  acme: { default_cluster: garage }\n  zed: { default_cluster: minio }\n", version)
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	f := &File{Version: version, Clusters: sampleClusters(t),
+		Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}, "zed": {DefaultCluster: "minio"}}}
+	body, err := marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// loadSample loads a directory sample that may leave out clusters: the sample clusters stand in.
+func loadSample(t testing.TB, path string, clusters map[string]config.Cluster) (*File, error) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if f.Clusters == nil {
+		f.Clusters = clusters
+	}
+	return f, validate(f)
 }
 
 func changes(t *testing.T, d *FileDir) []Change {
@@ -261,7 +292,7 @@ func changes(t *testing.T, d *FileDir) []Change {
 func TestFileDirWrites(t *testing.T) {
 	ctx := context.Background()
 	path := writeDir(t, 3)
-	d, err := Open(path, sampleClusters(t))
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,13 +317,13 @@ func TestFileDirWrites(t *testing.T) {
 	if d.Snapshot().Version() != 4 {
 		t.Fatalf("failed writes bumped the version to %d", d.Snapshot().Version())
 	}
-	if err := d.SetState(ctx, "acme", "data", StateRamping, Transition{To: StateMigrating}, "test"); !errors.Is(err, errConflict) {
+	if err := d.SetState(ctx, "acme", "data", StateRamping, Transition{To: StateMigrating}, "test"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale from-state: %v", err)
 	}
 	if err := d.SetState(ctx, "acme", "data", StateActive, Transition{To: StateMigrating, Target: "minio", Name: "acme-9999-data"}, "op"); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Delete(ctx, "acme", "data", "test"); !errors.Is(err, errConflict) {
+	if err := d.Delete(ctx, "acme", "data", "test"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("delete of a MIGRATING placement: %v", err)
 	}
 	if err := d.Delete(ctx, "acme", "missing", "test"); !errors.Is(err, ErrNotFound) {
@@ -319,7 +350,7 @@ func TestFileDirWrites(t *testing.T) {
 		t.Fatalf("change records: %+v", cs)
 	}
 	// A second instance opening the file sees the same content.
-	d2, err := Open(path, sampleClusters(t))
+	d2, err := Open(path)
 	if err != nil || d2.Snapshot().Version() != 8 {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -327,13 +358,12 @@ func TestFileDirWrites(t *testing.T) {
 
 func TestReload(t *testing.T) {
 	ctx := context.Background()
-	clusters := sampleClusters(t)
 	path := writeDir(t, 1)
-	a, err := Open(path, clusters)
+	a, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := Open(path, clusters)
+	b, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +412,7 @@ func TestReload(t *testing.T) {
 	if err := os.Symlink(v1, link); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Open(link, clusters)
+	c, err := Open(link)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +438,7 @@ func TestReadOnlyDirectory(t *testing.T) {
 		t.Skip("root ignores directory permissions")
 	}
 	path := writeDir(t, 1)
-	d, err := Open(path, sampleClusters(t))
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +457,7 @@ func TestReadOnlyDirectory(t *testing.T) {
 
 func TestLockTimeout(t *testing.T) {
 	path := writeDir(t, 1)
-	d, err := Open(path, sampleClusters(t))
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,10 +487,9 @@ func TestConcurrentCreate(t *testing.T) {
 		return
 	}
 	ctx := context.Background()
-	clusters := sampleClusters(t)
 	path := writeDir(t, 1)
-	a, _ := Open(path, clusters)
-	b, _ := Open(path, clusters)
+	a, _ := Open(path)
+	b, _ := Open(path)
 	var wins, exists int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -518,7 +547,7 @@ func TestConcurrentCreate(t *testing.T) {
 	if wins != 1 || exists != 8 {
 		t.Fatalf("wins %d exists %d", wins, exists)
 	}
-	f, err := Load(path, clusters)
+	f, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +561,7 @@ func TestConcurrentCreateHelper(t *testing.T) {
 	if path == "" {
 		t.Skip("helper process only")
 	}
-	d, err := Open(path, sampleClusters(t))
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +591,10 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if validate(d, clusters) != nil {
+		if d.Clusters == nil {
+			d.Clusters = clusters
+		}
+		if validate(d) != nil {
 			return
 		}
 		out, err := marshal(d)
@@ -573,7 +605,7 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			t.Fatalf("round trip does not parse: %v\n%s", err, out)
 		}
-		if err := validate(back, clusters); err != nil || back.Version != d.Version || len(back.Placements) != len(d.Placements) {
+		if err := validate(back); err != nil || back.Version != d.Version || len(back.Placements) != len(d.Placements) || len(back.Clusters) != len(d.Clusters) {
 			t.Fatalf("round trip changed the directory: %v\n%s", err, out)
 		}
 		newSnapshot(back)
@@ -595,10 +627,7 @@ func BenchmarkLookup(b *testing.B) {
 }
 
 func BenchmarkCreate(b *testing.B) {
-	dir := b.TempDir()
-	path := filepath.Join(dir, "directory.yaml")
-	_ = os.WriteFile(path, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\n"), 0o644)
-	d, err := Open(path, sampleClusters(b))
+	d, err := Open(writeDir(b, 1))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -610,5 +639,167 @@ func BenchmarkCreate(b *testing.B) {
 		if err := d.Create(ctx, "acme", fmt.Sprintf("bucket-%d", i), "garage", fmt.Sprintf("acme-0000-bucket-%d", i), "bench"); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// POC-5: clusters are directory state. A cluster can be added, replaced, and removed once nothing
+// names it; each change is logged with the definition (secret_ref only) before and after.
+func TestClusterLifecycle(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(writeDir(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vast02 := config.Cluster{Type: "vast", Scheme: "http", Region: "us-east-1", Endpoints: []string{"10.0.0.2:80"},
+		Credentials: config.Credentials{AccessKey: "AK2", SecretRef: "file:/etc/shunt/vast02.secret"}}
+	if err := d.PutCluster(ctx, "vast02", vast02, "api:test"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := d.Snapshot().Cluster("vast02")
+	if !ok || got.EndpointMode != "static" || got.Credentials.SecretRef != "file:/etc/shunt/vast02.secret" {
+		t.Fatalf("vast02 not added with defaults: %+v", got)
+	}
+	bad := vast02
+	bad.Scheme = "ftp"
+	if err := d.PutCluster(ctx, "vast03", bad, "api:test"); err == nil || !strings.Contains(err.Error(), "clusters.vast03.scheme") {
+		t.Fatalf("an invalid cluster was accepted: %v", err)
+	}
+	// garage is the default cluster of tenant acme: in use.
+	if err := d.RemoveCluster(ctx, "garage", "api:test"); !errors.Is(err, ErrInUse) || !strings.Contains(err.Error(), "tenants.acme.default_cluster") {
+		t.Fatalf("removing a referenced cluster: %v", err)
+	}
+	if err := d.Adopt(ctx, "acme", "data01", "vast02", "data01", "api:test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RemoveCluster(ctx, "vast02", "api:test"); !errors.Is(err, ErrInUse) || !strings.Contains(err.Error(), "placements.acme/data01") {
+		t.Fatalf("removing a cluster a placement uses: %v", err)
+	}
+	if err := d.RemoveCluster(ctx, "nope", "api:test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removing an unknown cluster: %v", err)
+	}
+	if err := d.RemoveCluster(ctx, "cold", "api:test"); err != nil {
+		t.Fatalf("removing an unused cluster: %v", err)
+	}
+	cs := changes(t, d)
+	if len(cs) != 3 || cs[0].Op != "cluster-put" || cs[0].ClusterBefore != nil || cs[0].ClusterAfter == nil ||
+		cs[2].Op != "cluster-remove" || cs[2].ClusterBefore == nil || cs[2].ClusterAfter != nil || cs[2].Key != "clusters/cold" {
+		t.Fatalf("change records: %+v", cs)
+	}
+}
+
+// Adopt creates the tenant when it is new; expand records a target the first transition inherits.
+func TestAdoptExpandAndCutoverEvidence(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(writeDir(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Adopt(ctx, "newco", "data01", "garage", "data01", "api:test"); err != nil {
+		t.Fatal(err)
+	}
+	if tn, ok := d.Snapshot().Tenant("newco"); !ok || tn.DefaultCluster != "garage" {
+		t.Fatalf("tenant not created: %+v", tn)
+	}
+	if err := d.Adopt(ctx, "newco", "data01", "garage", "data01", "api:test"); !errors.Is(err, ErrExists) {
+		t.Fatalf("second adopt: %v", err)
+	}
+	if err := d.SetTarget(ctx, "newco", "data01", "garage", "data01-001", "api:test"); err == nil {
+		t.Fatal("a target equal to the primary was accepted")
+	}
+	if err := d.SetTarget(ctx, "newco", "data01", "minio", "data01-001", "api:test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetTarget(ctx, "newco", "data01", "cold", "data01-001", "api:test"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a second target: %v", err)
+	}
+	// The ramp inherits the recorded target: no --to, and a different one is refused.
+	if err := d.SetState(ctx, "newco", "data01", StateActive, Transition{To: StateRamping, Target: "cold", Ratio: 0.5}, "op"); err == nil {
+		t.Fatal("a target other than the expanded one was accepted")
+	}
+	if err := d.SetState(ctx, "newco", "data01", StateActive, Transition{To: StateRamping, Ratio: 0.5}, "op"); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := d.Snapshot().Lookup("newco", "data01")
+	if p.Primary != "minio" || p.Source != "garage" || p.Target != "" || p.Names["minio"] != "data01-001" {
+		t.Fatalf("ramp from the recorded target: %+v", p)
+	}
+	for _, to := range []string{StateMigrating} {
+		if err := d.SetState(ctx, "newco", "data01", p.State, Transition{To: to}, "op"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Apply(*p, Transition{To: StateRamping, Ratio: 0.9, Cutover: &CutoverEvidence{}}); err == nil {
+		t.Error("cutover evidence on a ramp step was accepted")
+	}
+	ev := &CutoverEvidence{At: time.Unix(1_800_000_000, 0).UTC(), Window: time.Minute, FallbackReads: 12}
+	if err := d.SetState(ctx, "newco", "data01", StateMigrating, Transition{To: StateCutover, Cutover: ev}, "op"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := d.Snapshot().Lookup("newco", "data01"); p.Cutover == nil || p.Cutover.Window != time.Minute || p.Cutover.FallbackReads != 12 {
+		t.Fatalf("cutover evidence not recorded: %+v", p.Cutover)
+	}
+	if err := d.SetState(ctx, "newco", "data01", StateCutover, Transition{To: StateActive}, "op"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := d.Snapshot().Lookup("newco", "data01"); p.Cutover != nil || p.Source != "" || len(p.Names) != 1 {
+		t.Fatalf("ACTIVE keeps cutover state: %+v", p)
+	}
+	// Evidence outside CUTOVER is invalid on disk.
+	f := d.Snapshot().File()
+	pl := f.Placements["newco/data01"]
+	pl.Cutover = ev
+	f.Placements["newco/data01"] = pl
+	if err := validate(f); err == nil || !strings.Contains(err.Error(), "placements.newco/data01.cutover") {
+		t.Fatalf("cutover evidence on an ACTIVE placement: %v", err)
+	}
+}
+
+// Prepare runs before a version is installed and can refuse it; OnInstall runs after, on writes
+// and reloads alike.
+func TestPrepareAndOnInstallHooks(t *testing.T) {
+	ctx := context.Background()
+	path := writeDir(t, 1)
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var installed []int64
+	d.OnInstall = func(s *Snapshot) { installed = append(installed, s.Version()) }
+	refuse := errors.New("cannot build cluster")
+	d.Prepare = func(f *File) error {
+		if _, ok := f.Clusters["broken"]; ok {
+			return refuse
+		}
+		return nil
+	}
+	broken := config.Cluster{Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"10.0.0.9:80"}, Credentials: config.Credentials{AccessKey: "A", SecretRef: "env:NOPE"}}
+	if err := d.PutCluster(ctx, "broken", broken, "t"); !errors.Is(err, refuse) {
+		t.Fatalf("Prepare did not refuse the write: %v", err)
+	}
+	if on, _ := Load(path); on.Version != 1 {
+		t.Fatalf("a refused write reached disk: version %d", on.Version)
+	}
+	if err := d.Create(ctx, "acme", "data", "garage", "acme-0000-data", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// Another writer adds the broken cluster; the reload is refused and the last good version stays.
+	other, _ := Open(path)
+	if err := other.PutCluster(ctx, "broken", broken, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := d.Reload(); changed || !errors.Is(err, refuse) {
+		t.Fatalf("reload of a version Prepare refuses: %v %v", changed, err)
+	}
+	if d.Snapshot().Version() != 2 {
+		t.Fatalf("refused reload installed version %d", d.Snapshot().Version())
+	}
+	if err := other.RemoveCluster(ctx, "broken", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := d.Reload(); !changed || err != nil {
+		t.Fatalf("reload after the fix: %v %v", changed, err)
+	}
+	if !slices.Equal(installed, []int64{2, 4}) {
+		t.Fatalf("OnInstall versions: %v", installed)
 	}
 }

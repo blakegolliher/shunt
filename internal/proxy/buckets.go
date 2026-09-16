@@ -77,7 +77,7 @@ func (h *Handler) listBuckets(w http.ResponseWriter, r *http.Request, o *outcome
 // failed backend call only ever removes shunt's own row, never a bucket another request created.
 // The client's CreateBucketConfiguration is discarded: the directory, not the client, decides
 // where the bucket lives.
-func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, cred sigv4.Credential, snap *directory.Snapshot) {
+func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, cred sigv4.Credential, snap *directory.Snapshot, clusters *upstream.Set) {
 	bucket := o.info.Bucket
 	switch {
 	case !s3.ValidBucketName(bucket):
@@ -96,7 +96,7 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 		h.answer(w, r, o, s3.AccessDenied, "The tenant has no default cluster in the bucket directory.")
 		return
 	}
-	cl, ok := h.Clusters.Get(t.DefaultCluster)
+	cl, ok := clusters.Get(t.DefaultCluster)
 	if !ok {
 		h.answer(w, r, o, s3.InternalError, "")
 		return

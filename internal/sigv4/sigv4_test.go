@@ -1,6 +1,7 @@
 package sigv4
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -354,3 +355,54 @@ func BenchmarkSigningKey(b *testing.B) {
 }
 
 var _ io.Reader = strings.NewReader("")
+
+// Sign never lists a header net/http's client does not send: a bodyless DELETE
+// carries none, and a backend that checks signed headers against the request (Garage) refused it.
+func TestSignListsOnlyHeadersTheClientSends(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer srv.Close()
+	for _, tc := range []struct {
+		method string
+		body   []byte
+		noBody bool
+	}{
+		{http.MethodDelete, nil, true}, {http.MethodDelete, nil, false}, {http.MethodGet, nil, true}, {http.MethodHead, nil, true},
+		{http.MethodPut, nil, true}, {http.MethodPut, []byte("abc"), false}, {http.MethodPost, nil, true}, {http.MethodPost, []byte("<Delete/>"), false},
+	} {
+		req, err := http.NewRequest(tc.method, srv.URL+"/b/k", bytes.NewReader(tc.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.ContentLength = int64(len(tc.body))
+		switch {
+		case tc.noBody:
+			req.Body = http.NoBody
+		case len(tc.body) == 0:
+			req.Body = nil
+		}
+		Sign(req, Credentials{AccessKey: "AK", Secret: "SK"}, "us-east-1", UnsignedPayload, time.Now())
+		auth := req.Header.Get("Authorization")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		_, list, _ := strings.Cut(auth, "SignedHeaders=")
+		list, _, _ = strings.Cut(list, ",")
+		for _, name := range strings.Split(list, ";") {
+			if name != "host" && got.Get(name) == "" {
+				t.Errorf("%s (body %q, NoBody %v): %s is signed but was not sent", tc.method, tc.body, tc.noBody, name)
+			}
+		}
+		if tc.method == http.MethodDelete && strings.Contains(list, "content-length") {
+			t.Errorf("DELETE without a body signs content-length")
+		}
+		if len(tc.body) > 0 && !strings.Contains(list, "content-length") {
+			t.Errorf("%s with a body does not sign content-length", tc.method)
+		}
+	}
+}

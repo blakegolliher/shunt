@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -106,7 +105,7 @@ type Capabilities struct{ EnforcesSHA256, UnsignedTrailer bool }
 // resignParts builds a one-cluster set ("test", region garage, the cluster key) and a directory in
 // which tenant owns buckets b and bkt on that cluster under the same backend names, so the POC-2
 // resign tests keep their upstream paths.
-func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string) (*upstream.Set, *directory.FileDir) {
+func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string) (*upstream.Registry, *directory.FileDir) {
 	t.Helper()
 	sha, trailer := caps.EnforcesSHA256, caps.UnsignedTrailer
 	clusters := map[string]config.Cluster{"test": {
@@ -114,8 +113,8 @@ func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string
 		Credentials:  config.Credentials{AccessKey: clusterAK, SecretRef: "env:UNUSED"},
 		Capabilities: config.Capabilities{EnforcesSHA256: &sha, UnsignedTrailer: &trailer},
 	}}
-	set, err := upstream.NewSet(clusters, upstream.Options{}, func(string) (string, error) { return clusterSecret, nil })
-	if err != nil {
+	set := upstream.NewRegistry(upstream.Options{}, func(string) (string, error) { return clusterSecret, nil })
+	if _, _, err := set.Apply(clusters); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(set.Close)
@@ -123,10 +122,8 @@ func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string
 	body := "version: 1\ntenants: { " + tenant + ": { default_cluster: test } }\nplacements:\n" +
 		"  " + tenant + "/bbb: { state: ACTIVE, primary: test, names: { test: bbb } }\n" +
 		"  " + tenant + "/bkt: { state: ACTIVE, primary: test, names: { test: bkt } }\n"
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := directory.Open(path, clusters)
+	writeDirectory(t, path, body, clusters)
+	dir, err := directory.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

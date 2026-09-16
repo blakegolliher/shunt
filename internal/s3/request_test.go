@@ -2,6 +2,7 @@ package s3
 
 import (
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -106,4 +107,36 @@ func BenchmarkParse(b *testing.B) {
 			b.Fatal("misparsed")
 		}
 	}
+}
+
+func TestDecodeListingKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"plain/key":         "plain/key",
+		"dir%2Fa%20b%2Bc":   "dir/a b+c",
+		"100%":              "100%", // not an escape: left alone
+		"already/decoded +": "already/decoded +",
+	} {
+		if got := DecodeListingKey(in); got != want {
+			t.Errorf("DecodeListingKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func BenchmarkDecodeListingKey(b *testing.B) {
+	for b.Loop() {
+		_ = DecodeListingKey("dir%2Fobject%20name")
+	}
+}
+
+// Any key a backend percent-encodes decodes back to itself, and no input panics.
+func FuzzDecodeListingKey(f *testing.F) {
+	for _, s := range []string{"a/b", "dir%2Fobject%20name", "100%", "%zz", "π/\x00", "a+b", ""} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, key string) {
+		_ = DecodeListingKey(key)
+		if got := DecodeListingKey(url.PathEscape(key)); got != key {
+			t.Fatalf("DecodeListingKey(PathEscape(%q)) = %q", key, got)
+		}
+	})
 }

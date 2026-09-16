@@ -61,17 +61,18 @@ migrate_start() {
   grep -q -- '--accept-lost-write-window' <<<"$out" || fail "migrate start"
   note "refused as designed: the target ignores If-None-Match: * on PUT. Accepting the window for this demo."
   $SHUNT migrate start "$@" --accept-lost-write-window | sed 's/^/   /'
-  MOVER_ACCEPT=-accept-lost-write-window # the mover refuses the same target without it
+  MOVER_ACCEPT=--accept-lost-write-window # the mover refuses the same target without it
 }
 
 # --- preflight -------------------------------------------------------------------------------
 command -v aws >/dev/null || fail "aws-cli is not installed"
+command -v jq >/dev/null || fail "jq is not installed"
 [ -f "$CFG" ] || fail "$CFG is missing; run make e2e-up first"
 [ -x "$SHUNT" ] || fail "$SHUNT is missing; run make build"
 curl -fsS "$ADMIN/-/metrics" >/dev/null 2>&1 || fail "shunt is not running; start it with make run-mixed"
 # The mover picks its overwrite guard from capabilities.conditional_write. A config that predates
 # that key would silently get the optimistic guard on a backend that ignores If-None-Match.
-grep -q conditional_write "$CFG" || fail "$CFG has no capabilities.conditional_write; re-run make e2e-up"
+grep -q conditional_write "$DIR" || fail "$DIR has no capabilities.conditional_write; restart make run-mixed"
 set -a; . "$DATA/garage.env"; set +a
 
 creds=$(awk -v t="$TENANT" '/access_key:/{ak=$3} /secret:/{sk=$2} /tenant:/{if($2==t){print ak, sk; exit}}' "$DATA/credentials.yaml")
@@ -88,9 +89,9 @@ metric() { curl -fsS "$ADMIN/-/metrics" | awk -v n="$1" -v l="$2" '$0 ~ "^"n"{" 
 
 say "1. A bucket on $FROM, filled through shunt"
 s3api create-bucket --bucket "$BUCKET" >/dev/null || true
-primary=$($SHUNT directory get "$KEY" -c "$CFG" --json | awk -F'"' '/"primary"/{print $4}')
+primary=$($SHUNT status "$KEY" --json | jq -r '.placements[0].primary')
 [ "$primary" = "$FROM" ] || fail "$KEY landed on $primary, not $FROM (check the tenant's default_cluster)"
-note "$KEY is on $primary as $($SHUNT directory get "$KEY" -c "$CFG" --json | awk -F'"' -v c="$FROM" '$2=="names"{n=1} n&&$2==c{print $4; exit}')"
+note "$KEY is on $primary as $($SHUNT status "$KEY" --json | jq -r --arg c "$FROM" '.placements[0].names[$c]')"
 
 head -c 4096 /dev/urandom > "$WORK/small.bin"
 head -c $((9*1024*1024)) /dev/urandom > "$WORK/large.bin"   # over the 8 MiB cli threshold: multipart
@@ -126,7 +127,7 @@ note "background writer running (pid $WRITER_PID); it never stops until cutover"
 
 for step in 0.01 0.25 1.0; do
   before_p=$(metric shunt_ramp_writes_total "side=\"primary\"")
-  $SHUNT ramp "$KEY" --to "$TO" --create --ratio "$step" -c "$CFG" | sed 's/^/   /'
+  $SHUNT ramp "$KEY" --to "$TO" --create --ratio "$step" | sed 's/^/   /'
   sleep 6
   after_p=$(metric shunt_ramp_writes_total "side=\"primary\"")
   after_s=$(metric shunt_ramp_writes_total "side=\"source\"")
@@ -135,7 +136,7 @@ done
 [ "$(metric shunt_ramp_writes_total 'side="primary"')" -gt 0 ] || fail "no write ever reached the new primary during the ramp"
 
 say "3. Migrate, then move the bytes"
-migrate_start "$KEY" -c "$CFG"
+migrate_start "$KEY"
 
 say "6b. Latency during the migration (fallback reads, merged listings, dual deletes all live)"
 go run ./test/bench/s3bench -via-only -mode resign -bucket "$BUCKET" \
@@ -143,7 +144,7 @@ go run ./test/bench/s3bench -via-only -mode resign -bucket "$BUCKET" \
   $BENCH_ADDR | tee "$WORK/during.md" || fail "migration bench"
 
 note "copying $KEY from $FROM to $TO while clients keep reading it"
-go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" ${MOVER_ACCEPT:-} > "$WORK/mover.log" 2>&1 & MOVER_PID=$!
+$SHUNT migrate run "$KEY" --cursor-dir "$DATA" --ledger-dir "$DATA" ${MOVER_ACCEPT:-} > "$WORK/mover.log" 2>&1 & MOVER_PID=$!
 
 # Reads of objects the mover has not reached yet are served from the source. Poll that counter while
 # reading, so a plateau means "nothing is left on the source", not "nobody asked" (POC.md step 3).
@@ -165,9 +166,10 @@ note "reads stopped falling back to $FROM at $last"
 say "4. Cut over and verify every object"
 kill "$WRITER_PID" 2>/dev/null || true; wait "$WRITER_PID" 2>/dev/null || true; WRITER_PID=
 note "writer stopped after $(wc -l < "$WORK/writer.keys") live objects"
-# The writer's last object may still be in flight; re-run the mover so nothing is left behind.
-go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
-$SHUNT cutover "$KEY" -c "$CFG" | sed 's/^/   /'
+# The writer's last object may still be in flight; re-run the mover until a pass copies nothing,
+# which cutover requires, then cut over once no read has fallen back for 5s.
+$SHUNT migrate run "$KEY" --until-converged --cursor-dir "$DATA" --ledger-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
+$SHUNT cutover "$KEY" --window 5s | sed 's/^/   /'
 
 manifest > "$WORK/after.txt"
 if ! diff -u "$WORK/before.txt" "$WORK/after.txt" > "$WORK/listing.diff"; then
@@ -197,8 +199,8 @@ if [ -s "$WORK/lost.txt" ]; then
 fi
 note "$(wc -l < "$WORK/writer.keys") objects written during the migration all survived"
 
-$SHUNT migrate finish "$KEY" -c "$CFG" | sed 's/^/   /'
-now_primary=$($SHUNT directory get "$KEY" -c "$CFG" --json | awk -F'"' '/"primary"/{print $4}')
+$SHUNT migrate finish "$KEY" | sed 's/^/   /'
+now_primary=$($SHUNT status "$KEY" --json | jq -r '.placements[0].primary')
 [ "$now_primary" = "$TO" ] || fail "after finish the primary is $now_primary, not $TO"
 
 say "6c. Latency once the migration is over, on the new cluster alone"

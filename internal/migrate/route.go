@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"errors"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"strings"
@@ -88,55 +90,96 @@ func (s Side) String() string {
 //	                     ACTIVE    RAMPING (in range / out)   MIGRATING        CUTOVER
 //	write                primary   primary / source           primary          primary
 //	read                 primary   primary→source / source    primary→source   primary
-//	delete               primary   both                       both             primary
+//	delete               primary   both                       both             both
 //	list                 primary   merge                      merge            primary
 //	bucket config        primary   primary                    primary          primary
-func Decide(p *directory.Placement, class OpClass, key string) Route {
-	// A placement with no second cluster has nothing to decide, and neither does a state that
-	// keeps both sides in step.
-	if p.Source == "" || p.State == directory.StateActive || p.State == directory.StateCutover {
-		return Route{Cluster: Primary}
+//
+// A delete goes to both clusters through CUTOVER, not just MIGRATING, so the source stays a subset
+// of the primary until purge-source compares them (ADR-0004 amendment, POC-5).
+func Decide(p *directory.Placement, class OpClass, key string) (Route, error) {
+	// A placement with no second cluster has nothing to decide, and neither does ACTIVE.
+	if p.Source == "" || p.State == directory.StateActive {
+		return Route{Cluster: Primary}, nil
+	}
+	if p.State == directory.StateCutover {
+		if class == ClassDelete {
+			return Route{Cluster: Primary, Both: true}, nil
+		}
+		return Route{Cluster: Primary}, nil
 	}
 	switch class {
-	case ClassWrite:
-		if p.State == directory.StateRamping && !InRange(p.Ramp, key) {
-			return Route{Cluster: Source}
+	case ClassWrite, ClassRead:
+		if p.State == directory.StateRamping {
+			in, err := InRange(p.Ramp, key)
+			if err != nil {
+				return Route{}, err
+			}
+			if !in {
+				// A key whose writes still go to the source is read there too: the target cannot have it.
+				return Route{Cluster: Source}, nil
+			}
 		}
-		return Route{Cluster: Primary}
-	case ClassRead:
-		if p.State == directory.StateRamping && !InRange(p.Ramp, key) {
-			// The target cannot hold a key whose writes still go to the source.
-			return Route{Cluster: Source}
+		if class == ClassRead {
+			return Route{Cluster: Primary, Fallback: true}, nil
 		}
-		return Route{Cluster: Primary, Fallback: true}
+		return Route{Cluster: Primary}, nil
 	case ClassDelete:
-		return Route{Cluster: Primary, Both: true}
+		return Route{Cluster: Primary, Both: true}, nil
 	case ClassList:
-		return Route{Cluster: Primary, Merge: true}
+		return Route{Cluster: Primary, Merge: true}, nil
 	}
-	return Route{Cluster: Primary}
+	return Route{Cluster: Primary}, nil
 }
 
+// ErrUnknownRampHash is returned for a ramp whose keys are split by a hash this build does not
+// implement. Routing such a ramp with a different hash would move keys between sides mid-ramp and
+// serve stale reads (ADR-0004 race 5), so the request is refused instead.
+var ErrUnknownRampHash = errors.New("unknown ramp hash")
+
 // InRange reports whether a key's writes have moved to the new primary. A key matches when it
-// carries one of the ramp's prefixes, or when its hash falls under the ratio. The hash is FNV-1a
-// over the key with no seed, so every proxy in a fleet decides identically and a restart does not
-// move a key (docs/DESIGN.md §2.5).
-func InRange(r *directory.Ramp, key string) bool {
+// carries one of the ramp's prefixes, or when its hash falls under the ratio. The hash is the one
+// the ramp names (directory.Ramp.Hash); this build implements directory.RampHash, FNV-1a over the
+// key with no seed, so every proxy in a fleet decides identically and a restart does not move a
+// key (docs/DESIGN.md §2.5), finished with murmur3's 64-bit mixer: FNV-1a alone barely moves its
+// high bits for keys that differ only in their last bytes, so sequential keys (a/0000 … a/0999)
+// all fell on one side of a ratio of 0.5 (found by the POC-5 walkthrough; ADR-0004 amendment).
+// A ramp naming another hash is refused with ErrUnknownRampHash wherever the hash would decide:
+// not for a key a prefix already moved, and not at a ratio of 0 or 1.
+func InRange(r *directory.Ramp, key string) (bool, error) {
 	if r == nil {
-		return false
+		return false, nil
 	}
 	for _, p := range r.Prefixes {
 		if strings.HasPrefix(key, p) {
-			return true
+			return true, nil
 		}
 	}
-	switch {
-	case r.Ratio <= 0:
-		return false
-	case r.Ratio >= 1:
-		return true
+	if r.Ratio <= 0 {
+		return false, nil
 	}
+	if r.Ratio >= 1 {
+		return true, nil // every key, whatever the hash
+	}
+	if r.Hash != directory.RampHash {
+		return false, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, r.Hash, directory.RampHash)
+	}
+	return rampHash(key) < uint64(r.Ratio*float64(math.MaxUint64)), nil
+}
+
+// rampHash is directory.RampHash, fnv1a-fmix64-v1. Its values are pinned by a test: changing them
+// needs a new name.
+func rampHash(key string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
-	return h.Sum64() < uint64(r.Ratio*float64(math.MaxUint64))
+	return mix64(h.Sum64())
+}
+
+// mix64 is murmur3's fmix64 finalizer: every input bit reaches every output bit.
+func mix64(x uint64) uint64 {
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	x *= 0xc4ceb9fe1a85ec53
+	x ^= x >> 33
+	return x
 }

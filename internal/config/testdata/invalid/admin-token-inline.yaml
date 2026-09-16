@@ -1,0 +1,5 @@
+# expect: admin.control_token_ref
+listener: { address: ":8008", plaintext: true }
+admin: { address: "127.0.0.1:9900", control_token_ref: "s3cr3t" }
+auth: { mode: resign, credentials_file: creds.yaml }
+directory: { file: d.yaml }

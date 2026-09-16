@@ -53,7 +53,7 @@ migrate_start() {
   grep -q -- '--accept-lost-write-window' <<<"$out" || fail "migrate start"
   note "refused as designed: the target ignores If-None-Match: * on PUT. Accepting the window for this demo."
   $SHUNT migrate start "$@" --accept-lost-write-window | sed 's/^/   /'
-  MOVER_ACCEPT=-accept-lost-write-window # the mover refuses the same target without it
+  MOVER_ACCEPT=--accept-lost-write-window # the mover refuses the same target without it
 }
 
 command -v aws >/dev/null || fail "aws-cli is not installed"
@@ -101,26 +101,28 @@ done
 note "$(wc -l < "$WORK/before.txt") objects across both tenants, on both clusters"
 
 say "2. Start every bucket on $FROM moving to $TO"
-migrate_start --from "$FROM" --to "$TO" --create -c "$CFG"
-$SHUNT migrate status -c "$CFG" | sed 's/^/   /'
+migrate_start --from "$FROM" --to "$TO" --create
+$SHUNT status | sed 's/^/   /'
 
 say "3. Move the bytes"
-go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
-note "a second pass must copy nothing:"
-go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
+$SHUNT migrate run --from "$FROM" --cursor-dir "$DATA" --ledger-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
+note "passes until one copies nothing, which cutover requires:"
+$SHUNT migrate run --from "$FROM" --until-converged --cursor-dir "$DATA" --ledger-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
 note "fallback reads so far: $(metric shunt_migration_fallback_reads_total '')"
 
 say "4. Cut over and let go"
-$SHUNT cutover --from "$FROM" -c "$CFG" | sed 's/^/   /'
-$SHUNT migrate finish --from "$FROM" -c "$CFG" | sed 's/^/   /'
+$SHUNT cutover --from "$FROM" --window 5s | sed 's/^/   /'
+$SHUNT migrate finish --from "$FROM" | sed 's/^/   /'
 # Repoint any tenant that would still create new buckets on the cluster being retired.
 for t in $($SHUNT directory get -c "$CFG" --json | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 print(" ".join(n for n,t in sorted((d.get("tenants") or {}).items()) if t.get("default_cluster")==sys.argv[1]))
 ' "$FROM"); do
-  $SHUNT directory set-default "$t" "$TO" -c "$CFG" | sed 's/^/   /'
+  $SHUNT tenant set-default "$t" "$TO" | sed 's/^/   /'
 done
+# Nothing references the cluster any more, so shunt lets it go (make run-mixed brings it back).
+$SHUNT cluster remove "$FROM" | sed 's/^/   /'
 if grep -q "$FROM" "$DIR"; then
   grep -n "$FROM" "$DIR" | sed 's/^/   /'; fail "$DIR still names $FROM"
 fi

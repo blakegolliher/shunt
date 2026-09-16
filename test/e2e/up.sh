@@ -95,10 +95,11 @@ cred() { # cred <tenant> <access_key|secret>
 } > data/garage.env
 chmod 600 data/garage.env
 echo "e2e-up: credentials written to test/e2e/data/garage.env"
-sed "s/GK_SET_BY_E2E/$ak/" shunt-garage-resign.yaml > data/shunt-garage-resign.yaml
-sed "s/GK_SET_BY_E2E/$ak/" shunt-mixed.yaml > data/shunt-mixed.yaml
-cp shunt-minio-resign.yaml data/shunt-minio-resign.yaml
-echo "e2e-up: resign configs written to test/e2e/data/shunt-{garage,minio}-resign.yaml and shunt-mixed.yaml"
+cp shunt-garage-resign.yaml shunt-mixed.yaml shunt-minio-resign.yaml data/
+for d in directory-garage.yaml directory-mixed.yaml directory-minio.yaml; do
+  sed "s/GK_SET_BY_E2E/$ak/" "$d" > "data/$d"
+done
+echo "e2e-up: resign configs and their directories (clusters included) written to test/e2e/data/"
 
 # S3-level readiness: any HTTP status from an unsigned GET / counts (403 is fine, refused is not).
 wait_for_any garage-s3 "http://127.0.0.1:3900/"

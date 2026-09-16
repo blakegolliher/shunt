@@ -1,234 +1,235 @@
 package main
 
 import (
-	"net/http"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+	"time"
+
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
+
+	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/control"
+	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/telemetry"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
-// migrationBackend answers the three bucket-level calls the migration verbs make: HEAD to see
-// whether the target exists, PUT to create it, and GET ?versioning for the refusal check.
-type migrationBackend struct {
-	mu       sync.Mutex
-	exists   map[string]bool
-	versions string // status reported by GetBucketVersioning
-	puts     []string
+// apiRig is a control API over a directory file and two in-process S3 clusters, the way `shunt
+// serve` mounts it, for driving the operator CLI end to end.
+type apiRig struct {
+	url            string
+	dir            *directory.FileDir
+	dirPath        string
+	ctl            *control.Server
+	vast01, vast02 *s3mem.Backend
+	ep01, ep02     string
 }
 
-func (b *migrationBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	bucket := strings.TrimPrefix(r.URL.Path, "/")
-	if _, ok := r.URL.Query()["versioning"]; ok {
-		if b.versions != "" {
-			_, _ = w.Write([]byte(`<VersioningConfiguration><Status>` + b.versions + `</Status></VersioningConfiguration>`))
-			return
-		}
-		_, _ = w.Write([]byte(`<VersioningConfiguration/>`))
-		return
-	}
-	switch r.Method {
-	case http.MethodHead:
-		if b.exists[bucket] {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	case http.MethodPut:
-		b.puts = append(b.puts, bucket)
-		b.exists[bucket] = true
-		w.WriteHeader(http.StatusOK)
-	default:
-		http.Error(w, "unexpected "+r.Method, http.StatusBadRequest)
-	}
-}
-
-func migrationRig(t *testing.T) (cfgPath, dirPath string, be *migrationBackend) {
+func newAPIRig(t *testing.T) *apiRig {
 	t.Helper()
-	be = &migrationBackend{exists: map[string]bool{"acme-1111-data": true}}
-	srv := httptest.NewServer(be)
-	t.Cleanup(srv.Close)
+	rg := &apiRig{vast01: s3mem.New(), vast02: s3mem.New()}
+	for be, ep := range map[*s3mem.Backend]*string{rg.vast01: &rg.ep01, rg.vast02: &rg.ep02} {
+		srv := httptest.NewServer(gofakes3.New(be, gofakes3.WithTimeSkewLimit(0)).Server())
+		t.Cleanup(srv.Close)
+		*ep = strings.TrimPrefix(srv.URL, "http://")
+	}
 	t.Setenv("SHUNT_TEST_CLUSTER_SECRET", "cluster-secret")
-	dir := t.TempDir()
-	dirPath = filepath.Join(dir, "directory.yaml")
-	if err := os.WriteFile(dirPath, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: ACTIVE, primary: garage, names: { garage: acme-1111-data } }\n"), 0o644); err != nil {
+	rg.dirPath = filepath.Join(t.TempDir(), "directory.yaml")
+	if err := os.WriteFile(rg.dirPath, []byte("version: 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ep := strings.TrimPrefix(srv.URL, "http://")
-	cfgPath = filepath.Join(dir, "shunt.yaml")
-	cfg := "listener: { address: \":8443\", tls: { cert: c.pem, key: k.pem } }\nauth: { mode: resign, credentials_file: creds.yaml }\n" +
-		"directory: { file: " + dirPath + " }\nclusters:\n" +
-		"  garage: { type: s3, scheme: http, region: garage, endpoints: [\"" + ep + "\"], credentials: { access_key: GARAGEKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n" +
-		"  minio: { type: minio, scheme: http, region: us-east-1, endpoints: [\"" + ep + "\"], credentials: { access_key: MINIOKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n"
-	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+	var err error
+	if rg.dir, err = directory.Open(rg.dirPath); err != nil {
 		t.Fatal(err)
 	}
-	return cfgPath, dirPath, be
+	reg := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, config.ResolveSecret)
+	t.Cleanup(reg.Close)
+	rg.dir.Prepare = func(f *directory.File) error {
+		_, _, aerr := reg.Apply(f.Clusters)
+		return aerr
+	}
+	rg.ctl = &control.Server{Dir: rg.dir, Clusters: reg, Metrics: telemetry.NewMetrics()}
+	api := httptest.NewServer(rg.ctl.Handler())
+	t.Cleanup(api.Close)
+	rg.url = api.URL
+	return rg
 }
 
-// TestMigrationVerbsWalkTheWholeMove is the operator's path from one cluster to another, in the
-// order docs/DESIGN.md §2.5 prescribes, with the directory checked after every step.
-func TestMigrationVerbsWalkTheWholeMove(t *testing.T) {
-	cfg, dirPath, be := migrationRig(t)
-
-	out, _, err := run(t, "ramp", "acme/data", "--to", "minio", "--create", "--ratio", "0.25", "-c", cfg)
+// cli runs one shunt command against the rig's API and returns stdout and stderr together.
+func (rg *apiRig) cli(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	out, stderr, err := run(t, append(args, "--api", rg.url)...)
+	msg := out + stderr
 	if err != nil {
-		t.Fatalf("ramp: %v\n%s", err, out)
+		msg += err.Error()
 	}
-	if !strings.Contains(out, "created acme-") || !strings.Contains(out, "ACTIVE -> RAMPING") || !strings.Contains(out, "25% of keys") {
-		t.Fatalf("ramp said:\n%s", out)
-	}
-	if len(be.puts) != 1 {
-		t.Fatalf("expected one CreateBucket on the target, got %v", be.puts)
-	}
-	if d := readDir(t, dirPath); !strings.Contains(d, "state: RAMPING") || !strings.Contains(d, "ratio: 0.25") {
-		t.Fatalf("directory after ramp:\n%s", d)
-	}
+	return msg, err
+}
 
-	// A ramp step raises the ratio. Repeating --to is accepted because it names the same target;
-	// naming a different one is refused rather than silently redirecting the move.
-	if out, _, err = run(t, "ramp", "acme/data", "--to", "minio", "--ratio", "0.5", "-c", cfg); err != nil {
-		t.Fatalf("ramp step with a repeated --to: %v\n%s", err, out)
+func (rg *apiRig) must(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := rg.cli(t, args...)
+	if err != nil {
+		t.Fatalf("shunt %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
-	if out, _, err = run(t, "ramp", "acme/data", "--to", "garage", "--ratio", "0.75", "-c", cfg); err == nil {
-		t.Fatalf("a ramp step redirected the move:\n%s", out)
-	}
-	if out, _, err = run(t, "ramp", "acme/data", "--ratio", "1", "-c", cfg); err != nil {
-		t.Fatalf("ramp step: %v\n%s", err, out)
-	}
-	if out, _, err = run(t, "ramp", "acme/data", "--ratio", "0.5", "-c", cfg); err == nil {
-		t.Fatalf("a shrinking ramp was accepted:\n%s", out)
-	}
+	return out
+}
 
-	if out, _, err = run(t, "migrate", "start", "acme/data", "-c", cfg); err != nil {
-		t.Fatalf("migrate start: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "run the mover") {
-		t.Fatalf("migrate start said:\n%s", out)
-	}
-	out, _, err = run(t, "migrate", "status", "-c", cfg)
-	if err != nil || !strings.Contains(out, "MIGRATING") || !strings.Contains(out, "garage/acme-1111-data") {
-		t.Fatalf("status: %v\n%s", err, out)
-	}
-
-	// Finishing before cutover is refused: the states are not skippable.
-	if out, _, err = run(t, "migrate", "finish", "acme/data", "-c", cfg); err == nil {
-		t.Fatalf("MIGRATING -> ACTIVE was allowed:\n%s", out)
-	}
-	if out, _, err = run(t, "cutover", "acme/data", "-c", cfg); err != nil {
-		t.Fatalf("cutover: %v\n%s", err, out)
-	}
-	if out, _, err = run(t, "migrate", "finish", "acme/data", "-c", cfg); err != nil {
-		t.Fatalf("finish: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "served entirely by minio") {
-		t.Fatalf("finish said:\n%s", out)
-	}
-	d := readDir(t, dirPath)
-	if !strings.Contains(d, "state: ACTIVE") || !strings.Contains(d, "primary: minio") || strings.Contains(d, "source:") {
-		t.Fatalf("directory after finish still names a source:\n%s", d)
-	}
-	if strings.Contains(d, "acme-1111-data") {
-		t.Fatalf("the old backend bucket is still in the placement:\n%s", d)
-	}
-	out, _, err = run(t, "migrate", "status", "-c", cfg)
-	if err != nil || !strings.Contains(out, "no bucket is moving") {
-		t.Fatalf("status after finish: %v\n%s", err, out)
+func put(t *testing.T, be *s3mem.Backend, bucket, key, body string) {
+	t.Helper()
+	if _, err := be.PutObject(bucket, key, map[string]string{}, strings.NewReader(body), int64(len(body)), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestMigrationVerbsRefuseUnsafeStarts covers the guards that keep data from being stranded.
-func TestMigrationVerbsRefuseUnsafeStarts(t *testing.T) {
-	cfg, _, be := migrationRig(t)
+func (rg *apiRig) addCluster(t *testing.T, name, endpoint string, extra ...string) string {
+	t.Helper()
+	return rg.must(t, append([]string{"cluster", "add", name, "--type", "vast", "--scheme", "http", "--region", "us-east-1", "--endpoint", endpoint,
+		"--access-key", "AK", "--secret-ref", "env:SHUNT_TEST_CLUSTER_SECRET"}, extra...)...)
+}
 
-	// Without --create the target bucket must already exist, so a typo is not a silent 404 storm.
-	out, _, err := run(t, "migrate", "start", "acme/data", "--to", "minio", "-c", cfg)
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("a missing target was accepted: %v\n%s", err, out)
+// The walkthrough, through the CLI: every verb an operator types, and what each one prints.
+func TestOperatorVerbsWalkTheMove(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
 	}
-	// Versioned buckets are out of scope for v1 and are refused before the state changes.
-	be.versions = "Enabled"
-	out, _, err = run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "-c", cfg)
-	if err == nil || !strings.Contains(err.Error(), "versioning") {
-		t.Fatalf("a versioned bucket was accepted: %v\n%s", err, out)
+	put(t, rg.vast01, "data01", "a", "one")
+	put(t, rg.vast01, "data01", "dir/b", "two")
+
+	if out := rg.addCluster(t, "vast01", rg.ep01); !strings.Contains(out, "cluster vast01: vast http://"+rg.ep01) || !strings.Contains(out, "conditional_write true") {
+		t.Fatalf("cluster add: %s", out)
 	}
-	be.versions = ""
-	if _, _, err = run(t, "ramp", "acme/data", "--to", "minio", "--create", "-c", cfg); err == nil {
-		t.Fatal("a ramp with neither ratio nor prefix was accepted")
+	if out := rg.must(t, "adopt", "vast01", "acme/data01"); !strings.Contains(out, "acme/data01: ACTIVE on vast01/data01") {
+		t.Fatalf("adopt: %s", out)
 	}
-	if _, _, err = run(t, "ramp", "acme/data", "--to", "minio", "--create", "--ratio", "2", "-c", cfg); err == nil {
-		t.Fatal("a ratio above 1 was accepted")
+	rg.addCluster(t, "vast02", rg.ep02)
+	if out := rg.must(t, "expand", "acme/data01", "--to", "vast02", "--create"); !strings.Contains(out, "target vast02/data01-001 (created); canary write, read, delete ok") {
+		t.Fatalf("expand: %s", out)
 	}
-	if _, _, err = run(t, "cutover", "acme/nope", "-c", cfg); err == nil {
-		t.Fatal("cutover of a missing placement was accepted")
+	if out := rg.must(t, "ramp", "acme/data01", "--ratio", "0.5"); !strings.Contains(out, "ACTIVE -> RAMPING") || !strings.Contains(out, "writes for 50% of keys now land on vast02") {
+		t.Fatalf("ramp: %s", out)
 	}
-	if _, _, err = run(t, "cutover", "acme/data", "-c", cfg); err == nil {
-		t.Fatal("cutover of an ACTIVE placement was accepted")
+	rg.ctl.Metrics.RampWrites.WithLabelValues("acme/data01", "primary").Add(52)
+	rg.ctl.Metrics.RampWrites.WithLabelValues("acme/data01", "source").Add(48)
+	if out := rg.must(t, "status"); !strings.Contains(out, "52/48 (52%)") || !strings.Contains(out, "RAMPING") {
+		t.Fatalf("status: %s", out)
+	}
+	var st control.Status
+	if err := json.Unmarshal([]byte(rg.must(t, "status", "acme/data01", "--json")), &st); err != nil || len(st.Placements) != 1 || st.Placements[0].Writes["primary"] != 52 {
+		t.Fatalf("status --json: %v %+v", err, st)
+	}
+	rg.must(t, "ramp", "acme/data01", "--ratio", "1")
+	if out := rg.must(t, "migrate", "start", "acme/data01"); !strings.Contains(out, "RAMPING -> MIGRATING") {
+		t.Fatalf("migrate start: %s", out)
+	}
+	if out, err := rg.cli(t, "cutover", "acme/data01", "--window", "0s"); err == nil || !strings.Contains(out, "no mover has reported") {
+		t.Fatalf("cutover before the mover: %v %s", err, out)
+	}
+
+	cursors := t.TempDir()
+	out := rg.must(t, "migrate", "run", "acme/data01", "--until-converged", "--cursor-dir", cursors, "--ledger-dir", cursors)
+	if !strings.Contains(out, "(If-None-Match guard, re-HEAD withdrawal)") || !strings.Contains(out, "converged: the last pass copied nothing") ||
+		!strings.Contains(out, "mover: 2 copied, 2 already on the target") {
+		t.Fatalf("migrate run: %s", out)
+	}
+	if _, err := rg.vast02.HeadObject("data01-001", "dir/b"); err != nil {
+		t.Fatalf("the mover did not copy dir/b: %v", err)
+	}
+	if out := rg.must(t, "status", "acme/data01"); !strings.Contains(out, "pass 2: 0 copied, 2 already there, 0 failed, converged") {
+		t.Fatalf("status after the mover: %s", out)
+	}
+	if out := rg.must(t, "cutover", "acme/data01", "--window", "10ms"); !strings.Contains(out, "MIGRATING -> CUTOVER") {
+		t.Fatalf("cutover: %s", out)
+	}
+	if out := rg.must(t, "purge-source", "acme/data01"); !strings.Contains(out, "deleted 2 objects and aborted 0 uploads from vast01/data01") {
+		t.Fatalf("purge-source: %s", out)
+	}
+	if out, err := rg.cli(t, "cluster", "remove", "vast01"); err == nil || !strings.Contains(out, "refused: ") || !strings.Contains(out, "tenants.acme.default_cluster") {
+		t.Fatalf("removing the tenant's default: %v %s", err, out)
+	}
+	rg.must(t, "tenant", "set-default", "acme", "vast02")
+	if out := rg.must(t, "cluster", "remove", "vast01"); !strings.Contains(out, "cluster vast01 removed") {
+		t.Fatalf("cluster remove: %s", out)
+	}
+	if d := readDir(t, rg.dirPath); strings.Contains(d, "vast01") {
+		t.Fatalf("vast01 still in the directory:\n%s", d)
 	}
 }
 
-// TestEvacuateACluster is the vendor-removal path: one command per step for every bucket a cluster
-// still holds, repeatable after a partial failure, and nothing left pointing at it at the end.
+// --from is the fleet form: every bucket on a cluster, one command per step.
 func TestEvacuateACluster(t *testing.T) {
-	cfg, dirPath, _ := migrationRig(t)
-	if err := os.WriteFile(dirPath, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\nplacements:\n"+
-		"  acme/data: { state: ACTIVE, primary: garage, names: { garage: acme-1111-data } }\n"+
-		"  acme/logs: { state: ACTIVE, primary: garage, names: { garage: acme-2222-logs } }\n"+
-		"  acme/kept: { state: ACTIVE, primary: minio, names: { minio: acme-3333-kept } }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	rg := newAPIRig(t)
+	for _, b := range []string{"data", "logs"} {
+		if err := rg.vast01.CreateBucket(b); err != nil {
+			t.Fatal(err)
+		}
+		put(t, rg.vast01, b, "k", b)
 	}
-	out, _, err := run(t, "migrate", "start", "--from", "garage", "--to", "minio", "--create", "-c", cfg)
-	if err != nil {
-		t.Fatalf("evacuate: %v\n%s", err, out)
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.addCluster(t, "vast02", rg.ep02)
+	rg.must(t, "adopt", "vast01", "acme/data")
+	rg.must(t, "adopt", "vast01", "acme/logs")
+	if out := rg.must(t, "migrate", "start", "--from", "vast01", "--to", "vast02", "--create"); !strings.Contains(out, "2 buckets on vast01") || strings.Count(out, "ACTIVE -> MIGRATING") != 2 {
+		t.Fatalf("migrate start --from: %s", out)
 	}
-	if !strings.Contains(out, "2 buckets on garage") {
-		t.Fatalf("evacuate said:\n%s", out)
-	}
-	if d := readDir(t, dirPath); strings.Count(d, "state: MIGRATING") != 2 {
-		t.Fatalf("directory after evacuate:\n%s", d)
-	}
-	// The bucket that was never on garage is untouched.
-	if d := readDir(t, dirPath); !strings.Contains(d, "acme/kept: {state: ACTIVE, primary: minio") && !strings.Contains(d, "primary: minio") {
-		t.Fatalf("the unrelated placement moved:\n%s", d)
-	}
-	if out, _, err = run(t, "cutover", "--from", "garage", "-c", cfg); err != nil {
-		t.Fatalf("cutover --from: %v\n%s", err, out)
-	}
-	if out, _, err = run(t, "migrate", "finish", "--from", "garage", "-c", cfg); err != nil {
-		t.Fatalf("finish --from: %v\n%s", err, out)
-	}
-	d := readDir(t, dirPath)
-	if strings.Contains(d, "primary: garage") || strings.Contains(d, "source: garage") || strings.Contains(d, "garage: acme-") {
-		t.Fatalf("garage still holds a placement after the evacuation:\n%s", d)
-	}
-	// Moving every bucket is not the same as being rid of the cluster: the tenant still defaults there.
-	if !strings.Contains(out, "tenants acme default there") {
-		t.Fatalf("finish did not warn about the tenant default:\n%s", out)
-	}
-	// Repeating a finished step is a no-op, not an error: the operator can rerun after a partial failure.
-	out, _, err = run(t, "migrate", "finish", "--from", "garage", "-c", cfg)
-	if err != nil || !strings.Contains(out, "no bucket on garage needs this step") {
-		t.Fatalf("repeat: %v\n%s", err, out)
-	}
-	if _, _, err = run(t, "migrate", "start", "acme/data", "--from", "garage", "-c", cfg); err == nil {
+	if _, err := rg.cli(t, "migrate", "start", "acme/data", "--from", "vast01"); err == nil {
 		t.Fatal("a bucket and --from together were accepted")
 	}
-	// Repointing the tenant is the last step of retiring a cluster, and then nothing names it.
-	if out, _, err = run(t, "directory", "set-default", "acme", "minio", "-c", cfg); err != nil {
-		t.Fatalf("set-default: %v\n%s", err, out)
+	dir := t.TempDir()
+	out := rg.must(t, "migrate", "run", "--from", "vast01", "--until-converged", "--cursor-dir", dir, "--ledger-dir", dir)
+	if strings.Count(out, "converged: the last pass copied nothing") != 2 {
+		t.Fatalf("migrate run --from: %s", out)
 	}
-	if d := readDir(t, dirPath); strings.Contains(d, "garage") {
-		t.Fatalf("garage is still named in the directory:\n%s", d)
+	rg.must(t, "cutover", "--from", "vast01", "--window", "0s")
+	out = rg.must(t, "migrate", "finish", "--from", "vast01")
+	if strings.Count(out, "CUTOVER -> ACTIVE") != 2 || !strings.Contains(out, "still pointing at vast01: tenants.acme.default_cluster") {
+		t.Fatalf("migrate finish --from: %s", out)
 	}
-	if _, _, err = run(t, "directory", "set-default", "acme", "minio", "-c", cfg); err == nil {
-		t.Fatal("a no-op set-default was accepted")
+}
+
+// A target that ignores If-None-Match: * gives the mover a guard that can lose a client write.
+// migrate start and the mover both refuse it, naming the window, unless the operator accepts it.
+func TestLostWriteWindowRefusals(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data"); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err = run(t, "directory", "set-default", "acme", "nosuch", "-c", cfg); err == nil {
-		t.Fatal("set-default accepted an unconfigured cluster")
+	put(t, rg.vast01, "data", "k", "v")
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.addCluster(t, "garage", rg.ep02, "--conditional-write=false")
+	rg.must(t, "adopt", "vast01", "acme/data")
+	rg.must(t, "expand", "acme/data", "--to", "garage", "--create")
+	out, err := rg.cli(t, "migrate", "start", "acme/data")
+	for _, want := range []string{"conditional_write: false", "HEAD-then-commit", "docs/migrating.md", "--accept-lost-write-window"} {
+		if err == nil || !strings.Contains(out, want) {
+			t.Fatalf("migrate start refusal does not mention %q: %v\n%s", want, err, out)
+		}
+	}
+	if out := rg.must(t, "migrate", "start", "acme/data", "--accept-lost-write-window"); !strings.Contains(out, "WARNING accepted with accept_lost_write_window") {
+		t.Fatalf("accepted start: %s", out)
+	}
+	dir := t.TempDir()
+	if out, err := rg.cli(t, "migrate", "run", "acme/data", "--cursor-dir", dir, "--ledger-dir", dir); err == nil || !strings.Contains(out, "--accept-lost-write-window") {
+		t.Fatalf("the mover ran into a target without conditional PUT: %v %s", err, out)
+	}
+	if out := rg.must(t, "migrate", "run", "acme/data", "--accept-lost-write-window", "--cursor-dir", dir, "--ledger-dir", dir); !strings.Contains(out, "HEAD-then-commit guard") {
+		t.Fatalf("accepted mover run: %s", out)
+	}
+}
+
+func TestAPIUnreachable(t *testing.T) {
+	_, _, err := run(t, "status", "--api", "http://127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "is shunt serve running") {
+		t.Fatalf("unreachable API: %v", err)
+	}
+	if _, _, err := run(t, "status", "--api", "http://127.0.0.1:1", "--token-ref", "env:SHUNT_NO_SUCH_TOKEN"); err == nil || !strings.Contains(err.Error(), "--token-ref") {
+		t.Fatalf("unresolvable token: %v", err)
 	}
 }
 
@@ -241,62 +242,26 @@ func readDir(t *testing.T, path string) string {
 	return string(b)
 }
 
-// A target that ignores If-None-Match: * on PUT gives the mover a guard that can lose a client
-// write. migrate start refuses it, naming the window and the doc, unless the operator accepts it
-// explicitly; a target that honors the header needs no flag.
-func TestMigrateStartRefusesATargetWithoutConditionalPut(t *testing.T) {
-	cfg, dirPath, _ := migrationRig(t)
-	raw, err := os.ReadFile(cfg)
-	if err != nil {
+// shunt verify against a plain in-process endpoint: a clean run reports no errors and writes JSON.
+func TestVerifyCommand(t *testing.T) {
+	be := s3mem.New()
+	if err := be.CreateBucket("data01"); err != nil {
 		t.Fatal(err)
 	}
-	withProfile := strings.ReplaceAll(string(raw), "secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n", "secret_ref: env:SHUNT_TEST_CLUSTER_SECRET }, capabilities: { conditional_write: false } }\n")
-	if withProfile == string(raw) {
-		t.Fatal("rig config did not change")
+	srv := httptest.NewServer(gofakes3.New(be, gofakes3.WithTimeSkewLimit(0)).Server())
+	defer srv.Close()
+	t.Setenv("SHUNT_TEST_CLIENT_SECRET", "s")
+	report := filepath.Join(t.TempDir(), "verify.json")
+	out, stderr, err := run(t, "verify", "--endpoint", srv.URL, "--bucket", "data01", "--access-key", "AK", "--secret-ref", "env:SHUNT_TEST_CLIENT_SECRET",
+		"--duration", "300ms", "--keys", "10", "--workers", "2", "--interval", "0", "--json-out", report, "--cleanup")
+	if err != nil || !strings.Contains(out, "errors: 0") {
+		t.Fatalf("verify: %v\n%s%s", err, out, stderr)
 	}
-	if err := os.WriteFile(cfg, []byte(withProfile), 0o600); err != nil {
-		t.Fatal(err)
+	var rep map[string]any
+	if b, rerr := os.ReadFile(report); rerr != nil || json.Unmarshal(b, &rep) != nil || rep["errors"].(float64) != 0 {
+		t.Fatalf("json report: %v %v", rerr, rep)
 	}
-
-	out, _, err := run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "-c", cfg)
-	if err == nil {
-		t.Fatalf("migrate start into a cluster without conditional PUT was accepted:\n%s", out)
-	}
-	for _, want := range []string{"conditional_write: false", "If-None-Match", "HEAD-then-commit", "overwritten", "docs/migrating.md", "--accept-lost-write-window"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal does not mention %q: %v", want, err)
-		}
-	}
-	if b, _ := os.ReadFile(dirPath); !strings.Contains(string(b), "state: ACTIVE") || strings.Contains(string(b), "MIGRATING") {
-		t.Errorf("the refusal changed the directory:\n%s", b)
-	}
-
-	// --from refuses every bucket the same way.
-	if _, _, err := run(t, "migrate", "start", "--from", "garage", "--to", "minio", "--create", "-c", cfg); err == nil {
-		t.Error("migrate start --from into a cluster without conditional PUT was accepted")
-	}
-
-	out, _, err = run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "--accept-lost-write-window", "-c", cfg)
-	if err != nil {
-		t.Fatalf("migrate start with --accept-lost-write-window: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "ACTIVE -> MIGRATING") || !strings.Contains(out, "WARNING (accepted with --accept-lost-write-window)") {
-		t.Errorf("accepted start did not move and warn:\n%s", out)
-	}
-	if b, _ := os.ReadFile(dirPath); !strings.Contains(string(b), "MIGRATING") {
-		t.Errorf("directory not MIGRATING after an accepted start:\n%s", b)
-	}
-}
-
-// The profile default is a conformant backend, so a cluster with no capabilities block migrates
-// without the flag and without the warning.
-func TestMigrateStartNeedsNoFlagForAConditionalTarget(t *testing.T) {
-	cfg, _, _ := migrationRig(t)
-	out, _, err := run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "-c", cfg)
-	if err != nil {
-		t.Fatalf("migrate start: %v\n%s", err, out)
-	}
-	if strings.Contains(out, "WARNING") {
-		t.Errorf("warned for a target with conditional PUT:\n%s", out)
+	if _, _, err := run(t, "verify", "--endpoint", srv.URL); err == nil {
+		t.Fatal("verify without a bucket and credentials was accepted")
 	}
 }

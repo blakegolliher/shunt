@@ -36,6 +36,9 @@ func New(reg *prometheus.Registry, slow *telemetry.SlowRing) *Server {
 	return s
 }
 
+// Mount serves h for every path under prefix: the control API under /v1/ in resign mode.
+func (s *Server) Mount(prefix string, h http.Handler) { s.mux.Handle(prefix, h) }
+
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 

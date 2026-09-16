@@ -57,7 +57,7 @@ func newDirectoryGet(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			f, err := directory.Load(cfg.Directory.File, cfg.Clusters)
+			f, err := directory.Load(cfg.Directory.File)
 			if err != nil {
 				return err
 			}
@@ -100,7 +100,7 @@ func newDirectorySetDefault(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			d, err := directory.Open(cfg.Directory.File, cfg.Clusters)
+			d, err := directory.Open(cfg.Directory.File)
 			if err != nil {
 				return err
 			}
@@ -136,7 +136,7 @@ func newDirectoryValidate(cfgPath *string) *cobra.Command {
 			if file == "" {
 				return errors.New("no directory file: set directory.file or pass --file")
 			}
-			f, err := directory.Load(file, cfg.Clusters)
+			f, err := directory.Load(file)
 			if err != nil {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: invalid\n%v\n", file, err)
 				return err
@@ -172,7 +172,7 @@ func newDirectorySetState(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			d, err := directory.Open(cfg.Directory.File, cfg.Clusters)
+			d, err := directory.Open(cfg.Directory.File)
 			if err != nil {
 				return err
 			}
@@ -188,7 +188,7 @@ func newDirectorySetState(cfgPath *string) *cobra.Command {
 				ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 				defer cancel()
 				for _, side := range []struct{ role, cluster string }{{"source", np.Source}, {"primary", np.Primary}} {
-					if verr := refuseVersioned(ctx, cfg, side.role, side.cluster, np.Names[side.cluster]); verr != nil {
+					if verr := refuseVersioned(ctx, d.Snapshot().File().Clusters, side.role, side.cluster, np.Names[side.cluster]); verr != nil {
 						return verr
 					}
 				}
@@ -214,8 +214,8 @@ func newDirectorySetState(cfgPath *string) *cobra.Command {
 // refuseVersioned fails unless the bucket's versioning status is empty: a bucket that was ever
 // versioned (Enabled or Suspended) holds version history the migration would not carry. Every
 // error, including a missing bucket or denied access, also refuses: the check fails closed.
-func refuseVersioned(ctx context.Context, cfg *config.Config, role, clusterName, bucket string) error {
-	cc, ok := cfg.Clusters[clusterName]
+func refuseVersioned(ctx context.Context, clusters map[string]config.Cluster, role, clusterName, bucket string) error {
+	cc, ok := clusters[clusterName]
 	if !ok {
 		return fmt.Errorf("refused: %s cluster %q is not configured", role, clusterName)
 	}

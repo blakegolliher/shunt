@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/admin"
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/listener"
 	"github.com/blakegolliher/shunt/internal/proxy"
@@ -57,6 +61,11 @@ var locationLeaks = map[string]string{
 // In resign mode it also reloads the directory file on SIGHUP and every directory.poll_interval.
 func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	if cfg.Listener.Plaintext {
+		// Every line serve logs from here on says so, not just one warning an operator can miss.
+		log = log.With("client_listener", "PLAINTEXT http (listener.plaintext: true; lab use only)")
+		log.Warn("the client listener is PLAINTEXT http: signatures, credentials in presigned URLs, and object bytes cross the network unencrypted; listener.plaintext is for labs")
+	}
 
 	metrics := telemetry.NewMetrics()
 	slow := telemetry.NewSlowRing(cfg.Telemetry.Slow.RingSize, cfg.Telemetry.Slow.Threshold)
@@ -84,62 +93,77 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		IdleTimeout: cfg.Proxy.IdleTimeout, MetadataTimeout: cfg.Proxy.MetadataTimeout,
 		Via: "1.1 shunt/" + version, Log: log,
 	}
-	var clusters []*upstream.Cluster
 	var dir *directory.FileDir
+	var ctl *control.Server
 	if cfg.Auth.Mode == "resign" {
 		store, err := auth.Load(cfg.Auth.CredentialsFile)
 		if err != nil {
 			return err
 		}
-		set, err := upstream.NewSet(cfg.Clusters, upstream.Options{}, config.ResolveSecret)
-		if err != nil {
-			return err
-		}
-		defer set.Close()
-		dir, err = directory.Open(cfg.Directory.File, cfg.Clusters)
+		dir, err = directory.Open(cfg.Directory.File)
 		if err != nil {
 			return err
 		}
 		dir.ChangeLogError = func(err error) {
 			log.Error("directory change log append failed; the placement change itself is committed", "change_log", dir.ChangeLogPath(), "err", err.Error())
 		}
-		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, set, dir
-		hcfg.Rewrite, hcfg.ClockSkew = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew
-		for _, name := range set.Names() {
-			cl, _ := set.Get(name)
-			clusters = append(clusters, cl)
+		// Clusters are directory state (ADR-0008): the registry follows every installed version, and
+		// is built before the version that names a cluster becomes visible to requests.
+		registry := upstream.NewRegistry(upstream.Options{}, config.ResolveSecret)
+		defer registry.Close()
+		rewrite := !cfg.KillSwitches.XMLRewriteDisable
+		applyClusters := func(f *directory.File) error {
+			added, removed, aerr := registry.Apply(f.Clusters)
+			if aerr != nil {
+				log.Error("directory version refused: a cluster could not be built", "version", f.Version, "err", aerr.Error())
+				return aerr
+			}
+			for _, name := range added {
+				cl, _ := registry.Load().Get(name)
+				logCluster(log, cl, f.Clusters[name], rewrite)
+			}
+			for _, name := range removed {
+				log.Info("cluster removed", "cluster", name)
+			}
+			return nil
+		}
+		if applyErr := applyClusters(dir.Snapshot().File()); applyErr != nil {
+			return applyErr
+		}
+		dir.Prepare = applyClusters
+		dir.OnInstall = func(s *directory.Snapshot) {
+			publishRouteState(metrics, s)
+			warnUnknownRampHashes(log, s)
+		}
+		warnUnknownRampHashes(log, dir.Snapshot())
+		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, registry, dir
+		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = rewrite, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
+		if hcfg.DebugRoute {
+			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
-		log.Info("resign mode", "credentials", store.Len(), "clusters", set.Names(), "directory", cfg.Directory.File,
+		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log}
+		if ref := cfg.Admin.ControlTokenRef; ref != "" {
+			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
+				return fmt.Errorf("admin.control_token_ref: %w", err)
+			}
+		} else if host, _, herr := net.SplitHostPort(cfg.Admin.Address); herr != nil || !isLoopbackHost(host) {
+			log.Warn("the control API has no admin.control_token_ref and the admin listener is not loopback-only: it answers loopback peers only, so remote operators are refused", "admin", cfg.Admin.Address)
+		}
+		log.Info("resign mode", "credentials", store.Len(), "clusters", registry.Load().Names(), "directory", cfg.Directory.File,
 			"directory_version", dir.Snapshot().Version(), "poll_interval", cfg.Directory.PollInterval.String(), "xml_rewrite", hcfg.Rewrite)
 		if !hcfg.Rewrite {
 			log.Warn("kill_switches.xml_rewrite_disable is set: responses carry backend bucket names, cluster endpoints, and backend uploadIds to clients (ADR-0006)")
-			for _, cl := range clusters {
-				if evidence, leaks := locationLeaks[cl.Type]; leaks {
-					log.Warn("CompleteMultipartUpload <Location> will expose the upstream endpoint to clients while kill_switches.xml_rewrite_disable is set (docs/reference/backend-compat.md)",
-						"cluster", cl.Name, "type", cl.Type, "endpoints", cl.Endpoints, "evidence", evidence)
-				}
-			}
 		}
 	} else {
-		cl, err := upstream.New(cfg.Proxy.Cluster, cfg.Clusters[cfg.Proxy.Cluster], upstream.Options{})
+		cc := cfg.Clusters[cfg.Proxy.Cluster]
+		cl, err := upstream.New(cfg.Proxy.Cluster, cc, upstream.Options{})
 		if err != nil {
 			return err
 		}
 		defer cl.Close()
 		hcfg.Cluster = cl
-		clusters = []*upstream.Cluster{cl}
-	}
-	for _, cl := range clusters {
-		cc := cfg.Clusters[cl.Name]
-		log.Info("cluster", "cluster", cl.Name, "type", cl.Type, "scheme", cl.Scheme, "region", cl.Region, "endpoints", cl.Endpoints,
-			"id", cl.ID, "access_key", cc.Credentials.AccessKey, "enforces_sha256", cl.EnforcesSHA256, "unsigned_trailer", cl.UnsignedTrailer)
-		if cc.TLS.InsecureSkipVerify {
-			log.Warn("upstream TLS certificate verification is DISABLED (tls.insecure_skip_verify); temporary until the backend has a valid certificate", "cluster", cl.Name)
-		}
-		if cl.Scheme == "http" {
-			log.Warn("upstream scheme is http: bytes to the backend are plaintext (per-site decision, docs/DESIGN.md §2.9)", "cluster", cl.Name)
-		}
+		logCluster(log, cl, cc, true)
 	}
 	h := proxy.New(hcfg, cfg.Proxy.CopyBufferBytes)
 
@@ -155,6 +179,9 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	adm := admin.New(metrics.Registry, slow)
+	if ctl != nil {
+		adm.Mount("/v1/", ctl.Handler())
+	}
 	admSrv := adm.Listen(cfg.Admin.Address)
 
 	log.Info("shunt serving", "version", version, "listen", cfg.Listener.Address, "admin", cfg.Admin.Address,
@@ -192,9 +219,9 @@ wait:
 			}
 			break wait
 		case <-tick:
-			reloadDirectory(dir, log, "poll", metrics)
+			reloadDirectory(dir, log, "poll")
 		case <-hup:
-			reloadDirectory(dir, log, "SIGHUP", metrics)
+			reloadDirectory(dir, log, "SIGHUP")
 		}
 	}
 
@@ -210,6 +237,30 @@ wait:
 	_ = admSrv.Shutdown(dctx)
 	log.Info("stopped")
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// logCluster reports one cluster as it goes live, with the warnings its definition earns.
+func logCluster(log *slog.Logger, cl *upstream.Cluster, cc config.Cluster, rewrite bool) {
+	log.Info("cluster", "cluster", cl.Name, "type", cl.Type, "scheme", cl.Scheme, "region", cl.Region, "endpoints", cl.Endpoints,
+		"id", cl.ID, "access_key", cc.Credentials.AccessKey, "enforces_sha256", cl.EnforcesSHA256, "unsigned_trailer", cl.UnsignedTrailer)
+	if cc.TLS.InsecureSkipVerify {
+		log.Warn("upstream TLS certificate verification is DISABLED (tls.insecure_skip_verify); temporary until the backend has a valid certificate", "cluster", cl.Name)
+	}
+	if cl.Scheme == "http" {
+		log.Warn("upstream scheme is http: bytes to the backend are plaintext (per-site decision, docs/DESIGN.md §2.9)", "cluster", cl.Name)
+	}
+	if evidence, leaks := locationLeaks[cl.Type]; leaks && !rewrite {
+		log.Warn("CompleteMultipartUpload <Location> will expose the upstream endpoint to clients while kill_switches.xml_rewrite_disable is set (docs/reference/backend-compat.md)",
+			"cluster", cl.Name, "type", cl.Type, "endpoints", cl.Endpoints, "evidence", evidence)
+	}
 }
 
 // publishRouteState exports one gauge per placement that is mid-migration, and drops the series
@@ -237,15 +288,26 @@ func publishRouteState(m *telemetry.Metrics, snap *directory.Snapshot) {
 	}
 }
 
-func reloadDirectory(d *directory.FileDir, log *slog.Logger, trigger string, m *telemetry.Metrics) {
+func reloadDirectory(d *directory.FileDir, log *slog.Logger, trigger string) {
 	changed, err := d.Reload()
 	switch {
 	case err != nil:
 		log.Error("directory reload rejected; serving the last good version", "trigger", trigger, "version", d.Snapshot().Version(), "err", err.Error())
 	case changed:
-		log.Info("directory reloaded", "trigger", trigger, "version", d.Snapshot().Version())
-		publishRouteState(m, d.Snapshot())
+		log.Info("directory reloaded", "trigger", trigger, "version", d.Snapshot().Version()) // OnInstall republished the route gauges
 	case trigger == "SIGHUP":
 		log.Info("directory unchanged", "trigger", trigger, "version", d.Snapshot().Version())
+	}
+}
+
+// warnUnknownRampHashes names every ramp split by a hash this build does not implement. Its
+// hash-decided requests are refused with 503 until it moves on with a build that does (ADR-0004).
+func warnUnknownRampHashes(log *slog.Logger, s *directory.Snapshot) {
+	f := s.File()
+	for _, key := range slices.Sorted(maps.Keys(f.Placements)) {
+		if r := f.Placements[key].Ramp; r != nil && r.Hash != directory.RampHash && r.Ratio > 0 && r.Ratio < 1 {
+			log.Error("placement's ramp names a hash this build does not implement: requests its hash would route are refused with 503 rather than re-split; move the placement on with the build that started the ramp",
+				"placement", key, "ramp_hash", r.Hash, "implemented", directory.RampHash)
+		}
 	}
 }

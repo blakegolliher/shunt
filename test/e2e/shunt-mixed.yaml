@@ -1,6 +1,7 @@
 # POC-3: one shunt endpoint over Garage and MinIO (resign). Run: make run-mixed
-# up.sh writes test/e2e/data/shunt-mixed.yaml from this file with the Garage key filled in;
-# make run-mixed resets test/e2e/data/directory-mixed.yaml from directory-mixed.yaml first.
+# make run-mixed copies this file to test/e2e/data/shunt-mixed.yaml and resets
+# test/e2e/data/directory-mixed.yaml from directory-mixed.yaml with the Garage key filled in:
+# clusters are directory state since POC-5.
 # VAST joins this run only after `make check-tls-verify` passes (docs/STATUS.md).
 listener:
   address: "127.0.0.1:8443"
@@ -21,24 +22,6 @@ proxy:
   idle_timeout: 60s
   metadata_timeout: 30s
   drain_timeout: 30s
-clusters:
-  garage:
-    type: s3
-    scheme: http
-    region: garage
-    endpoints: ["127.0.0.1:3900"]
-    credentials: { access_key: GK_SET_BY_E2E, secret_ref: env:GARAGE_SECRET }
-    # measured by `make probe BACKEND=garage`: Garage 2.3.0 ignores If-None-Match: * on PUT and
-    # If-Match on DELETE
-    capabilities: { conditional_write: false, conditional_delete: false }
-  minio:
-    type: minio
-    scheme: http
-    region: us-east-1
-    endpoints: ["127.0.0.1:9000"]
-    credentials: { access_key: minioadmin, secret_ref: env:MINIO_SECRET }
-    # measured by `make probe BACKEND=minio` 2026-09-16: If-None-Match: * honored, If-Match on DELETE ignored
-    capabilities: { conditional_write: true, conditional_delete: false }
 telemetry:
   access_log: { enabled: true, path: test/e2e/data/shunt-mixed.access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }

@@ -1,4 +1,5 @@
-// Command shunt is the S3 front-end proxy. POC-2 ships `serve`, `probe`, `version`, and `check-config`;
+// Command shunt is the S3 front-end proxy and its operator CLI. The operator verbs (cluster, tenant,
+// adopt, expand, ramp, migrate, cutover, purge-source, status) call a running shunt's control API;
 // the other subcommands from docs/DESIGN.md §2.10 arrive with their phases.
 package main
 
@@ -36,7 +37,8 @@ func newRoot() *cobra.Command {
 	}
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
-	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory(), newRamp(), newMigrate(), newCutover())
+	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory(),
+		newCluster(), newTenant(), newAdopt(), newExpand(), newRamp(), newMigrate(), newCutover(), newPurgeSource(), newStatus(), newVerify())
 	return root
 }
 
@@ -66,12 +68,13 @@ func newCheckConfig() *cobra.Command {
 			}
 			summary := fmt.Sprintf("auth %s, %d clusters", c.Auth.Mode, len(c.Clusters))
 			if c.Directory.File != "" {
-				f, derr := directory.Load(c.Directory.File, c.Clusters)
+				f, derr := directory.Load(c.Directory.File)
 				if derr != nil {
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: invalid directory\n%v\n", args[0], derr)
 					return derr
 				}
-				summary += fmt.Sprintf("; directory %s version %d: %d tenants, %d placements", c.Directory.File, f.Version, len(f.Tenants), len(f.Placements))
+				summary = fmt.Sprintf("auth %s; directory %s version %d: %d clusters, %d tenants, %d placements",
+					c.Auth.Mode, c.Directory.File, f.Version, len(f.Clusters), len(f.Tenants), len(f.Placements))
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ok (%s)\n", args[0], summary)
 			return err

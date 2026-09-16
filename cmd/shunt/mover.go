@@ -1,18 +1,17 @@
-// Command mover copies a bucket's objects from a migrating placement's source cluster to its
-// primary. It implements the mover contract of docs/DESIGN.md §2.5 with the guards of ADR-0004:
+// The mover (docs/DESIGN.md §2.5, ADR-0004, ADR-0009): `shunt migrate run` copies a bucket's objects
+// from a moving placement's source cluster to its primary, in the operator's process, never in the
+// proxy's (docs/DESIGN.md decision 8). It keeps the obligations the test/mover fixture proved in POC-4:
 //
 //   - it refuses to run unless the placement is MIGRATING, or RAMPING at ratio 1, so it never
 //     copies a key whose writes still go to the source;
 //   - it never overwrites a newer client write: If-None-Match: * where the target honors it,
-//     and a HEAD-then-commit guard where it does not (Garage);
+//     and a HEAD-then-commit guard where it does not, only when the operator accepted that window;
 //   - it re-HEADs the source after each copy and removes its own copy if the object was deleted
 //     while in flight, so a delete is not resurrected; it removes only its own copy, with If-Match
 //     on the ETag its PUT returned where the target honors it, and otherwise after a HEAD shows that
 //     ETag and a Last-Modified no later than the PUT (ADR-0004 race 1);
 //   - it reproduces the source's multipart part layout, so ETags survive;
-//   - it keeps a resumable cursor and appends a JSONL ledger.
-//
-// It is a test fixture, not the product: a production mover has the same obligations.
+//   - it keeps a resumable cursor, appends a JSONL ledger, and reports each pass to the control API.
 package main
 
 import (
@@ -20,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -85,67 +83,6 @@ type stats struct {
 	bytes                                      int64
 }
 
-func main() {
-	var (
-		cfgPath  = flag.String("config", "test/e2e/data/shunt-mixed.yaml", "shunt config naming the clusters and the directory")
-		bucket   = flag.String("bucket", "", "one placement to move, as <tenant>/<bucket>")
-		from     = flag.String("from", "", "move every MIGRATING placement whose source is this cluster")
-		stateDir = flag.String("state-dir", "test/e2e/data", "where cursors and the ledger are written")
-		ledgerTo = flag.String("ledger-bucket", "", "backend bucket on the target cluster to upload the ledger to")
-		dryRun   = flag.Bool("dry-run", false, "list what would be copied and stop")
-		accept   = flag.Bool(migrate.AcceptLostWriteWindowFlag, false,
-			"copy into a target that ignores If-None-Match: * on PUT, accepting that a client write can be overwritten (docs/migrating.md)")
-	)
-	flag.Parse()
-
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		die("config: %v", err)
-	}
-	dir, err := directory.Load(cfg.Directory.File, cfg.Clusters)
-	if err != nil {
-		die("directory: %v", err)
-	}
-	jobs, err := selectPlacements(dir, cfg, *bucket, *from, *accept)
-	if err != nil {
-		die("%v", err)
-	}
-	if len(jobs) == 0 {
-		die("nothing to move: no MIGRATING placement matched (use -bucket <tenant>/<bucket> or -from <cluster>)")
-	}
-
-	ctx := context.Background()
-	total := stats{}
-	for i := range jobs {
-		j := jobs[i]
-		fmt.Printf("== %s/%s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", j.tenant, j.client,
-			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional), withdrawName(j.condDelete))
-		if !j.conditional {
-			fmt.Printf("   WARNING (accepted with -%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(j.tenant+"/"+j.client, j.dst.name))
-		}
-		s, err := move(ctx, j, *stateDir, *ledgerTo, *dryRun)
-		total.copied += s.copied
-		total.skipped += s.skipped
-		total.vanished += s.vanished
-		total.failed += s.failed
-		total.drifted += s.drifted
-		total.bytes += s.bytes
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mover: %s/%s: %v\n", j.tenant, j.client, err)
-			total.failed++
-		}
-	}
-	fmt.Printf("\nmover: %d copied, %d already on the target, %d vanished mid-copy, %d failed, %s moved\n",
-		total.copied, total.skipped, total.vanished, total.failed, humanBytes(total.bytes))
-	if total.drifted > 0 {
-		fmt.Fprintf(os.Stderr, "mover: %d objects changed ETag across the move\n", total.drifted)
-		os.Exit(1)
-	}
-	if total.failed > 0 {
-		os.Exit(1)
-	}
-}
-
 func guardName(conditional bool) string {
 	if conditional {
 		return "If-None-Match"
@@ -164,13 +101,13 @@ func withdrawName(condDelete bool) string {
 // that ignores If-None-Match: * is refused unless acceptLoss, with the message shunt migrate start
 // gives: the check lives in both, because the mover can also run on a placement RAMPING at ratio 1,
 // which migrate start never saw. Any refusal stops the whole run before a byte is copied.
-func selectPlacements(dir *directory.File, cfg *config.Config, one, from string, acceptLoss bool) ([]job, error) {
+func selectPlacements(dir *directory.File, one, from string, acceptLoss bool) ([]job, error) {
 	clients := map[string]*s3.Client{}
 	client := func(name string) (*s3.Client, error) {
 		if c, ok := clients[name]; ok {
 			return c, nil
 		}
-		cc, ok := cfg.Clusters[name]
+		cc, ok := dir.Clusters[name]
 		if !ok {
 			return nil, fmt.Errorf("cluster %q is not configured", name)
 		}
@@ -229,30 +166,31 @@ func selectPlacements(dir *directory.File, cfg *config.Config, one, from string,
 		if err != nil {
 			return nil, err
 		}
-		if !cfg.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+		if !dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
 			return nil, migrate.RefuseLostWriteWindow(key, p.Primary)
 		}
 		jobs = append(jobs, job{
 			tenant: tenant, client: name,
 			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl},
 			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl},
-			conditional: cfg.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
+			conditional: dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
 			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
-			condDelete: cfg.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
+			condDelete: dir.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
 		})
 	}
 	return jobs, nil
 }
 
 // move copies one placement's objects, resuming from its cursor.
-func move(ctx context.Context, j job, stateDir, ledgerBucket string, dryRun bool) (stats, error) {
+func move(ctx context.Context, j job, paths moverPaths, dryRun bool, out, errOut io.Writer, report func(s stats, lastKey string, done bool)) (stats, error) {
 	var s stats
 	safe := strings.ReplaceAll(j.tenant+"-"+j.client, "/", "-")
-	cursorPath := filepath.Join(stateDir, "mover-"+safe+".cursor")
-	ledgerPath := filepath.Join(stateDir, "mover-"+safe+".ledger.jsonl")
+	cursorPath := filepath.Join(paths.cursorDir, "mover-"+safe+".cursor")
+	ledgerPath := filepath.Join(paths.ledgerDir, "mover-"+safe+".ledger.jsonl")
+	ledgerBucket := paths.ledgerBucket
 	after := readCursor(cursorPath)
 	if after != "" {
-		fmt.Printf("   resuming after %q\n", after)
+		_, _ = fmt.Fprintf(out, "   resuming after %q\n", after)
 	}
 	ledger, err := os.OpenFile(ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -271,7 +209,7 @@ func move(ctx context.Context, j job, stateDir, ledgerBucket string, dryRun bool
 		for i := range page.Contents {
 			key := aws.ToString(page.Contents[i].Key)
 			if dryRun {
-				fmt.Printf("   would copy %s (%d bytes)\n", key, aws.ToInt64(page.Contents[i].Size))
+				_, _ = fmt.Fprintf(out, "   would copy %s (%d bytes)\n", key, aws.ToInt64(page.Contents[i].Size))
 				s.copied++
 				continue
 			}
@@ -285,7 +223,7 @@ func move(ctx context.Context, j job, stateDir, ledgerBucket string, dryRun bool
 				s.bytes += line.Size
 				if line.Drift {
 					s.drifted++
-					fmt.Fprintf(os.Stderr, "   %s: ETag changed across the move: %s -> %s\n", key, line.SrcETag, line.DstETag)
+					_, _ = fmt.Fprintf(errOut, "   %s: ETag changed across the move: %s -> %s\n", key, line.SrcETag, line.DstETag)
 				}
 			case "skipped":
 				s.skipped++
@@ -293,9 +231,12 @@ func move(ctx context.Context, j job, stateDir, ledgerBucket string, dryRun bool
 				s.vanished++
 			default:
 				s.failed++
-				fmt.Fprintf(os.Stderr, "   %s: %s\n", key, line.Detail)
+				_, _ = fmt.Fprintf(errOut, "   %s: %s\n", key, line.Detail)
 			}
 			writeCursor(cursorPath, key)
+			if n := s.copied + s.skipped + s.vanished + s.failed; report != nil && n%1000 == 0 {
+				report(s, key, false)
+			}
 		}
 		if page.IsTruncated == nil || !*page.IsTruncated {
 			break
@@ -306,10 +247,13 @@ func move(ctx context.Context, j job, stateDir, ledgerBucket string, dryRun bool
 	// Keeping it would make the next pass start after the last key of this one and silently skip
 	// everything a client wrote in the meantime under a lower-sorting prefix.
 	_ = os.Remove(cursorPath)
-	fmt.Printf("   %d copied, %d already there, %d vanished, %d failed, %s\n", s.copied, s.skipped, s.vanished, s.failed, humanBytes(s.bytes))
+	if report != nil && !dryRun {
+		report(s, "", true)
+	}
+	_, _ = fmt.Fprintf(out, "   %d copied, %d already there, %d vanished, %d failed, %s\n", s.copied, s.skipped, s.vanished, s.failed, humanBytes(s.bytes))
 	if ledgerBucket != "" && !dryRun {
-		if err := uploadLedger(ctx, j, ledgerBucket, ledgerPath); err != nil {
-			fmt.Fprintf(os.Stderr, "   ledger upload: %v\n", err)
+		if err := uploadLedger(ctx, j, ledgerBucket, ledgerPath, out); err != nil {
+			_, _ = fmt.Fprintf(errOut, "   ledger upload: %v\n", err)
 		}
 	}
 	return s, nil
@@ -588,7 +532,7 @@ func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOu
 	return aws.ToString(out.ETag), responseDate(out.ResultMetadata), nil
 }
 
-func uploadLedger(ctx context.Context, j job, bucket, path string) error {
+func uploadLedger(ctx context.Context, j job, bucket, path string, out io.Writer) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -597,7 +541,7 @@ func uploadLedger(ctx context.Context, j job, bucket, path string) error {
 	key := fmt.Sprintf("mover/%s-%s-%s.jsonl", j.tenant, j.client, time.Now().UTC().Format("20060102T150405Z"))
 	_, err = j.dst.cl.PutObject(ctx, &s3.PutObjectInput{Bucket: &bucket, Key: &key, Body: f})
 	if err == nil {
-		fmt.Printf("   ledger: s3://%s/%s\n", bucket, key)
+		_, _ = fmt.Fprintf(out, "   ledger: s3://%s/%s\n", bucket, key)
 	}
 	return err
 }
@@ -653,9 +597,4 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
 	}
 	return fmt.Sprintf("%d B", n)
-}
-
-func die(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "mover: "+format+"\n", a...)
-	os.Exit(2)
 }

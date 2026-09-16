@@ -24,11 +24,11 @@ func TestCheckConfigInvalidDirectoryNamesKey(t *testing.T) {
 	dir := t.TempDir()
 	dfile := filepath.Join(dir, "directory.yaml")
 	cfile := filepath.Join(dir, "shunt.yaml")
-	if err := os.WriteFile(dfile, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: MOVING, primary: garage, names: { garage: data } }\n"), 0o600); err != nil {
+	if err := os.WriteFile(dfile, []byte("version: 1\nclusters:\n  garage: { type: s3, scheme: http, region: garage, endpoints: [\"127.0.0.1:3900\"], credentials: { access_key: GK, secret_ref: env:S } }\n"+
+		"tenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: MOVING, primary: garage, names: { garage: data } }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := "listener: { address: \":8443\", tls: { cert: c.pem, key: k.pem } }\nauth: { mode: resign, credentials_file: creds.yaml }\ndirectory: { file: " + dfile + " }\n" +
-		"clusters:\n  garage: { type: s3, scheme: http, region: garage, endpoints: [\"127.0.0.1:3900\"], credentials: { access_key: GK, secret_ref: env:S } }\n"
+	cfg := "listener: { address: \":8443\", tls: { cert: c.pem, key: k.pem } }\nauth: { mode: resign, credentials_file: creds.yaml }\ndirectory: { file: " + dfile + " }\n"
 	if err := os.WriteFile(cfile, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}

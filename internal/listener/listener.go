@@ -71,15 +71,21 @@ func (cs *certSet) get(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return nil, fmt.Errorf("listener: no certificate for %q", hello.ServerName)
 }
 
-// Listen opens the TLS listener on c.Address.
+// Listen opens the client listener on c.Address: TLS, or plain TCP when c.Plaintext says so.
 func Listen(c config.Listener) (net.Listener, error) {
-	tc, err := tlsConfig(c)
-	if err != nil {
-		return nil, err
+	var tc *tls.Config
+	if !c.Plaintext {
+		var err error
+		if tc, err = tlsConfig(c); err != nil {
+			return nil, err
+		}
 	}
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", c.Address)
 	if err != nil {
 		return nil, fmt.Errorf("listener: %w", err)
+	}
+	if tc == nil {
+		return ln, nil
 	}
 	return tls.NewListener(ln, tc), nil
 }

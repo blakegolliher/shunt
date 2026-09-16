@@ -35,6 +35,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
@@ -52,6 +53,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/sigv4"
+	"github.com/blakegolliher/shunt/internal/verify"
 )
 
 const (
@@ -109,27 +111,11 @@ func propertySeed(t *testing.T) (int64, string) {
 	return n, "from SHUNT_PROPERTY_SEED"
 }
 
-// modelKey is one key's authoritative state. A worker holds the lock across the request and the
-// model update, so the model is never a guess about what the client did.
-type modelKey struct {
-	sync.Mutex
-	present bool
-	body    string
-	deleted time.Time // when the delete that emptied it returned
-}
-
-func (k *modelKey) String() string {
-	if k.present {
-		return "present:" + k.body
-	}
-	return "absent"
-}
-
 type propertyRun struct {
 	m         *mixedRig
 	rec       *recorder
 	mover     *testMover
-	keys      []*modelKey
+	keys      []*verify.Key
 	moving    atomic.Bool  // a mover pass is in flight
 	moverDone atomic.Bool  // the last pass has ended: kept keys are free
 	moverAt   atomic.Int32 // the key index the mover is on
@@ -189,7 +175,7 @@ func TestMigrationPreservesTheClientsView(t *testing.T) {
 		if err != nil || code != 200 {
 			t.Fatalf("seeding %s: %d %v", key(i), code, err)
 		}
-		r.keys[i].present, r.keys[i].body = true, body
+		r.keys[i].Present, r.keys[i].Body = true, body
 	}
 
 	deadline := time.Now().Add(dur)
@@ -257,10 +243,10 @@ func newPropertyRun(t *testing.T, seed int64, seedNote string, dur time.Duration
 		f.noHistory = true
 		f.mu.Unlock()
 	}
-	r := &propertyRun{m: m, keys: make([]*modelKey, propertyKeys), stats: map[string]int64{},
+	r := &propertyRun{m: m, keys: make([]*verify.Key, propertyKeys), stats: map[string]int64{},
 		losses: newLossLedger(), tolerateLoss: !putINM}
 	for i := range r.keys {
-		r.keys[i] = &modelKey{}
+		r.keys[i] = &verify.Key{}
 	}
 	m.minio.addBucket(propTarget)
 	m.backendNames = append(m.backendNames, propTarget)
@@ -346,7 +332,7 @@ func (r *propertyRun) placement(k string) string {
 	if p.Ramp != nil {
 		fmt.Fprintf(&b, " ratio=%g", p.Ramp.Ratio)
 		if p.State == directory.StateRamping && k != "" {
-			if migrate.InRange(p.Ramp, k) {
+			if in, _ := migrate.InRange(p.Ramp, k); in {
 				b.WriteString(" key->primary")
 			} else {
 				b.WriteString(" key->source")
@@ -404,7 +390,7 @@ func (r *propertyRun) client(t *testing.T, w int, rnd *rand.Rand, deadline time.
 			case err != nil:
 				r.violation(t, actor, id, key(i), "put-transport", ev.Start, "", "PUT %s: %v", key(i), err)
 			case code == 200:
-				k.present, k.body = true, body
+				k.Present, k.Body = true, body
 			default:
 				r.violation(t, actor, id, key(i), "put-status", ev.Start, "", "PUT %s: HTTP %d", key(i), code)
 			}
@@ -416,7 +402,7 @@ func (r *propertyRun) client(t *testing.T, w int, rnd *rand.Rand, deadline time.
 			case err != nil:
 				r.violation(t, actor, id, key(i), "delete-transport", ev.Start, "", "DELETE %s: %v", key(i), err)
 			case code == 204:
-				k.present, k.body, k.deleted = false, "", time.Now()
+				k.Present, k.Body, k.Deleted = false, "", time.Now()
 			default:
 				r.violation(t, actor, id, key(i), "delete-status", ev.Start, "", "DELETE %s: HTTP %d", key(i), code)
 			}
@@ -429,7 +415,7 @@ func (r *propertyRun) client(t *testing.T, w int, rnd *rand.Rand, deadline time.
 }
 
 // read checks one key against the model, allowing only the documented copy-in-flight window.
-func (r *propertyRun) read(t *testing.T, actor, id string, i int, k *modelKey, ev propEvent) {
+func (r *propertyRun) read(t *testing.T, actor, id string, i int, k *verify.Key, ev propEvent) {
 	code, body, err := r.do(http.MethodGet, key(i), nil, id)
 	ev.Op, ev.Status, ev.Err = http.MethodGet, code, errString(err)
 	if code == 200 {
@@ -441,33 +427,33 @@ func (r *propertyRun) read(t *testing.T, actor, id string, i int, k *modelKey, e
 		return
 	}
 	switch {
-	case k.present && code != 200:
-		r.violation(t, actor, id, key(i), "write-readable", ev.Start, "", "GET %s: HTTP %d, but the client wrote %q and never deleted it", key(i), code, k.body)
-	case k.present && string(body) != k.body:
-		if loss, ok := r.losses.staleRead(key(i), k.body, string(body)); ok {
+	case k.Present && code != 200:
+		r.violation(t, actor, id, key(i), "write-readable", ev.Start, "", "GET %s: HTTP %d, but the client wrote %q and never deleted it", key(i), code, k.Body)
+	case k.Present && string(body) != k.Body:
+		if loss, ok := r.losses.staleRead(key(i), k.Body, string(body)); ok {
 			r.violation(t, actor, id, key(i), "write-bytes", ev.Start, "known-window",
-				"GET %s: read %q, wrote %q: lost write %d, overwritten by %s inside the HEAD-then-commit window (ADR-0004 race 2)", key(i), body, k.body, loss.N, loss.MoverOp)
+				"GET %s: read %q, wrote %q: lost write %d, overwritten by %s inside the HEAD-then-commit window (ADR-0004 race 2)", key(i), body, k.Body, loss.N, loss.MoverOp)
 			break
 		}
-		r.violation(t, actor, id, key(i), "write-bytes", ev.Start, "", "GET %s: read %q, wrote %q", key(i), body, k.body)
-	case !k.present && code == 200:
+		r.violation(t, actor, id, key(i), "write-bytes", ev.Start, "", "GET %s: read %q, wrote %q", key(i), body, k.Body)
+	case !k.Present && code == 200:
 		// A copy already in flight when the delete landed may put the object back for as long as
 		// that one object's copy takes; the mover then removes it (ADR-0004). Outside a mover pass
 		// there is no such excuse.
 		if !r.moving.Load() {
-			r.violation(t, actor, id, key(i), "delete-stays-deleted", ev.Start, "", "GET %s: read %q, deleted %s ago, with no mover running", key(i), body, time.Since(k.deleted).Round(time.Millisecond))
+			r.violation(t, actor, id, key(i), "delete-stays-deleted", ev.Start, "", "GET %s: read %q, deleted %s ago, with no mover running", key(i), body, time.Since(k.Deleted).Round(time.Millisecond))
 			return
 		}
 		if ok := r.eventuallyGone(actor, i, k, 5*time.Second); !ok {
-			r.violation(t, actor, id, key(i), "delete-withdrawn-in-5s", ev.Start, "", "GET %s: read %q, deleted %s ago and still readable 5s after a mover pass touched it", key(i), body, time.Since(k.deleted).Round(time.Millisecond))
+			r.violation(t, actor, id, key(i), "delete-withdrawn-in-5s", ev.Start, "", "GET %s: read %q, deleted %s ago and still readable 5s after a mover pass touched it", key(i), body, time.Since(k.Deleted).Round(time.Millisecond))
 		}
-	case !k.present && code != 404:
+	case !k.Present && code != 404:
 		r.violation(t, actor, id, key(i), "delete-status-404", ev.Start, "", "GET %s: HTTP %d, expected 404 for a deleted key", key(i), code)
 	}
 }
 
 // eventuallyGone waits for the mover to withdraw a copy it made of a deleted object.
-func (r *propertyRun) eventuallyGone(actor string, i int, k *modelKey, within time.Duration) bool {
+func (r *propertyRun) eventuallyGone(actor string, i int, k *verify.Key, within time.Duration) bool {
 	for end := time.Now().Add(within); time.Now().Before(end); {
 		time.Sleep(20 * time.Millisecond)
 		id := r.rec.nextID("op")
@@ -567,11 +553,11 @@ func (r *propertyRun) movePass(t *testing.T, pass int) {
 	}
 }
 
-// testMover is test/mover's contract against the fake clusters: copy what the source still holds,
+// testMover is the mover contract of shunt migrate run (cmd/shunt/mover.go) against the fake clusters: copy what the source still holds,
 // never overwrite a client's newer write, and withdraw its own copy of an object that has been
 // deleted, without touching a client's newer write. putIfNoneMatch and deleteIfMatch say which
 // conditional headers the target honors (capabilities.conditional_write and conditional_delete);
-// without them the mover HEADs before it writes and before it withdraws, as test/mover does.
+// without them the mover HEADs before it writes and before it withdraws, as shunt migrate run does.
 type testMover struct {
 	m                             *mixedRig
 	source, target                string
@@ -693,7 +679,7 @@ func (mv *testMover) withdraw(k, id string, put *http.Response, step func(op str
 	return nil
 }
 
-// ownCopy mirrors test/mover: the object on the target is the mover's copy when it carries the
+// ownCopy mirrors cmd/shunt/mover.go: the object on the target is the mover's copy when it carries the
 // ETag the mover's PUT returned and was not modified after that PUT's Date. Both times are the
 // backend's own clock, at one-second resolution.
 func ownCopy(headETag, putETag string, modified, putDate time.Time) bool {
@@ -712,7 +698,7 @@ func (r *propertyRun) checkListing(t *testing.T) {
 	}
 	var want []string
 	for i, k := range r.keys {
-		if k.present {
+		if k.Present {
 			want = append(want, key(i))
 		}
 	}
@@ -773,23 +759,9 @@ func missing(a, b []string) []string {
 
 // do sends one client request through shunt without failing the test on a transport error.
 func (r *propertyRun) do(method, k string, body []byte, id string) (int, []byte, error) {
-	req, err := http.NewRequest(method, r.m.front.URL+"/data/"+k, bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, err
-	}
-	req.ContentLength = int64(len(body))
-	if len(body) == 0 {
-		req.Body = http.NoBody
-	}
-	req.Header.Set(opHeader, id)
-	sigv4.Sign(req, sigv4.Credentials{AccessKey: acmeAK, Secret: acmeSK}, "us-east-1", sigv4.UnsignedPayload, time.Now())
-	resp, err := fresh().Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close() //nolint:errcheck // read below
-	b, err := io.ReadAll(resp.Body)
-	return resp.StatusCode, b, err
+	c := verify.Client{Endpoint: r.m.front.URL, Bucket: "data", Creds: sigv4.Credentials{AccessKey: acmeAK, Secret: acmeSK}, HTTP: fresh()}
+	rep, err := c.Do(context.Background(), method, k, body, map[string]string{opHeader: id})
+	return rep.Status, rep.Body, err
 }
 
 // violation records one broken property: to disk first (violations.jsonl, then the run's report),

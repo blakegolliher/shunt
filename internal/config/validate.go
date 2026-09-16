@@ -52,6 +52,7 @@ func (e *errs) oneOf(key, val string, allowed []string) bool {
 func (c *Config) Validate() error {
 	var e errs
 	c.validateListener(&e)
+	c.validateAdmin(&e)
 	c.validateAuth(&e)
 	c.validateProxy(&e)
 	c.validateDirectory(&e)
@@ -69,11 +70,17 @@ func (c *Config) validateListener(e *errs) {
 		e.add("listener.address", "required")
 	}
 	hasDefault := l.TLS.Cert != "" || l.TLS.Key != ""
+	if l.Plaintext {
+		if hasDefault || len(l.TLS.SNI) > 0 {
+			e.add("listener.tls", "not allowed with listener.plaintext: true; a listener is TLS or plaintext, never both")
+		}
+		return
+	}
 	if hasDefault && (l.TLS.Cert == "" || l.TLS.Key == "") {
 		e.add("listener.tls", "cert and key must both be set")
 	}
 	if !hasDefault && len(l.TLS.SNI) == 0 {
-		e.add("listener.tls.cert", "required (or at least one listener.tls.sni entry)")
+		e.add("listener.tls.cert", "required (or at least one listener.tls.sni entry; a lab without TLS states listener.plaintext: true)")
 	}
 	e.oneOf("listener.tls.min_version", l.TLS.MinVersion, tlsVersions)
 	for _, name := range sortedKeys(l.TLS.SNI) {
@@ -86,6 +93,12 @@ func (c *Config) validateListener(e *errs) {
 		if d == "" {
 			e.add(fmt.Sprintf("listener.domains[%d]", i), "empty")
 		}
+	}
+}
+
+func (c *Config) validateAdmin(e *errs) {
+	if ref := c.Admin.ControlTokenRef; ref != "" && !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") {
+		e.add("admin.control_token_ref", "%q must start with env: or file:; the token itself never goes in the config", ref)
 	}
 }
 
@@ -159,13 +172,35 @@ func (c *Config) validateTelemetry(e *errs) {
 }
 
 func (c *Config) validateClusters(e *errs) {
+	if c.Auth.Mode == "resign" {
+		if len(c.Clusters) > 0 {
+			e.add("clusters", "not allowed in resign mode: clusters live in the directory file (directory.file) since POC-5, where shunt cluster add changes them without a restart")
+		}
+		return
+	}
 	if len(c.Clusters) == 0 {
 		e.add("clusters", "at least one cluster is required")
 		return
 	}
-	for _, name := range sortedKeys(c.Clusters) {
-		k := "clusters." + name
-		cl := c.Clusters[name]
+	validateClusters(e, "clusters", c.Clusters)
+}
+
+// ValidateClusters checks cluster definitions wherever they are held: the config in passthrough
+// mode, the directory file in resign mode. Every failure names its key under prefix. Call
+// ApplyClusterDefaults first.
+func ValidateClusters(prefix string, clusters map[string]Cluster) error {
+	var e errs
+	validateClusters(&e, prefix, clusters)
+	if len(e) == 0 {
+		return nil
+	}
+	return errors.Join(e...)
+}
+
+func validateClusters(e *errs, prefix string, clusters map[string]Cluster) {
+	for _, name := range sortedKeys(clusters) {
+		k := prefix + "." + name
+		cl := clusters[name]
 		e.oneOf(k+".type", cl.Type, clusterTypes)
 		e.oneOf(k+".scheme", cl.Scheme, schemes)
 		if cl.Region == "" {

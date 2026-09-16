@@ -17,13 +17,6 @@ proxy:
   idle_timeout: 60s
   metadata_timeout: 30s
   drain_timeout: 30s
-clusters:
-  minio:
-    type: minio
-    scheme: http
-    region: us-east-1
-    endpoints: ["127.0.0.1:9000"]
-    credentials: { access_key: minioadmin, secret_ref: env:MINIO_SECRET }
 telemetry:
   access_log: { enabled: true, path: test/e2e/data/shunt-minio-resign.access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }

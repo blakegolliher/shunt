@@ -62,13 +62,17 @@ func validTenant(name string) bool {
 	return true
 }
 
-// validate checks a directory file's structure and its references to the configured clusters. It
+// validate checks a directory file's structure: its clusters, and every reference to them. It
 // returns every failure joined, each naming its key. Transition legality is checked by Apply at
 // write time, not here: the validator only sees one state.
-func validate(f *File, clusters map[string]config.Cluster) error {
+func validate(f *File) error {
+	clusters := f.Clusters
 	var e errs
 	if f.Version < 0 {
 		e.add("version", "must not be negative")
+	}
+	if err := config.ValidateClusters("clusters", clusters); err != nil {
+		e = append(e, err)
 	}
 	for _, name := range sortedKeys(f.Tenants) {
 		k := "tenants." + name
@@ -109,6 +113,21 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 	}
 	e.ref(clusters, k+".primary", p.Primary)
 	migrating := p.State != StateActive
+	if p.Target != "" {
+		switch {
+		case migrating:
+			e.add(k+".target", "only allowed in state ACTIVE; a move in progress names its clusters in primary and source")
+		case p.Target == p.Primary:
+			e.add(k+".target", "must differ from primary")
+		case e.ref(clusters, k+".target", p.Target):
+			if _, ok := p.Names[p.Target]; !ok {
+				e.add(k+".names", "missing backend bucket name for target cluster %q", p.Target)
+			}
+		}
+	}
+	if p.Cutover != nil && p.State != StateCutover {
+		e.add(k+".cutover", "only allowed in state CUTOVER")
+	}
 	switch {
 	case migrating && p.Source == "":
 		e.add(k+".source", "required in state %s", p.State)
@@ -123,6 +142,9 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 	if p.Ramp != nil {
 		if p.State != StateRamping {
 			e.add(k+".ramp", "only allowed in state RAMPING")
+		}
+		if !validRampHashName(p.Ramp.Hash) {
+			e.add(k+".ramp.hash", "required: the name of the hash that splits the ramp's keys, e.g. %s; got %q", RampHash, p.Ramp.Hash)
 		}
 		if p.Ramp.Ratio < 0 || p.Ramp.Ratio > 1 {
 			e.add(k+".ramp.ratio", "must be within [0, 1], got %v", p.Ramp.Ratio)
@@ -195,4 +217,21 @@ func validateTier(e *errs, clusters map[string]config.Cluster, k string, p Place
 			}
 		}
 	}
+}
+
+// validRampHashName accepts a lowercase name of letters, digits and dashes. Whether this build
+// implements the named hash is a routing question, answered per placement (migrate.InRange), so a
+// directory written by a newer build still loads and only its ramps are refused.
+func validRampHashName(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }

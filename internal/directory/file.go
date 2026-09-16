@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -28,8 +29,7 @@ const defaultLockTimeout = 5 * time.Second
 // temp-file rename; each write appends one record to <file>.changes.jsonl. Other writers' changes
 // arrive through Reload. The lock needs a local filesystem; NFS flock semantics are not relied on.
 type FileDir struct {
-	path     string
-	clusters map[string]config.Cluster
+	path string
 
 	// LockTimeout defaults to DefaultLockTimeout.
 	LockTimeout time.Duration
@@ -38,6 +38,13 @@ type FileDir struct {
 	// ChangeLogError, if set, is called when a write succeeded but its change record could not be
 	// appended. The write is not undone: the placement row is the truth.
 	ChangeLogError func(error)
+	// Prepare, if set, is called with a validated file before it is installed, on a reload and
+	// on a write. An error rejects the file: a reload keeps the last good version, a write is
+	// refused before anything reaches disk. The proxy uses it to build the clusters a new file
+	// names before any request can route to them.
+	Prepare func(*File) error
+	// OnInstall, if set, is called after a new version is installed by a reload or a write.
+	OnInstall func(*Snapshot)
 
 	mu      sync.Mutex // serializes this instance's reloads and writes
 	snap    atomic.Pointer[Snapshot]
@@ -52,17 +59,21 @@ var _ Directory = (*FileDir)(nil)
 type Change struct {
 	Time    time.Time  `json:"ts"`
 	Actor   string     `json:"actor"`
-	Op      string     `json:"op"` // create | delete | set-state
+	Op      string     `json:"op"` // create | delete | set-state | set-default | adopt | set-target | cluster-put | cluster-remove
 	Key     string     `json:"key"`
 	Version int64      `json:"version"`
 	Before  *Placement `json:"before"`
 	After   *Placement `json:"after"`
+	// ClusterBefore and ClusterAfter are set for cluster-put and cluster-remove. They carry the
+	// secret_ref, never a secret.
+	ClusterBefore *config.Cluster `json:"cluster_before,omitempty"`
+	ClusterAfter  *config.Cluster `json:"cluster_after,omitempty"`
 }
 
 // Open loads and validates the directory file. The file must exist: a mistyped path must not
 // silently become an empty directory.
-func Open(path string, clusters map[string]config.Cluster) (*FileDir, error) {
-	d := &FileDir{path: path, clusters: clusters, LockTimeout: defaultLockTimeout, Now: time.Now}
+func Open(path string) (*FileDir, error) {
+	d := &FileDir{path: path, LockTimeout: defaultLockTimeout, Now: time.Now}
 	data, st, err := readFile(path)
 	if err != nil {
 		return nil, err
@@ -71,7 +82,7 @@ func Open(path string, clusters map[string]config.Cluster) (*FileDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validate(f, clusters); err != nil {
+	if err := validate(f); err != nil {
 		return nil, fmt.Errorf("directory %s: %w", path, err)
 	}
 	d.install(f, data, st)
@@ -79,7 +90,7 @@ func Open(path string, clusters map[string]config.Cluster) (*FileDir, error) {
 }
 
 // Load reads, parses, and validates a directory file without opening it for writes.
-func Load(path string, clusters map[string]config.Cluster) (*File, error) {
+func Load(path string) (*File, error) {
 	data, _, err := readFile(path)
 	if err != nil {
 		return nil, err
@@ -88,7 +99,7 @@ func Load(path string, clusters map[string]config.Cluster) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validate(f, clusters); err != nil {
+	if err := validate(f); err != nil {
 		return nil, fmt.Errorf("directory %s: %w", path, err)
 	}
 	return f, nil
@@ -159,7 +170,7 @@ func (d *FileDir) Reload() (bool, error) {
 	cur := d.snap.Load().Version()
 	f, err := parse(data)
 	if err == nil {
-		err = validate(f, d.clusters)
+		err = validate(f)
 	}
 	if err != nil {
 		return false, fmt.Errorf("directory: reload of %s rejected, keeping version %d: %w", d.path, cur, err)
@@ -170,7 +181,15 @@ func (d *FileDir) Reload() (bool, error) {
 		}
 		return false, fmt.Errorf("%w: %s has version %d, loaded version is %d; keeping version %d", errStaleVersion, d.path, f.Version, cur, cur)
 	}
+	if d.Prepare != nil {
+		if perr := d.Prepare(f); perr != nil {
+			return false, fmt.Errorf("directory: reload of %s rejected, keeping version %d: %w", d.path, cur, perr)
+		}
+	}
 	d.install(f, data, st)
+	if d.OnInstall != nil {
+		d.OnInstall(d.snap.Load())
+	}
 	return true, nil
 }
 
@@ -201,7 +220,7 @@ func (d *FileDir) Delete(ctx context.Context, tenant, bucket, actor string) erro
 			return ErrNotFound
 		}
 		if p.State != StateActive {
-			return fmt.Errorf("%w: %s is %s; only an ACTIVE placement can be deleted", errConflict, k, p.State)
+			return fmt.Errorf("%w: %s is %s; only an ACTIVE placement can be deleted", ErrConflict, k, p.State)
 		}
 		delete(f.Placements, k)
 		return nil
@@ -217,11 +236,11 @@ func (d *FileDir) SetTenantDefault(ctx context.Context, tenant, cluster, actor s
 		if !ok {
 			return fmt.Errorf("%w: tenant %q is not in the directory", ErrNotFound, tenant)
 		}
-		if _, ok := d.clusters[cluster]; !ok {
-			return fmt.Errorf("%w: cluster %q is not configured", ErrNotFound, cluster)
+		if _, ok := f.Clusters[cluster]; !ok {
+			return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, cluster)
 		}
 		if t.DefaultCluster == cluster {
-			return fmt.Errorf("%w: %s already defaults to %s", errConflict, tenant, cluster)
+			return fmt.Errorf("%w: %s already defaults to %s", ErrConflict, tenant, cluster)
 		}
 		t.DefaultCluster = cluster
 		f.Tenants[tenant] = t
@@ -238,7 +257,7 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 			return ErrNotFound
 		}
 		if p.State != from {
-			return fmt.Errorf("%w: %s is %s on disk, expected %s", errConflict, k, p.State, from)
+			return fmt.Errorf("%w: %s is %s on disk, expected %s", ErrConflict, k, p.State, from)
 		}
 		np, err := Apply(p, t)
 		if err != nil {
@@ -248,6 +267,82 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 		return nil
 	})
 }
+
+// PutCluster adds a cluster, or replaces its definition. The proxy's Prepare hook builds it (and
+// resolves its secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused.
+func (d *FileDir) PutCluster(ctx context.Context, name string, c config.Cluster, actor string) error {
+	return d.mutate(ctx, actor, "cluster-put", clusterKey(name), func(f *File) error {
+		if f.Clusters == nil {
+			f.Clusters = map[string]config.Cluster{}
+		}
+		f.Clusters[name] = c
+		config.ApplyClusterDefaults(f.Clusters)
+		return nil
+	})
+}
+
+// RemoveCluster deletes a cluster no tenant or placement references.
+func (d *FileDir) RemoveCluster(ctx context.Context, name, actor string) error {
+	return d.mutate(ctx, actor, "cluster-remove", clusterKey(name), func(f *File) error {
+		if _, ok := f.Clusters[name]; !ok {
+			return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
+		}
+		if refs := References(f, name); len(refs) > 0 {
+			return fmt.Errorf("%w: cluster %q is still referenced by %s", ErrInUse, name, strings.Join(refs, ", "))
+		}
+		delete(f.Clusters, name)
+		return nil
+	})
+}
+
+// Adopt writes an ACTIVE placement for a bucket that already exists on cluster under backend,
+// creating the tenant (defaulting to cluster) if it is not in the directory yet (docs/DESIGN.md §11).
+func (d *FileDir) Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
+	k := Key(tenant, bucket)
+	return d.mutate(ctx, actor, "adopt", k, func(f *File) error {
+		if _, ok := f.Placements[k]; ok {
+			return ErrExists
+		}
+		if f.Tenants == nil {
+			f.Tenants = map[string]Tenant{}
+		}
+		if _, ok := f.Tenants[tenant]; !ok {
+			f.Tenants[tenant] = Tenant{DefaultCluster: cluster}
+		}
+		f.Placements[k] = Placement{
+			State: StateActive, Primary: cluster, Names: map[string]string{cluster: backend},
+			Created: d.now().UTC().Truncate(time.Millisecond),
+		}
+		return nil
+	})
+}
+
+// SetTarget records the cluster and backend bucket an ACTIVE placement will move to (shunt expand).
+func (d *FileDir) SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
+	k := Key(tenant, bucket)
+	return d.mutate(ctx, actor, "set-target", k, func(f *File) error {
+		p, ok := f.Placements[k]
+		if !ok {
+			return ErrNotFound
+		}
+		if p.State != StateActive {
+			return fmt.Errorf("%w: %s is %s; expand prepares an ACTIVE placement", ErrConflict, k, p.State)
+		}
+		if p.Target != "" && p.Target != cluster {
+			return fmt.Errorf("%w: %s is already expanded to %s", ErrConflict, k, p.Target)
+		}
+		np := p.clone()
+		np.Target = cluster
+		if np.Names == nil {
+			np.Names = map[string]string{}
+		}
+		np.Names[cluster] = backend
+		f.Placements[k] = np
+		return nil
+	})
+}
+
+func clusterKey(name string) string { return "clusters/" + name }
 
 func (d *FileDir) now() time.Time {
 	if d.Now == nil {
@@ -271,7 +366,7 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	}
 	f, err := parse(data)
 	if err == nil {
-		err = validate(f, d.clusters)
+		err = validate(f)
 	}
 	if err != nil {
 		return fmt.Errorf("directory: %s on disk is invalid; refusing to write: %w", d.path, err)
@@ -279,17 +374,26 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	if f.Placements == nil {
 		f.Placements = map[string]Placement{}
 	}
-	var before *Placement
-	if p, ok := f.Placements[k]; ok {
+	change := Change{Actor: actor, Op: op, Key: k}
+	clusterName, isCluster := strings.CutPrefix(k, "clusters/")
+	if p, ok := f.Placements[k]; ok && !isCluster {
 		c := p.clone()
-		before = &c
+		change.Before = &c
+	}
+	if c, ok := f.Clusters[clusterName]; ok && isCluster {
+		change.ClusterBefore = &c
 	}
 	if ferr := fn(f); ferr != nil {
 		return ferr
 	}
 	f.Version++
-	if verr := validate(f, d.clusters); verr != nil {
+	if verr := validate(f); verr != nil {
 		return verr
+	}
+	if d.Prepare != nil {
+		if perr := d.Prepare(f); perr != nil {
+			return perr
+		}
 	}
 	out, err := marshal(f)
 	if err != nil {
@@ -300,12 +404,18 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	}
 	st, _ := os.Stat(d.path)
 	d.install(f, out, st)
-
-	var after *Placement
-	if p, ok := f.Placements[k]; ok {
-		after = &p
+	if d.OnInstall != nil {
+		d.OnInstall(d.snap.Load())
 	}
-	if err := d.appendChange(Change{Time: d.now().UTC(), Actor: actor, Op: op, Key: k, Version: f.Version, Before: before, After: after}); err != nil && d.ChangeLogError != nil {
+
+	if p, ok := f.Placements[k]; ok && !isCluster {
+		change.After = &p
+	}
+	if c, ok := f.Clusters[clusterName]; ok && isCluster {
+		change.ClusterAfter = &c
+	}
+	change.Time, change.Version = d.now().UTC(), f.Version
+	if err := d.appendChange(change); err != nil && d.ChangeLogError != nil {
 		d.ChangeLogError(err)
 	}
 	return nil

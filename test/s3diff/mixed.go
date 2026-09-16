@@ -93,11 +93,27 @@ func runMixed(ctx context.Context, cfgPath, viaEP, viaAddr, domain, caFile strin
 		fmt.Fprintln(os.Stderr, "mixed: credentials:", err)
 		return 2
 	}
+	vias := map[string]*target{}
+	for tenant, c := range tenants {
+		t, terr := newTarget("via-"+tenant, viaEP, viaAddr, domain, "us-east-1", c.ak, c.sk, caFile, true, false)
+		if terr != nil {
+			fmt.Fprintln(os.Stderr, "mixed:", terr)
+			return 2
+		}
+		vias[tenant] = t
+	}
+
+	// Pre-seeded placements: make sure the backend bucket exists, so a fresh lab passes.
+	seed, err := directory.Load(cfg.Directory.File)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mixed: directory:", err)
+		return 2
+	}
 	// One direct target per cluster, addressing it path-style with its own credentials.
 	directs := map[string]*target{}
 	var endpoints []string
-	for _, name := range sortedKeys(cfg.Clusters) {
-		cc := cfg.Clusters[name]
+	for _, name := range sortedKeys(seed.Clusters) {
+		cc := seed.Clusters[name]
 		secret, serr := config.ResolveSecret(cc.Credentials.SecretRef)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "mixed: cluster %s: %v\n", name, serr)
@@ -111,22 +127,6 @@ func runMixed(ctx context.Context, cfgPath, viaEP, viaAddr, domain, caFile strin
 			return 2
 		}
 		directs[name] = t
-	}
-	vias := map[string]*target{}
-	for tenant, c := range tenants {
-		t, terr := newTarget("via-"+tenant, viaEP, viaAddr, domain, "us-east-1", c.ak, c.sk, caFile, true, false)
-		if terr != nil {
-			fmt.Fprintln(os.Stderr, "mixed:", terr)
-			return 2
-		}
-		vias[tenant] = t
-	}
-
-	// Pre-seeded placements: make sure the backend bucket exists, so a fresh lab passes.
-	seed, err := directory.Load(cfg.Directory.File, cfg.Clusters)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "mixed: directory:", err)
-		return 2
 	}
 	for _, key := range sortedKeys(seed.Placements) {
 		p := seed.Placements[key]
@@ -167,7 +167,7 @@ func runMixed(ctx context.Context, cfgPath, viaEP, viaAddr, domain, caFile strin
 		vias[tenant].rec.take()
 	}
 	// The directory now names every bucket's cluster and backend name.
-	dir, err := directory.Load(cfg.Directory.File, cfg.Clusters)
+	dir, err := directory.Load(cfg.Directory.File)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mixed: directory:", err)
 		return 2

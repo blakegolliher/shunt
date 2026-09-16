@@ -32,3 +32,15 @@ Bodies are streamed and never buffered (§2.1), so the rewrite has to happen whi
 - A backend error message shape that no fixture covers could still carry a backend name in free text. The s3diff mixed-mode leak assertion is the backstop, and the rewriter counts every element it could not rewrite.
 - `CreateBucket` ignores the client's `CreateBucketConfiguration`: the directory, not the client, decides where a bucket lives, so a requested region or tag set is dropped.
 - Cross-cluster `x-amz-copy-source` is refused with 501 (carried gap in docs/STATUS.md): the backend cannot read the other cluster, and whether shunt streams the copy itself is a later phase's decision.
+
+## Amendment (POC-5, 2026-09-16): a flag-gated exception, the debug route header
+
+The walkthrough has to show an operator that writes split ~50/50 at a ratio of 0.5, and that reads succeed on both sides. From the client's side, that means knowing which cluster served each request, which is exactly what this ADR hides.
+
+`features.debug_route_header` (default off; removal criterion: P4 traces carry the route of every request) opens a narrow exception. With the flag on, a request that carries `X-Shunt-Debug: 1` gets a response header naming its route:
+- `X-Shunt-Route: <primary|source> <cluster name>` for a relayed request, set after any fallback read, so it names the side that answered;
+- `X-Shunt-Route: merged <primary>+<source>` for a merged listing.
+
+Without the flag, or without the request header, nothing is added. `X-Shunt-Debug` is never forwarded upstream. `serve` warns at startup that any client sending the header learns cluster names. The backend bucket name, the endpoint and the uploadId stay hidden either way.
+
+It is for labs and for `shunt verify --debug-route`. s3diff runs with the flag off, so transparency is still measured without it.

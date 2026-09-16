@@ -2,6 +2,13 @@
 # test/e2e/data/ before every run). Backend names equal client names, so s3diff can address the same
 # bucket directly and through shunt; its final DeleteBucket removes the placements, hence the reset.
 version: 1
+clusters:
+  minio:
+    type: minio
+    scheme: http
+    region: us-east-1
+    endpoints: ["127.0.0.1:9000"]
+    credentials: { access_key: minioadmin, secret_ref: env:MINIO_SECRET }
 tenants:
   e2e: { default_cluster: minio }
 placements:

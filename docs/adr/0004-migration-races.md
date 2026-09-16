@@ -101,7 +101,7 @@ Neither cluster has the whole bucket.
 
 - Every window above is a function of one round trip, except three: the ETag question, which is a property of the data rather than of timing; race 1's identical-bytes window, which is one second of the backend's clock; and race 1's partial dual delete, which lasts until the client retries.
 - A bucket with no concurrent overwrites migrates with no exposure at all, in either direction.
-- The mover is a test fixture (`test/mover`), not the product. It exists to prove the contract; a production mover has the same obligations, listed in §2.5.
+- The mover was a test fixture (`test/mover`) through POC-4. Since POC-5 it is `shunt migrate run`, with the same contract and refusals (ADR-0009); any other mover has the same obligations, listed in §2.5.
 - `capabilities.conditional_write` and `capabilities.conditional_delete` are measured, not assumed: re-run `shunt probe` after a backend upgrade, because a backend gaining the header silently upgrades the guarantee, and losing it silently downgrades it.
 
 ## The POC-4 property failure (15 violations in 1,857,740 operations)
@@ -126,3 +126,32 @@ Neither cluster has the whole bucket.
 **How the guarded variant is judged.** The property test classifies each violation from the target's commit stream. A client PUT that commits on a key between the mover's HEAD and the mover's PUT of that key is a loss in this window. A violation is a known-window read only when the model holds exactly that lost client body and the read returned exactly the mover's bytes. The guarded variant reports distinct lost writes as its headline and passes only if every violation is such a read. The conditional variant fails on any violation. A replay of `20260916T153050Z` classified 15,483 of 15,483 violations as known-window reads, 0 outside. `shunt migrate start` refuses a target whose `conditional_write` is false without `--accept-lost-write-window`.
 
 Neither run reached window A, B or C of race 1: no withdrawal found a newer client write on the target, and no primary leg failed. Those windows are covered by `TestMoverWithdrawLeavesANewerClientWrite` and `TestDualDeletePrimaryFailure`, not measured under load.
+
+## Amendment (POC-5, 2026-09-16): cutover evidence, purging the source, and the ramp hash
+
+**CUTOVER keeps the dual delete.** Through POC-4 a `CUTOVER` delete went to the primary only, so the source kept every key a client deleted after cutover. POC-5 deletes the source bucket, and before it does, it must show that the source holds nothing the primary lacks. With primary-only deletes that check fails for every post-cutover delete. A `CUTOVER` delete now goes to the source, then the primary, as in `MIGRATING`. Nothing else writes to the source after `MIGRATING` begins, so from then on the source only ever loses keys: **source ⊆ primary** holds from the mover's converged pass to the purge.
+
+**`shunt cutover` records its evidence.** `MIGRATING → CUTOVER` is refused unless:
+- the mover's latest report for the placement says a whole pass copied nothing and failed nothing;
+- this proxy's `shunt_migration_fallback_reads_total` for the bucket did not move during `--window` (default 60 s). The call waits out the window.
+
+The window, the time and the counter are written to the placement as `cutover:`. Two limits:
+- Both signals are per proxy and in memory. The mover report is lost on a restart; run the mover again.
+- A fleet must hold the window on every proxy until P4 aggregates the counter. This is stated in docs/migrating.md.
+
+**`shunt purge-source` is the only path that deletes a source bucket.** It is refused unless:
+- the placement is in `CUTOVER` with that evidence;
+- a listing of both buckets, walked in step with memory bounded by one page per side (ADR-0007), finds no source key the primary lacks. The first 20 such keys are returned with the refusal.
+
+It then aborts the source's in-progress multipart uploads, deletes every object and the bucket, and applies `CUTOVER → ACTIVE`, which drops the source. A client write cannot land on the source during the purge: no state after `MIGRATING` routes a write there.
+
+**Race 5, again: the ramp hash changed.** The POC-5 walkthrough measured an 80/20 write split at a ratio of 0.5. `InRange` used FNV-1a-64 directly, and FNV-1a barely moves its high bits for keys that differ only in their last bytes. `a/0000` … `a/0999` all fell under 0.5. The hash is now FNV-1a finished with murmur3's `fmix64`. A test holds sequential key shapes within ±4 % of 0.1, 0.5 and 0.9.
+
+Changing the function changes which keys are in range. A proxy that routed a running ramp with a different function than the one that started it would move keys back to the source, which is race 5's stale read, and two builds in one fleet would disagree about the same key. **So a ramp names its hash.** RAMPING start writes `ramp.hash: fnv1a-fmix64-v1` onto the placement, and the name stays for the life of the ramp. The name is a promise about exact values: `TestRampHashIsPinned` holds five keys to their hash outputs, so any change to the function needs a new name.
+
+- **On load**, a `RAMPING` placement must carry a well-formed `ramp.hash`. A name this build does not implement still loads, so one placement written by a newer build does not stop the whole directory, and `serve` logs an error naming the placement and both hashes.
+- **On the request path**, a write or read whose side the hash would decide is refused with 503 `ServiceUnavailable`, logged with the hash name, rather than routed by another function. Requests the hash does not decide still work: a key a prefix already moved, a ratio of 0 or 1, deletes, listings, bucket configuration and uploads pinned by their id.
+- **On the control path**, extending a ramp split by an unknown hash is refused. Moving it on to `MIGRATING` is allowed, since every write then goes to the primary whatever the hash says.
+
+A fleet mid-upgrade therefore never re-splits a ramp: an old proxy seeing a new hash refuses, and a new proxy seeing the old name routes by the old function or refuses. This replaces the earlier rule that proxies be upgraded only with no placement in `RAMPING`.
+

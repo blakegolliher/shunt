@@ -8,15 +8,17 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 |---|---|---|---|
 | `address` | host:port | `:443` | |
 | `domains` | list | | Wildcard domains for virtual-host addressing, e.g. `"*.s3.example.net"`; the bare name is path-style |
-| `tls.cert`, `tls.key` | paths | | Default pair; both or neither. Required unless `tls.sni` has an entry |
+| `plaintext` | bool | false | Lab use only: serve plain HTTP instead of TLS. Refused together with any `tls` key. `serve` adds `client_listener="PLAINTEXT http …"` to every log line and warns once: signatures, presigned-URL credentials and object bytes cross the network unencrypted |
+| `tls.cert`, `tls.key` | paths | | Default pair; both or neither. Required unless `tls.sni` has an entry or `plaintext: true` |
 | `tls.min_version` | `"1.2"` / `"1.3"` | `"1.2"` | |
 | `tls.sni.<name>.cert/key` | paths | | Pair selected by SNI; `<name>` may be `*.suffix` |
 
 ## `admin`
 
-| Key | Type | Default |
-|---|---|---|
-| `address` | host:port | `127.0.0.1:9900` |
+| Key | Type | Default | Rule |
+|---|---|---|---|
+| `address` | host:port | `127.0.0.1:9900` | Serves `/-/metrics`, `/-/healthz`, `/-/slow`, `/-/drain`, pprof, and the control API under `/v1/` (docs/reference/control-api.md) |
+| `control_token_ref` | `env:NAME` / `file:/path` | | Bearer token the control API requires. Unset: the API answers loopback peers only, and `serve` warns if `address` is not loopback |
 
 ## `auth`
 
@@ -30,7 +32,7 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 
 | Key | Type | Default | Rule |
 |---|---|---|---|
-| `cluster` | name | | Passthrough only, and required there: the `clusters:` entry every request is forwarded to. Forbidden in resign mode, where the placement decides the cluster per bucket |
+| `cluster` | name | | Passthrough only, and required there: the config's `clusters:` entry every request is forwarded to. Forbidden in resign mode, where the placement decides the cluster per bucket |
 | `copy_buffer_bytes` | int | 262144 | ≥ 4096; the pooled body-copy buffer size |
 | `idle_timeout` | duration | 60s | Data ops: abort when no bytes move for this long |
 | `metadata_timeout` | duration | 30s | Metadata ops: total deadline |
@@ -38,17 +40,24 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 
 ## `directory`
 
-The tenants and placements that route each bucket (docs/DESIGN.md §2.3, ADR-0005). Required in `resign` mode, forbidden in `passthrough`. It is a separate file because shunt writes it (CreateBucket, DeleteBucket, `shunt directory set-state`) and must never rewrite the operator's config.
+The clusters, tenants and placements that route each bucket (docs/DESIGN.md §1.5, §2.3; ADR-0005, ADR-0008). Required in `resign` mode, forbidden in `passthrough`. It is a separate file because shunt writes it (CreateBucket, DeleteBucket, the control API) and must never rewrite the operator's config.
 
 | Key | Type | Default | Rule |
 |---|---|---|---|
-| `file` | path | | The directory file. Must exist and validate against `clusters:` at startup |
+| `file` | path | | The directory file. Must exist and validate at startup; every cluster it names must build and resolve its `secret_ref` |
 | `poll_interval` | duration | 1s | How often `serve` re-checks the file for another writer's changes (SIGHUP reloads immediately) |
 
 Directory file schema (validated by `check-config` and `shunt directory validate`):
 
 ```yaml
 version: 12                       # increments on every write; a reload needs a higher version
+clusters:                         # same schema as clusters.<name> below; since POC-5 (ADR-0008)
+  vast-a:
+    type: vast
+    scheme: http
+    region: us-east-1
+    endpoints: ["10.0.0.1:80"]
+    credentials: { access_key: AKIA…, secret_ref: file:/etc/shunt/vast-a.secret }
 tenants:
   acme: { default_cluster: vast-a }
 placements:                       # key is <tenant>/<bucket>, both valid S3 bucket names
@@ -56,8 +65,10 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
     state: ACTIVE                 # ACTIVE | RAMPING | MIGRATING | CUTOVER
     primary: vast-a
     source: minio-1               # required unless ACTIVE, forbidden in ACTIVE
-    ramp: { ratio: 0.05, prefixes: ["2026-09/"] }   # RAMPING only
-    names: { vast-a: acme-7f3a-data }               # cluster → backend bucket name
+    ramp: { hash: fnv1a-fmix64-v1, ratio: 0.05, prefixes: ["2026-09/"] }   # RAMPING only; hash written at RAMPING start, never changed (ADR-0004)
+    target: vast-b                # ACTIVE only: recorded by `shunt expand`, used by the next ramp or migrate
+    names: { vast-a: acme-7f3a-data, vast-b: data-001 }   # cluster → backend bucket name
+    cutover: { at: 2026-09-16T20:31:00Z, window: 60s, fallback_reads: 37 }   # CUTOVER only: `shunt cutover` evidence
     cold: vault                   # with tier: emulated
     tier: emulated                # native | emulated
     lifecycle: "<LifecycleConfiguration/>"
@@ -67,6 +78,8 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
 Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write.
 
 ## `clusters.<name>`
+
+In resign mode clusters live in the directory file (above) and are added and removed live with `shunt cluster add|remove`; a `clusters:` key in a resign-mode config is refused. In passthrough mode the config keeps its `clusters:` block for `proxy.cluster`. The schema is the same in both places.
 
 | Key | Type | Rule |
 |---|---|---|
@@ -104,7 +117,11 @@ Moved out of the config into the directory file in POC-3 (see `directory` above 
 
 ## `features`
 
-Feature flags: behavior that is off until it is turned on. Each defaults off and carries a removal criterion in `internal/config/features.go`. None exist yet, and any key here is an error.
+Feature flags: behavior that is off until it is turned on. Each defaults off and carries a removal criterion in `internal/config/features.go`. Any other key here is an error.
+
+| Key | Type | Default | Rule |
+|---|---|---|---|
+| `debug_route_header` | bool | false | Lab use only. A request carrying `X-Shunt-Debug: 1` gets `X-Shunt-Route: <primary|source> <cluster>` (or `merged <primary>+<source>` on a merged listing) on its response, which `shunt verify --debug-route` tallies. This tells any client that asks which cluster served it, an exception to ADR-0006; `serve` warns at startup. `X-Shunt-Debug` is never forwarded upstream. Removal: when P4 traces carry the route of every request |
 
 ## `kill_switches`
 

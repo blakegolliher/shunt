@@ -186,7 +186,7 @@ func TestGuardedRunClassifiesAKnownWindowLoss(t *testing.T) {
 	if code, _, err := r.do(http.MethodPut, key(i), []byte("seed-body"), r.rec.nextID("seed")); err != nil || code != 200 {
 		t.Fatalf("seed: %d %v", code, err)
 	}
-	k.present, k.body = true, "seed-body"
+	k.Present, k.Body = true, "seed-body"
 	if err := r.m.dir.SetState(t.Context(), "acme", "data", directory.StateActive,
 		directory.Transition{To: directory.StateMigrating, Target: "minio", Name: propTarget}, "test"); err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestGuardedRunClassifiesAKnownWindowLoss(t *testing.T) {
 				t.Errorf("client PUT in the window: %d %v", code, err)
 				return
 			}
-			k.body = "client-body"
+			k.Body = "client-body"
 		})
 	}
 	r.m.minio.mu.Unlock()

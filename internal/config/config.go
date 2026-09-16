@@ -18,7 +18,7 @@ type Config struct {
 	Admin     Admin              `yaml:"admin"`
 	Auth      Auth               `yaml:"auth"`
 	Proxy     Proxy              `yaml:"proxy"`
-	Clusters  map[string]Cluster `yaml:"clusters"`
+	Clusters  map[string]Cluster `yaml:"clusters"` // passthrough only; resign-mode clusters live in the directory file
 	Directory Directory          `yaml:"directory"`
 	Telemetry Telemetry          `yaml:"telemetry"`
 	Features  Features           `yaml:"features"`
@@ -36,9 +36,13 @@ type Directory struct {
 
 // Listener is the client-facing TLS listener (docs/DESIGN.md §2.9).
 type Listener struct {
-	Address string      `yaml:"address"`
-	Domains []string    `yaml:"domains"` // wildcard domains for virtual-host addressing, e.g. "*.s3.example.net"
-	TLS     ListenerTLS `yaml:"tls"`
+	Address string `yaml:"address"`
+	// Plaintext serves clients over http with no TLS. It exists for labs (POC-5 walkthrough) and
+	// is never a default: it must be stated, it refuses any tls setting beside it, and serve
+	// marks every startup line with it.
+	Plaintext bool        `yaml:"plaintext"`
+	Domains   []string    `yaml:"domains"` // wildcard domains for virtual-host addressing, e.g. "*.s3.example.net"
+	TLS       ListenerTLS `yaml:"tls"`
 }
 
 // ListenerTLS holds the default certificate pair and an optional SNI map.
@@ -55,9 +59,13 @@ type CertPair struct {
 	Key  string `yaml:"key"`
 }
 
-// Admin is the separate admin listener (/-/healthz, /-/metrics, /debug/pprof).
+// Admin is the separate admin listener (/-/healthz, /-/metrics, /debug/pprof, and the control API
+// under /v1/ in resign mode).
 type Admin struct {
 	Address string `yaml:"address"`
+	// ControlTokenRef (env:NAME or file:/path) is the bearer token the control API requires. Unset,
+	// the control API answers loopback peers only.
+	ControlTokenRef string `yaml:"control_token_ref"`
 }
 
 // Auth selects the auth mode (ADR-0001).
@@ -79,34 +87,34 @@ type Proxy struct {
 
 // Cluster is one backend (docs/DESIGN.md §2.3).
 type Cluster struct {
-	Type           string       `yaml:"type"`   // vast | minio | aws | s3
-	Scheme         string       `yaml:"scheme"` // https | http — required, never defaulted
-	Region         string       `yaml:"region"`
-	EndpointMode   string       `yaml:"endpoint_mode"` // static (default) | dns
-	Endpoints      []string     `yaml:"endpoints"`     // static mode
-	Endpoint       string       `yaml:"endpoint"`      // dns mode
-	TLS            ClusterTLS   `yaml:"tls"`
-	Credentials    Credentials  `yaml:"credentials"`
-	StorageClasses string       `yaml:"storage_classes"` // native | emulated
-	StorageClass   string       `yaml:"storage_class"`   // emulated cold clusters only
-	Access         string       `yaml:"access"`          // instant | restore-required
-	Capabilities   Capabilities `yaml:"capabilities"`
+	Type           string       `yaml:"type" json:"type,omitempty"`     // vast | minio | aws | s3
+	Scheme         string       `yaml:"scheme" json:"scheme,omitempty"` // https | http — required, never defaulted
+	Region         string       `yaml:"region" json:"region,omitempty"`
+	EndpointMode   string       `yaml:"endpoint_mode,omitempty" json:"endpoint_mode,omitempty"` // static (default) | dns
+	Endpoints      []string     `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`         // static mode
+	Endpoint       string       `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`           // dns mode
+	TLS            ClusterTLS   `yaml:"tls,omitempty" json:"tls,omitempty"`
+	Credentials    Credentials  `yaml:"credentials" json:"credentials,omitempty"`
+	StorageClasses string       `yaml:"storage_classes,omitempty" json:"storage_classes,omitempty"` // native | emulated
+	StorageClass   string       `yaml:"storage_class,omitempty" json:"storage_class,omitempty"`     // emulated cold clusters only
+	Access         string       `yaml:"access,omitempty" json:"access,omitempty"`                   // instant | restore-required
+	Capabilities   Capabilities `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
 }
 
 // Capabilities is the hand-written capability profile of a cluster, filled from `shunt probe`
 // output (docs/DESIGN.md decision 3; auto-emit is P3b). Unset booleans default to true, the
 // safe assumption that the backend enforces its own checks.
 type Capabilities struct {
-	EnforcesSHA256  *bool `yaml:"enforces_sha256"`  // rejects a hex x-amz-content-sha256 that does not match the body
-	UnsignedTrailer *bool `yaml:"unsigned_trailer"` // accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+	EnforcesSHA256  *bool `yaml:"enforces_sha256,omitempty" json:"enforces_sha256,omitempty"`   // rejects a hex x-amz-content-sha256 that does not match the body
+	UnsignedTrailer *bool `yaml:"unsigned_trailer,omitempty" json:"unsigned_trailer,omitempty"` // accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
 	// ConditionalWrite: honors If-None-Match: * on PUT. The mover's overwrite guard depends on it
 	// (ADR-0004); a backend that ignores it forces the weaker HEAD-then-commit guard.
-	ConditionalWrite *bool `yaml:"conditional_write"`
+	ConditionalWrite *bool `yaml:"conditional_write,omitempty" json:"conditional_write,omitempty"`
 	// ConditionalDelete: honors If-Match on DeleteObject, refusing a mismatch with 412 and leaving
 	// the object. The mover withdraws its own copy with it (ADR-0004 race 1). Unlike the others it
 	// defaults to false: a backend that ignores the header deletes unconditionally, so assuming
 	// support where there is none deletes a client's newer write.
-	ConditionalDelete *bool `yaml:"conditional_delete"`
+	ConditionalDelete *bool `yaml:"conditional_delete,omitempty" json:"conditional_delete,omitempty"`
 }
 
 // EnforcesSHA256Or reports the capability with the default applied.
@@ -143,14 +151,14 @@ func (c Capabilities) ConditionalDeleteOr(def bool) bool {
 
 // ClusterTLS is the upstream TLS configuration for an https cluster.
 type ClusterTLS struct {
-	CA                 string `yaml:"ca"`
-	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
+	CA                 string `yaml:"ca" json:"ca,omitempty"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify" json:"insecure_skip_verify,omitempty"`
 }
 
 // Credentials are the cluster's own S3 credentials. Secrets are referenced, never inlined.
 type Credentials struct {
-	AccessKey string `yaml:"access_key"`
-	SecretRef string `yaml:"secret_ref"` // env:NAME or file:/path
+	AccessKey string `yaml:"access_key" json:"access_key,omitempty"`
+	SecretRef string `yaml:"secret_ref" json:"secret_ref,omitempty"` // env:NAME or file:/path
 }
 
 // Telemetry configures the access log and slow ring.
@@ -344,11 +352,17 @@ func (c *Config) applyDefaults() {
 	if c.Telemetry.Slow.Threshold == 0 {
 		c.Telemetry.Slow.Threshold = defaultSlowThreshold
 	}
-	for name := range c.Clusters {
-		if c.Clusters[name].EndpointMode == "" {
-			cl := c.Clusters[name]
+	ApplyClusterDefaults(c.Clusters)
+}
+
+// ApplyClusterDefaults fills the defaults of every cluster in m in place: endpoint_mode static.
+// The config (passthrough) and the directory file (resign, since POC-5) both hold clusters.
+func ApplyClusterDefaults(m map[string]Cluster) {
+	for name := range m {
+		if m[name].EndpointMode == "" {
+			cl := m[name]
 			cl.EndpointMode = "static"
-			c.Clusters[name] = cl
+			m[name] = cl
 		}
 	}
 }

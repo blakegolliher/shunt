@@ -144,3 +144,18 @@ func BenchmarkGetCertificate(b *testing.B) {
 		}
 	}
 }
+
+// A plaintext listener serves raw TCP and needs no certificate at all.
+func TestListenPlaintext(t *testing.T) {
+	ln, err := Listen(config.Listener{Address: "127.0.0.1:0", Plaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if _, isTLS := ln.(interface{ ConnectionState() tls.ConnectionState }); isTLS {
+		t.Fatal("plaintext listener wraps TLS")
+	}
+	if _, err := Listen(config.Listener{Address: "127.0.0.1:0"}); err == nil {
+		t.Fatal("a TLS listener without a certificate opened")
+	}
+}

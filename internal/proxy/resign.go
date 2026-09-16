@@ -54,6 +54,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	o.tenant, o.accessKey = id.Credential.Tenant, id.Credential.AccessKey
 	info := o.info
 	snap := h.Dir.Snapshot()
+	clusters := h.Clusters.Load() // live since POC-5; the pointers this request takes stay valid to its end
 
 	switch {
 	case info.Level == s3.LevelService && info.Op == s3.OpListBuckets:
@@ -66,7 +67,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.NotImplemented, info.Op.String()+" is not supported through shunt: its configuration names buckets and accounts that differ per backend.")
 		return nil, false
 	case info.Op == s3.OpCreateBucket:
-		h.createBucket(ctx, w, r, o, id.Credential, snap)
+		h.createBucket(ctx, w, r, o, id.Credential, snap, clusters)
 		return nil, false
 	}
 
@@ -91,7 +92,15 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// Where this request goes (docs/DESIGN.md §2.5, ADR-0004). An uploadId, resolved below, wins:
 	// a multipart upload only exists on the cluster that issued its id.
 	class := migrate.Class(info.Op)
-	route := migrate.Decide(p, class, info.Key)
+	route, err := migrate.Decide(p, class, info.Key)
+	if err != nil {
+		if h.Log != nil {
+			h.Log.Error("refusing a ramped request: the placement's ramp names a hash this build does not implement; routing it would re-split keys (ADR-0004)",
+				"request_id", o.rid, "tenant", o.tenant, "bucket", info.Bucket, "err", err.Error())
+		}
+		h.answer(w, r, o, s3.ServiceUnavailable, "This bucket's migration ramp cannot be routed by this proxy version. Try again later.")
+		return nil, false
+	}
 	clusterName := p.Primary
 	if route.Cluster == migrate.Source {
 		clusterName = p.Source
@@ -102,7 +111,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		return nil, false
 	}
 	if prefix != "" {
-		pcl, found := h.Clusters.ByID(prefix)
+		pcl, found := clusters.ByID(prefix)
 		if !found || p.Names[pcl.Name] == "" {
 			h.answer(w, r, o, s3.NoSuchUpload, "")
 			return nil, false
@@ -110,7 +119,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		clusterName = pcl.Name
 		route = migrate.Route{Cluster: migrate.Primary} // pinned: no fallback, no dual, no merge
 	}
-	cl, ok := h.Clusters.Get(clusterName)
+	cl, ok := clusters.Get(clusterName)
 	if !ok {
 		if h.Log != nil {
 			h.Log.Error("placement routes to a cluster that is not configured", "request_id", o.rid, "tenant", o.tenant, "bucket", info.Bucket, "cluster", clusterName)
@@ -133,7 +142,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		if route.Cluster == migrate.Source {
 			name = p.Primary
 		}
-		if oc, found := h.Clusters.Get(name); found && p.Names[name] != "" {
+		if oc, found := clusters.Get(name); found && p.Names[name] != "" {
 			other, otherBackend = oc, p.Names[name]
 		}
 	}
@@ -190,6 +199,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		for _, name := range clientAuthHeaders {
 			out.Header.Del(name)
 		}
+		out.Header.Del(headerDebug) // shunt's own request header; the backend never sees it
 		out.Header.Del("X-Amz-Expected-Bucket-Owner")
 		out.Header.Del("X-Amz-Source-Expected-Bucket-Owner")
 		if copySource != "" {

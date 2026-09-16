@@ -21,3 +21,28 @@ jobs:
         run: make all
       - name: go mod tidy is clean
         run: make tidy
+
+  walkthrough:
+    # POC-5: docs/walkthrough.md, unattended, on Garage (playing vast01) and MinIO (playing vast02).
+    # `shunt verify` reads and writes through shunt from step 4 to step 10; any error fails the job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: tools (aws-cli and jq ship on the runner image)
+        run: aws --version && jq --version
+      - name: e2e backends
+        run: make e2e-up COMPOSE="docker compose"
+      - name: make walkthrough
+        run: make walkthrough
+      - name: logs
+        if: failure()
+        run: |
+          cat test/e2e/data/walkthrough/run/shunt.log || true
+          cat test/e2e/data/walkthrough/run/verify.log || true
+      - name: e2e down
+        if: always()
+        run: make e2e-down COMPOSE="docker compose"

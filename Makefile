@@ -37,7 +37,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare licenses vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough s3diff s3diff-mixed bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -183,25 +183,39 @@ probe: build ## shunt probe against BACKEND=garage|minio|vast
 	  $(BIN)/shunt probe $(PROBE_ARGS) $(PROBE_FLAGS)
 
 run-garage-resign: build ## run shunt in resign mode in front of the e2e Garage (foreground; resets its directory)
-	cp $(E2E_DIR)/directory-garage.yaml $(E2E_DIR)/data/directory-garage.yaml
+	. $(E2E_DIR)/data/garage.env && sed "s/GK_SET_BY_E2E/$$GARAGE_ACCESS_KEY/" $(E2E_DIR)/directory-garage.yaml > $(E2E_DIR)/data/directory-garage.yaml
+	cp $(E2E_DIR)/shunt-garage-resign.yaml $(E2E_DIR)/data/shunt-garage-resign.yaml
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-garage-resign.yaml
 
 run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (foreground; resets its directory)
 	cp $(E2E_DIR)/directory-minio.yaml $(E2E_DIR)/data/directory-minio.yaml
+	cp $(E2E_DIR)/shunt-minio-resign.yaml $(E2E_DIR)/data/shunt-minio-resign.yaml
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-minio-resign.yaml
 
 run-mixed: build ## POC-3: one shunt in resign mode over the e2e Garage and MinIO (foreground; resets the mixed directory)
-	# Regenerate the run config from the template: a config edited after `make e2e-up` was otherwise
-	# still the old one on disk, and the run silently used stale capabilities.
-	. $(E2E_DIR)/data/garage.env && sed "s/GK_SET_BY_E2E/$$GARAGE_ACCESS_KEY/" $(E2E_DIR)/shunt-mixed.yaml > $(E2E_DIR)/data/shunt-mixed.yaml
-	cp $(E2E_DIR)/directory-mixed.yaml $(E2E_DIR)/data/directory-mixed.yaml
+	# Regenerate the run config and directory from the templates: a template edited after `make e2e-up`
+	# was otherwise still the old one on disk, and the run silently used stale capabilities.
+	cp $(E2E_DIR)/shunt-mixed.yaml $(E2E_DIR)/data/shunt-mixed.yaml
+	. $(E2E_DIR)/data/garage.env && sed "s/GK_SET_BY_E2E/$$GARAGE_ACCESS_KEY/" $(E2E_DIR)/directory-mixed.yaml > $(E2E_DIR)/data/directory-mixed.yaml
 	rm -f $(E2E_DIR)/data/directory-mixed.yaml.changes.jsonl
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-mixed.yaml
 
+WALKTHROUGH_DIR := $(E2E_DIR)/data/walkthrough
+walkthrough: build ## POC-5: the operator walkthrough, unattended, e2e Garage (as vast01) -> MinIO (as vast02); needs make e2e-up
+	mkdir -p $(WALKTHROUGH_DIR)
+	. $(E2E_DIR)/data/garage.env && umask 077 && \
+	  printf 'access_key=%s\nsecret=%s\n' "$$GARAGE_ACCESS_KEY" "$$GARAGE_SECRET" > $(WALKTHROUGH_DIR)/garage.creds && \
+	  printf 'access_key=%s\nsecret=%s\n' "$$MINIO_ACCESS_KEY" "$$MINIO_SECRET" > $(WALKTHROUGH_DIR)/minio.creds
+	rm -rf $(WALKTHROUGH_DIR)/run
+	$(E2E_DIR)/walkthrough.sh --reset --work $(WALKTHROUGH_DIR)/run \
+	  --src http://127.0.0.1:3900 --src-creds $(WALKTHROUGH_DIR)/garage.creds --src-type s3 --src-region garage --src-conditional-write false \
+	  --dst http://127.0.0.1:9000 --dst-creds $(WALKTHROUGH_DIR)/minio.creds --dst-type minio --dst-region us-east-1 \
+	  --listen 127.0.0.1:8008 --admin 127.0.0.1:9908 $(WALKTHROUGH_ARGS)
+
 run-vast-resign: build ## run shunt in resign mode in front of the VAST lab cluster (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
-	@sed "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" $(E2E_DIR)/shunt-vast-resign.yaml > $(E2E_DIR)/data/shunt-vast-resign.yaml
-	cp $(E2E_DIR)/directory-vast.yaml $(E2E_DIR)/data/directory-vast.yaml
+	cp $(E2E_DIR)/shunt-vast-resign.yaml $(E2E_DIR)/data/shunt-vast-resign.yaml
+	@sed "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" $(E2E_DIR)/directory-vast.yaml > $(E2E_DIR)/data/directory-vast.yaml
 	$(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-vast-resign.yaml
 
 e2e-down: ## tear down the e2e backends and their data

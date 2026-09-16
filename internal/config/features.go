@@ -1,9 +1,15 @@
 package config
 
 // Features holds feature flags: behavior that is off until an operator turns it on. Every flag
-// defaults off and carries a removal criterion (CLAUDE.md). None exist yet; the empty struct keeps
-// `features:` a known key, so an unknown flag name is still an error.
-type Features struct{}
+// defaults off and carries a removal criterion (CLAUDE.md).
+type Features struct {
+	// DebugRouteHeader answers a request carrying `X-Shunt-Debug: 1` with `X-Shunt-Route: <side>
+	// <cluster>`, naming which side of a migration served it and the cluster (ADR-0006 amendment).
+	// It deliberately breaks "a client cannot tell which cluster serves it", for labs and the
+	// POC-5 walkthrough, which uses it to show the write split. Off, the request header is ignored.
+	// Removal criterion: P4 traces carry the route of every request, and the walkthrough reads them.
+	DebugRouteHeader bool `yaml:"debug_route_header"`
+}
 
 // KillSwitches turn off behavior that is normally on, for an operator who hits a bug in it while
 // shunt is serving. A kill switch is not a feature flag: it defaults to the normal behavior

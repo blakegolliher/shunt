@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +59,64 @@ func TestRampSplitsWritesByKey(t *testing.T) {
 	}
 	if v := metricCounter(t, m.h.Metrics, "shunt_ramp_writes_total", `bucket="acme/data",side="source"`); v != 1 {
 		t.Errorf("writes to the source: %v", v)
+	}
+}
+
+// A ramp written by a build whose hash this proxy does not implement is refused where the hash
+// decides, never re-split: routing it by another hash would send a key's writes to the other side
+// mid-ramp (ADR-0004, POC-5 amendment). Requests the hash does not decide still work.
+func TestUnknownRampHashRefusesInsteadOfResplitting(t *testing.T) {
+	m := newMixedRig(t, nil)
+	ramp(t, m, directory.Transition{To: directory.StateRamping, Ratio: 0.5, Prefixes: []string{"moved/"}})
+	if p, _ := m.dir.Snapshot().Lookup("acme", "data"); p.Ramp.Hash != directory.RampHash {
+		t.Fatalf("RAMPING start did not record the hash: %+v", p.Ramp)
+	}
+	raw, err := os.ReadFile(m.dirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := directory.Load(m.dirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := strings.Replace(string(raw), "hash: "+directory.RampHash, "hash: fnv1a-fmix64-v2", 1)
+	next = strings.Replace(next, fmt.Sprintf("version: %d", f.Version), fmt.Sprintf("version: %d", f.Version+1), 1)
+	if next == string(raw) || !strings.Contains(next, "fnv1a-fmix64-v2") {
+		t.Fatalf("could not rewrite the ramp hash in:\n%s", raw)
+	}
+	if err := os.WriteFile(m.dirPath, []byte(next), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := m.dir.Reload(); err != nil || !changed {
+		t.Fatalf("a directory naming an unknown ramp hash must still load: %v %v", changed, err)
+	}
+
+	for _, req := range []struct{ method, path string }{{"PUT", "/data/stay/k"}, {"GET", "/data/stay/k"}} {
+		var body []byte
+		if req.method == "PUT" {
+			body = []byte("x")
+		}
+		r := m.acme(t, req.method, req.path, body)
+		if r.StatusCode != http.StatusServiceUnavailable || (req.method == "PUT" && !strings.Contains(string(r.body), "ramp")) {
+			t.Fatalf("%s by hash: want 503 naming the ramp, got %d %s", req.method, r.StatusCode, r.body)
+		}
+	}
+	if !strings.Contains(m.alerts.String(), `fnv1a-fmix64-v2`) {
+		t.Errorf("no error log naming the hash: %s", m.alerts.String())
+	}
+	if _, ok := m.garage.object("acme-1111-data", "stay/k"); ok {
+		t.Error("a refused write reached the source")
+	}
+	// A prefix decides without the hash, and a listing does not depend on it.
+	if r := m.acme(t, "PUT", "/data/moved/k", []byte("x")); r.StatusCode != 200 {
+		t.Fatalf("write decided by prefix: %d %s", r.StatusCode, r.body)
+	}
+	if r := m.acme(t, "GET", "/data?list-type=2", nil); r.StatusCode != 200 {
+		t.Fatalf("listing: %d %s", r.StatusCode, r.body)
+	}
+	// The control path refuses to extend the ramp rather than re-split it.
+	if err := m.dir.SetState(context.Background(), "acme", "data", directory.StateRamping, directory.Transition{To: directory.StateRamping, Ratio: 0.9}, "test"); err == nil || !strings.Contains(err.Error(), "does not implement") {
+		t.Errorf("extending a ramp with an unknown hash: %v", err)
 	}
 }
 
@@ -225,7 +284,8 @@ func TestMergedListingToleratesMissingSide(t *testing.T) {
 	}
 }
 
-// After CUTOVER the source is out of the path: no fallback, no dual delete, no merge.
+// After CUTOVER the source is out of the read and write path: no fallback, no merge. Deletes still
+// reach it, source first, so purge-source can require that it holds nothing the primary lacks.
 func TestCutoverStopsUsingTheSource(t *testing.T) {
 	m := newMixedRig(t, nil)
 	m.acme(t, "PUT", "/data/left-behind", []byte("on the source"))
@@ -243,6 +303,12 @@ func TestCutoverStopsUsingTheSource(t *testing.T) {
 	}
 	if v := metricCounter(t, m.h.Metrics, "shunt_migration_fallback_reads_total", `bucket="acme/data"`); v != 0 {
 		t.Errorf("fallback after cutover: %v", v)
+	}
+	if r := m.acme(t, "DELETE", "/data/left-behind", nil); r.StatusCode != 204 {
+		t.Fatalf("delete after cutover: %d", r.StatusCode)
+	}
+	if _, ok := m.garage.object("acme-1111-data", "left-behind"); ok {
+		t.Error("a delete after cutover left the key on the source; purge-source's diff would never empty")
 	}
 }
 
@@ -515,5 +581,49 @@ func BenchmarkMergedListingPage1000Keys(b *testing.B) {
 		if r := m.acme(b, "GET", "/data?list-type=2&max-keys=1000", nil); r.StatusCode != 200 {
 			b.Fatalf("listing: %d", r.StatusCode)
 		}
+	}
+}
+
+// features.debug_route_header: X-Shunt-Route names the side and cluster that served a request, only
+// when the flag is on and the request asks with X-Shunt-Debug: 1; the backend never sees the ask.
+func TestDebugRouteHeader(t *testing.T) {
+	route := func(m *mixedRig, method, target string, debug bool) (reply, string) {
+		hdr := map[string]string{}
+		if debug {
+			hdr["X-Shunt-Debug"] = "1"
+		}
+		var body []byte
+		if method == "PUT" {
+			body = []byte("x")
+		}
+		r := m.send(t, method, target, "", body, acmeAK, acmeSK, hdr)
+		return r, r.Header.Get("X-Shunt-Route")
+	}
+	off := newMixedRig(t, nil)
+	if _, got := route(off, "PUT", "/data/k", true); got != "" {
+		t.Errorf("flag off: header %q", got)
+	}
+
+	rigDebugRoute = true
+	m := newMixedRig(t, nil)
+	rigDebugRoute = false
+	if _, got := route(m, "PUT", "/data/k", false); got != "" {
+		t.Errorf("flag on, no X-Shunt-Debug: header %q", got)
+	}
+	if _, got := route(m, "PUT", "/data/on-source", true); got != "primary garage" {
+		t.Errorf("ACTIVE write: %q", got)
+	}
+	if _, h := m.garage.last(); h.Get("X-Shunt-Debug") != "" {
+		t.Error("X-Shunt-Debug reached the backend")
+	}
+	ramp(t, m, directory.Transition{To: directory.StateMigrating})
+	if r, got := route(m, "GET", "/data/on-source", true); r.StatusCode != 200 || got != "source garage" {
+		t.Errorf("MIGRATING read falling back to the source: %d %q", r.StatusCode, got)
+	}
+	if _, got := route(m, "PUT", "/data/new", true); got != "primary minio" {
+		t.Errorf("MIGRATING write: %q", got)
+	}
+	if r, got := route(m, "GET", "/data?list-type=2", true); r.StatusCode != 200 || got != "merged minio+garage" {
+		t.Errorf("merged listing: %d %q", r.StatusCode, got)
 	}
 }

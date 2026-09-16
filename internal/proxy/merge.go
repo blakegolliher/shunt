@@ -85,6 +85,9 @@ func (h *Handler) mergeListing(ctx context.Context, w http.ResponseWriter, r *ht
 	primary *upstream.Cluster, pBackend string, source *upstream.Cluster, sBackend string) {
 	start := time.Now()
 	bucketKey := directory.Key(o.tenant, o.info.Bucket)
+	if h.wantsRoute(r) {
+		w.Header().Set(headerRoute, "merged "+primary.Name+"+"+source.Name)
+	}
 	q := r.URL.Query()
 	maxKeys := maxListKeys
 	if v := q.Get("max-keys"); v != "" {
@@ -203,11 +206,11 @@ func (h *Handler) fetchListPage(ctx context.Context, o *outcome, s *listSide, q 
 	s.items = s.items[:0]
 	for _, c := range page.Contents {
 		if c.Key != nil {
-			s.items = append(s.items, listItem{name: decodeKey(*c.Key), obj: c})
+			s.items = append(s.items, listItem{name: s3.DecodeListingKey(*c.Key), obj: c})
 		}
 	}
 	for _, cp := range page.CommonPrefixes {
-		s.items = append(s.items, listItem{name: decodeKey(cp.Prefix), prefix: true})
+		s.items = append(s.items, listItem{name: s3.DecodeListingKey(cp.Prefix), prefix: true})
 	}
 	sort.Slice(s.items, func(i, j int) bool { return s.items[i].name < s.items[j].name })
 	for len(s.items) > 0 && after != "" && s.items[0].name <= after {
@@ -221,20 +224,6 @@ func (h *Handler) fetchListPage(ctx context.Context, o *outcome, s *listSide, q 
 		s.done = true
 	}
 	return nil
-}
-
-// decodeKey undoes the percent-encoding of an encoding-type=url listing. A backend that ignores
-// encoding-type returns the key verbatim, which decodes to itself unless the key really contains a
-// percent escape; that is the one key shape this normalization cannot tell apart, and it is
-// recorded in docs/backend-compat.md rather than guessed at.
-func decodeKey(s string) string {
-	if !strings.Contains(s, "%") {
-		return s
-	}
-	if d, err := url.PathUnescape(s); err == nil {
-		return d
-	}
-	return s
 }
 
 // writeListing renders the merged page as a ListBucketResult naming the client's bucket.

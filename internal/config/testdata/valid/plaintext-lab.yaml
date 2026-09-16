@@ -1,0 +1,4 @@
+# POC-5 lab: plaintext client listener on :8008, resign mode, clusters in the directory file.
+listener: { address: ":8008", plaintext: true }
+auth: { mode: resign, credentials_file: /etc/shunt/credentials.yaml }
+directory: { file: internal/directory/testdata/valid/mixed.yaml }

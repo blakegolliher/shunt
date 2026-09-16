@@ -2,448 +2,552 @@ package main
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"sort"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
-	"github.com/blakegolliher/shunt/internal/sigv4"
-	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
-// The migration verbs of docs/DESIGN.md §2.10. Each one is a guarded wrapper over the same state
-// machine `directory set-state` uses: they exist so an operator states an intent ("ramp to a
-// quarter", "cut over") instead of a state name, and so the target bucket can be created in the
-// same step. The guards live in the directory package, not here.
+// The operator verbs (docs/DESIGN.md §2.10, docs/walkthrough.md). Each one is a call to the control
+// API of a running shunt, which checks it and writes it through the directory's write path: the
+// CLI never edits the directory file itself. docs/reference/control-api.md lists the endpoints.
+
+func newCluster() *cobra.Command {
+	cmd := &cobra.Command{Use: "cluster", Short: "Add or remove a backend cluster while shunt serves"}
+	cmd.AddCommand(newClusterAdd(), newClusterRemove())
+	return cmd
+}
+
+func newClusterAdd() *cobra.Command {
+	var (
+		o                            apiOptions
+		c                            config.Cluster
+		conditionalWrite, condDelete bool
+	)
+	cmd := &cobra.Command{
+		Use:   "add <name>",
+		Short: "Add a cluster, or replace its definition; the proxy uses it from the next request",
+		Long: "Adds a backend cluster to the directory. shunt builds it before the change lands, including resolving\n" +
+			"--secret-ref in the server's environment, so a cluster the proxy could not sign for is refused.\n" +
+			"Use file: secret refs for a live add: an env: ref must already be in shunt serve's environment.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("conditional-write") {
+				c.Capabilities.ConditionalWrite = &conditionalWrite
+			}
+			if cmd.Flags().Changed("conditional-delete") {
+				c.Capabilities.ConditionalDelete = &condDelete
+			}
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.ClusterStatus
+			if callErr := api.call(cmd.Context(), "POST", "/v1/clusters", control.ClusterRequest{Name: args[0], Cluster: c}, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s: %s %s://%s region %s (conditional_write %v, conditional_delete %v)\n",
+				out.Name, out.Type, out.Scheme, strings.Join(out.Endpoints, ","), out.Region, out.ConditionalWrite, out.ConditionalDelete)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	f := cmd.Flags()
+	f.StringVar(&c.Type, "type", "", "vast | minio | aws | s3")
+	f.StringVar(&c.Scheme, "scheme", "", "http | https (never defaulted)")
+	f.StringVar(&c.Region, "region", "", "the region shunt signs requests to this cluster with")
+	f.StringArrayVar(&c.Endpoints, "endpoint", nil, "host:port (repeatable)")
+	f.StringVar(&c.Credentials.AccessKey, "access-key", "", "the cluster's access key")
+	f.StringVar(&c.Credentials.SecretRef, "secret-ref", "", "env:NAME or file:/path holding the secret, resolved by shunt serve")
+	f.StringVar(&c.TLS.CA, "ca", "", "https: CA bundle to verify the cluster's certificate")
+	f.BoolVar(&conditionalWrite, "conditional-write", true, "the cluster honors If-None-Match: * on PUT (shunt probe measures it)")
+	f.BoolVar(&condDelete, "conditional-delete", false, "the cluster honors If-Match on DELETE (shunt probe measures it)")
+	return cmd
+}
+
+func newClusterRemove() *cobra.Command {
+	var o apiOptions
+	cmd := &cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove a cluster nothing references any more",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out map[string]string
+			if callErr := api.call(cmd.Context(), "DELETE", "/v1/clusters/"+url.PathEscape(args[0]), nil, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s removed; shunt no longer holds a connection to it\n", args[0])
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	return cmd
+}
+
+func newTenant() *cobra.Command {
+	cmd := &cobra.Command{Use: "tenant", Short: "Change a tenant's settings"}
+	var o apiOptions
+	setDefault := &cobra.Command{
+		Use:   "set-default <tenant> <cluster>",
+		Short: "Point the cluster a tenant's new buckets land on elsewhere",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out map[string]any
+			if callErr := api.call(cmd.Context(), "POST", "/v1/tenants/"+url.PathEscape(args[0])+"/default-cluster", control.TenantDefaultRequest{Cluster: args[1]}, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: new buckets now land on %s (directory version %v)\n", args[0], args[1], out["version"])
+			return err
+		},
+	}
+	addAPIFlags(setDefault, &o)
+	cmd.AddCommand(setDefault)
+	return cmd
+}
+
+func newAdopt() *cobra.Command {
+	var (
+		o    apiOptions
+		name string
+	)
+	cmd := &cobra.Command{
+		Use:   "adopt <cluster> <tenant/bucket>",
+		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, err := placementPath(args[1])
+			if err != nil {
+				return err
+			}
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.PlacementStatus
+			if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name}, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", out.Key, out.Primary, out.Names[out.Primary])
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().StringVar(&name, "name", "", "the bucket's name on the cluster (default: the same name)")
+	return cmd
+}
+
+func newExpand() *cobra.Command {
+	var (
+		o   apiOptions
+		req control.ExpandRequest
+	)
+	cmd := &cobra.Command{
+		Use:   "expand <tenant/bucket>",
+		Short: "Prepare a second cluster for a bucket: its bucket, a versioning check, and a canary",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, err := placementPath(args[0])
+			if err != nil {
+				return err
+			}
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.ExpandResult
+			if callErr := api.call(cmd.Context(), "POST", path+"/expand", req, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			created := "exists"
+			if out.CreatedBucket {
+				created = "created"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s (%s); canary write, read, delete ok; conditional_write %v, conditional_delete %v (directory version %d)\n",
+				out.Key, out.Target, out.Name, created, out.ConditionalWrite, out.ConditionalDelete, out.Version)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	f := cmd.Flags()
+	f.StringVar(&req.To, "to", "", "the cluster the bucket will move to")
+	f.StringVar(&req.Name, "name", "", "the bucket's name there (default: <name>-001, the lowest unused)")
+	f.BoolVar(&req.Create, "create", false, "create the bucket there if it does not exist")
+	return cmd
+}
 
 func newRamp() *cobra.Command {
 	var (
-		cfgPath  string
-		to, name string
-		from     string
-		create   bool
-		ratio    float64
-		prefixes []string
-		actor    string
+		o    apiOptions
+		req  control.RampRequest
+		from string
 	)
 	cmd := &cobra.Command{
 		Use:   "ramp <tenant/bucket>",
-		Short: "Send a growing share of a bucket's writes to a new cluster",
+		Short: "Send a growing share of a bucket's writes to its new cluster",
 		Long: "Moves the placement into RAMPING, or raises an existing ramp. --ratio is the fraction of keys,\n" +
 			"chosen by a stable hash of the key, whose writes go to the new primary; --prefix names key\n" +
 			"prefixes that go there whatever the ratio. A ramp only grows: shrinking needs a reconcile.\n" +
 			"Reads still fall back to the source, so a key written on either side is readable throughout.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if ratio == 0 && len(prefixes) == 0 {
-				return fmt.Errorf("give --ratio, --prefix, or both")
+			if req.Ratio == 0 && len(req.Prefixes) == 0 {
+				return errors.New("give --ratio, --prefix, or both")
 			}
-			if ratio < 0 || ratio > 1 {
-				return fmt.Errorf("--ratio %v is outside 0..1", ratio)
+			if req.Ratio < 0 || req.Ratio > 1 {
+				return fmt.Errorf("--ratio %v is outside 0..1", req.Ratio)
 			}
-			return transitionAll(cmd, cfgPath, args, from, directory.Transition{
-				To: directory.StateRamping, Target: to, Name: name, Ratio: ratio, Prefixes: prefixes,
-			}, create, false, actor)
+			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
+				return transition(cmd, api, o, key, "/ramp", req, time.Minute)
+			})
 		},
 	}
+	addAPIFlags(cmd, &o)
 	f := cmd.Flags()
-	f.StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file naming the directory file and its clusters")
-	f.StringVar(&to, "to", "", "the cluster that becomes primary (required on the first step)")
-	f.StringVar(&from, "from", "", "instead of one bucket: every bucket currently served by this cluster")
-	f.StringVar(&name, "name", "", "the backend bucket name on --to (default: the generated name)")
-	f.BoolVar(&create, "create", false, "create the backend bucket on --to if it does not exist")
-	f.Float64Var(&ratio, "ratio", 0, "fraction of keys, by hash, whose writes go to the new primary")
-	f.StringArrayVar(&prefixes, "prefix", nil, "key prefix whose writes go to the new primary (repeatable)")
-	f.StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
+	f.Float64Var(&req.Ratio, "ratio", 0, "fraction of keys, by hash, whose writes go to the new primary")
+	f.StringArrayVar(&req.Prefixes, "prefix", nil, "key prefix whose writes go to the new primary (repeatable)")
+	f.StringVar(&req.To, "to", "", "the new cluster, if expand has not recorded one")
+	f.StringVar(&req.Name, "name", "", "the bucket's name on --to (default: a generated name)")
+	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
+	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
 	return cmd
 }
 
 func newMigrate() *cobra.Command {
-	var cfgPath string
 	cmd := &cobra.Command{
 		Use:   "migrate",
 		Short: "Move a bucket's data to another cluster while clients keep reading and writing",
 	}
-	cmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file naming the directory file and its clusters")
-	cmd.AddCommand(newMigrateStart(&cfgPath), newMigrateFinish(&cfgPath), newMigrateStatus(&cfgPath))
+	cmd.AddCommand(newMigrateStart(), newMigrateRun(), newMigrateFinish())
 	return cmd
 }
 
-func newMigrateStart(cfgPath *string) *cobra.Command {
+func newMigrateStart() *cobra.Command {
 	var (
-		to, name   string
-		from       string
-		create     bool
-		acceptLoss bool
-		actor      string
+		o    apiOptions
+		req  control.MigrateRequest
+		from string
 	)
 	cmd := &cobra.Command{
 		Use:   "start <tenant/bucket>",
-		Short: "Send all new writes to the new cluster and start serving reads from both",
+		Short: "Send all new writes to the new cluster and serve reads from both",
 		Long: "Moves the placement into MIGRATING. From here every write lands on the new primary, reads fall\n" +
 			"back to the source when the primary does not have the object, deletes go to both, and listings\n" +
-			"are merged. That is the state the mover copies in: it is safe to run then, and only then.",
+			"are merged. That is the state the mover copies in: `shunt migrate run`.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transitionAll(cmd, *cfgPath, args, from, directory.Transition{
-				To: directory.StateMigrating, Target: to, Name: name,
-			}, create, acceptLoss, actor)
+			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
+				return transition(cmd, api, o, key, "/migrate", req, time.Minute)
+			})
 		},
 	}
+	addAPIFlags(cmd, &o)
 	f := cmd.Flags()
-	f.BoolVar(&acceptLoss, migrate.AcceptLostWriteWindowFlag, false,
+	f.BoolVar(&req.AcceptLostWriteWindow, migrate.AcceptLostWriteWindowFlag, false,
 		"start even though the target ignores If-None-Match: * on PUT, accepting that the mover can overwrite a client write (docs/migrating.md)")
-	f.StringVar(&to, "to", "", "the cluster that becomes primary (required unless already RAMPING)")
-	f.StringVar(&from, "from", "", "instead of one bucket: every bucket currently served by this cluster (how a vendor is evacuated)")
-	f.StringVar(&name, "name", "", "the backend bucket name on --to (default: the generated name)")
-	f.BoolVar(&create, "create", false, "create the backend bucket on --to if it does not exist")
-	f.StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
-	return cmd
-}
-
-func newMigrateFinish(cfgPath *string) *cobra.Command {
-	var actor, from string
-	cmd := &cobra.Command{
-		Use:   "finish <tenant/bucket>",
-		Short: "Drop the source cluster: the migration is done",
-		Long: "Moves a CUTOVER placement back to ACTIVE and forgets the source. After this shunt never reads or\n" +
-			"deletes on the old cluster again, so run it only once the source bucket is known to be drained:\n" +
-			"`shunt migrate status` shows whether any read still fell back.",
-		Args: cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return transitionAll(cmd, *cfgPath, args, from, directory.Transition{To: directory.StateActive}, false, false, actor)
-		},
-	}
-	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket that has cut over from this cluster")
-	cmd.Flags().StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
+	f.StringVar(&req.To, "to", "", "the new cluster, if expand or ramp has not named one")
+	f.StringVar(&req.Name, "name", "", "the bucket's name on --to")
+	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
+	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
 	return cmd
 }
 
 func newCutover() *cobra.Command {
-	var cfgPath, actor, from string
+	var (
+		o      apiOptions
+		window time.Duration
+		from   string
+	)
 	cmd := &cobra.Command{
 		Use:   "cutover <tenant/bucket>",
-		Short: "Stop using the source cluster for a migrating bucket",
-		Long: "Moves the placement into CUTOVER: reads stop falling back, deletes stop being doubled, listings\n" +
-			"stop being merged. Anything still only on the source becomes invisible, so cut over after the\n" +
-			"mover reports convergence and shunt_migration_fallback_reads_total has stopped increasing.",
+		Short: "Stop reading the source, once the mover has converged and no read fell back for --window",
+		Long: "Moves a MIGRATING placement into CUTOVER: reads stop falling back and listings stop merging;\n" +
+			"deletes still reach the source, so it only ever loses keys. Refused unless the mover's last\n" +
+			"report says a whole pass copied nothing, and unless this proxy served no fallback read of the\n" +
+			"bucket during --window, which the call waits out.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transitionAll(cmd, cfgPath, args, from, directory.Transition{To: directory.StateCutover}, false, false, actor)
+			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
+				if !o.json {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: waiting %s for fallback reads to stay flat\n", key, window)
+				}
+				return transition(cmd, api, o, key, "/cutover", control.CutoverRequest{Window: window.String()}, window+2*time.Minute)
+			})
 		},
 	}
-	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file naming the directory file and its clusters")
-	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket still migrating off this cluster")
-	cmd.Flags().StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
+	addAPIFlags(cmd, &o)
+	cmd.Flags().DurationVar(&window, "window", 60*time.Second, "how long fallback reads must stay flat")
+	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket migrating off this cluster")
 	return cmd
 }
 
-func newMigrateStatus(cfgPath *string) *cobra.Command {
+func newPurgeSource() *cobra.Command {
+	var o apiOptions
 	cmd := &cobra.Command{
-		Use:   "status [tenant/bucket]",
-		Short: "Show which buckets are moving, and where they are",
-		Args:  cobra.MaximumNArgs(1),
+		Use:   "purge-source <tenant/bucket>",
+		Short: "Delete the source bucket of a cut-over placement and forget the source",
+		Long: "Refused unless the placement is in CUTOVER with the evidence shunt cutover recorded, and unless the\n" +
+			"source holds no key the primary lacks. Then every in-progress upload on the source is aborted,\n" +
+			"every object deleted, the bucket deleted, and the placement returns to ACTIVE on its primary.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadForDirectory(*cfgPath)
+			path, err := placementPath(args[0])
 			if err != nil {
 				return err
 			}
-			f, err := directory.Load(cfg.Directory.File, cfg.Clusters)
+			api, err := o.client()
 			if err != nil {
 				return err
 			}
-			keys := make([]string, 0, len(f.Placements))
-			for k := range f.Placements {
-				if len(args) == 1 && k != args[0] {
-					continue
-				}
-				if len(args) == 0 && f.Placements[k].State == directory.StateActive {
-					continue
-				}
-				keys = append(keys, k)
+			var out control.PurgeResult
+			if callErr := api.call(cmd.Context(), "POST", path+"/purge-source", nil, &out); callErr != nil {
+				return callErr
 			}
-			sort.Strings(keys)
-			out := cmd.OutOrStdout()
-			if len(keys) == 0 {
-				_, err = fmt.Fprintln(out, "no bucket is moving")
-				return err
+			if o.json {
+				return printJSON(cmd, out)
 			}
-			_, _ = fmt.Fprintf(out, "%-28s %-10s %-24s %-24s %s\n", "BUCKET", "STATE", "PRIMARY", "SOURCE", "RAMP")
-			for _, k := range keys {
-				p := f.Placements[k]
-				ramp := "-"
-				if p.Ramp != nil {
-					ramp = fmt.Sprintf("ratio %.2f", p.Ramp.Ratio)
-					if len(p.Ramp.Prefixes) > 0 {
-						ramp += " prefixes " + strings.Join(p.Ramp.Prefixes, ",")
-					}
-				}
-				source := "-"
-				if p.Source != "" {
-					source = p.Source + "/" + p.Names[p.Source]
-				}
-				_, _ = fmt.Fprintf(out, "%-28s %-10s %-24s %-24s %s\n", k, p.State,
-					p.Primary+"/"+p.Names[p.Primary], source, ramp)
-			}
-			_, err = fmt.Fprintf(out, "\nWatch shunt_migration_fallback_reads_total and shunt_ramp_writes_total on the metrics listener.\n")
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
+				out.Key, out.ObjectsDeleted, out.UploadsAborted, out.Source, out.Bucket, out.Version)
 			return err
 		},
 	}
+	addAPIFlags(cmd, &o)
 	return cmd
 }
 
-// transitionAll applies one state change to a named bucket, or to every bucket a cluster still
-// holds. The second form is how a vendor leaves the estate: one command per step for the whole
-// cluster, not one per bucket. A bucket that is already past the step is reported and skipped, so
-// the command can be repeated after a partial failure.
-func transitionAll(cmd *cobra.Command, cfgPath string, args []string, from string, t directory.Transition, create, acceptLoss bool, actor string) error {
+func newMigrateFinish() *cobra.Command {
+	var (
+		o    apiOptions
+		from string
+	)
+	cmd := &cobra.Command{
+		Use:   "finish <tenant/bucket>",
+		Short: "Forget the source of a cut-over placement without deleting its data",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			err := forEach(cmd, o, args, from, func(api *apiClient, key string) error {
+				return transition(cmd, api, o, key, "/finish", nil, time.Minute)
+			})
+			if err == nil && from != "" && !o.json {
+				return reportLeftovers(cmd, o, from)
+			}
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket that has cut over from this cluster")
+	return cmd
+}
+
+func newStatus() *cobra.Command {
+	var o apiOptions
+	cmd := &cobra.Command{
+		Use:   "status [tenant/bucket]",
+		Short: "Show clusters, moving buckets, the write split, fallback reads, and mover progress",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			q := ""
+			if len(args) == 1 {
+				q = "?bucket=" + url.QueryEscape(args[0])
+			}
+			var st control.Status
+			if err := api.call(cmd.Context(), "GET", "/v1/status"+q, nil, &st); err != nil {
+				return err
+			}
+			if o.json {
+				return printJSON(cmd, st)
+			}
+			return printStatus(cmd, st)
+		},
+	}
+	addAPIFlags(cmd, &o)
+	return cmd
+}
+
+func printStatus(cmd *cobra.Command, st control.Status) error {
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(out, "directory version %d\n\n", st.Version)
+	_, _ = fmt.Fprintf(out, "%-10s %-6s %-6s %-28s %-8s %s\n", "CLUSTER", "TYPE", "SCHEME", "ENDPOINTS", "COND.PUT", "USED BY")
+	for i := range st.Clusters {
+		c := &st.Clusters[i]
+		_, _ = fmt.Fprintf(out, "%-10s %-6s %-6s %-28s %-8v %s\n", c.Name, c.Type, c.Scheme, strings.Join(c.Endpoints, ","), c.ConditionalWrite, strings.Join(c.References, ", "))
+	}
+	_, _ = fmt.Fprintln(out)
+	if len(st.Placements) == 0 {
+		_, err := fmt.Fprintln(out, "no bucket is moving")
+		return err
+	}
+	_, _ = fmt.Fprintf(out, "%-18s %-9s %-5s %-22s %-22s %-19s %-8s %s\n", "BUCKET", "STATE", "RATIO", "PRIMARY", "SOURCE", "WRITES P/S", "FALLBACK", "MOVER")
+	for i := range st.Placements {
+		p := &st.Placements[i]
+		ratio := "-"
+		if p.Ratio > 0 {
+			ratio = strconv.FormatFloat(p.Ratio, 'f', 2, 64)
+		}
+		source := "-"
+		if p.Source != "" {
+			source = p.Source + "/" + p.Names[p.Source]
+		} else if p.Target != "" {
+			source = "(target " + p.Target + "/" + p.Names[p.Target] + ")"
+		}
+		writes := "-"
+		if w, s := p.Writes["primary"], p.Writes["source"]; w+s > 0 {
+			writes = fmt.Sprintf("%.0f/%.0f (%.0f%%)", w, s, 100*w/(w+s))
+		}
+		mover := "-"
+		if m := p.Mover; m != nil {
+			mover = fmt.Sprintf("pass %d: %d copied, %d already there, %d failed", m.Pass, m.Copied, m.Skipped, m.Failed)
+			if m.Converged {
+				mover += ", converged"
+			}
+		}
+		_, _ = fmt.Fprintf(out, "%-18s %-9s %-5s %-22s %-22s %-19s %-8.0f %s\n", p.Key, p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
+	}
+	return nil
+}
+
+// transition posts one state change and prints what it did.
+func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, op string, body any, timeout time.Duration) error {
+	path, err := placementPath(key)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := waitContext(cmd, timeout)
+	defer cancel()
+	var res control.TransitionResult
+	if err := api.call(ctx, "POST", path+op, body, &res); err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	if o.json {
+		return printJSON(cmd, res)
+	}
+	out := cmd.OutOrStdout()
+	if res.CreatedBucket != "" {
+		_, _ = fmt.Fprintf(out, "created %s on %s\n", res.CreatedBucket, res.Primary)
+	}
+	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", res.Key, res.From, res.To, res.Version)
+	switch res.To {
+	case directory.StateRamping:
+		_, _ = fmt.Fprintf(out, "writes for %.0f%% of keys now land on %s; reads fall back to %s\n", 100*res.Ratio, res.Primary, res.Source)
+	case directory.StateMigrating:
+		_, _ = fmt.Fprintf(out, "all writes now land on %s; run `shunt migrate run %s` to copy what is still on %s\n", res.Primary, res.Key, res.Source)
+	case directory.StateCutover:
+		_, _ = fmt.Fprintf(out, "%s is no longer read; `shunt purge-source %s` deletes it once you are satisfied\n", res.Source, res.Key)
+	case directory.StateActive:
+		_, _ = fmt.Fprintf(out, "migration complete: %s is served entirely by %s\n", res.Key, res.Primary)
+	}
+	if res.Warning != "" {
+		_, _ = fmt.Fprintf(out, "WARNING %s\n", res.Warning)
+	}
+	return nil
+}
+
+// forEach runs fn for the named bucket, or with --from for every bucket that cluster serves (ACTIVE)
+// or is moving off (every later state). A bucket already past the step fails on its own and the
+// rest continue, so the command can be repeated after a partial failure.
+func forEach(cmd *cobra.Command, o apiOptions, args []string, from string, fn func(api *apiClient, key string) error) error {
+	api, err := o.client()
+	if err != nil {
+		return err
+	}
 	switch {
 	case len(args) == 1 && from != "":
 		return errors.New("give a bucket or --from, not both")
 	case len(args) == 1:
-		return transition(cmd, cfgPath, args[0], t, create, acceptLoss, actor)
+		return fn(api, args[0])
 	case from == "":
 		return errors.New("give a bucket, or --from <cluster> for every bucket on one cluster")
 	}
-	cfg, err := loadForDirectory(cfgPath)
-	if err != nil {
+	var st control.Status
+	if err := api.call(cmd.Context(), "GET", "/v1/status?all=1", nil, &st); err != nil {
 		return err
 	}
-	f, err := directory.Load(cfg.Directory.File, cfg.Clusters)
-	if err != nil {
-		return err
-	}
-	if _, ok := cfg.Clusters[from]; !ok {
-		return fmt.Errorf("cluster %q is not configured", from)
-	}
-	keys := make([]string, 0, len(f.Placements))
-	for k := range f.Placements {
-		// Leaving ACTIVE selects what the cluster still serves; every later step selects what is
-		// already moving off it.
-		p := f.Placements[k]
+	var keys []string
+	for i := range st.Placements {
+		p := &st.Placements[i]
 		if (p.State == directory.StateActive && p.Primary == from) || (p.State != directory.StateActive && p.Source == from) {
-			keys = append(keys, k)
+			keys = append(keys, p.Key)
 		}
 	}
-	sort.Strings(keys)
 	if len(keys) == 0 {
-		_, err = fmt.Fprintf(cmd.OutOrStdout(), "no bucket on %s needs this step\n", from)
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "no bucket on %s needs this step\n", from)
 		return err
 	}
-	out := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(out, "%d buckets on %s\n", len(keys), from)
+	if !o.json {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%d buckets on %s\n", len(keys), from)
+	}
 	var failed []string
 	for _, key := range keys {
-		if err := transition(cmd, cfgPath, key, t, create, acceptLoss, actor); err != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: %v\n", key, err)
+		if err := fn(api, key); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", err)
 			failed = append(failed, key)
 		}
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("%d of %d buckets did not move: %s", len(failed), len(keys), strings.Join(failed, ", "))
 	}
-	if t.To == directory.StateActive {
-		reportLeftovers(cmd, cfg, f, from)
-	}
 	return nil
 }
 
 // reportLeftovers says what still points at an evacuated cluster. Moving every bucket off it is not
-// the same as being rid of it: a tenant that still defaults there would put its next new bucket
-// back on the cluster the operator is about to switch off.
-func reportLeftovers(cmd *cobra.Command, cfg *config.Config, f *directory.File, cluster string) {
-	out := cmd.OutOrStdout()
-	var tenants []string
-	for name, tn := range f.Tenants {
-		if tn.DefaultCluster == cluster {
-			tenants = append(tenants, name)
-		}
-	}
-	sort.Strings(tenants)
-	if len(tenants) > 0 {
-		_, _ = fmt.Fprintf(out, "\nstill pointing at %s: tenants %s default there, so their next new bucket would land on it.\n",
-			cluster, strings.Join(tenants, ", "))
-		_, _ = fmt.Fprintf(out, "Repoint them in %s before removing the cluster from the config.\n", cfg.Directory.File)
-		return
-	}
-	_, _ = fmt.Fprintf(out, "\nnothing in the directory names %s any more: remove its block from the config and run `shunt check-config`.\n", cluster)
-}
-
-// transition applies one state change, resolving and optionally creating the target bucket first.
-// acceptLoss allows entering MIGRATING on a target without conditional PUT.
-func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition, create, acceptLoss bool, actor string) error {
-	tenant, bucket, ok := directory.SplitKey(key)
-	if !ok {
-		return fmt.Errorf("%q: want <tenant>/<bucket>", key)
-	}
-	cfg, err := loadForDirectory(cfgPath)
+// the same as being rid of it: shunt cluster remove refuses while anything references it.
+func reportLeftovers(cmd *cobra.Command, o apiOptions, cluster string) error {
+	api, err := o.client()
 	if err != nil {
 		return err
 	}
-	d, err := directory.Open(cfg.Directory.File, cfg.Clusters)
-	if err != nil {
-		return err
-	}
-	p, ok := d.Snapshot().Lookup(tenant, bucket)
-	if !ok {
-		return fmt.Errorf("%s: %w", key, directory.ErrNotFound)
-	}
-	switch {
-	case p.State == directory.StateActive && t.Target != "" && t.Name == "":
-		t.Name = directory.BackendName(tenant, bucket, 0)
-	case p.State != directory.StateActive && t.Target != "":
-		// Repeating --to on a later ramp step is how an operator naturally types it: accept it when
-		// it names the target already chosen, and refuse only a change of destination mid-move.
-		if t.Target != p.Primary {
-			return fmt.Errorf("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, p.Primary)
-		}
-		if t.Name != "" && t.Name != p.Names[p.Primary] {
-			return fmt.Errorf("%s is already moving to %s/%s; --name cannot change mid-move", key, p.Primary, p.Names[p.Primary])
-		}
-		t.Target, t.Name = "", ""
-	}
-	np, err := directory.Apply(*p, t)
-	if err != nil {
-		return err
-	}
-	// MIGRATING is where the mover runs. On a target that ignores If-None-Match: * its guard has a
-	// window that loses client writes, and starting anyway is the operator's call, made explicitly.
-	lossWindow := np.State == directory.StateMigrating && p.State != directory.StateMigrating &&
-		!cfg.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true)
-	if lossWindow && !acceptLoss {
-		return migrate.RefuseLostWriteWindow(key, np.Primary)
-	}
-	ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
-	defer cancel()
-
-	// The target bucket has to exist before any write is routed to it, and versioning on either
-	// side is refused before the state changes, not after (docs/DESIGN.md §9 item 4).
-	if p.State == directory.StateActive {
-		target, tname := np.Primary, np.Names[np.Primary]
-		switch made, berr := ensureBucket(ctx, cfg, target, tname, create); {
-		case berr != nil:
-			return berr
-		case made:
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "created %s on %s\n", tname, target)
-		}
-	}
-	if np.State == directory.StateRamping || np.State == directory.StateMigrating {
-		for _, side := range []struct{ role, cluster string }{{"source", np.Source}, {"primary", np.Primary}} {
-			if verr := refuseVersioned(ctx, cfg, side.role, side.cluster, np.Names[side.cluster]); verr != nil {
-				return verr
-			}
-		}
-	}
-	if actor == "" {
-		actor = "cli:" + os.Getenv("USER")
-	}
-	if err := d.SetState(cmd.Context(), tenant, bucket, p.State, t, actor); err != nil {
-		return err
+	var st control.Status
+	if callErr := api.call(context.WithoutCancel(cmd.Context()), "GET", "/v1/status", nil, &st); callErr != nil {
+		return callErr
 	}
 	out := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", key, p.State, np.State, d.Snapshot().Version())
-	switch np.State {
-	case directory.StateRamping:
-		_, _ = fmt.Fprintf(out, "writes for %s of keys now land on %s; reads still fall back to %s\n",
-			rampShare(np.Ramp), np.Primary, np.Source)
-	case directory.StateMigrating:
-		_, _ = fmt.Fprintf(out, "all writes now land on %s; run the mover to copy what is still on %s\n", np.Primary, np.Source)
-		if lossWindow {
-			_, _ = fmt.Fprintf(out, "WARNING (accepted with --%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(key, np.Primary))
+	for i := range st.Clusters {
+		c := &st.Clusters[i]
+		if c.Name != cluster {
+			continue
 		}
-	case directory.StateCutover:
-		_, _ = fmt.Fprintf(out, "%s is no longer read; run `shunt migrate finish %s` to drop it for good\n", np.Source, key)
-	case directory.StateActive:
-		_, _ = fmt.Fprintf(out, "migration complete: %s is served entirely by %s\n", key, np.Primary)
+		if len(c.References) > 0 {
+			_, err = fmt.Fprintf(out, "\nstill pointing at %s: %s. Repoint tenants with `shunt tenant set-default`, then `shunt cluster remove %s`.\n",
+				cluster, strings.Join(c.References, ", "), cluster)
+			return err
+		}
+		_, err = fmt.Fprintf(out, "\nnothing references %s any more: `shunt cluster remove %s` takes it out of shunt.\n", cluster, cluster)
+		return err
 	}
 	return nil
-}
-
-func rampShare(r *directory.Ramp) string {
-	switch {
-	case r == nil:
-		return "no"
-	case r.Ratio > 0 && len(r.Prefixes) > 0:
-		return fmt.Sprintf("%.0f%% (plus %d prefixes)", r.Ratio*100, len(r.Prefixes))
-	case r.Ratio > 0:
-		return fmt.Sprintf("%.0f%%", r.Ratio*100)
-	}
-	return fmt.Sprintf("%d prefixes", len(r.Prefixes))
-}
-
-// ensureBucket checks that the backend bucket exists on a cluster, creating it when asked. A
-// bucket owned by someone else is an error either way: shunt will not migrate into it.
-func ensureBucket(ctx context.Context, cfg *config.Config, clusterName, bucket string, create bool) (bool, error) {
-	cc, ok := cfg.Clusters[clusterName]
-	if !ok {
-		return false, fmt.Errorf("cluster %q is not configured", clusterName)
-	}
-	cl, err := upstream.New(clusterName, cc, upstream.Options{})
-	if err != nil {
-		return false, fmt.Errorf("cluster %s: %w", clusterName, err)
-	}
-	defer cl.Close()
-	secret, err := config.ResolveSecret(cc.Credentials.SecretRef)
-	if err != nil {
-		return false, fmt.Errorf("cluster %s: %w", clusterName, err)
-	}
-	creds := sigv4.Credentials{AccessKey: cc.Credentials.AccessKey, Secret: secret}
-
-	status, _, err := bucketCall(ctx, cl, creds, http.MethodHead, bucket)
-	switch {
-	case err != nil:
-		return false, fmt.Errorf("cannot reach %s to check bucket %s: %w", clusterName, bucket, err)
-	case status == http.StatusOK:
-		return false, nil
-	case status != http.StatusNotFound:
-		return false, fmt.Errorf("%s on %s: HEAD returned HTTP %d", bucket, clusterName, status)
-	case !create:
-		return false, fmt.Errorf("bucket %s does not exist on %s; create it there or pass --create", bucket, clusterName)
-	}
-	status, code, err := bucketCall(ctx, cl, creds, http.MethodPut, bucket)
-	switch {
-	case err != nil:
-		return false, fmt.Errorf("creating %s on %s: %w", bucket, clusterName, err)
-	case status == http.StatusOK, status == http.StatusNoContent:
-		return true, nil
-	case code == "BucketAlreadyOwnedByYou":
-		return false, nil
-	}
-	return false, fmt.Errorf("creating %s on %s: HTTP %d %s", bucket, clusterName, status, code)
-}
-
-// bucketCall sends one bucket-level request with the cluster's own credentials and returns its
-// status and error code.
-func bucketCall(ctx context.Context, cl *upstream.Cluster, creds sigv4.Credentials, method, bucket string) (status int, code string, err error) {
-	endpoint := cl.Next()
-	req, err := http.NewRequestWithContext(ctx, method, cl.Scheme+"://"+endpoint+"/"+bucket, http.NoBody) //nolint:gosec // G704: configured cluster endpoint
-	if err != nil {
-		return 0, "", err
-	}
-	req.Host = endpoint
-	sigv4.Sign(req, creds, cl.Region, emptySHA256, time.Now())
-	resp, err := cl.Transport.RoundTrip(req)
-	if err != nil {
-		return 0, "", err
-	}
-	defer resp.Body.Close() //nolint:errcheck // read-only
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return resp.StatusCode, "", err
-	}
-	var e struct {
-		Code string `xml:"Code"`
-	}
-	_ = xml.Unmarshal(body, &e) //nolint:errcheck // a non-XML body just means no code
-	return resp.StatusCode, e.Code, nil
 }

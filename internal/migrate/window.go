@@ -6,7 +6,7 @@ import (
 )
 
 // AcceptLostWriteWindowFlag is the flag with which an operator starts a migration, or runs the
-// mover, into a cluster that ignores If-None-Match: * on PUT. shunt migrate start and test/mover
+// mover, into a cluster that ignores If-None-Match: * on PUT. shunt migrate start and shunt migrate run
 // both take it, and both refuse without it.
 const AcceptLostWriteWindowFlag = "accept-lost-write-window"
 

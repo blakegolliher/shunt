@@ -47,15 +47,17 @@ func directoryRig(t *testing.T) (cfgPath, dirPath string, be *versioningBackend)
 	t.Setenv("SHUNT_TEST_CLUSTER_SECRET", "cluster-secret")
 	dir := t.TempDir()
 	dirPath = filepath.Join(dir, "directory.yaml")
-	if err := os.WriteFile(dirPath, []byte("version: 1\ntenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: ACTIVE, primary: garage, names: { garage: acme-1111-data } }\n"), 0o644); err != nil {
+	ep := strings.TrimPrefix(srv.URL, "http://")
+	directoryBody := "version: 1\nclusters:\n" +
+		"  garage: { type: s3, scheme: http, region: garage, endpoints: [\"" + ep + "\"], credentials: { access_key: GARAGEKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n" +
+		"  minio: { type: minio, scheme: http, region: us-east-1, endpoints: [\"" + ep + "\"], credentials: { access_key: MINIOKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n" +
+		"tenants: { acme: { default_cluster: garage } }\nplacements:\n  acme/data: { state: ACTIVE, primary: garage, names: { garage: acme-1111-data } }\n"
+	if err := os.WriteFile(dirPath, []byte(directoryBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ep := strings.TrimPrefix(srv.URL, "http://")
 	cfgPath = filepath.Join(dir, "shunt.yaml")
 	cfg := "listener: { address: \":8443\", tls: { cert: c.pem, key: k.pem } }\nauth: { mode: resign, credentials_file: creds.yaml }\n" +
-		"directory: { file: " + dirPath + " }\nclusters:\n" +
-		"  garage: { type: s3, scheme: http, region: garage, endpoints: [\"" + ep + "\"], credentials: { access_key: GARAGEKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n" +
-		"  minio: { type: minio, scheme: http, region: us-east-1, endpoints: [\"" + ep + "\"], credentials: { access_key: MINIOKEY, secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n"
+		"directory: { file: " + dirPath + " }\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}

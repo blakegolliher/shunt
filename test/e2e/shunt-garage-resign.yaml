@@ -17,13 +17,6 @@ proxy:
   idle_timeout: 60s
   metadata_timeout: 30s
   drain_timeout: 30s
-clusters:
-  garage:
-    type: s3
-    scheme: http
-    region: garage
-    endpoints: ["127.0.0.1:3900"]
-    credentials: { access_key: GK_SET_BY_E2E, secret_ref: env:GARAGE_SECRET }
 telemetry:
   access_log: { enabled: true, path: test/e2e/data/shunt-garage-resign.access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }

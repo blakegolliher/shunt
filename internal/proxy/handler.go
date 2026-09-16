@@ -32,10 +32,13 @@ type Handler struct {
 	// response echoes of backend names, endpoints, and uploadIds (ADR-0006).
 	Mode      Mode
 	Store     sigv4.CredentialStore
-	Clusters  *upstream.Set
+	Clusters  *upstream.Registry
 	Dir       directory.Directory
 	Rewrite   bool
 	ClockSkew time.Duration
+	// DebugRoute is features.debug_route_header: a request with X-Shunt-Debug: 1 is answered with
+	// X-Shunt-Route naming the side and cluster that served it.
+	DebugRoute bool
 
 	Domains         s3.Domains
 	Metrics         *telemetry.Metrics
@@ -296,6 +299,17 @@ func (h *Handler) roundTrip(ctx context.Context, o *outcome, p *prepared, cl *up
 	}
 }
 
+// The debug route headers (features.debug_route_header).
+const (
+	headerDebug = "X-Shunt-Debug"
+	headerRoute = "X-Shunt-Route"
+)
+
+// wantsRoute reports whether this response names its route.
+func (h *Handler) wantsRoute(r *http.Request) bool {
+	return h.DebugRoute && r.Header.Get(headerDebug) == "1"
+}
+
 // relay sends the upstream response to the client.
 func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, p *prepared, resp *http.Response, wd *watchdog, rc *http.ResponseController) {
 	if p.plan != nil && p.plan.sha != nil && resp.StatusCode < 300 {
@@ -323,6 +337,13 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 
 	copyHeaders(w.Header(), resp.Header)
 	appendVia(w.Header(), h.Via)
+	if p.placement != nil && h.wantsRoute(r) {
+		side := migrate.Primary.String()
+		if p.placement.Source != "" && o.cluster == p.placement.Source {
+			side = migrate.Source.String()
+		}
+		w.Header().Set(headerRoute, side+" "+o.cluster)
+	}
 	if _, ok := resp.Header["Content-Type"]; !ok {
 		// Transparency: net/http sniffs a Content-Type onto any body that lacks one. The backend
 		// sent none, so the client must see none. A nil value disables the sniffing.

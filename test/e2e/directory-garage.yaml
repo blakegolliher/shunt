@@ -2,6 +2,13 @@
 # test/e2e/data/ before every run). Backend names equal client names, so s3diff can address the same
 # bucket directly and through shunt; its final DeleteBucket removes the placements, hence the reset.
 version: 1
+clusters:
+  garage:
+    type: s3
+    scheme: http
+    region: garage
+    endpoints: ["127.0.0.1:3900"]
+    credentials: { access_key: GK_SET_BY_E2E, secret_ref: env:GARAGE_SECRET }
 tenants:
   e2e: { default_cluster: garage }
 placements:

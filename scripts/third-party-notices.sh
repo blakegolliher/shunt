@@ -2,7 +2,7 @@
 # Regenerates the second half of THIRD_PARTY_NOTICES: the license and NOTICE text of every module
 # linked into bin/shunt, from `go-licenses report ./cmd/shunt`. The first half, code copied into
 # this repository (CLAUDE.md lift procedure), is maintained by hand above the marker and kept as is.
-# Test-tree programs (test/s3diff, test/mover, test/bench) are not shipped and not listed.
+# Test-tree programs (test/s3diff, test/bench) are not shipped and not listed.
 #
 #   GO_LICENSES=<go-licenses binary> scripts/third-party-notices.sh     (make licenses sets it)
 set -euo pipefail

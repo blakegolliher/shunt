@@ -7,11 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"os"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -135,36 +133,6 @@ type Set struct {
 	byName map[string]*Cluster
 	byID   map[string]*Cluster
 	names  []string
-}
-
-// NewSet builds every cluster. resolve turns a secret_ref into the secret (config.ResolveSecret);
-// nil leaves Creds.Secret empty, for passthrough mode, which never signs.
-func NewSet(clusters map[string]config.Cluster, o Options, resolve func(ref string) (string, error)) (*Set, error) {
-	s := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}}
-	for _, name := range slices.Sorted(maps.Keys(clusters)) {
-		cc := clusters[name]
-		s.names = append(s.names, name)
-		cl, err := New(name, cc, o)
-		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("cluster %s: %w", name, err)
-		}
-		if resolve != nil {
-			secret, err := resolve(cc.Credentials.SecretRef)
-			if err != nil {
-				s.Close()
-				return nil, fmt.Errorf("cluster %s: %w", name, err)
-			}
-			cl.Creds.Secret = secret
-		}
-		if other, dup := s.byID[cl.ID]; dup {
-			s.Close()
-			return nil, fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID)
-		}
-		s.byName[name], s.byID[cl.ID] = cl, cl
-	}
-	slices.Sort(s.names)
-	return s, nil
 }
 
 // Get returns a cluster by name.

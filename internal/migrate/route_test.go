@@ -1,7 +1,9 @@
 package migrate
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -24,7 +26,7 @@ func TestEveryOpHasAClass(t *testing.T) {
 
 func ramping(ratio float64, prefixes ...string) *directory.Placement {
 	return &directory.Placement{State: directory.StateRamping, Primary: "target", Source: "src",
-		Ramp: &directory.Ramp{Ratio: ratio, Prefixes: prefixes}}
+		Ramp: &directory.Ramp{Hash: directory.RampHash, Ratio: ratio, Prefixes: prefixes}}
 }
 
 // The table in docs/DESIGN.md §2.5, asserted row by row.
@@ -61,10 +63,11 @@ func TestRoutingTable(t *testing.T) {
 
 		{"cutover write", cutover, ClassWrite, Route{Cluster: Primary}},
 		{"cutover read does not fall back", cutover, ClassRead, Route{Cluster: Primary}},
-		{"cutover delete is single", cutover, ClassDelete, Route{Cluster: Primary}},
+		{"cutover delete still hits both, so the source stays a subset of the primary", cutover, ClassDelete, Route{Cluster: Primary, Both: true}},
+		{"cutover list does not merge", cutover, ClassList, Route{Cluster: Primary}},
 	}
 	for _, c := range cases {
-		if got := Decide(c.p, c.class, "some/key"); got != c.want {
+		if got, err := Decide(c.p, c.class, "some/key"); err != nil || got != c.want {
 			t.Errorf("%s: got %+v want %+v", c.name, got, c.want)
 		}
 	}
@@ -74,26 +77,46 @@ func TestRoutingTable(t *testing.T) {
 func TestNoSourceIsAlwaysPrimary(t *testing.T) {
 	p := &directory.Placement{State: directory.StateMigrating, Primary: "target"}
 	for _, class := range []OpClass{ClassRead, ClassWrite, ClassDelete, ClassList, ClassBucket, ClassUpload} {
-		if got := Decide(p, class, "k"); got != (Route{Cluster: Primary}) {
+		if got, err := Decide(p, class, "k"); err != nil || got != (Route{Cluster: Primary}) {
 			t.Errorf("class %d: %+v", class, got)
 		}
 	}
 }
 
 func TestInRangePrefixes(t *testing.T) {
-	r := &directory.Ramp{Prefixes: []string{"runs/2026-09/", "logs/"}}
+	r := &directory.Ramp{Hash: directory.RampHash, Prefixes: []string{"runs/2026-09/", "logs/"}}
 	for _, k := range []string{"runs/2026-09/a", "logs/x"} {
-		if !InRange(r, k) {
+		if !inRange(t, r, k) {
 			t.Errorf("%q should be in range", k)
 		}
 	}
 	for _, k := range []string{"runs/2026-08/a", "run", ""} {
-		if InRange(r, k) {
+		if inRange(t, r, k) {
 			t.Errorf("%q should not be in range", k)
 		}
 	}
-	if InRange(nil, "k") {
+	if inRange(t, nil, "k") {
 		t.Error("a nil ramp puts nothing in range")
+	}
+}
+
+// Keys that differ only in their last bytes, as sequential names do, split by the ratio too. Plain
+// FNV-1a put all of a/0000 … a/3999 on the target at 0.5, and 80% of the walkthrough's keys.
+func TestInRangeSplitsSequentialKeys(t *testing.T) {
+	for _, format := range []string{"a/%04d", "verify/1789589767464489064/%04d", "seed/obj-%d", "logs/2026/09/16/%d.json", "%d"} {
+		for _, ratio := range []float64{0.1, 0.5, 0.9} {
+			r := &directory.Ramp{Hash: directory.RampHash, Ratio: ratio}
+			const n = 4000
+			in := 0
+			for i := 0; i < n; i++ {
+				if inRange(t, r, fmt.Sprintf(format, i)) {
+					in++
+				}
+			}
+			if got := float64(in) / n; got < ratio-0.04 || got > ratio+0.04 {
+				t.Errorf("%q at ratio %v: %.3f of keys on the target", format, ratio, got)
+			}
+		}
 	}
 }
 
@@ -107,11 +130,11 @@ func TestInRangeIsStableAndMonotonic(t *testing.T) {
 	ratios := []float64{0, 0.01, 0.05, 0.25, 0.5, 0.9, 1}
 	var prev map[string]bool
 	for _, ratio := range ratios {
-		r := &directory.Ramp{Ratio: ratio}
+		r := &directory.Ramp{Hash: directory.RampHash, Ratio: ratio}
 		cur, in := map[string]bool{}, 0
 		for _, k := range keys {
-			v := InRange(r, k)
-			if v != InRange(r, k) {
+			v := inRange(t, r, k)
+			if v != inRange(t, r, k) {
 				t.Fatalf("%q: not stable at ratio %v", k, ratio)
 			}
 			cur[k] = v
@@ -143,8 +166,67 @@ func BenchmarkDecide(b *testing.B) {
 	p := ramping(0.25, "runs/")
 	b.ReportAllocs()
 	for b.Loop() {
-		if Decide(p, ClassWrite, "dir/object-12345.bin").Cluster == 0 {
+		if r, err := Decide(p, ClassWrite, "dir/object-12345.bin"); err != nil || r.Cluster == 0 {
 			b.Fatal("no decision")
+		}
+	}
+}
+
+// inRange is InRange for ramps the test built with this build's hash: an error is a test failure.
+func inRange(t testing.TB, r *directory.Ramp, key string) bool {
+	t.Helper()
+	in, err := InRange(r, key)
+	if err != nil {
+		t.Fatalf("InRange(%q): %v", key, err)
+	}
+	return in
+}
+
+// A ramp that names a hash this build does not implement is refused wherever the hash would decide,
+// and routed normally wherever it would not (ADR-0004, POC-5 amendment): a proxy never re-splits keys.
+func TestUnknownRampHashIsRefused(t *testing.T) {
+	foreign := &directory.Placement{State: directory.StateRamping, Primary: "target", Source: "src",
+		Ramp: &directory.Ramp{Hash: "fnv1a-v0", Ratio: 0.5, Prefixes: []string{"runs/"}}}
+	for _, class := range []OpClass{ClassWrite, ClassRead} {
+		if _, err := Decide(foreign, class, "data/k"); !errors.Is(err, ErrUnknownRampHash) || !strings.Contains(err.Error(), `"fnv1a-v0"`) {
+			t.Errorf("class %d by hash: want ErrUnknownRampHash naming the hash, got %v", class, err)
+		}
+		if got, err := Decide(foreign, class, "runs/k"); err != nil || got.Cluster != Primary {
+			t.Errorf("class %d by prefix: %+v %v", class, got, err)
+		}
+	}
+	for _, class := range []OpClass{ClassDelete, ClassList, ClassBucket, ClassUpload} {
+		if _, err := Decide(foreign, class, "data/k"); err != nil {
+			t.Errorf("class %d does not depend on the hash: %v", class, err)
+		}
+	}
+	prefixOnly := &directory.Ramp{Hash: "fnv1a-v0", Prefixes: []string{"runs/"}}
+	if in, err := InRange(prefixOnly, "data/k"); err != nil || in {
+		t.Errorf("a prefix-only ramp needs no hash: %v %v", in, err)
+	}
+	if _, err := InRange(&directory.Ramp{Ratio: 0.5}, "k"); !errors.Is(err, ErrUnknownRampHash) {
+		t.Errorf("a ramp with no hash name is refused, got %v", err)
+	}
+	if in, err := InRange(&directory.Ramp{Hash: "fnv1a-v0", Ratio: 1}, "k"); err != nil || !in {
+		t.Errorf("at ratio 1 every key is in range whatever the hash: %v %v", in, err)
+	}
+}
+
+// fnv1a-fmix64-v1 is a name for these exact values. A change that moves any of them must take a new
+// name in directory.RampHash, or proxies of two builds would split the same ramp differently.
+func TestRampHashIsPinned(t *testing.T) {
+	if directory.RampHash != "fnv1a-fmix64-v1" {
+		t.Fatalf("RampHash is %q: update the pinned values below only together with a new name", directory.RampHash)
+	}
+	for key, want := range map[string]uint64{
+		"":                                0xefd01f60ba992926,
+		"a/0000":                          0x1bef7c837bb43864,
+		"a/0001":                          0x887b798489aca7c0,
+		"verify/1789589767464489064/0012": 0x818f437aa9bfa4c6,
+		"runs/2026-09/ckpt-000017.pt":     0xc30d8369350a63cb,
+	} {
+		if got := rampHash(key); got != want {
+			t.Errorf("rampHash(%q) = %#x, want %#x", key, got, want)
 		}
 	}
 }
