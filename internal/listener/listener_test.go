@@ -49,7 +49,7 @@ func TestSNISelection(t *testing.T) {
 	def := writeCert(t, dir, "def", "*.shunt.example.com", "shunt.example.com")
 	alt := writeCert(t, dir, "alt", "*.s3.example.net")
 	exact := writeCert(t, dir, "exact", "special.example.org")
-	tc, err := TLSConfig(config.Listener{TLS: config.ListenerTLS{
+	tc, err := tlsConfig(config.Listener{TLS: config.ListenerTLS{
 		Cert: def.Cert, Key: def.Key, MinVersion: "1.2",
 		SNI: map[string]config.CertPair{"*.s3.example.net": alt, "special.example.org": exact},
 	}})
@@ -85,7 +85,7 @@ func TestSNISelection(t *testing.T) {
 func TestMinVersionAndNoDefault(t *testing.T) {
 	dir := t.TempDir()
 	alt := writeCert(t, dir, "alt", "*.s3.example.net")
-	tc, err := TLSConfig(config.Listener{TLS: config.ListenerTLS{MinVersion: "1.3", SNI: map[string]config.CertPair{"*.s3.example.net": alt}}})
+	tc, err := tlsConfig(config.Listener{TLS: config.ListenerTLS{MinVersion: "1.3", SNI: map[string]config.CertPair{"*.s3.example.net": alt}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,10 +95,10 @@ func TestMinVersionAndNoDefault(t *testing.T) {
 	if _, err := tc.GetCertificate(&tls.ClientHelloInfo{ServerName: "nomatch.example.org"}); err == nil {
 		t.Error("expected no certificate for an unmatched name without a default")
 	}
-	if _, err := TLSConfig(config.Listener{}); err != ErrNoCertificate {
+	if _, err := tlsConfig(config.Listener{}); err != errNoCertificate {
 		t.Errorf("want ErrNoCertificate, got %v", err)
 	}
-	if _, err := TLSConfig(config.Listener{TLS: config.ListenerTLS{Cert: "/nope.crt", Key: "/nope.key"}}); err == nil {
+	if _, err := tlsConfig(config.Listener{TLS: config.ListenerTLS{Cert: "/nope.crt", Key: "/nope.key"}}); err == nil {
 		t.Error("expected error for missing files")
 	}
 }
@@ -132,7 +132,7 @@ func BenchmarkGetCertificate(b *testing.B) {
 	dir := b.TempDir()
 	def := writeCert(&testing.T{}, dir, "def", "*.shunt.example.com")
 	alt := writeCert(&testing.T{}, dir, "alt", "*.s3.example.net")
-	tc, err := TLSConfig(config.Listener{TLS: config.ListenerTLS{Cert: def.Cert, Key: def.Key, SNI: map[string]config.CertPair{"*.s3.example.net": alt}}})
+	tc, err := tlsConfig(config.Listener{TLS: config.ListenerTLS{Cert: def.Cert, Key: def.Key, SNI: map[string]config.CertPair{"*.s3.example.net": alt}}})
 	if err != nil {
 		b.Fatal(err)
 	}

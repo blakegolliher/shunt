@@ -39,8 +39,8 @@ type Static struct {
 	byKey map[string]sigv4.Credential
 }
 
-// ErrPermissions is returned when the credentials file is readable by group or others.
-var ErrPermissions = errors.New("auth: credentials file must not be readable by group or others (chmod 0600)")
+// errPermissions is returned when the credentials file is readable by group or others.
+var errPermissions = errors.New("auth: credentials file must not be readable by group or others (chmod 0600)")
 
 // Load reads and validates a credentials file. Inline secrets are allowed because this file is
 // the secret store; it must be mode 0600 (encrypted at rest is P3c).
@@ -50,17 +50,17 @@ func Load(path string) (*Static, error) {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	if st.Mode().Perm()&(fs.ModePerm&0o077) != 0 {
-		return nil, fmt.Errorf("%w: %s is %04o", ErrPermissions, path, st.Mode().Perm())
+		return nil, fmt.Errorf("%w: %s is %04o", errPermissions, path, st.Mode().Perm())
 	}
 	data, err := os.ReadFile(path) //nolint:gosec // operator-configured path, validated above
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
-	return Parse(data)
+	return parse(data)
 }
 
-// Parse builds a Static store from YAML bytes. Unknown keys are errors.
-func Parse(data []byte) (*Static, error) {
+// parse builds a Static store from YAML bytes. Unknown keys are errors.
+func parse(data []byte) (*Static, error) {
 	var f File
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

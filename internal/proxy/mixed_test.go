@@ -41,7 +41,7 @@ const (
 // upload ids the way MinIO does.
 type fakeS3 struct {
 	name, ak, secret string
-	t                *testing.T
+	t                testing.TB
 
 	mu       sync.Mutex
 	buckets  map[string]map[string][]byte
@@ -111,7 +111,7 @@ func (s *statusWriter) Write(p []byte) (int, error) {
 	return s.ResponseWriter.Write(p)
 }
 
-func newFakeS3(t *testing.T, name, ak, secret string, buckets ...string) *fakeS3 {
+func newFakeS3(t testing.TB, name, ak, secret string, buckets ...string) *fakeS3 {
 	f := &fakeS3{name: name, ak: ak, secret: secret, t: t, buckets: map[string]map[string][]byte{}, uploads: map[string]string{},
 		parts: map[string][][]byte{}, foreign: map[string]bool{}, deny: map[string]bool{}, mtime: map[string]time.Time{}}
 	for _, b := range buckets {
@@ -162,15 +162,6 @@ func (f *fakeS3) object(bucket, key string) ([]byte, bool) {
 	defer f.mu.Unlock()
 	b, ok := f.buckets[bucket][key]
 	return b, ok
-}
-
-// addBucket creates a bucket directly on the backend.
-// deleteObject removes one object directly, as a mover withdrawing a copy would.
-func (f *fakeS3) deleteObject(bucket, key string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.buckets[bucket], key)
-	delete(f.mtime, bucket+"/"+key)
 }
 
 func (f *fakeS3) addBucket(name string) {
@@ -490,7 +481,7 @@ type mixedRig struct {
 	backendNames      []string
 }
 
-func newMixedRig(t *testing.T, store mapStore, adjust ...func(map[string]config.Cluster)) *mixedRig {
+func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.Cluster)) *mixedRig {
 	t.Helper()
 	m := &mixedRig{accessLog: &syncBuf{}, alerts: &syncBuf{}}
 	m.garage = newFakeS3(t, "garage", "GARAGECLUSTERKEY", "garage-cluster-secret", "acme-1111-data", "acme-7777-pics")
@@ -544,7 +535,7 @@ type reply struct {
 
 // send signs a client request with ak/sk (us-east-1, UNSIGNED-PAYLOAD) and sends it to shunt.
 // host "" is path-style against the front server's address.
-func (m *mixedRig) send(t *testing.T, method, target, host string, body []byte, ak, sk string, hdr map[string]string) reply {
+func (m *mixedRig) send(t testing.TB, method, target, host string, body []byte, ak, sk string, hdr map[string]string) reply {
 	t.Helper()
 	req, err := http.NewRequest(method, m.front.URL+target, bytes.NewReader(body))
 	if err != nil {
@@ -570,7 +561,7 @@ func (m *mixedRig) send(t *testing.T, method, target, host string, body []byte, 
 	return reply{resp, b}
 }
 
-func (m *mixedRig) acme(t *testing.T, method, target string, body []byte) reply {
+func (m *mixedRig) acme(t testing.TB, method, target string, body []byte) reply {
 	t.Helper()
 	return m.send(t, method, target, "", body, acmeAK, acmeSK, nil)
 }
@@ -844,7 +835,6 @@ func TestDeleteBucket(t *testing.T) {
 	}
 }
 
-func (m *mixedRig) minioLast() string  { s, _ := m.minio.last(); return s }
 func (m *mixedRig) garageLast() string { s, _ := m.garage.last(); return s }
 
 // TestUploadIDRoundTripAcrossDirectoryReload: a multipart upload started on one cluster completes

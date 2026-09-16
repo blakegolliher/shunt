@@ -173,21 +173,21 @@ type Slow struct {
 
 // Defaults applied before validation. Everything that is safe to default is here; scheme is not.
 const (
-	DefaultListenerAddress = ":443"
-	DefaultAdminAddress    = "127.0.0.1:9900"
-	DefaultCopyBufferBytes = 256 << 10
-	DefaultIdleTimeout     = 60 * time.Second
-	DefaultMetadataTimeout = 30 * time.Second
-	DefaultDrainTimeout    = 30 * time.Second
-	DefaultClockSkew       = 15 * time.Minute
-	DefaultSlowRingSize    = 100
-	DefaultSlowThreshold   = 500 * time.Millisecond
-	DefaultMinTLSVersion   = "1.2"
-	DefaultPollInterval    = time.Second
+	defaultListenerAddress = ":443"
+	defaultAdminAddress    = "127.0.0.1:9900"
+	defaultCopyBufferBytes = 256 << 10
+	defaultIdleTimeout     = 60 * time.Second
+	defaultMetadataTimeout = 30 * time.Second
+	defaultDrainTimeout    = 30 * time.Second
+	defaultClockSkew       = 15 * time.Minute
+	defaultSlowRingSize    = 100
+	defaultSlowThreshold   = 500 * time.Millisecond
+	defaultMinTLSVersion   = "1.2"
+	defaultPollInterval    = time.Second
 )
 
-// ErrEmpty is returned when the input has no YAML document.
-var ErrEmpty = errors.New("config: empty document")
+// errEmpty is returned when the input has no YAML document.
+var errEmpty = errors.New("config: empty document")
 
 // Load reads, parses, applies defaults, and validates a config file.
 func Load(path string) (*Config, error) {
@@ -196,11 +196,11 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	defer f.Close() //nolint:errcheck // read-only file
-	return Read(f)
+	return read(f)
 }
 
-// Read parses, applies defaults, and validates a config from r.
-func Read(r io.Reader) (*Config, error) {
+// read parses, applies defaults, and validates a config from r.
+func read(r io.Reader) (*Config, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
@@ -211,14 +211,14 @@ func Read(r io.Reader) (*Config, error) {
 // Parse parses, applies defaults, and validates a config from bytes.
 func Parse(data []byte) (*Config, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
-		return nil, ErrEmpty
+		return nil, errEmpty
 	}
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, ErrEmpty
+			return nil, errEmpty
 		}
 		return nil, decodeError(data, err)
 	}
@@ -312,37 +312,37 @@ func before(l1, c1, l2, c2 int) bool {
 
 func (c *Config) applyDefaults() {
 	if c.Listener.Address == "" {
-		c.Listener.Address = DefaultListenerAddress
+		c.Listener.Address = defaultListenerAddress
 	}
 	if c.Listener.TLS.MinVersion == "" {
-		c.Listener.TLS.MinVersion = DefaultMinTLSVersion
+		c.Listener.TLS.MinVersion = defaultMinTLSVersion
 	}
 	if c.Admin.Address == "" {
-		c.Admin.Address = DefaultAdminAddress
+		c.Admin.Address = defaultAdminAddress
 	}
 	if c.Auth.ClockSkew == 0 {
-		c.Auth.ClockSkew = DefaultClockSkew
+		c.Auth.ClockSkew = defaultClockSkew
 	}
 	if c.Proxy.CopyBufferBytes == 0 {
-		c.Proxy.CopyBufferBytes = DefaultCopyBufferBytes
+		c.Proxy.CopyBufferBytes = defaultCopyBufferBytes
 	}
 	if c.Proxy.IdleTimeout == 0 {
-		c.Proxy.IdleTimeout = DefaultIdleTimeout
+		c.Proxy.IdleTimeout = defaultIdleTimeout
 	}
 	if c.Proxy.MetadataTimeout == 0 {
-		c.Proxy.MetadataTimeout = DefaultMetadataTimeout
+		c.Proxy.MetadataTimeout = defaultMetadataTimeout
 	}
 	if c.Proxy.DrainTimeout == 0 {
-		c.Proxy.DrainTimeout = DefaultDrainTimeout
+		c.Proxy.DrainTimeout = defaultDrainTimeout
 	}
 	if c.Directory.File != "" && c.Directory.PollInterval == 0 {
-		c.Directory.PollInterval = DefaultPollInterval
+		c.Directory.PollInterval = defaultPollInterval
 	}
 	if c.Telemetry.Slow.RingSize == 0 {
-		c.Telemetry.Slow.RingSize = DefaultSlowRingSize
+		c.Telemetry.Slow.RingSize = defaultSlowRingSize
 	}
 	if c.Telemetry.Slow.Threshold == 0 {
-		c.Telemetry.Slow.Threshold = DefaultSlowThreshold
+		c.Telemetry.Slow.Threshold = defaultSlowThreshold
 	}
 	for name := range c.Clusters {
 		if c.Clusters[name].EndpointMode == "" {

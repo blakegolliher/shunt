@@ -213,33 +213,33 @@ func TestMigrationPreservesTheClientsView(t *testing.T) {
 	r.statsMu.Lock()
 	t.Logf("mover: %v", r.stats)
 	r.statsMu.Unlock()
-	losses := r.losses.snapshot()
-	if r.tolerateLoss || len(losses) > 0 {
-		t.Logf("lost writes in the known HEAD-then-commit window (ADR-0004 race 2): %d distinct, read stale %d times", len(losses), r.knownReads.Load())
+	h := r.headline()
+	t.Logf("headline: %d distinct lost writes in the known HEAD-then-commit window (ADR-0004 race 2), %d violations outside it; %d violation records, %d operations in %s, seed %d",
+		h.LostWrites, h.ViolationsOutsideWindow, h.ViolationRecords, r.ops.Load(), dur, seed)
+	if strings.HasPrefix(h.Verdict, "fail") {
+		t.Fatalf("%s; record in %s", h.Verdict, r.rec.dir)
 	}
-	switch fails, known := r.fails.Load(), r.knownReads.Load(); {
-	case fails > known || (fails > 0 && !r.tolerateLoss):
-		t.Fatalf("%s: %d property violations over %d operations (%d outside the known window), seed %d; record in %s",
-			r.verdict(), fails, r.ops.Load(), fails-known, seed, r.rec.dir)
-	case fails > 0:
-		t.Logf("property: %d operations in %s; every violation is a stale read of a write lost in the known window; seed %d", r.ops.Load(), dur, seed)
-	default:
-		t.Logf("property: %d operations in %s, no violations, seed %d", r.ops.Load(), dur, seed)
-	}
+	t.Log(h.Verdict)
 }
 
-// verdict is the run's one-line result for run.json and the report.
-func (r *propertyRun) verdict() string {
+// headline is the run's result. Its count is distinct lost writes, taken from the target's commit
+// history whether or not any read saw them; violations.jsonl is the evidence, not the count. The
+// guarded variant passes when nothing happened outside the known window; the conditional variant
+// passes only when nothing happened at all.
+func (r *propertyRun) headline() propHeadline {
 	fails, known := r.fails.Load(), r.knownReads.Load()
+	h := propHeadline{LostWrites: len(r.losses.snapshot()), ViolationsOutsideWindow: fails - known, ViolationRecords: fails}
 	switch {
-	case fails == 0:
-		return "pass: no violations"
-	case fails == known && r.tolerateLoss:
-		return fmt.Sprintf("pass: %d distinct writes lost in the known HEAD-then-commit window, no other violation", len(r.losses.snapshot()))
-	case fails == known:
-		return "fail: known-window losses, and this variant tolerates none"
+	case h.ViolationsOutsideWindow > 0:
+		h.Verdict = fmt.Sprintf("fail: %d violations outside the known window", h.ViolationsOutsideWindow)
+	case h.LostWrites > 0 && !r.tolerateLoss:
+		h.Verdict = fmt.Sprintf("fail: %d writes lost in the HEAD-then-commit window, and this variant tolerates none", h.LostWrites)
+	case h.LostWrites > 0:
+		h.Verdict = fmt.Sprintf("pass: %d distinct writes lost in the known HEAD-then-commit window, nothing outside it", h.LostWrites)
+	default:
+		h.Verdict = "pass: no lost writes, no violations"
 	}
-	return fmt.Sprintf("fail: %d violations outside the known window", fails-known)
+	return h
 }
 
 // newPropertyRun builds the rig, the recorder, the loss ledger and the mover for one run. guard is
@@ -299,7 +299,7 @@ func newPropertyRun(t *testing.T, seed int64, seedNote string, dur time.Duration
 			stats[k] = v
 		}
 		r.statsMu.Unlock()
-		r.rec.close(t, r.ops.Load(), propOutcome{mover: stats, losses: r.losses.snapshot(), verdict: r.verdict()})
+		r.rec.close(t, r.ops.Load(), propOutcome{mover: stats, losses: r.losses.snapshot(), headline: r.headline()})
 	})
 	observe := func(cluster string) func(backendEvent) {
 		return func(ev backendEvent) {

@@ -16,7 +16,7 @@ import (
 )
 
 // ramp moves acme/data from garage to minio and returns the target's backend bucket name.
-func ramp(t *testing.T, m *mixedRig, tr directory.Transition) string {
+func ramp(t testing.TB, m *mixedRig, tr directory.Transition) string {
 	t.Helper()
 	const target = "acme-9000-data"
 	m.minio.addBucket(target)
@@ -474,5 +474,46 @@ func BenchmarkOwnCopy(b *testing.B) {
 	at := time.Now()
 	for b.Loop() {
 		_ = ownCopy(`"a"`, `"a"`, at, at)
+	}
+}
+
+// ADR-0007: a DeleteObjects body during a migration is held in memory, up to 1 MiB, so it can be
+// sent to both clusters. This is the cost of the largest body S3 allows: 1,000 keys.
+func BenchmarkMigratingDeleteObjects1000Keys(b *testing.B) {
+	m := newMixedRig(b, nil)
+	ramp(b, m, directory.Transition{To: directory.StateMigrating})
+	var body strings.Builder
+	body.WriteString(`<Delete><Quiet>true</Quiet>`)
+	for i := 0; i < 1000; i++ {
+		fmt.Fprintf(&body, "<Object><Key>dir/object-with-a-long-name-%06d</Key></Object>", i)
+	}
+	body.WriteString(`</Delete>`)
+	payload := []byte(body.String())
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if r := m.acme(b, "POST", "/data?delete", payload); r.StatusCode != 200 {
+			b.Fatalf("DeleteObjects: %d %s", r.StatusCode, r.body)
+		}
+	}
+}
+
+// ADR-0007: a merged listing page holds one upstream page per side in memory and renders the
+// merged page into a buffer before writing it. The cost of a full 1,000-key page from each side.
+func BenchmarkMergedListingPage1000Keys(b *testing.B) {
+	m := newMixedRig(b, nil)
+	for i := 0; i < 1000; i++ {
+		m.acme(b, "PUT", fmt.Sprintf("/data/src/%06d", i), []byte("x"))
+	}
+	target := ramp(b, m, directory.Transition{To: directory.StateMigrating})
+	for i := 0; i < 1000; i++ {
+		m.acme(b, "PUT", fmt.Sprintf("/data/dst/%06d", i), []byte("y"))
+	}
+	_ = target
+	b.ReportAllocs()
+	for b.Loop() {
+		if r := m.acme(b, "GET", "/data?list-type=2&max-keys=1000", nil); r.StatusCode != 200 {
+			b.Fatalf("listing: %d", r.StatusCode)
+		}
 	}
 }

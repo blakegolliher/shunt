@@ -53,6 +53,7 @@ migrate_start() {
   grep -q -- '--accept-lost-write-window' <<<"$out" || fail "migrate start"
   note "refused as designed: the target ignores If-None-Match: * on PUT. Accepting the window for this demo."
   $SHUNT migrate start "$@" --accept-lost-write-window | sed 's/^/   /'
+  MOVER_ACCEPT=-accept-lost-write-window # the mover refuses the same target without it
 }
 
 command -v aws >/dev/null || fail "aws-cli is not installed"
@@ -104,9 +105,9 @@ migrate_start --from "$FROM" --to "$TO" --create -c "$CFG"
 $SHUNT migrate status -c "$CFG" | sed 's/^/   /'
 
 say "3. Move the bytes"
-go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" | sed 's/^/   /'
+go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
 note "a second pass must copy nothing:"
-go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" | sed 's/^/   /'
+go run ./test/mover -config "$CFG" -from "$FROM" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
 note "fallback reads so far: $(metric shunt_migration_fallback_reads_total '')"
 
 say "4. Cut over and let go"

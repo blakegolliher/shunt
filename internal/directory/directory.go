@@ -86,9 +86,9 @@ func SplitKey(k string) (tenant, bucket string, ok bool) {
 	return tenant, bucket, ok && tenant != "" && bucket != ""
 }
 
-// Parse decodes a directory file. Unknown keys are errors naming their key path; an empty
+// parse decodes a directory file. Unknown keys are errors naming their key path; an empty
 // document is an empty directory at version 0.
-func Parse(data []byte) (*File, error) {
+func parse(data []byte) (*File, error) {
 	f := &File{}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return f, nil
@@ -104,8 +104,8 @@ func Parse(data []byte) (*File, error) {
 	return f, nil
 }
 
-// Marshal encodes a directory file. Map keys come out sorted, so the output is deterministic.
-func Marshal(f *File) ([]byte, error) {
+// marshal encodes a directory file. Map keys come out sorted, so the output is deterministic.
+func marshal(f *File) ([]byte, error) {
 	body, err := yaml.Dump(f, yaml.WithIndent(2))
 	if err != nil {
 		return nil, err
@@ -130,10 +130,10 @@ type Directory interface {
 var (
 	ErrExists       = errors.New("directory: placement already exists")
 	ErrNotFound     = errors.New("directory: no such placement")
-	ErrConflict     = errors.New("directory: placement changed concurrently")
+	errConflict     = errors.New("directory: placement changed concurrently")
 	ErrReadOnly     = errors.New("directory: directory file is not writable")
 	ErrLockTimeout  = errors.New("directory: timed out waiting for the directory lock")
-	ErrStaleVersion = errors.New("directory: file version did not increase")
+	errStaleVersion = errors.New("directory: file version did not increase")
 )
 
 type key struct{ tenant, bucket string }

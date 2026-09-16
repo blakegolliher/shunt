@@ -37,8 +37,8 @@ var legal = map[[2]string]bool{
 	{StateCutover, StateActive}:    true,
 }
 
-// Next lists the states reachable from state.
-func Next(state string) []string {
+// next lists the states reachable from state.
+func next(state string) []string {
 	var out []string
 	for _, to := range States {
 		if legal[[2]string{state, to}] {
@@ -57,7 +57,7 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		return fail("unknown state %q; states are %s", t.To, strings.Join(States, ", "))
 	}
 	if !legal[[2]string{p.State, t.To}] {
-		next := Next(p.State)
+		next := next(p.State)
 		return fail("allowed from %s: %s", p.State, strings.Join(next, ", "))
 	}
 	leaving := p.State == StateActive

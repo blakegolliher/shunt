@@ -123,7 +123,7 @@ func Parse(r *http.Request, d Domains) RequestInfo {
 			info.Level = LevelBucket
 		}
 	}
-	info.Op = Classify(r.Method, info.Level, info.Query, r.Header)
+	info.Op = classify(r.Method, info.Level, info.Query, r.Header)
 	return info
 }
 

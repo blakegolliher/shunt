@@ -68,10 +68,10 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Proxy.DrainTimeout != DefaultDrainTimeout {
+	if c.Proxy.DrainTimeout != defaultDrainTimeout {
 		t.Errorf("drain_timeout default: got %v", c.Proxy.DrainTimeout)
 	}
-	if c.Auth.ClockSkew != DefaultClockSkew {
+	if c.Auth.ClockSkew != defaultClockSkew {
 		t.Errorf("clock_skew default: got %v", c.Auth.ClockSkew)
 	}
 	if c.Listener.TLS.MinVersion != "1.2" {
@@ -126,7 +126,7 @@ func TestKillSwitchDefaults(t *testing.T) {
 
 func TestEmpty(t *testing.T) {
 	for _, in := range []string{"", "   \n", "# only a comment\n"} {
-		if _, err := Parse([]byte(in)); !errors.Is(err, ErrEmpty) {
+		if _, err := Parse([]byte(in)); !errors.Is(err, errEmpty) {
 			t.Errorf("Parse(%q): want ErrEmpty, got %v", in, err)
 		}
 	}

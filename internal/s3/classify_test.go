@@ -26,7 +26,7 @@ func TestEveryRow(t *testing.T) {
 		}
 		name := fmt.Sprintf("%02d_%s_%s_%s", i, r.method, r.level, r.op)
 		t.Run(name, func(t *testing.T) {
-			if got := Classify(r.method, r.level, q, h); got != r.op {
+			if got := classify(r.method, r.level, q, h); got != r.op {
 				t.Fatalf("row %d (%s %s %v %v %s): got %s want %s", i, r.method, r.level, r.query, r.value, r.header, got, r.op)
 			}
 		})
@@ -81,7 +81,7 @@ func TestPrecedence(t *testing.T) {
 			for k, v := range c.header {
 				h.Set(k, v)
 			}
-			if got := Classify(c.method, c.level, q, h); got != c.want {
+			if got := classify(c.method, c.level, q, h); got != c.want {
 				t.Fatalf("got %s want %s", got, c.want)
 			}
 		})
@@ -133,7 +133,7 @@ func BenchmarkClassify(b *testing.B) {
 	h := http.Header{}
 	b.ReportAllocs()
 	for b.Loop() {
-		if Classify(http.MethodPut, LevelObject, q, h) != OpUploadPart {
+		if classify(http.MethodPut, LevelObject, q, h) != OpUploadPart {
 			b.Fatal("misclassified")
 		}
 	}
@@ -144,7 +144,7 @@ func BenchmarkClassifyGetObject(b *testing.B) {
 	h := http.Header{}
 	b.ReportAllocs()
 	for b.Loop() {
-		if Classify(http.MethodGet, LevelObject, q, h) != OpGetObject {
+		if classify(http.MethodGet, LevelObject, q, h) != OpGetObject {
 			b.Fatal("misclassified")
 		}
 	}

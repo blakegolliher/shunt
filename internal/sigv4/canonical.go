@@ -14,13 +14,12 @@ import (
 
 // Algorithm strings.
 const (
-	Algorithm   = "AWS4-HMAC-SHA256"
-	AlgorithmA  = "AWS4-ECDSA-P256-SHA256"
-	Service     = "s3"
-	Terminator  = "aws4_request"
-	TimeFormat  = "20060102T150405Z"
-	DateFormat  = "20060102"
-	EmptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	Algorithm  = "AWS4-HMAC-SHA256"
+	AlgorithmA = "AWS4-ECDSA-P256-SHA256"
+	Service    = "s3"
+	terminator = "aws4_request"
+	TimeFormat = "20060102T150405Z"
+	DateFormat = "20060102"
 
 	// Payload hash sentinels (x-amz-content-sha256).
 	UnsignedPayload                 = "UNSIGNED-PAYLOAD"
@@ -37,7 +36,7 @@ type Scope struct {
 }
 
 func (s Scope) String() string {
-	return s.Date + "/" + s.Region + "/" + s.Service + "/" + Terminator
+	return s.Date + "/" + s.Region + "/" + s.Service + "/" + terminator
 }
 
 // CanonicalRequest builds the SigV4 canonical request with the S3 rules:
@@ -56,7 +55,7 @@ func CanonicalRequest(method, rawPath string, query url.Values, headers http.Hea
 	b.WriteByte('\n')
 	b.WriteString(rawPath)
 	b.WriteByte('\n')
-	b.WriteString(CanonicalQuery(query))
+	b.WriteString(canonicalQuery(query))
 	b.WriteByte('\n')
 	names := normalizeSignedHeaders(signedHeaders)
 	for _, name := range names {
@@ -135,9 +134,9 @@ func foldSpace(v string) string {
 	return b.String()
 }
 
-// CanonicalQuery sorts by key then value and encodes per RFC 3986 (space → %20, "+" → %2B,
+// canonicalQuery sorts by key then value and encodes per RFC 3986 (space → %20, "+" → %2B,
 // unreserved A-Za-z0-9-_.~ kept, uppercase hex). Empty values render as "key=".
-func CanonicalQuery(q url.Values) string {
+func canonicalQuery(q url.Values) string {
 	if len(q) == 0 {
 		return ""
 	}
@@ -205,7 +204,7 @@ func SigningKey(secret string, scope Scope) []byte {
 	k := hmacSHA256([]byte("AWS4"+secret), []byte(scope.Date))
 	k = hmacSHA256(k, []byte(scope.Region))
 	k = hmacSHA256(k, []byte(scope.Service))
-	return hmacSHA256(k, []byte(Terminator))
+	return hmacSHA256(k, []byte(terminator))
 }
 
 // Signature is hex(HMAC(kSigning, stringToSign)).

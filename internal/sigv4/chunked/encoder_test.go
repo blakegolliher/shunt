@@ -40,7 +40,7 @@ func TestEncoderRoundTripThroughUnsignedReader(t *testing.T) {
 				t.Fatalf("size %d chunk %d: encoded %d bytes, precomputed %d\n%q", size, chunk, len(encoded), want, encoded[:min(200, len(encoded))])
 			}
 			// Decode with the lifted unsigned reader, which also validates the trailer checksum.
-			rd, err := NewUnsignedChunkReader(bytes.NewReader(encoded), checksumTypeCrc32, int64(size))
+			rd, err := newUnsignedChunkReader(bytes.NewReader(encoded), checksumTypeCrc32, int64(size))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -83,7 +83,7 @@ func FuzzUnsignedChunkReader(f *testing.F) {
 		if declared < 0 || declared > 1<<20 {
 			return
 		}
-		rd, err := NewUnsignedChunkReader(bytes.NewReader(body), checksumTypeCrc32, declared)
+		rd, err := newUnsignedChunkReader(bytes.NewReader(body), checksumTypeCrc32, declared)
 		if err != nil {
 			return
 		}
@@ -135,7 +135,7 @@ func BenchmarkUnsignedDecode1MiB(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for b.Loop() {
-		rd, _ := NewUnsignedChunkReader(bytes.NewReader(encoded), checksumTypeCrc32, int64(len(payload)))
+		rd, _ := newUnsignedChunkReader(bytes.NewReader(encoded), checksumTypeCrc32, int64(len(payload)))
 		if _, err := io.Copy(io.Discard, rd); err != nil {
 			b.Fatal(err)
 		}

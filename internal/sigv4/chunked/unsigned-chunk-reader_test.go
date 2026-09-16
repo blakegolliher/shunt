@@ -13,6 +13,8 @@
 // under the License.
 // Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-15: package renamed to chunked;
 // error assertions use the shunt s3 error table.
+// Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-16: follows the unexported
+// newUnsignedChunkReader (G1).
 
 package chunked
 
@@ -35,7 +37,7 @@ func TestUnsignedChunkReaderStreamsLargeChunkWithoutBuffering(t *testing.T) {
 		strings.NewReader(fmt.Sprintf("%x\r\n", chunkSize)),
 		strings.NewReader("abc"),
 	)
-	reader, err := NewUnsignedChunkReader(body, "", chunkSize)
+	reader, err := newUnsignedChunkReader(body, "", chunkSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func TestUnsignedChunkReaderStreamsLargeChunkWithoutBuffering(t *testing.T) {
 func TestUnsignedChunkReaderReadsAcrossChunksAndThenEOF(t *testing.T) {
 	firstChunk := strings.Repeat("a", int(minChunkSize))
 	body := unsignedChunkBody(firstChunk, "tail")
-	reader, err := NewUnsignedChunkReader(strings.NewReader(body), "", int64(len(firstChunk)+len("tail")))
+	reader, err := newUnsignedChunkReader(strings.NewReader(body), "", int64(len(firstChunk)+len("tail")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,7 @@ func TestUnsignedChunkReaderValidatesTrailingChecksum(t *testing.T) {
 	body := fmt.Sprintf("%x\r\n%s\r\n0\r\n%s:%s\r\n\r\n",
 		len(payload), payload, checksumTypeSha256, checksum)
 
-	reader, err := NewUnsignedChunkReader(strings.NewReader(body), checksumTypeSha256, int64(len(payload)))
+	reader, err := newUnsignedChunkReader(strings.NewReader(body), checksumTypeSha256, int64(len(payload)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +112,7 @@ func TestUnsignedChunkReaderValidatesTrailingChecksum(t *testing.T) {
 
 func TestUnsignedChunkReaderContentLengthMismatchStopsAtDecodedLength(t *testing.T) {
 	body := "b\r\nabcdefghijk\r\n0\r\n\r\n"
-	reader, err := NewUnsignedChunkReader(strings.NewReader(body), "", 5)
+	reader, err := newUnsignedChunkReader(strings.NewReader(body), "", 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +127,7 @@ func TestUnsignedChunkReaderContentLengthMismatchStopsAtDecodedLength(t *testing
 
 func TestUnsignedChunkReaderDeclaredChunkLongerThanPayloadReturnsIncompleteBody(t *testing.T) {
 	body := "B\r\ndummy data\r\n0\r\n\r\n"
-	reader, err := NewUnsignedChunkReader(strings.NewReader(body), checksumTypeCrc64nvme, 10)
+	reader, err := newUnsignedChunkReader(strings.NewReader(body), checksumTypeCrc64nvme, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +142,7 @@ func TestUnsignedChunkReaderDeclaredChunkLongerThanPayloadReturnsIncompleteBody(
 
 func TestUnsignedChunkReaderInvalidChunkSize(t *testing.T) {
 	body := unsignedChunkBody("short", "x")
-	reader, err := NewUnsignedChunkReader(strings.NewReader(body), "", int64(len("short")+len("x")))
+	reader, err := newUnsignedChunkReader(strings.NewReader(body), "", int64(len("short")+len("x")))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,6 +14,9 @@
 // Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-15: package renamed to chunked;
 // debuglogger calls removed; s3err replaced by the shunt s3 error table; aws-sdk types replaced by string;
 // sha512/md5/xxhash hashers dropped (Versity extensions, not AWS algorithms).
+// Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-16: NewUnsignedChunkReader
+// unexported and an unused method removed (G1: the reader is the test oracle for shunt's encoder,
+// and only this package's tests use it).
 
 package chunked
 
@@ -82,11 +85,7 @@ type UnsignedChunkReader struct {
 	dataRead int64
 }
 
-func (ucr *UnsignedChunkReader) decodedBytesReturned() int64 {
-	return ucr.dataRead - ucr.chunkDataLeft
-}
-
-func NewUnsignedChunkReader(r io.Reader, ct checksumType, decContentLength int64) (*UnsignedChunkReader, error) {
+func newUnsignedChunkReader(r io.Reader, ct checksumType, decContentLength int64) (*UnsignedChunkReader, error) {
 	var hasher hash.Hash
 	var err error
 	if ct != "" {
@@ -397,7 +396,7 @@ func (ucr *UnsignedChunkReader) readTrailer() error {
 func (ucr *UnsignedChunkReader) validateChecksum() error {
 	algo := (strings.ToUpper(strings.TrimPrefix(string(ucr.checksumType), "x-amz-checksum-")))
 	// validate the checksum
-	if !IsValidChecksum(ucr.parsedChecksum, algo) {
+	if !isValidChecksum(ucr.parsedChecksum, algo) {
 		return errInvalidTrailingChecksum(string(ucr.checksumType))
 	}
 

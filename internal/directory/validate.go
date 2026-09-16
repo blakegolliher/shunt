@@ -46,10 +46,10 @@ func (e *errs) ref(clusters map[string]config.Cluster, key, name string) bool {
 
 func sortedKeys[V any](m map[string]V) []string { return slices.Sorted(maps.Keys(m)) }
 
-// ValidTenant reports whether name is a legal tenant name: 1–32 lowercase letters, digits, and
+// validTenant reports whether name is a legal tenant name: 1–32 lowercase letters, digits, and
 // hyphens, starting and ending with a letter or digit. Tenant names prefix generated backend
 // bucket names, so they must be legal there.
-func ValidTenant(name string) bool {
+func validTenant(name string) bool {
 	if name == "" || len(name) > 32 || name[0] == '-' || name[len(name)-1] == '-' {
 		return false
 	}
@@ -62,17 +62,17 @@ func ValidTenant(name string) bool {
 	return true
 }
 
-// Validate checks a directory file's structure and its references to the configured clusters. It
+// validate checks a directory file's structure and its references to the configured clusters. It
 // returns every failure joined, each naming its key. Transition legality is checked by Apply at
 // write time, not here: the validator only sees one state.
-func Validate(f *File, clusters map[string]config.Cluster) error {
+func validate(f *File, clusters map[string]config.Cluster) error {
 	var e errs
 	if f.Version < 0 {
 		e.add("version", "must not be negative")
 	}
 	for _, name := range sortedKeys(f.Tenants) {
 		k := "tenants." + name
-		if !ValidTenant(name) {
+		if !validTenant(name) {
 			e.add(k, "tenant names are 1-32 lowercase letters, digits, and hyphens, starting and ending with a letter or digit")
 		}
 		if t := f.Tenants[name]; t.DefaultCluster == "" {

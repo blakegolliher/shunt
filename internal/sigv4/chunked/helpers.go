@@ -18,26 +18,14 @@ type AuthData struct {
 	Signature string
 }
 
-// ChecksumType exposes the trailer checksum type to callers outside the package.
-type ChecksumType = checksumType
-
-// Checksum trailer names accepted by the readers and produced by the encoder.
-const (
-	ChecksumCRC32     = checksumTypeCrc32
-	ChecksumCRC32C    = checksumTypeCrc32c
-	ChecksumSHA1      = checksumTypeSha1
-	ChecksumSHA256    = checksumTypeSha256
-	ChecksumCRC64NVME = checksumTypeCrc64nvme
-)
-
 // checksumLengths is the decoded byte length of each algorithm's base64 checksum value.
 var checksumLengths = map[string]int{
 	"CRC32": 4, "CRC32C": 4, "SHA1": 20, "SHA256": 32, "CRC64NVME": 8,
 }
 
-// IsValidChecksum reports whether checksum is base64 of the right length for algorithm
+// isValidChecksum reports whether checksum is base64 of the right length for algorithm
 // (algorithm is the upper-case name without the x-amz-checksum- prefix).
-func IsValidChecksum(checksum, algorithm string) bool {
+func isValidChecksum(checksum, algorithm string) bool {
 	want, ok := checksumLengths[strings.ToUpper(algorithm)]
 	if !ok {
 		return false

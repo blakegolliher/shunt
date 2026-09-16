@@ -270,7 +270,7 @@ func TestCredentialRedaction(t *testing.T) {
 }
 
 func TestCanonicalPieces(t *testing.T) {
-	if got := CanonicalQuery(url.Values{"b": {"2", "1"}, "a": {""}, "s p": {"v+w"}}); got != "a=&b=1&b=2&s%20p=v%2Bw" {
+	if got := canonicalQuery(url.Values{"b": {"2", "1"}, "a": {""}, "s p": {"v+w"}}); got != "a=&b=1&b=2&s%20p=v%2Bw" {
 		t.Errorf("query: %s", got)
 	}
 	if got := foldSpace("  a  \t b   c "); got != "a b c" {
@@ -284,7 +284,7 @@ func TestCanonicalPieces(t *testing.T) {
 	if RawPath(sr) != "/b/k%2Fx" {
 		t.Errorf("raw path: %s", RawPath(sr))
 	}
-	if ParsePayloadMode("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER") != PayloadStreamingSignedTrailer || ParsePayloadMode(strings.Repeat("a", 64)) != PayloadSHA256 || ParsePayloadMode("zz") != PayloadInvalid {
+	if parsePayloadMode("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER") != PayloadStreamingSignedTrailer || parsePayloadMode(strings.Repeat("a", 64)) != PayloadSHA256 || parsePayloadMode("zz") != PayloadInvalid {
 		t.Error("payload mode")
 	}
 	if StringToSign(now, Scope{"20260915", "r", "s3"}, "x")[:len(Algorithm)] != Algorithm {
@@ -298,7 +298,7 @@ func FuzzParseAuthorization(f *testing.F) {
 	f.Add(Algorithm + " Credential=,SignedHeaders=,Signature=")
 	f.Add("")
 	f.Fuzz(func(_ *testing.T, in string) {
-		_, _ = ParseAuthorization(in)
+		_, _ = parseAuthorization(in)
 	})
 }
 

@@ -66,6 +66,7 @@ and a copied key could go stale. It refuses to start otherwise.
 ```sh
 go run ./test/mover -config /etc/shunt/shunt.yaml -bucket acme/data   # one placement
 go run ./test/mover -config /etc/shunt/shunt.yaml -from minio         # everything moving off minio
+go run ./test/mover -config … -from minio -accept-lost-write-window    # when the target lacks conditional PUT
 go run ./test/mover -config … -bucket acme/data -dry-run              # list, do not copy
 ```
 
@@ -103,12 +104,16 @@ between that HEAD and the mover's PUT (or `CompleteMultipartUpload`) is overwrit
 source bytes.** The client already got 200 for its write, and nothing reports the loss. The window is
 one round trip per object, repeated for every object the mover copies.
 
-`shunt migrate start` refuses such a target, naming the window and this section, unless it is given
-`--accept-lost-write-window`. The flag changes nothing about the mover. It is the
-operator saying the next point has been dealt with. The refusal is keyed on the profile, so a
-cluster whose `conditional_write` is unset is taken at its default, true: fill the profile from
-`shunt probe`. It guards `migrate start` only. A mover run while the placement is `RAMPING` at ratio 1
-has the same window and no such check.
+The check lives in two places, and both give the same refusal, naming the window and this section:
+
+- `shunt migrate start` refuses such a target unless given `--accept-lost-write-window`;
+- the mover refuses it unless given `-accept-lost-write-window`, whatever state the placement is in.
+  That catches a mover run on a placement `RAMPING` at ratio 1, which never went through
+  `migrate start`. With `-from`, one refused placement stops the whole run before anything is copied.
+
+Neither flag changes what the mover does. Each is the operator saying the point below has been
+dealt with. The refusal is keyed on the profile, so a cluster whose `conditional_write` is unset is
+taken at its default, true: fill the profile from `shunt probe`.
 
 What to do:
 

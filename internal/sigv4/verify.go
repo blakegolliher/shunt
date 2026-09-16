@@ -109,8 +109,8 @@ type Auth struct {
 	Expires       int64  // X-Amz-Expires for presigned
 }
 
-// ParseAuthorization parses "AWS4-HMAC-SHA256 Credential=…, SignedHeaders=…, Signature=…".
-func ParseAuthorization(h string) (Auth, *AuthError) {
+// parseAuthorization parses "AWS4-HMAC-SHA256 Credential=…, SignedHeaders=…, Signature=…".
+func parseAuthorization(h string) (Auth, *AuthError) {
 	h = strings.TrimSpace(h)
 	if h == "" {
 		return Auth{}, fail(ReasonMissing, s3.AccessDenied, "Missing Authorization header.")
@@ -162,7 +162,7 @@ func parseCredential(v string) (string, Scope, *AuthError) {
 	if p[3] != Service {
 		return "", Scope{}, fail(ReasonMalformed, s3.AuthorizationHeaderMalformed, `The authorization header is malformed; incorrect service "`+p[3]+`". This endpoint belongs to "s3".`)
 	}
-	if p[4] != Terminator {
+	if p[4] != terminator {
 		return "", Scope{}, fail(ReasonMalformed, s3.AuthorizationHeaderMalformed, `The authorization header is malformed; incorrect terminal "`+p[4]+`". This endpoint uses "aws4_request".`)
 	}
 	if _, err := time.Parse(DateFormat, p[1]); err != nil {
@@ -174,8 +174,8 @@ func parseCredential(v string) (string, Scope, *AuthError) {
 	return p[0], Scope{Date: p[1], Region: p[2], Service: Service}, nil
 }
 
-// ParsePresigned parses the X-Amz-* query parameters of a presigned URL.
-func ParsePresigned(r *http.Request, maxExpires int64) (Auth, *AuthError) {
+// parsePresigned parses the X-Amz-* query parameters of a presigned URL.
+func parsePresigned(r *http.Request, maxExpires int64) (Auth, *AuthError) {
 	q := RawQuery(r)
 	if q.Get("AWSAccessKeyId") != "" || (q.Get("Signature") != "" && q.Get("Expires") != "") {
 		return Auth{}, fail(ReasonMalformed, s3.InvalidRequest, "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.")
@@ -245,7 +245,7 @@ func Verify(ctx context.Context, r *http.Request, store CredentialStore, now tim
 	q := RawQuery(r)
 	switch {
 	case authHeader != "":
-		if a, aerr = ParseAuthorization(authHeader); aerr != nil {
+		if a, aerr = parseAuthorization(authHeader); aerr != nil {
 			return Identity{}, aerr
 		}
 		var terr *AuthError
@@ -256,7 +256,7 @@ func Verify(ctx context.Context, r *http.Request, store CredentialStore, now tim
 			return Identity{}, fail(ReasonMalformed, s3.AuthorizationHeaderMalformed, "Invalid credential date. Date is not the same as X-Amz-Date.")
 		}
 	case q.Get("X-Amz-Algorithm") != "" || q.Get("X-Amz-Credential") != "" || q.Get("X-Amz-Signature") != "":
-		if a, aerr = ParsePresigned(r, o.MaxExpires); aerr != nil {
+		if a, aerr = parsePresigned(r, o.MaxExpires); aerr != nil {
 			return Identity{}, aerr
 		}
 		signTime, _ = time.Parse(TimeFormat, a.Date)
@@ -283,7 +283,7 @@ func Verify(ctx context.Context, r *http.Request, store CredentialStore, now tim
 	mode := PayloadUnsigned
 	if !a.Presigned {
 		v := r.Header.Get("X-Amz-Content-Sha256")
-		mode = ParsePayloadMode(v)
+		mode = parsePayloadMode(v)
 		switch mode {
 		case PayloadMissing:
 			if o.RequireHash && r.Method != http.MethodHead {

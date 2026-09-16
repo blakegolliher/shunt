@@ -19,8 +19,8 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 )
 
-// DefaultLockTimeout bounds how long a write waits for another writer to finish.
-const DefaultLockTimeout = 5 * time.Second
+// defaultLockTimeout bounds how long a write waits for another writer to finish.
+const defaultLockTimeout = 5 * time.Second
 
 // FileDir is the file backend (ADR-0005). Reads are a lock-free snapshot pointer. Writes, from
 // the proxy and the CLI alike, take an exclusive flock on <file>.lock, re-read the file, apply
@@ -62,16 +62,16 @@ type Change struct {
 // Open loads and validates the directory file. The file must exist: a mistyped path must not
 // silently become an empty directory.
 func Open(path string, clusters map[string]config.Cluster) (*FileDir, error) {
-	d := &FileDir{path: path, clusters: clusters, LockTimeout: DefaultLockTimeout, Now: time.Now}
+	d := &FileDir{path: path, clusters: clusters, LockTimeout: defaultLockTimeout, Now: time.Now}
 	data, st, err := readFile(path)
 	if err != nil {
 		return nil, err
 	}
-	f, err := Parse(data)
+	f, err := parse(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := Validate(f, clusters); err != nil {
+	if err := validate(f, clusters); err != nil {
 		return nil, fmt.Errorf("directory %s: %w", path, err)
 	}
 	d.install(f, data, st)
@@ -84,11 +84,11 @@ func Load(path string, clusters map[string]config.Cluster) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := Parse(data)
+	f, err := parse(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := Validate(f, clusters); err != nil {
+	if err := validate(f, clusters); err != nil {
 		return nil, fmt.Errorf("directory %s: %w", path, err)
 	}
 	return f, nil
@@ -157,9 +157,9 @@ func (d *FileDir) Reload() (bool, error) {
 	}
 	d.stamp = st
 	cur := d.snap.Load().Version()
-	f, err := Parse(data)
+	f, err := parse(data)
 	if err == nil {
-		err = Validate(f, d.clusters)
+		err = validate(f, d.clusters)
 	}
 	if err != nil {
 		return false, fmt.Errorf("directory: reload of %s rejected, keeping version %d: %w", d.path, cur, err)
@@ -168,7 +168,7 @@ func (d *FileDir) Reload() (bool, error) {
 		if f.Version == cur && sha256.Sum256(data) == d.sum {
 			return false, nil // touched, not changed
 		}
-		return false, fmt.Errorf("%w: %s has version %d, loaded version is %d; keeping version %d", ErrStaleVersion, d.path, f.Version, cur, cur)
+		return false, fmt.Errorf("%w: %s has version %d, loaded version is %d; keeping version %d", errStaleVersion, d.path, f.Version, cur, cur)
 	}
 	d.install(f, data, st)
 	return true, nil
@@ -201,7 +201,7 @@ func (d *FileDir) Delete(ctx context.Context, tenant, bucket, actor string) erro
 			return ErrNotFound
 		}
 		if p.State != StateActive {
-			return fmt.Errorf("%w: %s is %s; only an ACTIVE placement can be deleted", ErrConflict, k, p.State)
+			return fmt.Errorf("%w: %s is %s; only an ACTIVE placement can be deleted", errConflict, k, p.State)
 		}
 		delete(f.Placements, k)
 		return nil
@@ -221,7 +221,7 @@ func (d *FileDir) SetTenantDefault(ctx context.Context, tenant, cluster, actor s
 			return fmt.Errorf("%w: cluster %q is not configured", ErrNotFound, cluster)
 		}
 		if t.DefaultCluster == cluster {
-			return fmt.Errorf("%w: %s already defaults to %s", ErrConflict, tenant, cluster)
+			return fmt.Errorf("%w: %s already defaults to %s", errConflict, tenant, cluster)
 		}
 		t.DefaultCluster = cluster
 		f.Tenants[tenant] = t
@@ -238,7 +238,7 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 			return ErrNotFound
 		}
 		if p.State != from {
-			return fmt.Errorf("%w: %s is %s on disk, expected %s", ErrConflict, k, p.State, from)
+			return fmt.Errorf("%w: %s is %s on disk, expected %s", errConflict, k, p.State, from)
 		}
 		np, err := Apply(p, t)
 		if err != nil {
@@ -269,9 +269,9 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	if err != nil {
 		return err
 	}
-	f, err := Parse(data)
+	f, err := parse(data)
 	if err == nil {
-		err = Validate(f, d.clusters)
+		err = validate(f, d.clusters)
 	}
 	if err != nil {
 		return fmt.Errorf("directory: %s on disk is invalid; refusing to write: %w", d.path, err)
@@ -288,10 +288,10 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 		return ferr
 	}
 	f.Version++
-	if verr := Validate(f, d.clusters); verr != nil {
+	if verr := validate(f, d.clusters); verr != nil {
 		return verr
 	}
-	out, err := Marshal(f)
+	out, err := marshal(f)
 	if err != nil {
 		return err
 	}
@@ -319,7 +319,7 @@ func (d *FileDir) lock(ctx context.Context) (func(), error) {
 	fd := int(lf.Fd()) //nolint:gosec // G115: a file descriptor fits in int
 	timeout := d.LockTimeout
 	if timeout <= 0 {
-		timeout = DefaultLockTimeout
+		timeout = defaultLockTimeout
 	}
 	deadline := time.Now().Add(timeout)
 	for {

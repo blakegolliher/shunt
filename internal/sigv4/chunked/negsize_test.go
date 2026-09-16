@@ -32,7 +32,7 @@ func TestSignedReaderRejectsNegativeChunkSize(t *testing.T) {
 }
 
 func TestUnsignedReaderRejectsNegativeChunkSize(t *testing.T) {
-	rd, err := NewUnsignedChunkReader(bytes.NewReader([]byte("-1\r\nx\r\n0\r\n\r\n")), checksumTypeCrc32, 1)
+	rd, err := newUnsignedChunkReader(bytes.NewReader([]byte("-1\r\nx\r\n0\r\n\r\n")), checksumTypeCrc32, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -33,7 +33,7 @@ func TestResolveSecret(t *testing.T) {
 		if c.ok && (err != nil || got != c.want) {
 			t.Errorf("%q: got %q %v", c.ref, got, err)
 		}
-		if !c.ok && (err == nil || !errors.Is(err, ErrSecretRef)) {
+		if !c.ok && (err == nil || !errors.Is(err, errSecretRef)) {
 			t.Errorf("%q: expected ErrSecretRef, got %v", c.ref, err)
 		}
 	}

@@ -89,7 +89,7 @@ func TestInvalidSamplesNameTheKey(t *testing.T) {
 }
 
 func TestEmptyFileIsEmptyDirectory(t *testing.T) {
-	f, err := Parse([]byte("  \n# nothing\n"))
+	f, err := parse([]byte("  \n# nothing\n"))
 	if err != nil || f.Version != 0 || len(f.Placements) != 0 {
 		t.Fatalf("%+v %v", f, err)
 	}
@@ -141,7 +141,7 @@ func TestTransitionMatrix(t *testing.T) {
 				continue
 			}
 			f := &File{Version: 1, Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{"acme/data": np}}
-			if err := Validate(f, clusters); err != nil {
+			if err := validate(f, clusters); err != nil {
 				t.Errorf("%s -> %s produced an invalid placement: %v\n%+v", from, to, err, np)
 			}
 		}
@@ -208,7 +208,7 @@ func TestBackendName(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		tenant := gen(1, 32, "-")
 		bucket := gen(3, 63, "-.")
-		if !ValidTenant(tenant) || !s3.ValidBucketName(bucket) {
+		if !validTenant(tenant) || !s3.ValidBucketName(bucket) {
 			continue
 		}
 		name := BackendName(tenant, bucket, i%3)
@@ -286,13 +286,13 @@ func TestFileDirWrites(t *testing.T) {
 	if d.Snapshot().Version() != 4 {
 		t.Fatalf("failed writes bumped the version to %d", d.Snapshot().Version())
 	}
-	if err := d.SetState(ctx, "acme", "data", StateRamping, Transition{To: StateMigrating}, "test"); !errors.Is(err, ErrConflict) {
+	if err := d.SetState(ctx, "acme", "data", StateRamping, Transition{To: StateMigrating}, "test"); !errors.Is(err, errConflict) {
 		t.Fatalf("stale from-state: %v", err)
 	}
 	if err := d.SetState(ctx, "acme", "data", StateActive, Transition{To: StateMigrating, Target: "minio", Name: "acme-9999-data"}, "op"); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Delete(ctx, "acme", "data", "test"); !errors.Is(err, ErrConflict) {
+	if err := d.Delete(ctx, "acme", "data", "test"); !errors.Is(err, errConflict) {
 		t.Fatalf("delete of a MIGRATING placement: %v", err)
 	}
 	if err := d.Delete(ctx, "acme", "missing", "test"); !errors.Is(err, ErrNotFound) {
@@ -363,12 +363,12 @@ func TestReload(t *testing.T) {
 		t.Fatalf("last good snapshot lost: %d", a.Snapshot().Version())
 	}
 	// A version that does not increase is rejected.
-	good, _ := Marshal(a.Snapshot().File())
+	good, _ := marshal(a.Snapshot().File())
 	stale := strings.Replace(string(good), "zed-0000-logs", "zed-0001-logs", 1)
 	if err := os.WriteFile(path, []byte(stale), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Reload(); !errors.Is(err, ErrStaleVersion) {
+	if _, err := a.Reload(); !errors.Is(err, errStaleVersion) {
 		t.Fatalf("stale version: %v", err)
 	}
 	// Kubernetes ConfigMap style: path is a symlink swapped to a new target with a higher version.
@@ -377,7 +377,7 @@ func TestReload(t *testing.T) {
 	v1, v2 := filepath.Join(dir, "..v1"), filepath.Join(dir, "..v2")
 	f := a.Snapshot().File()
 	f.Version = 10
-	out, _ := Marshal(f)
+	out, _ := marshal(f)
 	_ = os.WriteFile(v1, out, 0o644)
 	if err := os.Symlink(v1, link); err != nil {
 		t.Fatal(err)
@@ -388,7 +388,7 @@ func TestReload(t *testing.T) {
 	}
 	f.Version = 11
 	delete(f.Placements, "zed/logs")
-	out, _ = Marshal(f)
+	out, _ = marshal(f)
 	_ = os.WriteFile(v2, out, 0o644)
 	tmpLink := link + ".new"
 	_ = os.Symlink(v2, tmpLink)
@@ -558,22 +558,22 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("version: 1\nplacements: { a/b: { state: ACTIVE } }"))
 	clusters := sampleClusters(f)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		d, err := Parse(data)
+		d, err := parse(data)
 		if err != nil {
 			return
 		}
-		if Validate(d, clusters) != nil {
+		if validate(d, clusters) != nil {
 			return
 		}
-		out, err := Marshal(d)
+		out, err := marshal(d)
 		if err != nil {
 			t.Fatalf("marshal of a valid directory: %v", err)
 		}
-		back, err := Parse(out)
+		back, err := parse(out)
 		if err != nil {
 			t.Fatalf("round trip does not parse: %v\n%s", err, out)
 		}
-		if err := Validate(back, clusters); err != nil || back.Version != d.Version || len(back.Placements) != len(d.Placements) {
+		if err := validate(back, clusters); err != nil || back.Version != d.Version || len(back.Placements) != len(d.Placements) {
 			t.Fatalf("round trip changed the directory: %v\n%s", err, out)
 		}
 		newSnapshot(back)

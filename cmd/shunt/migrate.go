@@ -16,6 +16,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -100,7 +101,7 @@ func newMigrateStart(cfgPath *string) *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.BoolVar(&acceptLoss, "accept-lost-write-window", false,
+	f.BoolVar(&acceptLoss, migrate.AcceptLostWriteWindowFlag, false,
 		"start even though the target ignores If-None-Match: * on PUT, accepting that the mover can overwrite a client write (docs/migrating.md)")
 	f.StringVar(&to, "to", "", "the cluster that becomes primary (required unless already RAMPING)")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket currently served by this cluster (how a vendor is evacuated)")
@@ -278,13 +279,6 @@ func reportLeftovers(cmd *cobra.Command, cfg *config.Config, f *directory.File, 
 	_, _ = fmt.Fprintf(out, "\nnothing in the directory names %s any more: remove its block from the config and run `shunt check-config`.\n", cluster)
 }
 
-// lostWriteWindow is the refusal, and with --accept-lost-write-window the warning, for a migration
-// into a cluster that ignores If-None-Match: * on PUT (ADR-0004 race 2).
-const lostWriteWindow = "%s: target cluster %s has capabilities.conditional_write: false (it ignores If-None-Match: * on PUT), " +
-	"so the mover falls back to HEAD-then-commit. A client write that lands between the mover's HEAD and its PUT " +
-	"is overwritten with the source's older bytes, after the client was told 200, and nothing reports it (one round trip per copied object; ADR-0004 race 2). " +
-	"Quiesce writers for the mover run, or ramp to 1 and run the mover at low write volume; see docs/migrating.md"
-
 // transition applies one state change, resolving and optionally creating the target bucket first.
 // acceptLoss allows entering MIGRATING on a target without conditional PUT.
 func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition, create, acceptLoss bool, actor string) error {
@@ -327,7 +321,7 @@ func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition,
 	lossWindow := np.State == directory.StateMigrating && p.State != directory.StateMigrating &&
 		!cfg.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true)
 	if lossWindow && !acceptLoss {
-		return fmt.Errorf(lostWriteWindow+". To start anyway, re-run with --accept-lost-write-window", key, np.Primary)
+		return migrate.RefuseLostWriteWindow(key, np.Primary)
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
 	defer cancel()
@@ -365,7 +359,7 @@ func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition,
 	case directory.StateMigrating:
 		_, _ = fmt.Fprintf(out, "all writes now land on %s; run the mover to copy what is still on %s\n", np.Primary, np.Source)
 		if lossWindow {
-			_, _ = fmt.Fprintf(out, "WARNING (accepted with --accept-lost-write-window): "+lostWriteWindow+"\n", key, np.Primary)
+			_, _ = fmt.Fprintf(out, "WARNING (accepted with --%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(key, np.Primary))
 		}
 	case directory.StateCutover:
 		_, _ = fmt.Fprintf(out, "%s is no longer read; run `shunt migrate finish %s` to drop it for good\n", np.Source, key)

@@ -72,12 +72,22 @@ type propStall struct {
 
 const stallThreshold = time.Second
 
+// propHeadline is the run's result, first in run.json. The count is distinct lost writes from the
+// commit history; violation records are evidence, not the count.
+type propHeadline struct {
+	LostWrites              int    `json:"lost_writes"`                     // distinct, from the target's commit history, observed by a read or not
+	ViolationsOutsideWindow int64  `json:"violations_outside_known_window"` // any of these fails the run
+	ViolationRecords        int64  `json:"violation_records"`               // lines in violations.jsonl: evidence
+	Verdict                 string `json:"verdict"`
+}
+
 type propRunInfo struct {
 	Started    time.Time        `json:"started"`
 	Ended      time.Time        `json:"ended,omitzero"`
 	Seed       int64            `json:"seed"`
 	SeedNote   string           `json:"seed_note"`
 	Duration   string           `json:"duration"`
+	Headline   *propHeadline    `json:"headline,omitempty"`
 	Workers    int              `json:"workers"`
 	Keys       int              `json:"keys"`
 	Topology   any              `json:"topology"`
@@ -87,7 +97,6 @@ type propRunInfo struct {
 	Stalls     []propStall      `json:"harness_stalls"`
 	Mover      map[string]int64 `json:"mover,omitempty"` // pass<N>.<churn|kept>.<step>.<status> -> count
 	LostWrites []propLoss       `json:"lost_writes_known_window"`
-	Verdict    string           `json:"verdict,omitempty"`
 	Result     string           `json:"result,omitempty"`
 	Events     string           `json:"events,omitempty"`
 }
@@ -237,9 +246,9 @@ func (rec *recorder) violation(v propViolation) propViolation {
 // report. A clean run's event log is removed; its run.json stays.
 // propOutcome is what the run knows once it has stopped.
 type propOutcome struct {
-	mover   map[string]int64
-	losses  []propLoss
-	verdict string
+	mover    map[string]int64
+	losses   []propLoss
+	headline propHeadline
 }
 
 func (rec *recorder) close(t *testing.T, ops int64, out propOutcome) {
@@ -256,7 +265,7 @@ func (rec *recorder) close(t *testing.T, ops int64, out propOutcome) {
 	violations := append([]propViolation(nil), rec.violations...)
 	rec.vmu.Unlock()
 	rec.info.Ended, rec.info.Ops, rec.info.Violations, rec.info.Mover = time.Now(), ops, int64(len(violations)), out.mover
-	rec.info.LostWrites, rec.info.Verdict = out.losses, out.verdict
+	rec.info.LostWrites, rec.info.Headline = out.losses, &out.headline
 	rec.smu.Lock()
 	rec.info.Stalls = append([]propStall{}, rec.stalls...)
 	rec.smu.Unlock()
@@ -357,8 +366,12 @@ func (rec *recorder) report(violations []propViolation, events string) error {
 	md.WriteString("Files: `run.json`, `violations.jsonl` (written as each violation happened), `events.jsonl.gz` (every event of the run), `keys/<key>.jsonl` (full history of each violating key, with every operator transition and mover pass boundary).\n\n")
 	md.WriteString("Times are offsets from the run start in seconds. `backend` rows are what a fake cluster served, in commit order, and name the client op or mover step that sent them.\n\n")
 
-	fmt.Fprintf(&md, "**Verdict: %s.** Distinct writes lost in the known HEAD-then-commit window (ADR-0004 race 2): **%d**. Harness stalls over %s: %d.\n\n",
-		rec.info.Verdict, len(rec.info.LostWrites), stallThreshold, len(rec.info.Stalls))
+	var hl propHeadline
+	if rec.info.Headline != nil {
+		hl = *rec.info.Headline
+	}
+	fmt.Fprintf(&md, "**Headline: %d distinct lost writes** in the known HEAD-then-commit window (ADR-0004 race 2), from the commit history; %d violations outside it. **%s.** The %d violation records below are the evidence, not the count. Harness stalls over %s: %d.\n\n",
+		hl.LostWrites, hl.ViolationsOutsideWindow, hl.Verdict, hl.ViolationRecords, stallThreshold, len(rec.info.Stalls))
 	if len(rec.info.LostWrites) > 0 {
 		md.WriteString("| loss | key | mover op | mover HEAD committed | client op | client body | client PUT committed | mover PUT committed | mover body | stale reads |\n|---|---|---|---|---|---|---|---|---|---|\n")
 		for _, l := range rec.info.LostWrites {

@@ -16,6 +16,8 @@
 // s3 error table (SignatureDoesNotMatch no longer echoes the string-to-sign); aws-sdk types replaced by string;
 // Read never returns more decoded bytes than x-amz-decoded-content-length, and negative chunk sizes are
 // rejected instead of panicking as a slice bound (both found by fuzzing; the second also exists upstream).
+// Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-16: isValidChecksum
+// unexported (G1: only this package calls it).
 
 package chunked
 
@@ -423,7 +425,7 @@ func (cr *ChunkReader) parseChunkHeaderBytes(header []byte) (int64, string, int,
 				return cr.handleRdrErr(err, header)
 			}
 
-			if !IsValidChecksum(checksum, algo) {
+			if !isValidChecksum(checksum, algo) {
 				return 0, "", 0, errInvalidTrailingChecksum(trailer)
 			}
 

@@ -25,7 +25,7 @@ credentials:
 
 func TestParseAndLookup(t *testing.T) {
 	t.Setenv("SHUNT_TEST_TWO", "two-secret")
-	s, err := Parse([]byte(good))
+	s, err := parse([]byte(good))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestParseErrors(t *testing.T) {
 		"not yaml":      "credentials: [",
 	}
 	for name, in := range cases {
-		if _, err := Parse([]byte(in)); err == nil {
+		if _, err := parse([]byte(in)); err == nil {
 			t.Errorf("%s: expected error", name)
 		} else if strings.Contains(err.Error(), "s2") {
 			t.Errorf("%s: error leaks a secret: %v", name, err)
@@ -75,7 +75,7 @@ func TestLoadPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SHUNT_TEST_TWO", "x")
-	if _, err := Load(p); !errors.Is(err, ErrPermissions) {
+	if _, err := Load(p); !errors.Is(err, errPermissions) {
 		t.Fatalf("0644 accepted: %v", err)
 	}
 	if err := os.Chmod(p, 0o600); err != nil {
@@ -90,7 +90,7 @@ func TestLoadPermissions(t *testing.T) {
 }
 
 func BenchmarkLookup(b *testing.B) {
-	s, _ := Parse([]byte("credentials:\n  - {access_key: a, secret: s, tenant: t}\n"))
+	s, _ := parse([]byte("credentials:\n  - {access_key: a, secret: s, tenant: t}\n"))
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := s.Lookup(context.Background(), "a"); err != nil {

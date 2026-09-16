@@ -228,14 +228,38 @@ func TestGuardedRunClassifiesAKnownWindowLoss(t *testing.T) {
 	if r.fails.Load() != 1 || r.knownReads.Load() != 1 {
 		t.Errorf("violations %d, known-window %d; want 1 and 1", r.fails.Load(), r.knownReads.Load())
 	}
-	if v := r.verdict(); !strings.HasPrefix(v, "pass: 1 distinct") {
-		t.Errorf("verdict %q", v)
+	if h := r.headline(); h.LostWrites != 1 || h.ViolationsOutsideWindow != 0 || !strings.HasPrefix(h.Verdict, "pass:") {
+		t.Errorf("headline %+v", h)
 	}
 	r.tolerateLoss = false // the conditional variant's rule
-	if v := r.verdict(); !strings.HasPrefix(v, "fail:") {
-		t.Errorf("a variant that tolerates no loss must fail: %q", v)
+	if h := r.headline(); !strings.HasPrefix(h.Verdict, "fail:") {
+		t.Errorf("a variant that tolerates no loss must fail: %+v", h)
 	}
 	r.tolerateLoss = true
+}
+
+// The headline counts losses from the commit history, not from reads: a write overwritten in the
+// window and replaced by a later client write before anyone read it is still one lost write, and
+// still fails the conditional variant, with no violation on record.
+func TestHeadlineCountsLossesNobodyRead(t *testing.T) {
+	l := newLossLedger()
+	now := time.Now()
+	for _, e := range []backendEvent{
+		{end: now, method: "HEAD", key: "k", status: 404, opID: "mover-1"},
+		{end: now, method: "PUT", key: "k", status: 200, body: []byte("client"), opID: "op-1"},
+		{end: now, method: "PUT", key: "k", status: 200, body: []byte("seed"), opID: "mover-1"},
+		{end: now, method: "PUT", key: "k", status: 200, body: []byte("later"), opID: "op-2"},
+	} {
+		l.observe(e)
+	}
+	guarded := &propertyRun{losses: l, tolerateLoss: true}
+	if h := guarded.headline(); h.LostWrites != 1 || h.ViolationRecords != 0 || !strings.HasPrefix(h.Verdict, "pass: 1 distinct") {
+		t.Errorf("guarded: %+v", h)
+	}
+	conditional := &propertyRun{losses: l}
+	if h := conditional.headline(); h.LostWrites != 1 || !strings.HasPrefix(h.Verdict, "fail:") {
+		t.Errorf("conditional: a loss nobody read must still fail: %+v", h)
+	}
 }
 
 func BenchmarkLossLedgerObserve(b *testing.B) {

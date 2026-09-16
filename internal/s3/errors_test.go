@@ -20,7 +20,7 @@ func TestTableIsConsistent(t *testing.T) {
 			t.Errorf("%s: empty message", code)
 		}
 	}
-	if len(Codes()) != len(table) {
+	if len(codes()) != len(table) {
 		t.Fatal("Codes() length mismatch")
 	}
 }

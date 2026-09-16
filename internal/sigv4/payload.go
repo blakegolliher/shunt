@@ -50,8 +50,8 @@ func (m PayloadMode) Decodes() bool {
 	return m == PayloadStreamingSigned || m == PayloadStreamingSignedTrailer
 }
 
-// ParsePayloadMode classifies the header value.
-func ParsePayloadMode(v string) PayloadMode {
+// parsePayloadMode classifies the header value.
+func parsePayloadMode(v string) PayloadMode {
 	switch v {
 	case "":
 		return PayloadMissing

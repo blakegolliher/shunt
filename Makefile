@@ -16,6 +16,10 @@ BENCH_COUNT   ?= 6
 # Current releases as of 2026-09-14 (Go 1.27.1 on the dev box; both need Go >= 1.26).
 GOLANGCI_LINT_VERSION ?= v2.13.2
 BENCHSTAT             ?= golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
+GO_LICENSES_VERSION   ?= v2.0.1
+GOVULNCHECK_VERSION   ?= v1.8.0
+GO_LICENSES           := $(BIN)/go-licenses-$(GO_LICENSES_VERSION)
+GOVULNCHECK           := $(BIN)/govulncheck-$(GOVULNCHECK_VERSION)
 GOLANGCI_LINT         := $(BIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -33,7 +37,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed s3diff s3diff-mixed bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -87,13 +91,29 @@ bench: ## run all benchmarks, write test/bench/new.txt
 bench-compare: bench ## compare test/bench/new.txt against test/bench/baseline.txt with benchstat
 	$(GO) run $(BENCHSTAT) test/bench/baseline.txt test/bench/new.txt
 
-tools: $(GOLANGCI_LINT) ## install pinned tool binaries into ./bin
+licenses: $(GO_LICENSES) ## regenerate the linked-module half of THIRD_PARTY_NOTICES (G4)
+	GO_LICENSES=$(GO_LICENSES) GO=$(GO) scripts/third-party-notices.sh
+
+vuln: $(GOVULNCHECK) ## govulncheck over every package (G4)
+	$(GOVULNCHECK) ./...
+
+tools: $(GOLANGCI_LINT) $(GO_LICENSES) $(GOVULNCHECK) ## install pinned tool binaries into ./bin
 
 # The binary is named by version so a pin bump reinstalls it.
 $(GOLANGCI_LINT):
 	@mkdir -p $(BIN)
 	GOBIN=$(BIN) $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	mv $(BIN)/golangci-lint $(GOLANGCI_LINT)
+
+$(GO_LICENSES):
+	@mkdir -p $(BIN)
+	GOBIN=$(BIN) $(GO) install github.com/google/go-licenses/v2@$(GO_LICENSES_VERSION)
+	mv $(BIN)/go-licenses $(GO_LICENSES)
+
+$(GOVULNCHECK):
+	@mkdir -p $(BIN)
+	GOBIN=$(BIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	mv $(BIN)/govulncheck $(GOVULNCHECK)
 
 tidy: ## go mod tidy and verify nothing changed
 	$(GO) mod tidy

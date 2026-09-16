@@ -12,33 +12,7 @@
 // specific language governing permissions and limitations
 // under the License.
 // Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-15: package renamed to chunked.
+// Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-16: removed the test of
+// IsValidSha256PayloadHeader, which G1 deleted as unused.
 
 package chunked
-
-import "testing"
-
-func TestIsValidSha256PayloadHeader(t *testing.T) {
-	tests := []struct {
-		name string
-		hash string
-		want bool
-	}{
-		{"empty header", "", true},
-		{"special payload type 1", "UNSIGNED-PAYLOAD", true},
-		{"special payload type 2", "STREAMING-UNSIGNED-PAYLOAD-TRAILER", true},
-		{"special payload type 3", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", true},
-		{"special payload type 4", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", true},
-		{"special payload type 5", "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", true},
-		{"special payload type 6", "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", true},
-		{"invalid hext", "invalid_hex", false},
-		{"valid hex, but not sha256", "d41d8cd98f00b204e9800998ecf8427e", false},
-		{"valid sh256", "9c56cc51b374bb0f2f8d55af2b34d2a6f8f7f42dd4bbcccbbf8e3279b6e1e6d4", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsValidSha256PayloadHeader(tt.hash); got != tt.want {
-				t.Errorf("IsValidSha256PayloadHeader() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}

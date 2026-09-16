@@ -139,9 +139,9 @@ func buildRules() []rule {
 	return t
 }
 
-// Classify maps a request to an operation. OPTIONS at any level is a CORS preflight; anything
+// classify maps a request to an operation. OPTIONS at any level is a CORS preflight; anything
 // that matches no row is OpUnknown and is still proxied.
-func Classify(method string, level Level, q url.Values, h http.Header) Op {
+func classify(method string, level Level, q url.Values, h http.Header) Op {
 	if method == http.MethodOptions {
 		return OpPreflight
 	}

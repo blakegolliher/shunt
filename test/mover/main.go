@@ -42,6 +42,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 )
 
 // inlineLimit is the largest object the mover holds in memory; anything larger is streamed
@@ -92,6 +93,8 @@ func main() {
 		stateDir = flag.String("state-dir", "test/e2e/data", "where cursors and the ledger are written")
 		ledgerTo = flag.String("ledger-bucket", "", "backend bucket on the target cluster to upload the ledger to")
 		dryRun   = flag.Bool("dry-run", false, "list what would be copied and stop")
+		accept   = flag.Bool(migrate.AcceptLostWriteWindowFlag, false,
+			"copy into a target that ignores If-None-Match: * on PUT, accepting that a client write can be overwritten (docs/migrating.md)")
 	)
 	flag.Parse()
 
@@ -103,7 +106,7 @@ func main() {
 	if err != nil {
 		die("directory: %v", err)
 	}
-	jobs, err := selectPlacements(dir, cfg, *bucket, *from)
+	jobs, err := selectPlacements(dir, cfg, *bucket, *from, *accept)
 	if err != nil {
 		die("%v", err)
 	}
@@ -117,6 +120,9 @@ func main() {
 		j := jobs[i]
 		fmt.Printf("== %s/%s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", j.tenant, j.client,
 			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional), withdrawName(j.condDelete))
+		if !j.conditional {
+			fmt.Printf("   WARNING (accepted with -%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(j.tenant+"/"+j.client, j.dst.name))
+		}
 		s, err := move(ctx, j, *stateDir, *ledgerTo, *dryRun)
 		total.copied += s.copied
 		total.skipped += s.skipped
@@ -154,8 +160,11 @@ func withdrawName(condDelete bool) string {
 	return "re-HEAD"
 }
 
-// selectPlacements finds the placements to move and refuses the ones that are not ready.
-func selectPlacements(dir *directory.File, cfg *config.Config, one, from string) ([]job, error) {
+// selectPlacements finds the placements to move and refuses the ones that are not ready. A target
+// that ignores If-None-Match: * is refused unless acceptLoss, with the message shunt migrate start
+// gives: the check lives in both, because the mover can also run on a placement RAMPING at ratio 1,
+// which migrate start never saw. Any refusal stops the whole run before a byte is copied.
+func selectPlacements(dir *directory.File, cfg *config.Config, one, from string, acceptLoss bool) ([]job, error) {
 	clients := map[string]*s3.Client{}
 	client := func(name string) (*s3.Client, error) {
 		if c, ok := clients[name]; ok {
@@ -219,6 +228,9 @@ func selectPlacements(dir *directory.File, cfg *config.Config, one, from string)
 		dstCl, err := client(p.Primary)
 		if err != nil {
 			return nil, err
+		}
+		if !cfg.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+			return nil, migrate.RefuseLostWriteWindow(key, p.Primary)
 		}
 		jobs = append(jobs, job{
 			tenant: tenant, client: name,

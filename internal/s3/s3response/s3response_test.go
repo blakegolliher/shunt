@@ -3,7 +3,6 @@ package s3response
 import (
 	"bytes"
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,15 +49,6 @@ func get(t *testing.T, url string, v any) {
 	}
 }
 
-func TestListBucketsAgainstFake(t *testing.T) {
-	srv := fake(t, "alpha", 0)
-	var out ListAllMyBucketsResult
-	get(t, srv.URL+"/", &out)
-	if len(out.Buckets.Bucket) != 1 || out.Buckets.Bucket[0].Name != "alpha" {
-		t.Fatalf("buckets: %+v", out.Buckets)
-	}
-}
-
 func TestListObjectsV2AgainstFake(t *testing.T) {
 	srv := fake(t, "b", 5)
 	var out ListObjectsV2Result
@@ -75,38 +65,6 @@ func TestListObjectsV2AgainstFake(t *testing.T) {
 	}
 	if first.LastModified == nil || first.LastModified.IsZero() {
 		t.Fatal("LastModified not parsed")
-	}
-}
-
-func TestListObjectsV1AgainstFake(t *testing.T) {
-	srv := fake(t, "b", 2)
-	var out ListObjectsResult
-	get(t, srv.URL+"/b?delimiter=/", &out)
-	if len(out.CommonPrefixes) != 1 || out.CommonPrefixes[0].Prefix != "dir/" {
-		t.Fatalf("common prefixes: %+v", out.CommonPrefixes)
-	}
-}
-
-func TestInitiateMultipartAgainstFake(t *testing.T) {
-	srv := fake(t, "b", 0)
-	resp, err := http.Post(srv.URL+"/b/big.bin?uploads", "application/octet-stream", nil) //nolint:gosec,noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close() //nolint:errcheck // test
-	// gofakes3 omits the S3 XML namespace here (AWS, Garage, and MinIO emit it), so decode into
-	// a namespace-free view of the same fields. s3diff in POC-1 checks the real backends.
-	var out struct {
-		XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
-		Bucket   string
-		Key      string
-		UploadId string //nolint:revive // S3 wire name
-	}
-	if err := xml.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Bucket != "b" || out.Key != "big.bin" || out.UploadId == "" {
-		t.Fatalf("initiate: %+v", out)
 	}
 }
 
@@ -138,53 +96,6 @@ func TestListObjectsV2MarshalShape(t *testing.T) {
 	if len(back.Contents) != 1 || str(back.Contents[0].Key) != "k" || !back.Contents[0].LastModified.Equal(lm) {
 		t.Fatalf("round trip: %+v", back)
 	}
-}
-
-func TestTaggingUnmarshal(t *testing.T) {
-	const in = `<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>a</Key><Value>1</Value></Tag></TagSet></Tagging>`
-	var tg Tagging
-	if err := xml.Unmarshal([]byte(in), &tg); err != nil {
-		t.Fatal(err)
-	}
-	if len(tg.TagSet.Tags) != 1 || tg.TagSet.Tags[0].Key != "a" {
-		t.Fatalf("tags: %+v", tg)
-	}
-}
-
-func TestAmzDate(t *testing.T) {
-	for _, in := range []string{"2026-09-14T12:00:00.000Z", "2026-09-14T12:00:00.000000Z", "2026-09-14T12:00:00-0700"} {
-		var d struct {
-			Date AmzDate
-		}
-		if err := xml.Unmarshal([]byte("<x><Date>"+in+"</Date></x>"), &d); err != nil {
-			t.Errorf("%s: %v", in, err)
-		}
-	}
-	var d struct{ Date AmzDate }
-	err := xml.Unmarshal([]byte("<x><Date>yesterday</Date></x>"), &d)
-	if !errors.Is(err, ErrInvalidDate) {
-		t.Fatalf("want ErrInvalidDate, got %v", err)
-	}
-}
-
-func FuzzTaggingUnmarshal(f *testing.F) {
-	f.Add(`<Tagging><TagSet><Tag><Key>a</Key><Value>1</Value></Tag></TagSet></Tagging>`)
-	f.Add(`<Tagging><TagSet></TagSet></Tagging>`)
-	f.Add(`<Tagging>`)
-	f.Fuzz(func(_ *testing.T, in string) {
-		var tg Tagging
-		_ = xml.Unmarshal([]byte(in), &tg) // must not panic
-	})
-}
-
-func FuzzAmzDate(f *testing.F) {
-	f.Add("2026-09-14T12:00:00.000Z")
-	f.Add("2026-09-14T12:00:00-0700")
-	f.Add("")
-	f.Fuzz(func(_ *testing.T, in string) {
-		var d struct{ Date AmzDate }
-		_ = xml.Unmarshal([]byte("<x><Date>"+in+"</Date></x>"), &d)
-	})
 }
 
 func BenchmarkMarshalListObjectsV2(b *testing.B) {

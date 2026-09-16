@@ -46,8 +46,8 @@ type Options struct {
 	DialTimeout           time.Duration // default 5s
 }
 
-// ErrNoEndpoints is returned by New for a cluster with an empty endpoint list.
-var ErrNoEndpoints = errors.New("upstream: cluster has no endpoints")
+// errNoEndpoints is returned by New for a cluster with an empty endpoint list.
+var errNoEndpoints = errors.New("upstream: cluster has no endpoints")
 
 // ClusterID derives a cluster's opaque id: the first 6 hex characters of SHA-256 over its name.
 // It is stable across restarts and reveals neither the name nor the backend type.
@@ -64,7 +64,7 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 		eps = []string{c.Endpoint}
 	}
 	if len(eps) == 0 {
-		return nil, ErrNoEndpoints
+		return nil, errNoEndpoints
 	}
 	if o.ExpectContinueTimeout == 0 {
 		o.ExpectContinueTimeout = time.Second

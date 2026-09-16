@@ -70,15 +70,6 @@ var tables = []*table{
 	}},
 }
 
-// Roots lists the document roots the Writer rewrites, for tests and docs.
-func Roots() []string {
-	out := make([]string, len(tables))
-	for i, t := range tables {
-		out[i] = t.root
-	}
-	return out
-}
-
 const (
 	maxName  = 64 // longer element names cannot match a rule
 	maxDepth = 3  // deepest rule path, counting the root as depth 1

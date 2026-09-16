@@ -27,7 +27,7 @@ func TestRoundRobin(t *testing.T) {
 }
 
 func TestNoEndpoints(t *testing.T) {
-	if _, err := New("x", config.Cluster{Scheme: "http"}, Options{}); err != ErrNoEndpoints {
+	if _, err := New("x", config.Cluster{Scheme: "http"}, Options{}); err != errNoEndpoints {
 		t.Fatalf("want ErrNoEndpoints, got %v", err)
 	}
 }

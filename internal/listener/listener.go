@@ -17,11 +17,11 @@ type certSet struct {
 	sni map[string]*tls.Certificate // exact host or "*.suffix"
 }
 
-// ErrNoCertificate is returned when neither a default pair nor an SNI entry is configured.
-var ErrNoCertificate = errors.New("listener: no certificate configured")
+// errNoCertificate is returned when neither a default pair nor an SNI entry is configured.
+var errNoCertificate = errors.New("listener: no certificate configured")
 
-// TLSConfig builds the server TLS configuration from config. Certificates are loaded once.
-func TLSConfig(c config.Listener) (*tls.Config, error) {
+// tlsConfig builds the server TLS configuration from config. Certificates are loaded once.
+func tlsConfig(c config.Listener) (*tls.Config, error) {
 	cs := &certSet{sni: map[string]*tls.Certificate{}}
 	if c.TLS.Cert != "" {
 		cert, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
@@ -38,7 +38,7 @@ func TLSConfig(c config.Listener) (*tls.Config, error) {
 		cs.sni[strings.ToLower(name)] = &cert
 	}
 	if cs.def == nil && len(cs.sni) == 0 {
-		return nil, ErrNoCertificate
+		return nil, errNoCertificate
 	}
 	minVersion := uint16(tls.VersionTLS12)
 	if c.TLS.MinVersion == "1.3" {
@@ -73,7 +73,7 @@ func (cs *certSet) get(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 
 // Listen opens the TLS listener on c.Address.
 func Listen(c config.Listener) (net.Listener, error) {
-	tc, err := TLSConfig(c)
+	tc, err := tlsConfig(c)
 	if err != nil {
 		return nil, err
 	}

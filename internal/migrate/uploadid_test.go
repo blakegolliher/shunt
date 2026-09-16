@@ -9,13 +9,13 @@ func TestUploadIDRoundTrip(t *testing.T) {
 	for _, backend := range []string{
 		"2~abc", "VXBsb2FkIElEIGZvciBlbHZpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA", "a1b2c3~d4", "~", "x", "has spaces/and?query=1&", "0123456789abcdef0123456789abcdef",
 	} {
-		enc := EncodeUploadID("0f3a9c", backend)
+		enc := encodeUploadID("0f3a9c", backend)
 		id, got, ok := DecodeUploadID(enc)
 		if !ok || id != "0f3a9c" || got != backend {
 			t.Errorf("%q: encoded %q decoded (%q, %q, %v)", backend, enc, id, got, ok)
 		}
 	}
-	if EncodeUploadID("0f3a9c", "") != "" {
+	if encodeUploadID("0f3a9c", "") != "" {
 		t.Error("empty id was prefixed")
 	}
 }
@@ -41,17 +41,17 @@ func FuzzDecodeUploadID(f *testing.F) {
 			}
 			return
 		}
-		if EncodeUploadID(id, backend) != v && backend != "" {
+		if encodeUploadID(id, backend) != v && backend != "" {
 			t.Fatalf("%q does not re-encode: %q %q", v, id, backend)
 		}
-		if len(id) != IDLen || strings.Contains(id, "~") {
+		if len(id) != idLen || strings.Contains(id, "~") {
 			t.Fatalf("bad id %q from %q", id, v)
 		}
 	})
 }
 
 func BenchmarkDecodeUploadID(b *testing.B) {
-	v := EncodeUploadID("0f3a9c", "VXBsb2FkIElEIGZvciBlbHZpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA")
+	v := encodeUploadID("0f3a9c", "VXBsb2FkIElEIGZvciBlbHZpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA")
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, _, ok := DecodeUploadID(v); !ok {

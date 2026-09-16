@@ -61,6 +61,7 @@ migrate_start() {
   grep -q -- '--accept-lost-write-window' <<<"$out" || fail "migrate start"
   note "refused as designed: the target ignores If-None-Match: * on PUT. Accepting the window for this demo."
   $SHUNT migrate start "$@" --accept-lost-write-window | sed 's/^/   /'
+  MOVER_ACCEPT=-accept-lost-write-window # the mover refuses the same target without it
 }
 
 # --- preflight -------------------------------------------------------------------------------
@@ -142,7 +143,7 @@ go run ./test/bench/s3bench -via-only -mode resign -bucket "$BUCKET" \
   $BENCH_ADDR | tee "$WORK/during.md" || fail "migration bench"
 
 note "copying $KEY from $FROM to $TO while clients keep reading it"
-go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" > "$WORK/mover.log" 2>&1 & MOVER_PID=$!
+go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" ${MOVER_ACCEPT:-} > "$WORK/mover.log" 2>&1 & MOVER_PID=$!
 
 # Reads of objects the mover has not reached yet are served from the source. Poll that counter while
 # reading, so a plateau means "nothing is left on the source", not "nobody asked" (POC.md step 3).
@@ -165,7 +166,7 @@ say "4. Cut over and verify every object"
 kill "$WRITER_PID" 2>/dev/null || true; wait "$WRITER_PID" 2>/dev/null || true; WRITER_PID=
 note "writer stopped after $(wc -l < "$WORK/writer.keys") live objects"
 # The writer's last object may still be in flight; re-run the mover so nothing is left behind.
-go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" | sed 's/^/   /'
+go run ./test/mover -config "$CFG" -bucket "$KEY" -state-dir "$DATA" ${MOVER_ACCEPT:-} | sed 's/^/   /'
 $SHUNT cutover "$KEY" -c "$CFG" | sed 's/^/   /'
 
 manifest > "$WORK/after.txt"

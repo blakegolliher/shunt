@@ -2,12 +2,12 @@ package migrate
 
 import "strings"
 
-// IDLen is the length of an opaque cluster id (upstream.ClusterID).
-const IDLen = 6
+// idLen is the length of an opaque cluster id (upstream.ClusterID).
+const idLen = 6
 
-// EncodeUploadID returns <clusterID>~<backendID>. An empty backend id stays empty, so the empty
+// encodeUploadID returns <clusterID>~<backendID>. An empty backend id stays empty, so the empty
 // markers of an unpaginated listing are not turned into something that looks like an id.
-func EncodeUploadID(clusterID, backendID string) string {
+func encodeUploadID(clusterID, backendID string) string {
 	if backendID == "" {
 		return ""
 	}
@@ -21,7 +21,7 @@ func EncodeUploadID(clusterID, backendID string) string {
 // before the codec existed still complete.
 func DecodeUploadID(v string) (clusterID, backendID string, prefixed bool) {
 	i := strings.IndexByte(v, '~')
-	if i != IDLen || !isLowerHex(v[:i]) {
+	if i != idLen || !isLowerHex(v[:i]) {
 		return "", v, false
 	}
 	return v[:i], v[i+1:], true

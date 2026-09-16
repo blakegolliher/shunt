@@ -167,8 +167,8 @@ func Lookup(code Code) Error {
 	return e
 }
 
-// Codes lists every code in the table, for tests and docs.
-func Codes() []Code {
+// codes lists every code in the table, for tests and docs.
+func codes() []Code {
 	out := make([]Code, 0, len(table))
 	for c := range table {
 		out = append(out, c)

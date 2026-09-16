@@ -14,17 +14,17 @@
 // Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-15: package renamed to chunked;
 // fiber.Ctx parameters replaced by http.Header; debuglogger calls removed; s3err replaced by the shunt
 // s3 error table; sha512/md5/xxhash checksum types dropped (Versity extensions, not AWS algorithms).
+// Modified by Blake Golliher for github.com/blakegolliher/shunt, 2026-09-16: removed the unused
+// payload-type helpers (IsStreamingPayload, IsUnsignedPaylod, IsUnsignedStreamingPayload,
+// IsAnonymousPayloadHashSupported, IsSpecialPayload, IsValidSha256PayloadHeader), NewChunkReader,
+// and the checksum-type constants nothing used (G1 simplicity review).
 
 package chunked
 
 import (
-	"encoding/hex"
-	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/blakegolliher/shunt/internal/s3"
 )
@@ -44,14 +44,6 @@ const (
 	payloadTypeStreamingEcdsaTrailer    payloadType = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER"
 )
 
-func getPayloadTypeNotSupportedErr(p payloadType) error {
-	return s3.Error{
-		Status:  http.StatusNotImplemented,
-		Code:    s3.NotImplemented,
-		Message: fmt.Sprintf("The chunk encoding algorithm %v is not supported.", p),
-	}
-}
-
 var (
 	specialValues = map[payloadType]bool{
 		payloadTypeUnsigned:                 true,
@@ -62,15 +54,6 @@ var (
 		payloadTypeStreamingEcdsaTrailer:    true,
 	}
 )
-
-func (pt payloadType) isValid() bool {
-	return pt == payloadTypeUnsigned ||
-		pt == payloadTypeStreamingUnsignedTrailer ||
-		pt == payloadTypeStreamingSigned ||
-		pt == payloadTypeStreamingSignedTrailer ||
-		pt == payloadTypeStreamingEcdsa ||
-		pt == payloadTypeStreamingEcdsaTrailer
-}
 
 type checksumType string
 
@@ -101,65 +84,6 @@ func ExtractChecksumType(h http.Header) (checksumType, error) {
 	return chType, nil
 }
 
-// IsSpecialPayload checks for special authorization types
-func IsSpecialPayload(str string) bool {
-	return specialValues[payloadType(str)]
-}
-
-// IsValidSha256PayloadHeader checks if the provided x-amz-content-sha256
-// payload header is valid special payload type or a valid sh256 hash
-func IsValidSha256PayloadHeader(value string) bool {
-	// empty header is valid
-	if value == "" {
-		return true
-	}
-	// special values are valid
-	if IsSpecialPayload(value) {
-		return true
-	}
-
-	// check to be a valid sha256
-	if len(value) != 64 {
-		return false
-	}
-
-	// decode the string as hex
-	_, err := hex.DecodeString(value)
-	return err == nil
-}
-
-// Checks if the provided string is unsigned payload trailer type
-func IsUnsignedStreamingPayload(str string) bool {
-	return payloadType(str) == payloadTypeStreamingUnsignedTrailer
-}
-
-// IsAnonymousPayloadHashSupported returns error if payload hash
-// is streaming signed.
-// e.g.
-// "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD" ...
-func IsAnonymousPayloadHashSupported(hash string) error {
-	switch payloadType(hash) {
-	case payloadTypeStreamingEcdsa, payloadTypeStreamingEcdsaTrailer, payloadTypeStreamingSigned, payloadTypeStreamingSignedTrailer:
-		return errAnonymousSignedStreaming
-	}
-
-	return nil
-}
-
-// IsUnsignedPaylod checks if the provided payload hash type
-// is "UNSIGNED-PAYLOAD"
-func IsUnsignedPaylod(hash string) bool {
-	return hash == string(payloadTypeUnsigned)
-}
-
-// IsStreamingPayload checks for streaming/unsigned authorization types
-func IsStreamingPayload(str string) bool {
-	pt := payloadType(str)
-	return pt == payloadTypeStreamingUnsignedTrailer ||
-		pt == payloadTypeStreamingSigned ||
-		pt == payloadTypeStreamingSignedTrailer
-}
-
 // ParseDecodedContentLength extracts and validates the
 // 'x-amz-decoded-content-length' from fiber context
 func ParseDecodedContentLength(h http.Header) (int64, error) {
@@ -177,36 +101,4 @@ func ParseDecodedContentLength(h http.Header) (int64, error) {
 	}
 
 	return decContLength, nil
-}
-
-func NewChunkReader(h http.Header, r io.Reader, authdata AuthData, canonicalString string, derivedKey []byte, date time.Time) (io.Reader, error) {
-	cLength, err := ParseDecodedContentLength(h)
-	if err != nil {
-		return nil, err
-	}
-
-	contentSha256 := payloadType(h.Get("X-Amz-Content-Sha256"))
-	if !contentSha256.isValid() {
-		//TODO: Add proper APIError
-		return nil, fmt.Errorf("invalid x-amz-content-sha256: %v", string(contentSha256))
-	}
-
-	checksumType, err := ExtractChecksumType(h)
-	if err != nil {
-		return nil, err
-	}
-
-	switch contentSha256 {
-	case payloadTypeStreamingUnsignedTrailer:
-		return NewUnsignedChunkReader(r, checksumType, cLength)
-	case payloadTypeStreamingSignedTrailer:
-		return NewSignedChunkReader(r, authdata, canonicalString, derivedKey, date, checksumType, true, cLength)
-	case payloadTypeStreamingSigned:
-		return NewSignedChunkReader(r, authdata, canonicalString, derivedKey, date, "", false, cLength)
-	// return not supported for:
-	// - STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD
-	// - STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER
-	default:
-		return nil, getPayloadTypeNotSupportedErr(contentSha256)
-	}
 }
