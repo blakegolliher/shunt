@@ -47,7 +47,10 @@ typo is a refusal rather than a slow trickle of 404s. `--name` overrides the gen
 - `shunt_migration_fallback_reads_total` — reads the primary could not serve, answered from the
   source. This is the "how much is left" signal: **cut over when it stops increasing** under real
   read traffic, not when the mover prints a total.
-- `shunt_migration_dual_delete_total{outcome}` — `both`, `source_missing`, `source_failed`.
+- `shunt_migration_dual_delete_total{outcome}` — `both`, `source_missing`, `source_failed`,
+  `primary_failed`. A migration delete goes to the source first, then the primary. Alert on
+  `source_failed` (the mover will copy the object back) and `primary_failed` (see "A delete can
+  half-succeed" below).
 - `shunt_listing_merge_seconds` — what merged listings cost while `MIGRATING`.
 - `shunt_route_state{bucket,state}` and `shunt_ramp_ratio{bucket}` — where each bucket is.
 
@@ -68,13 +71,19 @@ go run ./test/mover -config … -bucket acme/data -dry-run              # list, 
 
 What it guarantees, and how (ADR-0004):
 
-- **It never overwrites a newer client write.** Where the target honors `If-None-Match: *` it uses
-  it; where it does not — Garage 2.3.0 — it falls back to a HEAD-then-commit guard, taken from the
-  cluster's `capabilities.conditional_write`. For multipart objects the guard `HEAD` is issued
-  immediately before `CompleteMultipartUpload`, so the window is one round trip whatever the object
-  weighs.
-- **It never resurrects a deleted object.** After each copy it re-`HEAD`s the source; if the object
-  vanished mid-copy it removes its own copy.
+- **It does not overwrite a newer client write.** Where the target honors `If-None-Match: *` it
+  uses it and there is no window. Where it does not (Garage 2.3.0), it falls back to a
+  HEAD-then-commit guard, taken from the cluster's `capabilities.conditional_write`, which has a
+  window: see the section below. For multipart objects the guard `HEAD` is issued immediately
+  before `CompleteMultipartUpload`, so the window is one round trip whatever the object weighs.
+- **It does not resurrect a deleted object, and it removes only its own copy.** shunt sends a
+  migration delete to the source first and then the primary. After each copy the mover re-`HEAD`s
+  the source, and if the object has gone it withdraws its copy. Where the target honors `If-Match`
+  on `DELETE` (`capabilities.conditional_delete`), the withdrawal is conditional on the ETag of the
+  mover's own `PUT`. Otherwise the mover `HEAD`s the target first and deletes only if the ETag and
+  `Last-Modified` still say it is its copy. Neither Garage 2.3.0 nor MinIO honors `If-Match` on
+  `DELETE`, so today every migration uses the `HEAD`: a client write landing between that `HEAD` and
+  the `DELETE`, one round trip, is lost (ADR-0004 race 1, window A).
 - **ETags survive.** A multipart object is re-uploaded with the source's own part layout, read back
   with `HEAD partNumber=N`. The ledger flags any object whose ETag changed, and the run exits
   non-zero if one did.
@@ -85,12 +94,54 @@ What it guarantees, and how (ADR-0004):
 
 Run it more than once. The last pass should copy nothing.
 
+### Into a cluster without conditional writes, the mover can lose a client write
+
+If the target cluster's `capabilities.conditional_write` is `false` (Garage 2.3.0 today; re-run
+`shunt probe` to check yours), the mover cannot ask the backend to refuse an overwrite. It HEADs
+the target, and if the key is absent it writes the source's copy. **A client write to the same key
+between that HEAD and the mover's PUT (or `CompleteMultipartUpload`) is overwritten with the older
+source bytes.** The client already got 200 for its write, and nothing reports the loss. The window is
+one round trip per object, repeated for every object the mover copies.
+
+`shunt migrate start` refuses such a target, naming the window and this section, unless it is given
+`--accept-lost-write-window`. The flag changes nothing about the mover. It is the
+operator saying the next point has been dealt with. The refusal is keyed on the profile, so a
+cluster whose `conditional_write` is unset is taken at its default, true: fill the profile from
+`shunt probe`. It guards `migrate start` only. A mover run while the placement is `RAMPING` at ratio 1
+has the same window and no such check.
+
+What to do:
+
+- **Quiesce writers** to the bucket for as long as the mover runs, or
+- **ramp to ratio 1 and run the mover when write volume is low**, so few writes can land inside a
+  window, and
+- check the mover's run summary: it names the guard it used (`HEAD-then-commit` versus
+  `If-None-Match`).
+
+Migrating *out of* such a cluster is unaffected: the source is only read.
+
+The same advice covers the mover's withdrawal on a target without `conditional_delete`, which is
+every backend measured so far. It only matters for keys that clients delete and then write again
+while the mover is copying them.
+
+### A delete can half-succeed
+
+A delete during `RAMPING` or `MIGRATING` goes to the source first and the primary second. If the
+source accepts it and the primary refuses it (5xx, timeout), **the client gets the primary's error,
+the object is gone from the source, and it is still on the primary**. Reads still return it, since
+the primary answers first. This is visible as
+`shunt_migration_dual_delete_total{outcome="primary_failed"}` and an error log line naming the
+bucket and request id. What to do: nothing if clients retry failed deletes, as every S3 SDK does,
+because the retry removes it from the primary. Otherwise, re-issue the delete for the logged request
+before `CUTOVER`.
+
 ## Removing a vendor entirely
 
 The same steps, once, for every bucket a cluster still holds:
 
 ```sh
-shunt migrate start --from minio --to garage --create   # every bucket on minio starts moving
+shunt migrate start --from minio --to garage --create   # refused: garage ignores If-None-Match: * (see below)
+shunt migrate start --from minio --to garage --create --accept-lost-write-window   # writers quiesced
 go run ./test/mover -config /etc/shunt/shunt.yaml -from minio
 shunt migrate status                                    # fallback reads flat? then:
 shunt cutover --from minio

@@ -240,3 +240,63 @@ func readDir(t *testing.T, path string) string {
 	}
 	return string(b)
 }
+
+// A target that ignores If-None-Match: * on PUT gives the mover a guard that can lose a client
+// write. migrate start refuses it, naming the window and the doc, unless the operator accepts it
+// explicitly; a target that honors the header needs no flag.
+func TestMigrateStartRefusesATargetWithoutConditionalPut(t *testing.T) {
+	cfg, dirPath, _ := migrationRig(t)
+	raw, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withProfile := strings.ReplaceAll(string(raw), "secret_ref: env:SHUNT_TEST_CLUSTER_SECRET } }\n", "secret_ref: env:SHUNT_TEST_CLUSTER_SECRET }, capabilities: { conditional_write: false } }\n")
+	if withProfile == string(raw) {
+		t.Fatal("rig config did not change")
+	}
+	if err := os.WriteFile(cfg, []byte(withProfile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, err := run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "-c", cfg)
+	if err == nil {
+		t.Fatalf("migrate start into a cluster without conditional PUT was accepted:\n%s", out)
+	}
+	for _, want := range []string{"conditional_write: false", "If-None-Match", "HEAD-then-commit", "overwritten", "docs/migrating.md", "--accept-lost-write-window"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
+	}
+	if b, _ := os.ReadFile(dirPath); !strings.Contains(string(b), "state: ACTIVE") || strings.Contains(string(b), "MIGRATING") {
+		t.Errorf("the refusal changed the directory:\n%s", b)
+	}
+
+	// --from refuses every bucket the same way.
+	if _, _, err := run(t, "migrate", "start", "--from", "garage", "--to", "minio", "--create", "-c", cfg); err == nil {
+		t.Error("migrate start --from into a cluster without conditional PUT was accepted")
+	}
+
+	out, _, err = run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "--accept-lost-write-window", "-c", cfg)
+	if err != nil {
+		t.Fatalf("migrate start with --accept-lost-write-window: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "ACTIVE -> MIGRATING") || !strings.Contains(out, "WARNING (accepted with --accept-lost-write-window)") {
+		t.Errorf("accepted start did not move and warn:\n%s", out)
+	}
+	if b, _ := os.ReadFile(dirPath); !strings.Contains(string(b), "MIGRATING") {
+		t.Errorf("directory not MIGRATING after an accepted start:\n%s", b)
+	}
+}
+
+// The profile default is a conformant backend, so a cluster with no capabilities block migrates
+// without the flag and without the warning.
+func TestMigrateStartNeedsNoFlagForAConditionalTarget(t *testing.T) {
+	cfg, _, _ := migrationRig(t)
+	out, _, err := run(t, "migrate", "start", "acme/data", "--to", "minio", "--create", "-c", cfg)
+	if err != nil {
+		t.Fatalf("migrate start: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("warned for a target with conditional PUT:\n%s", out)
+	}
+}

@@ -181,7 +181,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p = h.preparePassthrough(r, o, inBody)
 	}
 
+	// A delete during a migration goes to the source first and the primary second (ADR-0004 race 1):
+	// a mover that copies the object in between then finds the source already gone when it
+	// re-HEADs it, and takes its copy back out. The other order leaves that copy on the primary.
+	source := ""
+	if h.Mode == ModeResign && p.route.Both && p.other != nil {
+		source = h.deleteOnSource(ctx, o, p)
+	}
 	resp, err := h.roundTrip(ctx, o, p, p.cl, p.backend, inBody)
+	if source != "" {
+		h.countDualDelete(o, p, source, resp, err)
+	}
 	if inBody != nil {
 		o.bytesIn = inBody.count()
 	}
@@ -308,11 +318,6 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 				resp = alt
 				defer resp.Body.Close() //nolint:errcheck // relayed or aborted below
 			}
-		}
-		// A delete during a migration removes the object from both clusters, or the mover copies
-		// it back (ADR-0004).
-		if p.route.Both && p.other != nil {
-			h.deleteOnSource(ctx, o, p, resp.StatusCode)
 		}
 	}
 

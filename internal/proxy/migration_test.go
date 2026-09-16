@@ -5,8 +5,12 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
 )
@@ -304,5 +308,171 @@ func TestCopyFromAMigratingBucketIsRefused(t *testing.T) {
 	r = m.send(t, "PUT", "/data/copy", "", nil, acmeAK, acmeSK, map[string]string{"X-Amz-Copy-Source": "/data/original"})
 	if r.StatusCode != 200 {
 		t.Fatalf("copy after cutover: %d %s", r.StatusCode, r.body)
+	}
+}
+
+// ADR-0004 race 1, the order of the dual delete. The five steps: the mover reads k from the source;
+// the client deletes k; the mover's copy lands on the primary; the mover re-checks the source; the
+// delete's other leg runs. The mover's copy and re-check run between shunt's two delete legs. With
+// the primary deleted first, the re-check still finds k on the source and the copy stays forever.
+// With the source deleted first, the re-check finds k gone and the copy comes back out.
+func TestDeleteRacingAMoverCopyStaysDeleted(t *testing.T) {
+	for _, conditional := range []bool{true, false} {
+		t.Run(map[bool]string{true: "conditional", false: "guarded"}[conditional], func(t *testing.T) {
+			m := newMixedRig(t, nil)
+			m.acme(t, "PUT", "/data/k", []byte("before")) // on the source
+			target := ramp(t, m, directory.Transition{To: directory.StateMigrating})
+			m.minio.mu.Lock()
+			m.minio.ignoreINM = !conditional
+			m.minio.mu.Unlock()
+			mv := &testMover{m: m, source: "acme-1111-data", target: target, putIfNoneMatch: conditional}
+
+			data, ok := mv.read("k") // 1
+			if !ok {
+				t.Fatal("k is not on the source")
+			}
+			var mu sync.Mutex
+			var legs, steps []string
+			leg := func(side string) func(*http.Request) {
+				return func(r *http.Request) {
+					if r.Method != http.MethodDelete || r.Header.Get("Via") == "" {
+						return // not one of shunt's delete legs
+					}
+					mu.Lock()
+					legs = append(legs, side)
+					second := len(legs) == 2
+					mu.Unlock()
+					if !second {
+						return
+					}
+					err := mv.commit("k", "", data, func(op string, status int, _, detail string) { // 3, 4
+						mu.Lock()
+						defer mu.Unlock()
+						steps = append(steps, fmt.Sprintf("%s %d %s", op, status, detail))
+					})
+					if err != nil {
+						t.Errorf("mover: %v", err)
+					}
+				}
+			}
+			m.garage.mu.Lock()
+			m.garage.before = leg("source")
+			m.garage.mu.Unlock()
+			m.minio.mu.Lock()
+			m.minio.before = leg("primary")
+			m.minio.mu.Unlock()
+
+			if r := m.acme(t, "DELETE", "/data/k", nil); r.StatusCode != 204 { // 2, 5
+				t.Fatalf("delete: %d %s", r.StatusCode, r.body)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(legs) != 2 || legs[0] != "source" {
+				t.Errorf("delete legs went %v; the source must come first (ADR-0004 race 1)", legs)
+			}
+			if _, ok := m.minio.object(target, "k"); ok {
+				t.Errorf("the mover's copy is still on the primary after the delete; mover steps: %v", steps)
+			}
+			if r := m.acme(t, "GET", "/data/k", nil); r.StatusCode != 404 {
+				t.Errorf("GET after delete: %d %q", r.StatusCode, r.body)
+			}
+			if v := metricCounter(t, m.h.Metrics, "shunt_migration_dual_delete_total", `bucket="acme/data",outcome="both"`); v != 1 {
+				t.Errorf("dual delete not counted as both: %v", v)
+			}
+		})
+	}
+}
+
+// ADR-0004 race 1, the mover's withdrawal: the client deletes k, the mover's stale copy lands on the
+// empty primary, and a client writes k again before the mover re-checks the source. The mover sees
+// the source gone and withdraws its copy, and must not take the client's newer write with it.
+func TestMoverWithdrawLeavesANewerClientWrite(t *testing.T) {
+	for _, ifMatch := range []bool{true, false} {
+		t.Run(map[bool]string{true: "if-match", false: "re-head"}[ifMatch], func(t *testing.T) {
+			m := newMixedRig(t, nil)
+			m.acme(t, "PUT", "/data/k", []byte("before"))
+			target := ramp(t, m, directory.Transition{To: directory.StateMigrating})
+			m.minio.mu.Lock()
+			m.minio.ignoreIfMatch = !ifMatch
+			m.minio.mu.Unlock()
+			mv := &testMover{m: m, source: "acme-1111-data", target: target, putIfNoneMatch: true, deleteIfMatch: ifMatch}
+
+			data, _ := mv.read("k")
+			if r := m.acme(t, "DELETE", "/data/k", nil); r.StatusCode != 204 {
+				t.Fatalf("delete: %d", r.StatusCode)
+			}
+			mv.afterPut = func() {
+				if r := m.acme(t, "PUT", "/data/k", []byte("newer")); r.StatusCode != 200 {
+					t.Errorf("client rewrite: %d", r.StatusCode)
+				}
+			}
+			var steps []string
+			if err := mv.commit("k", "", data, func(op string, status int, _, detail string) {
+				steps = append(steps, fmt.Sprintf("%s %d %s", op, status, detail))
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if r := m.acme(t, "GET", "/data/k", nil); r.StatusCode != 200 || string(r.body) != "newer" {
+				t.Errorf("GET: %d %q, want the client's newer write; mover steps: %v", r.StatusCode, r.body, steps)
+			}
+		})
+	}
+}
+
+// The ownership test the re-HEAD path uses, on the backend's own one-second clock.
+func TestOwnCopy(t *testing.T) {
+	at := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name           string
+		head, put      string
+		modified, date time.Time
+		want           bool
+	}{
+		{"same etag, same second", `"a"`, `"a"`, at, at, true},
+		{"same etag, modified before the put's date", `"a"`, `"a"`, at.Add(-time.Second), at, true},
+		{"same etag, modified after the put", `"a"`, `"a"`, at.Add(time.Second), at, false},
+		{"different etag", `"b"`, `"a"`, at, at, false},
+		{"no etag on the head", "", `"a"`, at, at, false},
+		{"no date on the put: etag decides", `"a"`, `"a"`, at, time.Time{}, true},
+	} {
+		if got := ownCopy(tc.head, tc.put, tc.modified, tc.date); got != tc.want {
+			t.Errorf("%s: ownCopy = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A delete whose source leg succeeds and whose primary leg fails: the client gets the primary's
+// error, the object is gone from the source but still on the primary, and the metric says so.
+func TestDualDeletePrimaryFailure(t *testing.T) {
+	m := newMixedRig(t, nil)
+	m.acme(t, "PUT", "/data/k", []byte("old"))
+	target := ramp(t, m, directory.Transition{To: directory.StateMigrating})
+	m.acme(t, "PUT", "/data/k", []byte("new")) // on the primary too
+	m.minio.mu.Lock()
+	m.minio.deleteStatus = http.StatusServiceUnavailable
+	m.minio.mu.Unlock()
+
+	if r := m.acme(t, "DELETE", "/data/k", nil); r.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("delete: %d, want the primary's 503", r.StatusCode)
+	}
+	if _, ok := m.garage.object("acme-1111-data", "k"); ok {
+		t.Error("the source leg should have run first and removed k")
+	}
+	if b, ok := m.minio.object(target, "k"); !ok || string(b) != "new" {
+		t.Errorf("primary: %q %v, want the object still there", b, ok)
+	}
+	if v := metricCounter(t, m.h.Metrics, "shunt_migration_dual_delete_total", `bucket="acme/data",outcome="primary_failed"`); v != 1 {
+		t.Errorf("primary_failed not counted: %v", v)
+	}
+	if !strings.Contains(m.alerts.String(), "removed the object from the source but the primary refused it") {
+		t.Errorf("no alert for the partial failure: %s", m.alerts.String())
+	}
+}
+
+// One step of the mover's ownership check, the only arithmetic on the withdraw path.
+func BenchmarkOwnCopy(b *testing.B) {
+	at := time.Now()
+	for b.Loop() {
+		_ = ownCopy(`"a"`, `"a"`, at, at)
 	}
 }

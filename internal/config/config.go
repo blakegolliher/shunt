@@ -102,6 +102,11 @@ type Capabilities struct {
 	// ConditionalWrite: honors If-None-Match: * on PUT. The mover's overwrite guard depends on it
 	// (ADR-0004); a backend that ignores it forces the weaker HEAD-then-commit guard.
 	ConditionalWrite *bool `yaml:"conditional_write"`
+	// ConditionalDelete: honors If-Match on DeleteObject, refusing a mismatch with 412 and leaving
+	// the object. The mover withdraws its own copy with it (ADR-0004 race 1). Unlike the others it
+	// defaults to false: a backend that ignores the header deletes unconditionally, so assuming
+	// support where there is none deletes a client's newer write.
+	ConditionalDelete *bool `yaml:"conditional_delete"`
 }
 
 // EnforcesSHA256Or reports the capability with the default applied.
@@ -126,6 +131,14 @@ func (c Capabilities) ConditionalWriteOr(def bool) bool {
 		return def
 	}
 	return *c.ConditionalWrite
+}
+
+// ConditionalDeleteOr reports the capability with the default applied.
+func (c Capabilities) ConditionalDeleteOr(def bool) bool {
+	if c.ConditionalDelete == nil {
+		return def
+	}
+	return *c.ConditionalDelete
 }
 
 // ClusterTLS is the upstream TLS configuration for an https cluster.

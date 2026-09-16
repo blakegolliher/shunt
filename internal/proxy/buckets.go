@@ -327,37 +327,50 @@ func (h *Handler) fallbackRead(ctx context.Context, r *http.Request, o *outcome,
 	return alt
 }
 
-// deleteOnSource sends the same delete to the placement's other cluster. Its failure is logged and
-// metered but never surfaced: the client's delete succeeded, and a source copy left behind is the
-// mover's problem, not the caller's (docs/DESIGN.md §2.5).
-func (h *Handler) deleteOnSource(ctx context.Context, o *outcome, p *prepared, primaryStatus int) {
-	count := func(outcome string) { h.Metrics.DualDelete.WithLabelValues(p.bucketKey, outcome).Inc() }
-	if primaryStatus >= 300 {
-		count("primary_only")
-		return
-	}
+// deleteOnSource sends a migration delete to the placement's source cluster, before the primary
+// gets it, and reports the outcome of that leg: both (the source accepted it), source_missing, or
+// source_failed. A failed source leg is logged but does not stop the primary leg: the client asked
+// for a delete, and the primary is where its reads go first (docs/DESIGN.md §2.5, ADR-0004).
+func (h *Handler) deleteOnSource(ctx context.Context, o *outcome, p *prepared) string {
 	side := &outcome{rid: o.rid, info: o.info, tm: &timings{}}
 	resp, err := h.roundTrip(context.WithoutCancel(ctx), side, p, p.other, p.otherBackend, nil)
 	if err != nil {
-		count("source_failed")
 		if h.Log != nil {
 			h.Log.Error("delete did not reach the migration source; the object can come back when the mover copies it (ADR-0004)",
 				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "backend_bucket", p.otherBackend, "err", err.Error())
 		}
-		return
+		return "source_failed"
 	}
 	defer resp.Body.Close() //nolint:errcheck // drained below
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		count("source_missing")
+		return "source_missing"
 	case resp.StatusCode < 300:
-		count("both")
-	default:
-		count("source_failed")
-		if h.Log != nil {
-			h.Log.Error("the migration source refused a delete; the object can come back when the mover copies it (ADR-0004)",
-				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "status", resp.StatusCode)
+		return "both"
+	}
+	if h.Log != nil {
+		h.Log.Error("the migration source refused a delete; the object can come back when the mover copies it (ADR-0004)",
+			"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "status", resp.StatusCode)
+	}
+	return "source_failed"
+}
+
+// countDualDelete meters a migration delete once both legs have run. A primary leg that fails
+// after the source leg succeeded is the partial failure docs/migrating.md tells operators about:
+// the object is gone from the source but still on the primary, and the client saw an error.
+func (h *Handler) countDualDelete(o *outcome, p *prepared, source string, primary *http.Response, err error) {
+	outcome := source
+	if err != nil || primary.StatusCode >= 300 {
+		outcome = "primary_failed"
+		if source != "source_failed" && h.Log != nil {
+			status := 0
+			if primary != nil {
+				status = primary.StatusCode
+			}
+			h.Log.Error("a migration delete removed the object from the source but the primary refused it; the object is still on the primary and the client was told the delete failed (docs/migrating.md)",
+				"request_id", o.rid, "bucket", p.bucketKey, "primary", p.cl.Name, "status", status, "source_leg", source)
 		}
 	}
+	h.Metrics.DualDelete.WithLabelValues(p.bucketKey, outcome).Inc()
 }

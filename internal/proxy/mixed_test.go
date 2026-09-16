@@ -5,6 +5,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,11 +56,64 @@ type fakeS3 struct {
 	listPad  int  // extra <Contents> entries in listings
 	escapes  bool // percent-encodes "/" in listing keys, as Garage 2.3.0 does
 	cutList  int  // > 0: listings promise a large Content-Length, send this many bytes, and die
+
+	ignoreINM     bool                 // accepts If-None-Match: * and overwrites anyway, as Garage 2.3.0 does
+	ignoreIfMatch bool                 // deletes whatever If-Match says, as a backend without conditional deletes does
+	noHistory     bool                 // keep no per-request record (seen, headers): long runs would hold every request
+	observe       func(backendEvent)   // called for every object request, with the lock held
+	before        func(*http.Request)  // called before a request is served, without the lock; set it under the lock
+	deleteStatus  int                  // > 0: every object DELETE fails with this status
+	mtime         map[string]time.Time // bucket/key -> when the object was last written
+}
+
+// etagOf is the fake's ETag for an object: the hex MD5 of its bytes, quoted, as S3 gives a
+// single-part object.
+func etagOf(data []byte) string {
+	sum := md5.Sum(data) //nolint:gosec // S3 ETag, not security
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// wrote records an object write for Last-Modified. Called with the lock held.
+func (f *fakeS3) wrote(bucket, key string) { f.mtime[bucket+"/"+key] = time.Now() }
+
+// backendEvent is one object request as the backend saw it, for the property test's record.
+type backendEvent struct {
+	start, end  time.Time
+	method, key string
+	bucket      string
+	status      int
+	ifNoneMatch bool
+	body        []byte // the PUT body, or the GET body on a 200
+	opID        string // X-Property-Op: the client op or mover step that sent it
+}
+
+// statusWriter remembers the status a fake backend answered with.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	body   []byte
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(p []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	if len(s.body) < 256 {
+		s.body = append(s.body, p[:min(len(p), 256-len(s.body))]...)
+	}
+	return s.ResponseWriter.Write(p)
 }
 
 func newFakeS3(t *testing.T, name, ak, secret string, buckets ...string) *fakeS3 {
 	f := &fakeS3{name: name, ak: ak, secret: secret, t: t, buckets: map[string]map[string][]byte{}, uploads: map[string]string{},
-		parts: map[string][][]byte{}, foreign: map[string]bool{}, deny: map[string]bool{}}
+		parts: map[string][][]byte{}, foreign: map[string]bool{}, deny: map[string]bool{}, mtime: map[string]time.Time{}}
 	for _, b := range buckets {
 		f.buckets[b] = map[string][]byte{}
 	}
@@ -115,6 +170,7 @@ func (f *fakeS3) deleteObject(bucket, key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.buckets[bucket], key)
+	delete(f.mtime, bucket+"/"+key)
 }
 
 func (f *fakeS3) addBucket(name string) {
@@ -170,9 +226,40 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
+	before := f.before
+	f.mu.Unlock()
+	if before != nil {
+		before(r)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.seen = append(f.seen, r.Method+" "+r.RequestURI)
-	f.headers = append(f.headers, r.Header.Clone())
+	if f.observe != nil {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w}
+		w = sw
+		defer func() {
+			bucket, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+			if key == "" {
+				return
+			}
+			ev := backendEvent{start: start, end: time.Now(), method: r.Method, bucket: bucket, key: key, status: sw.status,
+				ifNoneMatch: r.Header.Get("If-None-Match") == "*", opID: r.Header.Get("X-Property-Op")}
+			if ev.status == 0 {
+				ev.status = http.StatusOK
+			}
+			switch {
+			case r.Method == http.MethodPut:
+				ev.body = body
+			case r.Method == http.MethodGet && ev.status == http.StatusOK:
+				ev.body = sw.body
+			}
+			f.observe(ev)
+		}()
+	}
+	if !f.noHistory {
+		f.seen = append(f.seen, r.Method+" "+r.RequestURI)
+		f.headers = append(f.headers, r.Header.Clone())
+	}
 	w.Header().Set("X-Amz-Request-Id", f.name+"-req")
 	if f.redirect {
 		w.Header().Set("Location", "http://elsewhere.example"+r.RequestURI)
@@ -321,6 +408,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `<ListPartsResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId><Part><PartNumber>1</PartNumber></Part></ListPartsResult>`, bucket, esc(key), id)
 		case http.MethodPost:
 			objs[key] = bytes.Join(f.parts[id], nil)
+			f.wrote(bucket, key)
 			delete(f.uploads, id)
 			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<CompleteMultipartUploadResult><Location>http://%s/%s/%s</Location><Bucket>%s</Bucket><Key>%s</Key><ETag>"mp"</ETag></CompleteMultipartUploadResult>`, r.Host, bucket, esc(key), bucket, esc(key))
 		case http.MethodDelete:
@@ -336,16 +424,18 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		objs[key] = data
+		f.wrote(bucket, key)
 		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"copy"</ETag></CopyObjectResult>`))
 	case r.Method == http.MethodPut:
 		// Conditional write, as a backend with capabilities.conditional_write=true offers it: the
 		// mover uses it so a client write during the copy is never clobbered (ADR-0004).
-		if _, taken := objs[key]; taken && r.Header.Get("If-None-Match") == "*" {
+		if _, taken := objs[key]; taken && r.Header.Get("If-None-Match") == "*" && !f.ignoreINM {
 			f.fail(w, r, 412, "PreconditionFailed", bucket, key)
 			return
 		}
 		objs[key] = body
-		w.Header().Set("ETag", `"obj"`)
+		f.wrote(bucket, key)
+		w.Header().Set("ETag", etagOf(body))
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		data, ok := objs[key]
 		if !ok {
@@ -353,9 +443,27 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		w.Header().Set("ETag", etagOf(data))
+		w.Header().Set("Last-Modified", f.mtime[bucket+"/"+key].UTC().Format(http.TimeFormat))
 		_, _ = w.Write(data)
+	case r.Method == http.MethodDelete && f.deleteStatus > 0:
+		f.fail(w, r, f.deleteStatus, "ServiceUnavailable", bucket, key)
 	case r.Method == http.MethodDelete:
+		// Conditional delete, as a backend that supports If-Match on DeleteObject offers it: the
+		// mover uses it to take back only its own copy (ADR-0004 race 1).
+		if want := r.Header.Get("If-Match"); want != "" && !f.ignoreIfMatch {
+			data, ok := objs[key]
+			switch {
+			case !ok:
+				f.fail(w, r, 404, "NoSuchKey", bucket, key)
+				return
+			case etagOf(data) != want:
+				f.fail(w, r, 412, "PreconditionFailed", bucket, key)
+				return
+			}
+		}
 		delete(objs, key)
+		delete(f.mtime, bucket+"/"+key)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

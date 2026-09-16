@@ -40,6 +40,21 @@ say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
 fail() { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# migrate_start runs `shunt migrate start` and shows a refusal for a target without conditional PUT
+# (ADR-0004 race 2) instead of hiding it. The demo then accepts the window explicitly, which a real
+# operator does only with writers quiesced or at low write volume (docs/migrating.md).
+migrate_start() {
+  local out
+  if out=$($SHUNT migrate start "$@" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/   /'
+    return
+  fi
+  printf '%s\n' "$out" | sed 's/^/   /'
+  grep -q -- '--accept-lost-write-window' <<<"$out" || fail "migrate start"
+  note "refused as designed: the target ignores If-None-Match: * on PUT. Accepting the window for this demo."
+  $SHUNT migrate start "$@" --accept-lost-write-window | sed 's/^/   /'
+}
+
 command -v aws >/dev/null || fail "aws-cli is not installed"
 [ -f "$CFG" ] || fail "$CFG is missing; run make e2e-up first"
 curl -fsS "$ADMIN/-/metrics" >/dev/null 2>&1 || fail "shunt is not running; start it with make run-mixed"
@@ -85,7 +100,7 @@ done
 note "$(wc -l < "$WORK/before.txt") objects across both tenants, on both clusters"
 
 say "2. Start every bucket on $FROM moving to $TO"
-$SHUNT migrate start --from "$FROM" --to "$TO" --create -c "$CFG" | sed 's/^/   /'
+migrate_start --from "$FROM" --to "$TO" --create -c "$CFG"
 $SHUNT migrate status -c "$CFG" | sed 's/^/   /'
 
 say "3. Move the bytes"

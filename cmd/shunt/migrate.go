@@ -52,7 +52,7 @@ func newRamp() *cobra.Command {
 			}
 			return transitionAll(cmd, cfgPath, args, from, directory.Transition{
 				To: directory.StateRamping, Target: to, Name: name, Ratio: ratio, Prefixes: prefixes,
-			}, create, actor)
+			}, create, false, actor)
 		},
 	}
 	f := cmd.Flags()
@@ -80,10 +80,11 @@ func newMigrate() *cobra.Command {
 
 func newMigrateStart(cfgPath *string) *cobra.Command {
 	var (
-		to, name string
-		from     string
-		create   bool
-		actor    string
+		to, name   string
+		from       string
+		create     bool
+		acceptLoss bool
+		actor      string
 	)
 	cmd := &cobra.Command{
 		Use:   "start <tenant/bucket>",
@@ -95,10 +96,12 @@ func newMigrateStart(cfgPath *string) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return transitionAll(cmd, *cfgPath, args, from, directory.Transition{
 				To: directory.StateMigrating, Target: to, Name: name,
-			}, create, actor)
+			}, create, acceptLoss, actor)
 		},
 	}
 	f := cmd.Flags()
+	f.BoolVar(&acceptLoss, "accept-lost-write-window", false,
+		"start even though the target ignores If-None-Match: * on PUT, accepting that the mover can overwrite a client write (docs/migrating.md)")
 	f.StringVar(&to, "to", "", "the cluster that becomes primary (required unless already RAMPING)")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket currently served by this cluster (how a vendor is evacuated)")
 	f.StringVar(&name, "name", "", "the backend bucket name on --to (default: the generated name)")
@@ -117,7 +120,7 @@ func newMigrateFinish(cfgPath *string) *cobra.Command {
 			"`shunt migrate status` shows whether any read still fell back.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transitionAll(cmd, *cfgPath, args, from, directory.Transition{To: directory.StateActive}, false, actor)
+			return transitionAll(cmd, *cfgPath, args, from, directory.Transition{To: directory.StateActive}, false, false, actor)
 		},
 	}
 	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket that has cut over from this cluster")
@@ -135,7 +138,7 @@ func newCutover() *cobra.Command {
 			"mover reports convergence and shunt_migration_fallback_reads_total has stopped increasing.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transitionAll(cmd, cfgPath, args, from, directory.Transition{To: directory.StateCutover}, false, actor)
+			return transitionAll(cmd, cfgPath, args, from, directory.Transition{To: directory.StateCutover}, false, false, actor)
 		},
 	}
 	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file naming the directory file and its clusters")
@@ -202,12 +205,12 @@ func newMigrateStatus(cfgPath *string) *cobra.Command {
 // holds. The second form is how a vendor leaves the estate: one command per step for the whole
 // cluster, not one per bucket. A bucket that is already past the step is reported and skipped, so
 // the command can be repeated after a partial failure.
-func transitionAll(cmd *cobra.Command, cfgPath string, args []string, from string, t directory.Transition, create bool, actor string) error {
+func transitionAll(cmd *cobra.Command, cfgPath string, args []string, from string, t directory.Transition, create, acceptLoss bool, actor string) error {
 	switch {
 	case len(args) == 1 && from != "":
 		return errors.New("give a bucket or --from, not both")
 	case len(args) == 1:
-		return transition(cmd, cfgPath, args[0], t, create, actor)
+		return transition(cmd, cfgPath, args[0], t, create, acceptLoss, actor)
 	case from == "":
 		return errors.New("give a bucket, or --from <cluster> for every bucket on one cluster")
 	}
@@ -240,7 +243,7 @@ func transitionAll(cmd *cobra.Command, cfgPath string, args []string, from strin
 	_, _ = fmt.Fprintf(out, "%d buckets on %s\n", len(keys), from)
 	var failed []string
 	for _, key := range keys {
-		if err := transition(cmd, cfgPath, key, t, create, actor); err != nil {
+		if err := transition(cmd, cfgPath, key, t, create, acceptLoss, actor); err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s: %v\n", key, err)
 			failed = append(failed, key)
 		}
@@ -275,8 +278,16 @@ func reportLeftovers(cmd *cobra.Command, cfg *config.Config, f *directory.File, 
 	_, _ = fmt.Fprintf(out, "\nnothing in the directory names %s any more: remove its block from the config and run `shunt check-config`.\n", cluster)
 }
 
+// lostWriteWindow is the refusal, and with --accept-lost-write-window the warning, for a migration
+// into a cluster that ignores If-None-Match: * on PUT (ADR-0004 race 2).
+const lostWriteWindow = "%s: target cluster %s has capabilities.conditional_write: false (it ignores If-None-Match: * on PUT), " +
+	"so the mover falls back to HEAD-then-commit. A client write that lands between the mover's HEAD and its PUT " +
+	"is overwritten with the source's older bytes, after the client was told 200, and nothing reports it (one round trip per copied object; ADR-0004 race 2). " +
+	"Quiesce writers for the mover run, or ramp to 1 and run the mover at low write volume; see docs/migrating.md"
+
 // transition applies one state change, resolving and optionally creating the target bucket first.
-func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition, create bool, actor string) error {
+// acceptLoss allows entering MIGRATING on a target without conditional PUT.
+func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition, create, acceptLoss bool, actor string) error {
 	tenant, bucket, ok := directory.SplitKey(key)
 	if !ok {
 		return fmt.Errorf("%q: want <tenant>/<bucket>", key)
@@ -310,6 +321,13 @@ func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition,
 	np, err := directory.Apply(*p, t)
 	if err != nil {
 		return err
+	}
+	// MIGRATING is where the mover runs. On a target that ignores If-None-Match: * its guard has a
+	// window that loses client writes, and starting anyway is the operator's call, made explicitly.
+	lossWindow := np.State == directory.StateMigrating && p.State != directory.StateMigrating &&
+		!cfg.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true)
+	if lossWindow && !acceptLoss {
+		return fmt.Errorf(lostWriteWindow+". To start anyway, re-run with --accept-lost-write-window", key, np.Primary)
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
 	defer cancel()
@@ -346,6 +364,9 @@ func transition(cmd *cobra.Command, cfgPath, key string, t directory.Transition,
 			rampShare(np.Ramp), np.Primary, np.Source)
 	case directory.StateMigrating:
 		_, _ = fmt.Fprintf(out, "all writes now land on %s; run the mover to copy what is still on %s\n", np.Primary, np.Source)
+		if lossWindow {
+			_, _ = fmt.Fprintf(out, "WARNING (accepted with --accept-lost-write-window): "+lostWriteWindow+"\n", key, np.Primary)
+		}
 	case directory.StateCutover:
 		_, _ = fmt.Fprintf(out, "%s is no longer read; run `shunt migrate finish %s` to drop it for good\n", np.Source, key)
 	case directory.StateActive:

@@ -49,4 +49,12 @@ func TestCapabilitiesDefaults(t *testing.T) {
 	if c.EnforcesSHA256Or(true) {
 		t.Fatal("explicit false ignored")
 	}
+	if c.ConditionalDeleteOr(false) {
+		t.Fatal("conditional_delete must default to false where the caller asks for it")
+	}
+	tr := true
+	c.ConditionalDelete = &tr
+	if !c.ConditionalDeleteOr(false) {
+		t.Fatal("explicit conditional_delete: true ignored")
+	}
 }

@@ -24,7 +24,7 @@ func TestProbeAgainstFake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, v := range map[string]string{"sha256": res.EnforcesSHA256, "trailer": res.UnsignedTrailer, "ifnonematch": res.IfNoneMatchPut, "ifmatch": res.IfMatchPut} {
+	for name, v := range map[string]string{"sha256": res.EnforcesSHA256, "trailer": res.UnsignedTrailer, "ifnonematch": res.IfNoneMatchPut, "ifmatch": res.IfMatchPut, "ifmatchdelete": res.IfMatchDelete} {
 		if v == "" {
 			t.Errorf("%s not reported", name)
 		}

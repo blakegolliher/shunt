@@ -79,6 +79,10 @@ The second pass is the convergence check: nothing left to move. The 16 objects "
 target" in the first pass are the bench harness's own keys, which the client rewrote onto the new
 primary while the mover was working — exactly the case the overwrite guard exists for.
 
+## The property test does not appear in these numbers, and its first results were wrong
+
+The POC-4 gate also counted a clean 2-minute and a clean 10-minute property run (docs/STATUS.md). **Neither exercised the mover's copy path.** The clients had emptied the source before the bucket reached `MIGRATING`, so both mover passes copied nothing, and the runs said nothing about the delete/copy and overwrite races. Their harness also held every request in memory, which stalled the process long enough to fail GETs. Both are fixed (2026-09-16), and the 60-minute reruns, one clean and one with the documented HEAD-then-commit loss, are in docs/STATUS.md and ADR-0004. None of the latencies above came from the property test.
+
 ## Reproducing
 
 ```sh

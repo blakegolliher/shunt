@@ -25,6 +25,7 @@ Read docs/DESIGN.md before every task. docs/CONTEXT.md is ground truth about the
 - Every new dependency gets a line in docs/deps.md.
 - Every body buffer needs an ADR.
 - Nothing assumes hardware.
+- **Never pipe a build, test, or property run through `head`, `tail`, `grep`, or any other filter.** Redirect the full output to a file (`> run.log 2>&1`), then read the file. Filtering has destroyed evidence three times: twice a stale binary survived a build killed by `tail`, and once a property run's 15 violations were reduced to a summary line.
 - Commit messages carry no tool attribution: no Co-Authored-By, no Generated-with, no Claude-Session trailer. Check `git log -1 --format=%B` after every commit.
 
 ## Lift procedure (copying third-party code in; from docs/reuse.md)

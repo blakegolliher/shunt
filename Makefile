@@ -67,8 +67,18 @@ fuzz: ## run every fuzz target for FUZZ_TIME (default 30s)
 	done; \
 	test $$found -eq 1 || { echo "no fuzz targets found"; exit 1; }
 
-property: build ## POC-4 migration property test (PROPERTY_TIME, default 2m; 10m for a local soak)
-	SHUNT_PROPERTY_DURATION=$(PROPERTY_TIME) $(GO) test ./internal/proxy -run TestMigrationPreservesTheClientsView -count=1 -timeout $(PROPERTY_TIMEOUT) -v
+# The whole run goes to test/property/runs/<timestamp>/: go-test.log (the complete output, never
+# filtered), git.txt, and the test's own record (run.json; on a violation also violations.jsonl,
+# events.jsonl.gz, keys/, report.md). PROPERTY_SEED, PROPERTY_GUARD and PROPERTY_WITHDRAW pass through when set.
+property: build ## POC-4 migration property test (PROPERTY_TIME, default 2m; PROPERTY_SEED; PROPERTY_GUARD=conditional|guarded; PROPERTY_WITHDRAW=re-head|if-match)
+	@set -uo pipefail; \
+	dir=$(CURDIR)/test/property/runs/$$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $$dir; \
+	{ git rev-parse HEAD; git status --porcelain; } > $$dir/git.txt 2>&1; \
+	echo "property run $(PROPERTY_TIME): full output in $$dir/go-test.log"; \
+	SHUNT_PROPERTY_RUN_DIR=$$dir SHUNT_PROPERTY_DURATION=$(PROPERTY_TIME) \
+	  $(if $(PROPERTY_SEED),SHUNT_PROPERTY_SEED=$(PROPERTY_SEED)) $(if $(PROPERTY_GUARD),SHUNT_PROPERTY_GUARD=$(PROPERTY_GUARD)) $(if $(PROPERTY_WITHDRAW),SHUNT_PROPERTY_WITHDRAW=$(PROPERTY_WITHDRAW)) \
+	  $(GO) test ./internal/proxy -run TestMigrationPreservesTheClientsView -count=1 -timeout $(PROPERTY_TIMEOUT) -v > $$dir/go-test.log 2>&1; \
+	rc=$$?; echo "property run exited $$rc; record in $$dir"; exit $$rc
 
 bench: ## run all benchmarks, write test/bench/new.txt
 	@mkdir -p test/bench

@@ -6,7 +6,9 @@
 //   - it never overwrites a newer client write: If-None-Match: * where the target honors it,
 //     and a HEAD-then-commit guard where it does not (Garage);
 //   - it re-HEADs the source after each copy and removes its own copy if the object was deleted
-//     while in flight, so a delete is never resurrected;
+//     while in flight, so a delete is not resurrected; it removes only its own copy, with If-Match
+//     on the ETag its PUT returned where the target honors it, and otherwise after a HEAD shows that
+//     ETag and a Last-Modified no later than the PUT (ADR-0004 race 1);
 //   - it reproduces the source's multipart part layout, so ETags survive;
 //   - it keeps a resumable cursor and appends a JSONL ledger.
 //
@@ -21,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,10 +32,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -53,7 +59,8 @@ type job struct {
 	tenant      string
 	client      string
 	src, dst    side
-	conditional bool
+	conditional bool // the target honors If-None-Match: * on PUT
+	condDelete  bool // the target honors If-Match on DELETE
 }
 
 // ledgerLine is one row of the run's record, in the order the mover wrote them.
@@ -108,8 +115,8 @@ func main() {
 	total := stats{}
 	for i := range jobs {
 		j := jobs[i]
-		fmt.Printf("== %s/%s: %s/%s → %s/%s (%s guard)\n", j.tenant, j.client,
-			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional))
+		fmt.Printf("== %s/%s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", j.tenant, j.client,
+			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional), withdrawName(j.condDelete))
 		s, err := move(ctx, j, *stateDir, *ledgerTo, *dryRun)
 		total.copied += s.copied
 		total.skipped += s.skipped
@@ -138,6 +145,13 @@ func guardName(conditional bool) string {
 		return "If-None-Match"
 	}
 	return "HEAD-then-commit"
+}
+
+func withdrawName(condDelete bool) string {
+	if condDelete {
+		return "If-Match"
+	}
+	return "re-HEAD"
 }
 
 // selectPlacements finds the placements to move and refuses the ones that are not ready.
@@ -211,6 +225,8 @@ func selectPlacements(dir *directory.File, cfg *config.Config, one, from string)
 			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl},
 			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl},
 			conditional: cfg.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
+			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
+			condDelete: cfg.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
 		})
 	}
 	return jobs, nil
@@ -323,10 +339,11 @@ func copyOne(ctx context.Context, j job, key string) ledgerLine {
 	}
 
 	var etag string
+	var putDate time.Time
 	if line.Parts > 1 {
-		etag, err = copyMultipart(ctx, j, key, head, line.Parts)
+		etag, putDate, err = copyMultipart(ctx, j, key, head, line.Parts)
 	} else {
-		etag, err = copySingle(ctx, j, key, head)
+		etag, putDate, err = copySingle(ctx, j, key, head)
 	}
 	switch {
 	case err != nil && isPreconditionFailed(err):
@@ -348,17 +365,72 @@ func copyOne(ctx context.Context, j job, key string) ledgerLine {
 	}
 
 	// The delete/copy race: if the object went away while we were copying it, take our copy back
-	// out rather than resurrect it (docs/DESIGN.md §2.5, ADR-0004 race 1).
+	// out rather than resurrect it (docs/DESIGN.md §2.5, ADR-0004 race 1). Only our copy: a client
+	// may have written the key again since our PUT landed.
 	if _, serr := j.src.cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &j.src.bucket, Key: &key}); serr != nil && isNotFound(serr) {
-		if _, derr := j.dst.cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &j.dst.bucket, Key: &key}); derr != nil {
-			line.Result, line.Detail = "error", "deleted from the source mid-copy and the copy could not be removed: "+derr.Error()
+		detail, werr := withdraw(ctx, j, key, etag, putDate)
+		if werr != nil {
+			line.Result, line.Detail = "error", "deleted from the source mid-copy and the copy could not be removed: "+werr.Error()
 			return line
 		}
-		line.Result, line.Detail = "vanished", "deleted from the source mid-copy; the copy was removed"
+		line.Result, line.Detail = "vanished", "deleted from the source mid-copy; "+detail
 		return line
 	}
 	line.Result = "copied"
 	return line
+}
+
+// withdraw removes the mover's own copy of key from the target, and nothing a client wrote after
+// it. With conditional_delete it is one DELETE with If-Match on the ETag the mover's PUT returned.
+// Without it, a HEAD must show that ETag and a Last-Modified no later than the PUT's Date before an
+// unconditional DELETE; a client write that lands between that HEAD and the DELETE is still lost,
+// and so is a client write of identical bytes within the same second (ADR-0004 race 1).
+func withdraw(ctx context.Context, j job, key, etag string, putDate time.Time) (string, error) {
+	if j.condDelete {
+		_, err := j.dst.cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &j.dst.bucket, Key: &key, IfMatch: aws.String(etag)})
+		switch {
+		case err == nil:
+			return "the copy was removed (If-Match)", nil
+		case isPreconditionFailed(err):
+			return "a newer client write had replaced the copy and was kept (412)", nil
+		case isNotFound(err):
+			return "the copy was already gone", nil
+		}
+		return "", err
+	}
+	head, err := j.dst.cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &j.dst.bucket, Key: &key})
+	switch {
+	case err != nil && isNotFound(err):
+		return "the copy was already gone", nil
+	case err != nil:
+		return "", err
+	case !ownCopy(aws.ToString(head.ETag), etag, aws.ToTime(head.LastModified), putDate):
+		return "the target holds a newer client write, which was kept", nil
+	}
+	if _, err := j.dst.cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &j.dst.bucket, Key: &key}); err != nil {
+		return "", err
+	}
+	return "the copy was removed (re-HEAD)", nil
+}
+
+// ownCopy reports whether the object a HEAD found is the mover's copy: it carries the ETag the
+// mover's PUT returned and was not modified after that PUT's Date. Both times come from the
+// backend's clock at one-second resolution; with no Date the ETag alone decides.
+func ownCopy(headETag, putETag string, modified, putDate time.Time) bool {
+	if headETag == "" || headETag != putETag {
+		return false
+	}
+	return putDate.IsZero() || !modified.After(putDate)
+}
+
+// responseDate is the Date header of an SDK response, the backend's clock at the moment it answered.
+func responseDate(md middleware.Metadata) time.Time {
+	if raw, ok := awsmiddleware.GetRawResponse(md).(*smithyhttp.Response); ok {
+		if t, err := http.ParseTime(raw.Header.Get("Date")); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // sourceParts reports how many parts the source object was uploaded in. A plain HEAD does not
@@ -390,10 +462,10 @@ func sourceParts(ctx context.Context, j job, key string, head *s3.HeadObjectOutp
 
 // copySingle streams a one-part object. Objects up to inlineLimit go through memory; larger ones
 // through a temporary file, so the PUT stays a single part and the ETag is preserved.
-func copySingle(ctx context.Context, j job, key string, head *s3.HeadObjectOutput) (string, error) {
+func copySingle(ctx context.Context, j job, key string, head *s3.HeadObjectOutput) (string, time.Time, error) {
 	get, err := j.src.cl.GetObject(ctx, &s3.GetObjectInput{Bucket: &j.src.bucket, Key: &key})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer get.Body.Close() //nolint:errcheck // copied below
 	size := aws.ToInt64(head.ContentLength)
@@ -409,39 +481,39 @@ func copySingle(ctx context.Context, j job, key string, head *s3.HeadObjectOutpu
 	if size <= inlineLimit {
 		body, rerr := io.ReadAll(get.Body)
 		if rerr != nil {
-			return "", rerr
+			return "", time.Time{}, rerr
 		}
 		in.Body = bytes.NewReader(body)
 	} else {
 		tmp, terr := os.CreateTemp("", "shunt-mover-*")
 		if terr != nil {
-			return "", terr
+			return "", time.Time{}, terr
 		}
 		defer os.Remove(tmp.Name()) //nolint:errcheck // best effort
 		defer tmp.Close()           //nolint:errcheck // best effort
 		if _, cerr := io.Copy(tmp, get.Body); cerr != nil {
-			return "", cerr
+			return "", time.Time{}, cerr
 		}
 		if _, serr := tmp.Seek(0, io.SeekStart); serr != nil {
-			return "", serr
+			return "", time.Time{}, serr
 		}
 		in.Body = tmp
 	}
 	out, err := j.dst.cl.PutObject(ctx, in)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	return aws.ToString(out.ETag), nil
+	return aws.ToString(out.ETag), responseDate(out.ResultMetadata), nil
 }
 
 // copyMultipart reproduces the source's part layout, so the object keeps its ETag. Part sizes come
 // from the source itself: HEAD with a part number reports that part's length.
-func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOutput, parts int32) (string, error) {
+func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOutput, parts int32) (string, time.Time, error) {
 	create, err := j.dst.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: &j.dst.bucket, Key: &key, ContentType: head.ContentType, Metadata: head.Metadata,
 	})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	uploadID := create.UploadId
 	abort := func() {
@@ -454,20 +526,20 @@ func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOu
 		ph, perr := j.src.cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &j.src.bucket, Key: &key, PartNumber: aws.Int32(n)})
 		if perr != nil {
 			abort()
-			return "", fmt.Errorf("part %d of %d: %w", n, parts, perr)
+			return "", time.Time{}, fmt.Errorf("part %d of %d: %w", n, parts, perr)
 		}
 		size := aws.ToInt64(ph.ContentLength)
 		rng := fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)
 		get, gerr := j.src.cl.GetObject(ctx, &s3.GetObjectInput{Bucket: &j.src.bucket, Key: &key, Range: &rng})
 		if gerr != nil {
 			abort()
-			return "", gerr
+			return "", time.Time{}, gerr
 		}
 		body, rerr := io.ReadAll(get.Body)
 		_ = get.Body.Close()
 		if rerr != nil {
 			abort()
-			return "", rerr
+			return "", time.Time{}, rerr
 		}
 		up, uerr := j.dst.cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: &j.dst.bucket, Key: &key, UploadId: uploadID, PartNumber: aws.Int32(n),
@@ -475,7 +547,7 @@ func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOu
 		})
 		if uerr != nil {
 			abort()
-			return "", uerr
+			return "", time.Time{}, uerr
 		}
 		completed = append(completed, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(n)})
 		offset += size
@@ -491,17 +563,17 @@ func copyMultipart(ctx context.Context, j job, key string, head *s3.HeadObjectOu
 		in.IfNoneMatch = aws.String("*")
 	} else if _, herr := j.dst.cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &j.dst.bucket, Key: &key}); herr == nil {
 		abort()
-		return "", &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "a client wrote it while the parts were uploading"}
+		return "", time.Time{}, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "a client wrote it while the parts were uploading"}
 	} else if !isNotFound(herr) {
 		abort()
-		return "", herr
+		return "", time.Time{}, herr
 	}
 	out, err := j.dst.cl.CompleteMultipartUpload(ctx, in)
 	if err != nil {
 		abort()
-		return "", err
+		return "", time.Time{}, err
 	}
-	return aws.ToString(out.ETag), nil
+	return aws.ToString(out.ETag), responseDate(out.ResultMetadata), nil
 }
 
 func uploadLedger(ctx context.Context, j job, bucket, path string) error {

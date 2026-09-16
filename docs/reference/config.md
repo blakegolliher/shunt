@@ -84,9 +84,10 @@ Two placements may never share a backend bucket on one cluster: that would make 
 | `storage_class` + `access` | class + `instant` / `restore-required` | Set together; `restore-required` only with `GLACIER` or `DEEP_ARCHIVE`; not on a `storage_classes: native` cluster |
 | `capabilities.enforces_sha256` | bool | Default true. False means the backend does not reject a wrong hex `x-amz-content-sha256`; shunt then hashes the body itself and logs a mismatch (ADR-0002, POC: log-and-alert). Fill from `shunt probe` |
 | `capabilities.conditional_write` | bool | Default true. False means the backend ignores `If-None-Match: *` on PUT (Garage 2.3.0 does). The mover then falls back to a HEAD-then-commit guard with a race window; see ADR-0004. Fill from `shunt probe` |
+| `capabilities.conditional_delete` | bool | **Default false**, unlike the others. True means the backend honors `If-Match` on `DeleteObject`: a mismatched ETag gets 412 and the object stays. The mover then withdraws its own copy with `If-Match` on the ETag its PUT returned; without it, the mover HEADs the target and deletes only if ETag and Last-Modified still match its copy, which leaves a one-round-trip window (ADR-0004 race 1). It defaults to false because a backend that ignores the header deletes unconditionally. Fill from `shunt probe` |
 | `capabilities.unsigned_trailer` | bool | Default true. False means the backend rejects `STREAMING-UNSIGNED-PAYLOAD-TRAILER`; shunt then verifies the trailer checksum itself and forwards `UNSIGNED-PAYLOAD`. Fill from `shunt probe` |
 
-`capabilities` are measured facts about a backend, filled from `shunt probe`, not switches over shunt's behavior: the feature-flag and kill-switch rules (CLAUDE.md) do not apply to them. Each default states what a conformant S3 backend does; a backend that differs gets a profile, and shunt compensates for the difference (ADR-0002).
+`capabilities` are measured facts about a backend, filled from `shunt probe`, not switches over shunt's behavior: the feature-flag and kill-switch rules (CLAUDE.md) do not apply to them. Each default except `conditional_delete` states what a conformant S3 backend does (that one defaults to the choice that cannot delete a client's write); a backend that differs gets a profile, and shunt compensates for the difference (ADR-0002).
 
 ## `tenants`, `placements`
 

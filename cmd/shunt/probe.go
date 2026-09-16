@@ -43,6 +43,7 @@ type probeResult struct {
 	Checksums       map[string]string `json:"checksums"`
 	IfNoneMatchPut  string            `json:"if_none_match_star_put"`
 	IfMatchPut      string            `json:"if_match_put"`
+	IfMatchDelete   string            `json:"if_match_delete"`
 	Notes           []string          `json:"notes,omitempty"`
 }
 
@@ -330,6 +331,28 @@ func (p *prober) run(ctx context.Context) (*probeResult, error) {
 		default:
 			res.IfMatchPut = fmt.Sprintf("rejected (%d %s / %d %s)", r3.status, r3.code, r4.status, r4.code)
 		}
+		// 6. Conditional DELETE: a mismatched If-Match must leave the object, a matching one remove it.
+		// The mover's withdrawal of its own copy depends on it (capabilities.conditional_delete).
+		etag = r4.header.Get("ETag")
+		if etag == "" {
+			etag = r.header.Get("ETag")
+		}
+		d1, _ := p.do(ctx, http.MethodDelete, k, nil, "", false, map[string]string{"If-Match": `"0000000000000000000000000000dead"`})
+		h1, _ := p.do(ctx, http.MethodHead, k, nil, "", false, nil)
+		switch {
+		case h1.status == 404:
+			res.IfMatchDelete = fmt.Sprintf("NO (mismatch deleted the object, %d)", d1.status)
+		case d1.status == 412:
+			d2, _ := p.do(ctx, http.MethodDelete, k, nil, "", false, map[string]string{"If-Match": etag})
+			h2, _ := p.do(ctx, http.MethodHead, k, nil, "", false, nil)
+			if d2.status/100 == 2 && h2.status == 404 {
+				res.IfMatchDelete = fmt.Sprintf("yes (412 on mismatch, %d on match)", d2.status)
+			} else {
+				res.IfMatchDelete = fmt.Sprintf("mismatch refused (412) but match did not delete (%d %s, then HEAD %d)", d2.status, d2.code, h2.status)
+			}
+		default:
+			res.IfMatchDelete = fmt.Sprintf("rejected (%d %s), object kept", d1.status, d1.code)
+		}
 		p.del(ctx, k)
 	}
 	return res, nil
@@ -352,6 +375,7 @@ func printProbe(w io.Writer, r *probeResult) {
 	}
 	row("If-None-Match: * on PUT", r.IfNoneMatchPut)
 	row("If-Match on PUT", r.IfMatchPut)
+	row("If-Match on DELETE", r.IfMatchDelete)
 	for _, n := range r.Notes {
 		row("note", n)
 	}

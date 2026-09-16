@@ -28,15 +28,17 @@ clusters:
     region: garage
     endpoints: ["127.0.0.1:3900"]
     credentials: { access_key: GK_SET_BY_E2E, secret_ref: env:GARAGE_SECRET }
-    # measured by `make probe BACKEND=garage`: Garage 2.3.0 ignores If-None-Match: * on PUT
-    capabilities: { conditional_write: false }
+    # measured by `make probe BACKEND=garage`: Garage 2.3.0 ignores If-None-Match: * on PUT and
+    # If-Match on DELETE
+    capabilities: { conditional_write: false, conditional_delete: false }
   minio:
     type: minio
     scheme: http
     region: us-east-1
     endpoints: ["127.0.0.1:9000"]
     credentials: { access_key: minioadmin, secret_ref: env:MINIO_SECRET }
-    capabilities: { conditional_write: true }
+    # measured by `make probe BACKEND=minio` 2026-09-16: If-None-Match: * honored, If-Match on DELETE ignored
+    capabilities: { conditional_write: true, conditional_delete: false }
 telemetry:
   access_log: { enabled: true, path: test/e2e/data/shunt-mixed.access.jsonl }
   slow: { ring_size: 100, threshold: 500ms }
