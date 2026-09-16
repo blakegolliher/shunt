@@ -30,9 +30,10 @@ type Cluster struct {
 	Endpoints []string // host:port
 	Transport *http.Transport
 
-	Creds           sigv4.Credentials // set by NewSet when secrets are resolved (resign mode)
-	EnforcesSHA256  bool              // backend rejects a wrong hex x-amz-content-sha256 itself
-	UnsignedTrailer bool              // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+	Creds            sigv4.Credentials // set by NewSet when secrets are resolved (resign mode)
+	EnforcesSHA256   bool              // backend rejects a wrong hex x-amz-content-sha256 itself
+	UnsignedTrailer  bool              // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+	ConditionalWrite bool              // backend honors If-None-Match: * on PUT (ADR-0004)
 
 	next atomic.Uint64
 }
@@ -109,6 +110,7 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 		Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: ClusterID(name), Endpoints: eps, Transport: tr,
 		Creds:          sigv4.Credentials{AccessKey: c.Credentials.AccessKey},
 		EnforcesSHA256: c.Capabilities.EnforcesSHA256Or(true), UnsignedTrailer: c.Capabilities.UnsignedTrailerOr(true),
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true),
 	}, nil
 }
 

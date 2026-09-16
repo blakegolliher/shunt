@@ -208,6 +208,27 @@ func (d *FileDir) Delete(ctx context.Context, tenant, bucket, actor string) erro
 	})
 }
 
+// SetTenantDefault repoints a tenant's default cluster: the cluster its next CreateBucket lands on.
+// It is not part of the Directory seam — the proxy never changes it — but an operator needs it when
+// a cluster is being retired, or every new bucket keeps landing on the machine being switched off.
+func (d *FileDir) SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error {
+	return d.mutate(ctx, actor, "set-default", tenant, func(f *File) error {
+		t, ok := f.Tenants[tenant]
+		if !ok {
+			return fmt.Errorf("%w: tenant %q is not in the directory", ErrNotFound, tenant)
+		}
+		if _, ok := d.clusters[cluster]; !ok {
+			return fmt.Errorf("%w: cluster %q is not configured", ErrNotFound, cluster)
+		}
+		if t.DefaultCluster == cluster {
+			return fmt.Errorf("%w: %s already defaults to %s", ErrConflict, tenant, cluster)
+		}
+		t.DefaultCluster = cluster
+		f.Tenants[tenant] = t
+		return nil
+	})
+}
+
 // SetState implements Directory.
 func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error {
 	k := Key(tenant, bucket)

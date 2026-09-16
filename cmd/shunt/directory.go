@@ -31,7 +31,7 @@ func newDirectory() *cobra.Command {
 		Short: "Inspect and change tenant placements in the directory file",
 	}
 	cmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file naming the directory file and its clusters")
-	cmd.AddCommand(newDirectoryGet(&cfgPath), newDirectorySetState(&cfgPath), newDirectoryValidate(&cfgPath))
+	cmd.AddCommand(newDirectoryGet(&cfgPath), newDirectorySetState(&cfgPath), newDirectoryValidate(&cfgPath), newDirectorySetDefault(&cfgPath))
 	return cmd
 }
 
@@ -84,6 +84,38 @@ func newDirectoryGet(cfgPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
+func newDirectorySetDefault(cfgPath *string) *cobra.Command {
+	var actor string
+	cmd := &cobra.Command{
+		Use:   "set-default <tenant> <cluster>",
+		Short: "Choose the cluster a tenant's new buckets are created on",
+		Long: "Existing buckets do not move: this only decides where the tenant's next CreateBucket lands.\n" +
+			"Repoint every tenant that still defaults to a cluster before retiring it.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadForDirectory(*cfgPath)
+			if err != nil {
+				return err
+			}
+			d, err := directory.Open(cfg.Directory.File, cfg.Clusters)
+			if err != nil {
+				return err
+			}
+			if actor == "" {
+				actor = "cli:" + os.Getenv("USER")
+			}
+			if serr := d.SetTenantDefault(cmd.Context(), args[0], args[1], actor); serr != nil {
+				return serr
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: new buckets now land on %s (directory version %d)\n",
+				args[0], args[1], d.Snapshot().Version())
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
 	return cmd
 }
 

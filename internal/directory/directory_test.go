@@ -60,7 +60,7 @@ func TestValidSample(t *testing.T) {
 	}
 	s := newSnapshot(f)
 	p, ok := s.Lookup("acme", "runs")
-	if !ok || p.State != StateRamping || p.Ramp == nil || len(p.Ramp.Prefixes) != 1 || p.Route() != "vast-a" {
+	if !ok || p.State != StateRamping || p.Ramp == nil || len(p.Ramp.Prefixes) != 1 || p.Source != "vast-a" {
 		t.Fatalf("acme/runs: %+v", p)
 	}
 	if got := s.Buckets("acme"); !slices.Equal(got, []string{"archive", "checkpoints", "runs", "training-sets"}) {

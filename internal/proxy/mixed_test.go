@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -50,8 +51,9 @@ type fakeS3 struct {
 	foreign  map[string]bool // CreateBucket answers BucketAlreadyExists
 	deny     map[string]bool // CreateBucket answers AccessDenied
 	redirect bool
-	listPad  int // extra <Contents> entries in listings
-	cutList  int // > 0: listings promise a large Content-Length, send this many bytes, and die
+	listPad  int  // extra <Contents> entries in listings
+	escapes  bool // percent-encodes "/" in listing keys, as Garage 2.3.0 does
+	cutList  int  // > 0: listings promise a large Content-Length, send this many bytes, and die
 }
 
 func newFakeS3(t *testing.T, name, ak, secret string, buckets ...string) *fakeS3 {
@@ -108,6 +110,13 @@ func (f *fakeS3) object(bucket, key string) ([]byte, bool) {
 }
 
 // addBucket creates a bucket directly on the backend.
+// deleteObject removes one object directly, as a mover withdrawing a copy would.
+func (f *fakeS3) deleteObject(bucket, key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.buckets[bucket], key)
+}
+
 func (f *fakeS3) addBucket(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -214,18 +223,72 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(`</ListMultipartUploadsResult>`))
 	case key == "" && r.Method == http.MethodGet:
-		var b bytes.Buffer
-		fmt.Fprintf(&b, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>%s</Name><Prefix></Prefix><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>`, bucket)
-		keys := make([]string, 0, len(objs))
+		// A listing that honors prefix, delimiter, start-after, continuation-token and max-keys,
+		// which the merge in internal/proxy/merge.go depends on.
+		prefix, delim := q.Get("prefix"), q.Get("delimiter")
+		after := q.Get("start-after")
+		if t := q.Get("continuation-token"); t != "" {
+			after = t
+		}
+		maxKeys := 1000
+		if v := q.Get("max-keys"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				maxKeys = n
+			}
+		}
+		keys := make([]string, 0, len(objs)+f.listPad)
 		for k := range objs {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(&b, `<Contents><Key>%s</Key><Size>%d</Size></Contents>`, esc(k), len(objs[k]))
-		}
 		for i := 0; i < f.listPad; i++ {
-			fmt.Fprintf(&b, `<Contents><Key>pad/%06d-%s</Key><Size>0</Size></Contents>`, i, bucket)
+			keys = append(keys, fmt.Sprintf("pad/%06d-%s", i, bucket))
+		}
+		sort.Strings(keys)
+		var contents []string
+		seenPrefix, order := map[string]bool{}, []string{}
+		truncated, last := false, ""
+		for _, k := range keys {
+			if !strings.HasPrefix(k, prefix) || (after != "" && k <= after) {
+				continue
+			}
+			if delim != "" {
+				if i := strings.Index(k[len(prefix):], delim); i >= 0 {
+					cp := k[:len(prefix)+i+len(delim)]
+					if !seenPrefix[cp] {
+						if len(contents)+len(order) >= maxKeys {
+							truncated = true
+							break
+						}
+						seenPrefix[cp], order = true, append(order, cp)
+					}
+					last = k
+					continue
+				}
+			}
+			if len(contents)+len(order) >= maxKeys {
+				truncated = true
+				break
+			}
+			contents, last = append(contents, k), k
+		}
+		var b bytes.Buffer
+		fmt.Fprintf(&b, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>%d</MaxKeys><IsTruncated>%t</IsTruncated>`,
+			bucket, esc(prefix), len(contents)+len(order), maxKeys, truncated)
+		if truncated {
+			fmt.Fprintf(&b, `<NextContinuationToken>%s</NextContinuationToken>`, esc(last))
+		}
+		enc := func(k string) string {
+			if f.escapes {
+				return strings.ReplaceAll(k, "/", "%2F")
+			}
+			return k
+		}
+		for _, k := range contents {
+			fmt.Fprintf(&b, `<Contents><Key>%s</Key><LastModified>2026-09-15T18:00:00.000Z</LastModified><ETag>&quot;%s&quot;</ETag><Size>%d</Size><StorageClass>STANDARD</StorageClass></Contents>`,
+				esc(enc(k)), f.name, len(objs[k]))
+		}
+		for _, cp := range order {
+			fmt.Fprintf(&b, `<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>`, esc(enc(cp)))
 		}
 		b.WriteString(`</ListBucketResult>`)
 		if f.cutList > 0 {
@@ -275,6 +338,12 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		objs[key] = data
 		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"copy"</ETag></CopyObjectResult>`))
 	case r.Method == http.MethodPut:
+		// Conditional write, as a backend with capabilities.conditional_write=true offers it: the
+		// mover uses it so a client write during the copy is never clobbered (ADR-0004).
+		if _, taken := objs[key]; taken && r.Header.Get("If-None-Match") == "*" {
+			f.fail(w, r, 412, "PreconditionFailed", bucket, key)
+			return
+		}
 		objs[key] = body
 		w.Header().Set("ETag", `"obj"`)
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
@@ -661,9 +730,9 @@ func TestDeleteBucket(t *testing.T) {
 	if m.upstreamCalls() != before {
 		t.Fatal("refused bucket operations reached a backend")
 	}
-	// POC-3 routes a MIGRATING bucket to its source.
-	if r := m.acme(t, "GET", "/old?list-type=2", nil); r.StatusCode != 200 || !strings.HasPrefix(m.minioLast(), "GET /acme-2222-old") {
-		t.Fatalf("MIGRATING read not routed to the source: %d %s", r.StatusCode, m.minioLast())
+	// A MIGRATING bucket still lists, from whichever side holds the objects (see migration_test.go).
+	if r := m.acme(t, "GET", "/old?list-type=2", nil); r.StatusCode != 200 {
+		t.Fatalf("MIGRATING listing: %d %s", r.StatusCode, r.body)
 	}
 }
 
@@ -791,8 +860,9 @@ func TestLargeRewrittenBodySpillsToChunked(t *testing.T) {
 	if r.StatusCode != 200 || r.ContentLength != -1 || len(r.body) < 100<<10 || !strings.Contains(string(r.body[:400]), "<Name>data</Name>") {
 		t.Fatalf("large listing: %d len %d cl %d", r.StatusCode, len(r.body), r.ContentLength)
 	}
-	if !strings.HasSuffix(string(r.body), "</ListBucketResult>") || strings.Count(string(r.body), "<Contents>") != 2000 {
-		t.Fatal("large listing body incomplete")
+	// The bucket holds 2000 keys; one page returns the S3 maximum of 1000 and says it is truncated.
+	if !strings.HasSuffix(string(r.body), "</ListBucketResult>") || strings.Count(string(r.body), "<Contents>") != 1000 {
+		t.Fatalf("large listing body incomplete: %d entries", strings.Count(string(r.body), "<Contents>"))
 	}
 }
 

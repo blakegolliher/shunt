@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -46,6 +47,7 @@ type bodyPlan struct {
 	stripEncoding bool // drop aws-chunked framing headers
 	keepTrailer   bool // forward as unsigned trailer (headers kept)
 	decodedLen    int64
+	buffered      []byte // set when the body must be sent to both clusters (ADR-0004)
 }
 
 // planBody applies the §2.2 payload table against the target cluster's capability profile.
@@ -124,6 +126,35 @@ func (h *Handler) planBody(r *http.Request, id sigv4.Identity, inBody *progressR
 	}
 	plan.body = &guardReader{r: plan.body, log: h.Log}
 	return plan, nil
+}
+
+// maxDeleteBody caps the DeleteObjects body shunt replays to the second cluster. S3 allows 1000
+// keys per request; 1 MiB is comfortably above the largest legal body.
+const maxDeleteBody = 1 << 20
+
+// buffer reads the planned body once so it can be sent to both clusters (ADR-0004). It is used
+// only for deletes, whose bodies are small and bounded.
+func (p *bodyPlan) buffer(limit int64) *sigv4.AuthError {
+	if p.body == nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(p.body, limit+1))
+	if err != nil {
+		return &sigv4.AuthError{Reason: sigv4.ReasonChunkSignature, Err: asS3(err)}
+	}
+	if int64(len(data)) > limit {
+		return &sigv4.AuthError{Reason: sigv4.ReasonMalformed, Err: s3.Lookup(s3.MaxMessageLengthExceeded)}
+	}
+	p.buffered, p.body, p.contentLength = data, nil, int64(len(data))
+	return nil
+}
+
+// reader returns the body for one upstream attempt: the replayable copy when there is one.
+func (p *bodyPlan) reader() io.Reader {
+	if p.buffered != nil {
+		return bytes.NewReader(p.buffered)
+	}
+	return p.body
 }
 
 // guardReader turns a panic inside a body decoder into a read error. Decoders run in net/http's

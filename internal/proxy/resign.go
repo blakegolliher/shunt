@@ -17,6 +17,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
 // refusedOps answer 501 in resign mode: their configuration bodies name buckets (as ARNs or
@@ -87,7 +88,14 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	if id.Presigned {
 		rawQuery = stripPresign(rawQuery)
 	}
-	clusterName := p.Route()
+	// Where this request goes (docs/DESIGN.md §2.5, ADR-0004). An uploadId, resolved below, wins:
+	// a multipart upload only exists on the cluster that issued its id.
+	class := migrate.Class(info.Op)
+	route := migrate.Decide(p, class, info.Key)
+	clusterName := p.Primary
+	if route.Cluster == migrate.Source {
+		clusterName = p.Source
+	}
 	rawQuery, prefix, conflict := rewriteUploadIDs(rawQuery)
 	if conflict {
 		h.answer(w, r, o, s3.NoSuchUpload, "")
@@ -100,6 +108,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			return nil, false
 		}
 		clusterName = pcl.Name
+		route = migrate.Route{Cluster: migrate.Primary} // pinned: no fallback, no dual, no merge
 	}
 	cl, ok := h.Clusters.Get(clusterName)
 	if !ok {
@@ -111,6 +120,27 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	backend := p.Names[cl.Name]
 	o.cluster, o.clusterType, o.backend = cl.Name, cl.Type, backend
+	if p.State == directory.StateRamping && class == migrate.ClassWrite {
+		h.Metrics.RampWrites.WithLabelValues(directory.Key(o.tenant, info.Bucket), route.Cluster.String()).Inc()
+	}
+
+	// The placement's other cluster, for a read that falls back, a delete that goes to both, or a
+	// listing that merges.
+	var other *upstream.Cluster
+	otherBackend := ""
+	if p.Source != "" && (route.Fallback || route.Both || route.Merge) {
+		name := p.Source
+		if route.Cluster == migrate.Source {
+			name = p.Primary
+		}
+		if oc, found := h.Clusters.Get(name); found && p.Names[name] != "" {
+			other, otherBackend = oc, p.Names[name]
+		}
+	}
+	if route.Merge && other != nil && info.Op == s3.OpListObjectsV2 {
+		h.mergeListing(ctx, w, r, o, cl, backend, other, otherBackend)
+		return nil, false
+	}
 
 	copySource := ""
 	if v := r.Header.Get("X-Amz-Copy-Source"); v != "" {
@@ -131,16 +161,26 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		return nil, false
 	}
 
-	target := upstreamPath(r, info, backend)
-	if rawQuery != "" {
-		target += "?" + rawQuery
+	// A delete that goes to both clusters needs its body twice, so it is read once and replayed.
+	// Bounded by S3's own limit on DeleteObjects (1000 keys); see ADR-0004.
+	if route.Both && plan.body != nil && r.ContentLength != 0 {
+		if aerr := plan.buffer(maxDeleteBody); aerr != nil {
+			h.Metrics.AuthFailures.WithLabelValues(string(aerr.Reason)).Inc()
+			o.status, o.err = aerr.Err.Status, "auth: "+string(aerr.Reason)
+			writeAuthError(w, aerr, r.URL.Path, o.rid)
+			return nil, false
+		}
 	}
 	var ed *editor
 	if h.Rewrite {
 		ed = newEditor(r, info, cl, backend)
 	}
-	build := func(ctx context.Context, endpoint string) (*http.Request, error) {
-		out, err := http.NewRequestWithContext(ctx, r.Method, cl.Scheme+"://"+endpoint+target, plan.body) //nolint:gosec // G704: scheme and host come from config
+	build := func(ctx context.Context, cl *upstream.Cluster, backend, endpoint string) (*http.Request, error) {
+		target := upstreamPath(r, info, backend)
+		if rawQuery != "" {
+			target += "?" + rawQuery
+		}
+		out, err := http.NewRequestWithContext(ctx, r.Method, cl.Scheme+"://"+endpoint+target, plan.reader()) //nolint:gosec // G704: scheme and host come from config
 		if err != nil {
 			return nil, err
 		}
@@ -175,7 +215,8 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		sigv4.Sign(out, cl.Creds, cl.Region, plan.payloadHash, time.Now())
 		return out, nil
 	}
-	return &prepared{cl: cl, build: build, plan: plan, ed: ed, placement: p}, true
+	return &prepared{cl: cl, backend: backend, other: other, otherBackend: otherBackend, route: route,
+		build: build, plan: plan, ed: ed, placement: p, bucketKey: directory.Key(o.tenant, info.Bucket)}, true
 }
 
 // allowed applies the credential's bucket allowlist. A credential without one may use every
@@ -270,7 +311,13 @@ func rewriteCopySource(v, tenant string, cred sigv4.Credential, snap *directory.
 	if !ok || !allowed(cred, bucket) {
 		return "", s3.NoSuchBucket, "The source bucket does not exist."
 	}
-	if sp.Route() != cluster || sp.Names[cluster] == "" {
+	// A bucket mid-migration holds its objects on two clusters, and the backend doing the copy can
+	// only read one of them, so the copy is refused rather than answered with a confusing NoSuchKey
+	// for whichever objects have not moved yet (docs/DESIGN.md §9).
+	if sp.State == directory.StateRamping || sp.State == directory.StateMigrating {
+		return "", s3.NotImplemented, "Copying from a bucket that is being migrated is not supported yet."
+	}
+	if sp.Primary != cluster || sp.Names[cluster] == "" {
 		return "", s3.NotImplemented, "Copying between buckets on different clusters is not supported yet."
 	}
 	return lead + sp.Names[cluster] + sep + rest, "", ""

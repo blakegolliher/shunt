@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/s3/xmlrw"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -90,11 +91,18 @@ type outcome struct {
 // for one endpoint (called again when an endpoint refuses the connection), and what the response
 // path needs to know.
 type prepared struct {
-	cl        *upstream.Cluster
-	build     func(ctx context.Context, endpoint string) (*http.Request, error)
-	plan      *bodyPlan            // resign: the payload decision
-	ed        *editor              // resign with Rewrite: response echo rewriting
-	placement *directory.Placement // resign: the placement the request was routed by
+	cl      *upstream.Cluster
+	backend string
+	// other is the placement's second cluster, set when the route needs it: a read that falls
+	// back, a delete that goes to both, or a listing that merges (docs/DESIGN.md §2.5).
+	other        *upstream.Cluster
+	otherBackend string
+	route        migrate.Route
+	bucketKey    string // "<tenant>/<bucket>", the label on the migration metrics
+	build        func(ctx context.Context, cl *upstream.Cluster, backend, endpoint string) (*http.Request, error)
+	plan         *bodyPlan            // resign: the payload decision
+	ed           *editor              // resign with Rewrite: response echo rewriting
+	placement    *directory.Placement // resign: the placement the request was routed by
 }
 
 // timings holds what the httptrace callbacks measure. They run on the transport's goroutines, so
@@ -173,7 +181,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p = h.preparePassthrough(r, o, inBody)
 	}
 
-	resp, err := h.roundTrip(ctx, o, p, inBody)
+	resp, err := h.roundTrip(ctx, o, p, p.cl, p.backend, inBody)
 	if inBody != nil {
 		o.bytesIn = inBody.count()
 	}
@@ -217,7 +225,7 @@ func (h *Handler) preparePassthrough(r *http.Request, o *outcome, inBody *progre
 	if inBody != nil {
 		body = inBody
 	}
-	build := func(ctx context.Context, endpoint string) (*http.Request, error) {
+	build := func(ctx context.Context, _ *upstream.Cluster, _, endpoint string) (*http.Request, error) {
 		out, err := http.NewRequestWithContext(ctx, r.Method, h.Cluster.Scheme+"://"+endpoint+r.URL.RequestURI(), body) //nolint:gosec // G704: forwarding to a configured cluster endpoint is the proxy's purpose; scheme and host come from config, only path and query from the client
 		if err != nil {
 			return nil, err
@@ -237,7 +245,7 @@ func (h *Handler) preparePassthrough(r *http.Request, o *outcome, inBody *progre
 
 // roundTrip sends the request, moving to the cluster's next endpoint when one refuses the
 // connection before any request byte was sent (POC-3: round-robin plus skip-on-connect-error).
-func (h *Handler) roundTrip(ctx context.Context, o *outcome, p *prepared, inBody *progressReader) (*http.Response, error) {
+func (h *Handler) roundTrip(ctx context.Context, o *outcome, p *prepared, cl *upstream.Cluster, backend string, inBody *progressReader) (*http.Response, error) {
 	// One trace struct per request: the only per-request allocation beyond net/http's own,
 	// justified because connect time and TTFB are catalog signals (docs/DESIGN.md §2.7).
 	var tConnect, tWrote time.Time
@@ -260,17 +268,17 @@ func (h *Handler) roundTrip(ctx context.Context, o *outcome, p *prepared, inBody
 	}
 	tctx := httptrace.WithClientTrace(ctx, trace)
 	for attempt := 1; ; attempt++ {
-		endpoint := p.cl.Next()
+		endpoint := cl.Next()
 		o.upstream = endpoint
-		out, err := p.build(tctx, endpoint)
+		out, err := p.build(tctx, cl, backend, endpoint)
 		if err != nil {
 			return nil, &buildError{err}
 		}
-		resp, err := p.cl.Transport.RoundTrip(out)
-		if err != nil && attempt < len(p.cl.Endpoints) && upstream.IsConnectError(err) && (inBody == nil || inBody.count() == 0) {
+		resp, err := cl.Transport.RoundTrip(out)
+		if err != nil && attempt < len(cl.Endpoints) && upstream.IsConnectError(err) && (inBody == nil || inBody.count() == 0) {
 			if h.Log != nil {
 				h.Log.Warn("upstream endpoint refused the connection; trying the next endpoint",
-					"request_id", o.rid, "cluster", p.cl.Name, "endpoint", endpoint, "err", err.Error())
+					"request_id", o.rid, "cluster", cl.Name, "endpoint", endpoint, "err", err.Error())
 			}
 			continue
 		}
@@ -293,6 +301,18 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		}
 		if !h.afterDeleteBucket(ctx, w, r, o, p, resp) {
 			return
+		}
+		// The primary does not have this object yet; the source still might (§2.5).
+		if p.route.Fallback && resp.StatusCode == http.StatusNotFound && p.other != nil {
+			if alt := h.fallbackRead(ctx, r, o, p, resp); alt != nil {
+				resp = alt
+				defer resp.Body.Close() //nolint:errcheck // relayed or aborted below
+			}
+		}
+		// A delete during a migration removes the object from both clusters, or the mover copies
+		// it back (ADR-0004).
+		if p.route.Both && p.other != nil {
+			h.deleteOnSource(ctx, o, p, resp.StatusCode)
 		}
 	}
 

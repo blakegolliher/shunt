@@ -10,6 +10,7 @@ One line per dependency saying why the stdlib wasn't enough (CLAUDE.md). Tool bi
 | `github.com/spf13/cobra` | v1.10.2 | Apache-2.0 | Subcommand tree with help; stdlib `flag` has no subcommands. Chosen in docs/CONTEXT.md. Pulls `spf13/pflag` (BSD-3) and `inconshreveable/mousetrap` (Apache-2.0). |
 | `github.com/prometheus/client_golang` | v1.24.1 | Apache-2.0 | Metrics (docs/DESIGN.md decision 10): the leanest hot-path client; stdlib has no exposition format. Pulls `prometheus/client_model`, `prometheus/common`, `prometheus/procfs`, `protobuf`. |
 | `github.com/aws/aws-sdk-go-v2` (+ `config`, `credentials`, `service/s3`) | v1.47.0 / s3 v1.113.1 | Apache-2.0 | **Test tree only** (`test/s3diff`, `test/bench/s3bench`, main packages). SigV4-signing S3 client for the differential and bench harnesses; never imported by `internal/` or `cmd/`. |
+| `github.com/aws/smithy-go` | v1.28.1 | Apache-2.0 | **Test tree only** (`test/mover`). Already pulled in by aws-sdk-go-v2; named directly so the mover can read an S3 error's code (`PreconditionFailed`, `NotFound`) instead of matching on error strings. Never imported by `internal/` or `cmd/`. |
 | `github.com/johannesboyne/gofakes3` | v1.2.0 | MIT | **Test-only** (imported from `_test.go` files). In-process fake S3 so unit tests need no Docker. Pulls aws-sdk-go-v2, afero, bbolt into the test build only; `go build ./cmd/shunt` does not link them. |
 
 ## Tool binaries (Makefile, ./bin)

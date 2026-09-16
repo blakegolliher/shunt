@@ -50,15 +50,6 @@ type Placement struct {
 	Created   time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
 }
 
-// Route returns the cluster POC-3 sends a request to. RAMPING and MIGRATING route to the source
-// until POC-4 adds ramp and fallback routing, so no request silently 404s against an empty target.
-func (p *Placement) Route() string {
-	if p.State == StateRamping || p.State == StateMigrating {
-		return p.Source
-	}
-	return p.Primary
-}
-
 func (p Placement) clone() Placement {
 	c := p
 	c.Names = maps.Clone(p.Names)

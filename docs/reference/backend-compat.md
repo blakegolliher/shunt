@@ -17,6 +17,8 @@ Probe run 2026-09-15 with shunt at POC-2.
 | `x-amz-checksum-sha256` header validated | yes | yes | yes |
 | `x-amz-checksum-crc64nvme` header validated | yes | yes | yes |
 | `If-None-Match: *` on PUT | **no, overwrites with 200** | yes, 412 | yes, 412 |
+| `encoding-type=url` on a listing | percent-encodes `/` in keys | **leaves keys verbatim** | not measured |
+| `x-amz-mp-parts-count` on a plain HEAD | not sent | **not sent** (needs `partNumber`) | not measured |
 | `If-Match` on PUT | **no, mismatch accepted** | yes, 412 on mismatch | **no, mismatch accepted** |
 | Unsigned `GET /` | 403 | 403 | **200**, empty `ListAllMyBucketsResult` owned by `Anonymous` |
 | Enforces the signing region | yes (`garage`) | yes (`us-east-1`) | **no**: a signature scoped to `nowhere-1` is accepted |
@@ -30,7 +32,9 @@ shunt hides **which cluster serves a bucket and under which name**: bucket names
 
 - **Capability profile.** All three enforce the hex SHA-256 and accept and validate unsigned trailers, so `enforces_sha256: true` and `unsigned_trailer: true` (the defaults) are correct for all three. With these profiles shunt's ADR-0002 log-and-alert path is never reached on these backends; it stays for backends that fail the probe.
 - **Error codes differ by backend** for the same failure. shunt relays the backend's code unchanged in resign mode. Clients that match on `BadDigest` versus `XAmzContentChecksumMismatch` will see whatever the backend emits.
-- **Mover contract (docs/DESIGN.md §2.5, POC-4).** The mover requires `If-None-Match: *` on PUT. Garage ignores it, so Garage cannot be a migration **target** without an extra guard; MinIO and VAST honor it. Neither Garage nor VAST honors `If-Match` on PUT; the mover does not use it.
+- **Mover contract (docs/DESIGN.md §2.5, POC-4).** The mover prefers `If-None-Match: *` on PUT. Garage ignores it, so a migration **into** Garage uses the HEAD-then-commit guard of ADR-0004 instead; MinIO and VAST honor it. The choice is made per cluster from `capabilities.conditional_write`, not from the backend's name. Neither Garage nor VAST honors `If-Match` on PUT; the mover does not use it.
+- **Listing key encoding is not portable (found by the POC-4 demo, 2026-09-15).** With `encoding-type=url`, Garage 2.3.0 percent-encodes `/` in a key and MinIO returns it verbatim, so the same object arrives from the two clusters under two different spellings. A merged listing that compared them as strings reported every key twice. shunt now asks both sides for `encoding-type=url`, decodes the keys itself, merges the decoded names, and re-encodes on the way out according to what the **client** asked for (`internal/proxy/merge.go`). The one shape this cannot distinguish is a key that really contains a percent escape on a backend that ignores `encoding-type`; that is the backend's non-compliance, and shunt decodes it.
+- **A part count needs a part number (found by the POC-4 demo, 2026-09-15).** MinIO does not send `x-amz-mp-parts-count` on a plain `HEAD`, so a mover that trusts it copies a multipart object as a single part and its ETag changes. The mover takes the multipart `-N` ETag suffix as the trigger and a `HEAD` with `partNumber=1` as the authority (`test/mover`).
 - **Health checks (§2.8).** "Any HTTP response counts as alive" holds for all three. VAST answering 200 anonymously is not an error but means an unsigned `GET /` proves nothing about credentials.
 - **Region.** VAST accepts any scope region, so the cluster record's `region` only matters for backends that enforce it. The resign path signs with the cluster's configured region regardless (ADR-0001 amendment).
 - **TLS on VAST is TEMPORARY-insecure.** `tls.insecure_skip_verify: true` in `test/e2e/shunt-vast-resign.yaml`, `--insecure` on the probe, `-direct-insecure` on s3diff. Remove all three once the cluster has a certificate for `vast02.example.com` and set `tls.ca`.

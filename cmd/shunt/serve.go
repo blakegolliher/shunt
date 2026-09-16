@@ -109,6 +109,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			cl, _ := set.Get(name)
 			clusters = append(clusters, cl)
 		}
+		publishRouteState(metrics, dir.Snapshot())
 		log.Info("resign mode", "credentials", store.Len(), "clusters", set.Names(), "directory", cfg.Directory.File,
 			"directory_version", dir.Snapshot().Version(), "poll_interval", cfg.Directory.PollInterval.String(), "xml_rewrite", hcfg.Rewrite)
 		if !hcfg.Rewrite {
@@ -191,9 +192,9 @@ wait:
 			}
 			break wait
 		case <-tick:
-			reloadDirectory(dir, log, "poll")
+			reloadDirectory(dir, log, "poll", metrics)
 		case <-hup:
-			reloadDirectory(dir, log, "SIGHUP")
+			reloadDirectory(dir, log, "SIGHUP", metrics)
 		}
 	}
 
@@ -211,13 +212,39 @@ wait:
 	return nil
 }
 
-func reloadDirectory(d *directory.FileDir, log *slog.Logger, trigger string) {
+// publishRouteState exports one gauge per placement that is mid-migration, and drops the series
+// of every placement that has returned to ACTIVE (docs/telemetry-catalog.md: the bucket label is
+// bounded by the number of migrations in flight).
+func publishRouteState(m *telemetry.Metrics, snap *directory.Snapshot) {
+	m.RouteState.Reset()
+	m.RampRatio.Reset()
+	f := snap.File()
+	for key := range f.Placements {
+		p := f.Placements[key]
+		if p.State == directory.StateActive {
+			continue
+		}
+		for _, state := range directory.States {
+			v := 0.0
+			if state == p.State {
+				v = 1
+			}
+			m.RouteState.WithLabelValues(key, state).Set(v)
+		}
+		if p.State == directory.StateRamping && p.Ramp != nil {
+			m.RampRatio.WithLabelValues(key).Set(p.Ramp.Ratio)
+		}
+	}
+}
+
+func reloadDirectory(d *directory.FileDir, log *slog.Logger, trigger string, m *telemetry.Metrics) {
 	changed, err := d.Reload()
 	switch {
 	case err != nil:
 		log.Error("directory reload rejected; serving the last good version", "trigger", trigger, "version", d.Snapshot().Version(), "err", err.Error())
 	case changed:
 		log.Info("directory reloaded", "trigger", trigger, "version", d.Snapshot().Version())
+		publishRouteState(m, d.Snapshot())
 	case trigger == "SIGHUP":
 		log.Info("directory unchanged", "trigger", trigger, "version", d.Snapshot().Version())
 	}

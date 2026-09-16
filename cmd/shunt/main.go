@@ -36,7 +36,7 @@ func newRoot() *cobra.Command {
 	}
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
-	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory())
+	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory(), newRamp(), newMigrate(), newCutover())
 	return root
 }
 

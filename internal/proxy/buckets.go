@@ -300,3 +300,64 @@ func errorCode(body []byte) string {
 	}
 	return string(rest[:j])
 }
+
+// fallbackRead answers from the source when the primary has not been backfilled yet. It returns
+// nil when the source cannot answer either, leaving the primary's 404 to be relayed untouched.
+func (h *Handler) fallbackRead(ctx context.Context, r *http.Request, o *outcome, p *prepared, primary *http.Response) *http.Response {
+	side := &outcome{rid: o.rid, info: o.info, tm: &timings{}}
+	alt, err := h.roundTrip(ctx, side, p, p.other, p.otherBackend, nil)
+	if err != nil || alt.StatusCode >= 400 {
+		if alt != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(alt.Body, 64<<10))
+			_ = alt.Body.Close()
+		}
+		if err != nil && h.Log != nil {
+			h.Log.Warn("fallback read to the migration source failed; relaying the primary's 404",
+				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "err", err.Error())
+		}
+		return nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(primary.Body, 64<<10))
+	_ = primary.Body.Close()
+	h.Metrics.FallbackReads.WithLabelValues(p.bucketKey).Inc()
+	o.cluster, o.clusterType, o.backend, o.upstream = p.other.Name, p.other.Type, p.otherBackend, side.upstream
+	if h.Rewrite {
+		p.ed = newEditor(r, o.info, p.other, p.otherBackend) // echoes now come from the source
+	}
+	return alt
+}
+
+// deleteOnSource sends the same delete to the placement's other cluster. Its failure is logged and
+// metered but never surfaced: the client's delete succeeded, and a source copy left behind is the
+// mover's problem, not the caller's (docs/DESIGN.md §2.5).
+func (h *Handler) deleteOnSource(ctx context.Context, o *outcome, p *prepared, primaryStatus int) {
+	count := func(outcome string) { h.Metrics.DualDelete.WithLabelValues(p.bucketKey, outcome).Inc() }
+	if primaryStatus >= 300 {
+		count("primary_only")
+		return
+	}
+	side := &outcome{rid: o.rid, info: o.info, tm: &timings{}}
+	resp, err := h.roundTrip(context.WithoutCancel(ctx), side, p, p.other, p.otherBackend, nil)
+	if err != nil {
+		count("source_failed")
+		if h.Log != nil {
+			h.Log.Error("delete did not reach the migration source; the object can come back when the mover copies it (ADR-0004)",
+				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "backend_bucket", p.otherBackend, "err", err.Error())
+		}
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // drained below
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		count("source_missing")
+	case resp.StatusCode < 300:
+		count("both")
+	default:
+		count("source_failed")
+		if h.Log != nil {
+			h.Log.Error("the migration source refused a delete; the object can come back when the mover copies it (ADR-0004)",
+				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "status", resp.StatusCode)
+		}
+	}
+}

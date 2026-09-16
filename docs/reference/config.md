@@ -83,6 +83,7 @@ Two placements may never share a backend bucket on one cluster: that would make 
 | `storage_classes` | `native` / `emulated` | |
 | `storage_class` + `access` | class + `instant` / `restore-required` | Set together; `restore-required` only with `GLACIER` or `DEEP_ARCHIVE`; not on a `storage_classes: native` cluster |
 | `capabilities.enforces_sha256` | bool | Default true. False means the backend does not reject a wrong hex `x-amz-content-sha256`; shunt then hashes the body itself and logs a mismatch (ADR-0002, POC: log-and-alert). Fill from `shunt probe` |
+| `capabilities.conditional_write` | bool | Default true. False means the backend ignores `If-None-Match: *` on PUT (Garage 2.3.0 does). The mover then falls back to a HEAD-then-commit guard with a race window; see ADR-0004. Fill from `shunt probe` |
 | `capabilities.unsigned_trailer` | bool | Default true. False means the backend rejects `STREAMING-UNSIGNED-PAYLOAD-TRAILER`; shunt then verifies the trailer checksum itself and forwards `UNSIGNED-PAYLOAD`. Fill from `shunt probe` |
 
 `capabilities` are measured facts about a backend, filled from `shunt probe`, not switches over shunt's behavior: the feature-flag and kill-switch rules (CLAUDE.md) do not apply to them. Each default states what a conformant S3 backend does; a backend that differs gets a profile, and shunt compensates for the difference (ADR-0002).

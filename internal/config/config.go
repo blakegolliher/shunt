@@ -99,6 +99,9 @@ type Cluster struct {
 type Capabilities struct {
 	EnforcesSHA256  *bool `yaml:"enforces_sha256"`  // rejects a hex x-amz-content-sha256 that does not match the body
 	UnsignedTrailer *bool `yaml:"unsigned_trailer"` // accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+	// ConditionalWrite: honors If-None-Match: * on PUT. The mover's overwrite guard depends on it
+	// (ADR-0004); a backend that ignores it forces the weaker HEAD-then-commit guard.
+	ConditionalWrite *bool `yaml:"conditional_write"`
 }
 
 // EnforcesSHA256Or reports the capability with the default applied.
@@ -115,6 +118,14 @@ func (c Capabilities) UnsignedTrailerOr(def bool) bool {
 		return def
 	}
 	return *c.UnsignedTrailer
+}
+
+// ConditionalWriteOr reports the capability with the default applied.
+func (c Capabilities) ConditionalWriteOr(def bool) bool {
+	if c.ConditionalWrite == nil {
+		return def
+	}
+	return *c.ConditionalWrite
 }
 
 // ClusterTLS is the upstream TLS configuration for an https cluster.

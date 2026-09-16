@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -170,6 +171,9 @@ func main() {
 		backend  = flag.String("backend", "garage", "backend label for the report")
 		mode     = flag.String("mode", "passthrough", "passthrough|resign; resign signs the via side with SHUNT_ACCESS_KEY/SHUNT_SECRET")
 		insecure = flag.Bool("direct-insecure", false, "skip TLS verification on the direct side (temporary)")
+		viaOnly  = flag.Bool("via-only", false, "measure only through shunt, on an existing bucket that is left alone (POC-4 migration timing)")
+		out      = flag.String("out", "", "via-only: write the measured cells to this file")
+		baseline = flag.String("baseline", "", "via-only: an earlier -out file; the report gains added p50/p99 columns against it")
 	)
 	flag.Parse()
 	ak, sk := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
@@ -187,6 +191,13 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+	if *viaOnly {
+		if err := viaOnlyReport(ctx, via, *bucket, *matrix, *runs, *out, *baseline); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	_, _ = direct.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: bucket})
 
@@ -283,4 +294,89 @@ func deterministic(n int) []byte {
 		b[i] = byte(x) //nolint:gosec // G115: the low byte is the intent
 	}
 	return b
+}
+
+// cell is one measured (size, conns, op) point, as written by -out and read by -baseline.
+type cell struct {
+	Size  int     `json:"size"`
+	Conns int     `json:"conns"`
+	Op    string  `json:"op"`
+	P50us int64   `json:"p50_us"`
+	P99us int64   `json:"p99_us"`
+	MBps  float64 `json:"mbps"`
+}
+
+func (c cell) id() string { return fmt.Sprintf("%d:%d:%s", c.Size, c.Conns, c.Op) }
+
+// viaOnlyReport measures through shunt alone, on a bucket it neither creates nor cleans up. It is
+// how the POC-4 demo prices a migration: one run before, one run while the bucket is MIGRATING,
+// with the second reporting the added p50/p99 against the first (docs/POC.md POC-4 step 6).
+func viaOnlyReport(ctx context.Context, via *side, bucket, matrix string, runs int, outPath, baselinePath string) error {
+	base := map[string]cell{}
+	if baselinePath != "" {
+		b, err := os.ReadFile(baselinePath)
+		if err != nil {
+			return fmt.Errorf("baseline: %w", err)
+		}
+		var cells []cell
+		if err := json.Unmarshal(b, &cells); err != nil {
+			return fmt.Errorf("baseline: %w", err)
+		}
+		for _, c := range cells {
+			base[c.id()] = c
+		}
+	}
+	fmt.Printf("| size | conns | op | via p50 | via p99 | via MiB/s |")
+	if baselinePath != "" {
+		fmt.Printf(" added p50 | added p99 |")
+	}
+	fmt.Printf("\n|---|---|---|---|---|---|")
+	if baselinePath != "" {
+		fmt.Printf("---|---|")
+	}
+	fmt.Println()
+
+	var measured []cell
+	for _, spec := range strings.Split(matrix, ",") {
+		var size, conns, ops int
+		if _, err := fmt.Sscanf(spec, "%d:%d:%d", &size, &conns, &ops); err != nil {
+			return fmt.Errorf("bad matrix cell %q: %w", spec, err)
+		}
+		payload := deterministic(size)
+		for _, op := range []string{"PUT", "GET"} {
+			if op == "GET" { // seed through shunt: there is no direct side here
+				if _, err := run(ctx, via, bucket, "PUT", size, conns, conns, payload); err != nil {
+					return fmt.Errorf("seed: %w", err)
+				}
+			}
+			var vs []stats
+			for r := 0; r < runs; r++ {
+				v, err := run(ctx, via, bucket, op, size, conns, ops, payload)
+				if err != nil {
+					return fmt.Errorf("via %s: %w", op, err)
+				}
+				vs = append(vs, v)
+			}
+			v := median(vs)
+			c := cell{Size: size, Conns: conns, Op: op, P50us: v.p50.Microseconds(), P99us: v.p99.Microseconds(), MBps: v.mbps}
+			measured = append(measured, c)
+			fmt.Printf("| %s | %d | %s | %s | %s | %.1f |", human(size), conns, op, ms(v.p50), ms(v.p99), v.mbps)
+			if baselinePath != "" {
+				if b, ok := base[c.id()]; ok {
+					fmt.Printf(" %s | %s |", ms(v.p50-time.Duration(b.P50us)*time.Microsecond), ms(v.p99-time.Duration(b.P99us)*time.Microsecond))
+				} else {
+					fmt.Printf(" - | - |")
+				}
+			}
+			fmt.Println()
+		}
+	}
+	if outPath != "" {
+		b, err := json.MarshalIndent(measured, "", "  ")
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(outPath, b, 0o644) //nolint:gosec // a benchmark result file
+	}
+	return nil
 }

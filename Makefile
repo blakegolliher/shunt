@@ -67,6 +67,9 @@ fuzz: ## run every fuzz target for FUZZ_TIME (default 30s)
 	done; \
 	test $$found -eq 1 || { echo "no fuzz targets found"; exit 1; }
 
+property: build ## POC-4 migration property test (PROPERTY_TIME, default 2m; 10m for a local soak)
+	SHUNT_PROPERTY_DURATION=$(PROPERTY_TIME) $(GO) test ./internal/proxy -run TestMigrationPreservesTheClientsView -count=1 -timeout $(PROPERTY_TIMEOUT) -v
+
 bench: ## run all benchmarks, write test/bench/new.txt
 	@mkdir -p test/bench
 	$(GO) test -run '^$$' -bench . -benchmem -benchtime $(BENCH_TIME) -count $(BENCH_COUNT) $(PKGS) | tee test/bench/new.txt
@@ -105,6 +108,8 @@ run-minio: build ## run shunt in front of the e2e MinIO (foreground)
 # garage/minio need `make e2e-up` (credentials in test/e2e/data/garage.env) and shunt running in
 # front of that backend (`make run-<backend>` or `make run-<backend>-resign`). vast needs
 # VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY exported and `make run-vast-resign`.
+PROPERTY_TIME    ?= 2m
+PROPERTY_TIMEOUT ?= 20m
 BACKEND      ?= garage
 MODE         ?= passthrough
 VAST_ENDPOINT ?= https://vast02.example.com:443
@@ -156,6 +161,9 @@ run-minio-resign: build ## run shunt in resign mode in front of the e2e MinIO (f
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-minio-resign.yaml
 
 run-mixed: build ## POC-3: one shunt in resign mode over the e2e Garage and MinIO (foreground; resets the mixed directory)
+	# Regenerate the run config from the template: a config edited after `make e2e-up` was otherwise
+	# still the old one on disk, and the run silently used stale capabilities.
+	. $(E2E_DIR)/data/garage.env && sed "s/GK_SET_BY_E2E/$$GARAGE_ACCESS_KEY/" $(E2E_DIR)/shunt-mixed.yaml > $(E2E_DIR)/data/shunt-mixed.yaml
 	cp $(E2E_DIR)/directory-mixed.yaml $(E2E_DIR)/data/directory-mixed.yaml
 	rm -f $(E2E_DIR)/data/directory-mixed.yaml.changes.jsonl
 	. $(E2E_DIR)/data/garage.env && $(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-mixed.yaml

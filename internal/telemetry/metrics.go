@@ -21,6 +21,15 @@ type Metrics struct {
 	AuthFailures    *prometheus.CounterVec   // shunt_auth_failures_total{reason}
 	AuthDuration    *prometheus.HistogramVec // shunt_auth_duration_seconds{mode}
 	Compensation    *prometheus.CounterVec   // shunt_compensation_total{reason,outcome}
+
+	// Migration (POC-4). The bucket label is bounded: these are exported only while a placement
+	// is not ACTIVE, and the series are dropped when it returns to ACTIVE.
+	RouteState    *prometheus.GaugeVec     // shunt_route_state{bucket,state}
+	RampRatio     *prometheus.GaugeVec     // shunt_ramp_ratio{bucket}
+	RampWrites    *prometheus.CounterVec   // shunt_ramp_writes_total{bucket,side}
+	FallbackReads *prometheus.CounterVec   // shunt_migration_fallback_reads_total{bucket}
+	DualDelete    *prometheus.CounterVec   // shunt_migration_dual_delete_total{bucket,outcome}
+	ListingMerge  *prometheus.HistogramVec // shunt_listing_merge_seconds{bucket}
 }
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
@@ -82,9 +91,29 @@ func NewMetrics() *Metrics {
 		Compensation: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "shunt_compensation_total", Help: "Late payload-check failures found after the upstream write (ADR-0002).",
 		}, []string{"reason", "outcome"}),
+		RouteState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_route_state", Help: "1 for a placement's current state; exported only while it is not ACTIVE.",
+		}, []string{"bucket", "state"}),
+		RampRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_ramp_ratio", Help: "A RAMPING placement's current ratio, 0 to 1.",
+		}, []string{"bucket"}),
+		RampWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_ramp_writes_total", Help: "Writes during RAMPING, by the side the key's hash or prefix rule chose.",
+		}, []string{"bucket", "side"}),
+		FallbackReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_migration_fallback_reads_total", Help: "Reads served from the source after the primary answered 404.",
+		}, []string{"bucket"}),
+		DualDelete: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_migration_dual_delete_total", Help: "Deletes sent to both clusters during a migration, by outcome.",
+		}, []string{"bucket", "outcome"}),
+		ListingMerge: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "shunt_listing_merge_seconds", Help: "Time to serve one merged ListObjectsV2 page from both clusters.",
+			Buckets: durationBuckets,
+		}, []string{"bucket"}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
+		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

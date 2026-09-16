@@ -212,6 +212,18 @@ var opNames = [...]string{
 	OpListParts:               "ListParts",
 }
 
+// Ops lists every operation the classifier can produce, in table order. Used by the routing
+// completeness test: an operation added without a routing class fails the build.
+func Ops() []Op {
+	out := make([]Op, 0, opCount)
+	for o := Op(0); o < opCount; o++ {
+		if opNames[o] != "" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // String returns the AWS API name, used as the `op` metric label.
 func (o Op) String() string {
 	if o < opCount && opNames[o] != "" {
