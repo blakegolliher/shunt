@@ -152,7 +152,7 @@ With several proxies, the window has to hold on each of them: this API reads onl
 Deletes the source bucket, then returns the placement to `ACTIVE` on its primary. Refused unless all of these hold:
 - the placement is `CUTOVER`;
 - it carries `cutover` evidence;
-- a full listing of both buckets finds no source key that the primary lacks. The refusal names the first 20 keys it finds.
+- a full listing of both buckets finds no source key that the primary lacks, each candidate confirmed by a HEAD that finds it absent on the primary and then present on the source. The refusal names the first 20 keys it finds.
 
 Once allowed, it aborts the source's in-progress multipart uploads, deletes every object and then the bucket, and applies `CUTOVER → ACTIVE`, which drops the source.
 

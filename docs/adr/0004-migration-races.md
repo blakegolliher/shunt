@@ -143,6 +143,8 @@ The window, the time and the counter are written to the placement as `cutover:`.
 - the placement is in `CUTOVER` with that evidence;
 - a listing of both buckets, walked in step with memory bounded by one page per side (ADR-0007), finds no source key the primary lacks. The first 20 such keys are returned with the refusal.
 
+  A key the listings disagree on counts only once HEADs confirm it: the primary answers 404, then the source answers 200. The listings are read a page at a time, so a client delete landing between a source page and the matching primary page would otherwise look like a missing key (seen once under warp load, docs/bench/poc5-load.md). The order is what makes the check exact: a delete reaches the source before the primary (race 1) and nothing writes to the source after `MIGRATING`, so a key still on the source after the primary's 404 was absent from the primary at that moment. Amended 2026-09-17.
+
 It then aborts the source's in-progress multipart uploads, deletes every object and the bucket, and applies `CUTOVER → ACTIVE`, which drops the source. A client write cannot land on the source during the purge: no state after `MIGRATING` routes a write there.
 
 **Race 5, again: the ramp hash changed.** The POC-5 walkthrough measured an 80/20 write split at a ratio of 0.5. `InRange` used FNV-1a-64 directly, and FNV-1a barely moves its high bits for keys that differ only in their last bytes. `a/0000` … `a/0999` all fell under 0.5. The hash is now FNV-1a finished with murmur3's `fmix64`. A test holds sequential key shapes within ±4 % of 0.1, 0.5 and 0.9.

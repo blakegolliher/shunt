@@ -129,9 +129,9 @@ The whole demo was run inside a 15-minute `warp mixed` benchmark, 16 clients, th
 
 **Garage → MinIO** errors came from Garage-issued version ids and a full local disk (backend-compat.md).
 
-**Two findings to fix:**
-1. **Spurious purge refusal under deletes.** `purge-source` can refuse spuriously while clients delete concurrently (seen once, on MinIO). A HEAD of each missing key on the source before refusing would remove it.
-2. **Version ids invented by Garage.** Version ids invented by a backend (Garage) break version-echoing clients after a move.
+**Two findings:**
+1. **Spurious purge refusal under deletes (fixed 2026-09-17).** `purge-source` refused once on MinIO while warp deleted concurrently. The diff now confirms each key the listings disagree on with a HEAD of the primary, then of the source, before counting it (see the entry below).
+2. **Version ids invented by Garage (open).** Version ids invented by a backend (Garage) break version-echoing clients after a move.
 
 ## Operator ergonomics (ADR-0010, 2026-09-16)
 
@@ -167,6 +167,7 @@ The one failure was operator-side, and the product made it hard to see. The move
 - **Operator actions were invisible in serve's log (found on the second VAST run).** Only cluster changes were logged; adopt, expand, ramps, migrate, mover passes, cutover and purge showed up only in the terminal that ran them. Every control API mutation now logs one INFO line on success and one WARN line (`<operation> refused|failed`, with the reason) otherwise. A cluster or bucket name that doesn't exist is reported as such, not as `no such placement`.
 - **`shunt status` columns misaligned** when an endpoint name was long. The table now sizes columns to their contents, and the fallback column is labelled `FALLBACK READS`: it counts GET and HEAD requests, not objects.
 - **A refusal was indistinguishable from a failure in the CLI.** The API's `refused` code did not reach the terminal; the CLI now prints `refused: <reason>`, and an in-use cluster and an illegal transition answer `refused` rather than `conflict`.
+- **`purge-source` refused spuriously under concurrent deletes (found by the warp load test, 2026-09-17).** The diff walks both buckets' listings a page at a time. A client delete (source, then primary) that landed after the source's page was read and before the primary's made the key look missing from the primary. Every key the listings disagree on is now confirmed before it counts: a HEAD of the primary, and only if that answers 404, a HEAD of the source. Deletes reach the source first and nothing writes to the source after `MIGRATING`, so a source that still holds the key after the primary's 404 means the primary really lacked it; a concurrent delete can no longer produce a refusal. The check runs inline, so unconfirmed keys do not use up the 20-key report and cut the walk short. `TestPurgeDiffIgnoresConcurrentDeletes` deletes 25 keys between the two listings' second pages: before the fix it reported 20 of them and missed the one key really absent from the primary; now it reports only that key.
 - **`expand` refused spuriously about 1 time in 20 on MinIO (found by `make walkthrough`, 2026-09-17).** After answering the conditional-write probe's `If-None-Match: *` PUT with 412, MinIO sometimes closes the connection without saying so. The next request, the `If-Match` DELETE, went out on that dead connection, and Go replays only requests it knows are idempotent, so it failed with a bare `EOF`. Every control-plane request to a backend is safe to send twice, so each is now marked idempotent (a zero-length `Idempotency-Key`, never sent or signed) and the transport replays it on a fresh connection. `TestBackendReplaysOnAStaleConnection` fails with `EOF` without the fix. Against the e2e MinIO, 2,000 canary-and-probe rounds went from 96 failures to 0.
 
 

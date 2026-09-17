@@ -182,7 +182,8 @@ In `CUTOVER`, reads and listings use the new primary alone. Deletes still reach 
 source only ever loses keys. Then either:
 
 - `shunt purge-source data`: refused unless the placement is in `CUTOVER` with recorded
-  evidence *and* a full listing of both buckets finds no source key that the primary lacks. It then
+  evidence *and* a full listing of both buckets finds no source key that the primary lacks (each
+  candidate is confirmed with a HEAD on both sides, so clients deleting meanwhile do not trip it). It then
   aborts the source's in-progress multipart uploads, deletes every object and the bucket, and returns
   the placement to `ACTIVE` without a source. The refusal names the first 20 missing keys: run the
   mover again, or find out why they are missing, before retrying.

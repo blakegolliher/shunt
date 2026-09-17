@@ -202,7 +202,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 }
 
 // missingOn returns up to limit keys that source holds and primary does not, walking both
-// listings in step: memory is two pages, whatever the bucket size.
+// listings in step: memory is two pages, whatever the bucket size. A key the listings disagree on
+// is confirmed with HEADs before it counts (stillMissing), so a client delete landing between the
+// two listings' pages is not reported.
 func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int) ([]string, error) {
 	src := &lister{b: source, bucket: sourceBucket}
 	dst := &lister{b: primary, bucket: primaryBucket}
@@ -225,12 +227,46 @@ func missingOn(ctx context.Context, source backend, sourceBucket string, primary
 			}
 		}
 		if !dok || d != s {
+			confirmed, err := stillMissing(ctx, source, sourceBucket, primary, primaryBucket, s)
+			if err != nil {
+				return nil, err
+			}
+			if !confirmed {
+				continue
+			}
 			missing = append(missing, s)
 			if len(missing) >= limit {
 				return missing, nil
 			}
 		}
 	}
+}
+
+// stillMissing reports whether key, listed on the source and not on the primary, is still on the
+// source and absent from the primary. The primary is asked first. A delete goes to the source
+// before the primary (ADR-0004 race 1) and nothing writes to the source after MIGRATING, so a
+// source that still holds the key after the primary answered 404 means the primary really lacked
+// it: a concurrent delete cannot make this report a key, only the listings' timing could.
+func stillMissing(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket, key string) (bool, error) {
+	onPrimary, err := primary.objectExists(ctx, primaryBucket, key)
+	if err != nil || onPrimary {
+		return false, err
+	}
+	return source.objectExists(ctx, sourceBucket, key)
+}
+
+// objectExists HEADs one object: 200 is true, 404 false, anything else an error.
+func (b backend) objectExists(ctx context.Context, bucket, key string) (bool, error) {
+	r, err := b.do(ctx, http.MethodHead, bucket, key, nil, nil, nil)
+	switch {
+	case err != nil:
+		return false, err
+	case r.status == http.StatusOK:
+		return true, nil
+	case r.status == http.StatusNotFound:
+		return false, nil
+	}
+	return false, fmt.Errorf("%s: HEAD %s/%s: HTTP %d", b.cl.Name, bucket, key, r.status)
 }
 
 // errNotEmpty is returned when a bucket still holds objects after every delete was issued.

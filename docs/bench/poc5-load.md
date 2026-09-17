@@ -103,7 +103,7 @@ Two identical MinIO RELEASE.2025-07-23 containers on the dev box, same load unca
 
 - **Result:** **0 errors in 453,336 requests.** All steps succeeded; the mover copied 1,578 objects (1.5 GiB) in 3.5 min.
 - **Latency:** shunt added about +6 ms p50 on GET/STAT/DELETE, and p99 roughly doubled while the mover ran. warp, shunt and both MinIOs shared 16 cores, so these numbers are CPU contention as much as shunt. The VAST run above is the representative one.
-- **One false refusal:** the first `purge-source` was refused: "the listing diff is not empty … first 1: pSIWAbR4/337…". The retry 6 s later passed. warp deleted that key from both clusters between purge's reads of the source and target listing pages. Purge can only refuse wrongly this way, never delete wrongly. Re-checking each reported key on the source with a HEAD before refusing would remove the noise.
+- **One false refusal:** the first `purge-source` was refused: "the listing diff is not empty … first 1: pSIWAbR4/337…". The retry 6 s later passed. warp deleted that key from both clusters between purge's reads of the source and target listing pages. Purge can only refuse wrongly this way, never delete wrongly. Fixed since: each key the listings disagree on is now confirmed with a HEAD of the primary and then the source before it counts (ADR-0004 amendment, `TestPurgeDiffIgnoresConcurrentDeletes`).
 
 ## 3. MinIO → MinIO, 40 MiB objects (multipart)
 

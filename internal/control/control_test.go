@@ -30,10 +30,11 @@ type fakeCluster struct {
 	srv       *httptest.Server
 	be        *s3mem.Backend
 	versioned map[string]bool
-	reject    string // when set, every request answers 403 with this error code
-	server    string // the Server response header, when set
-	condPut   bool   // honor If-None-Match: * on PUT over an existing object
-	condDel   bool   // honor a mismatched If-Match on DELETE
+	reject    string             // when set, every request answers 403 with this error code
+	server    string             // the Server response header, when set
+	condPut   bool               // honor If-None-Match: * on PUT over an existing object
+	condDel   bool               // honor a mismatched If-Match on DELETE
+	onList    func(token string) // called before a ListObjectsV2 page is served, with its continuation token
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -60,6 +61,9 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 			if !fc.condDel {
 				r.Header.Del("If-Match")
 			}
+		}
+		if q := r.URL.Query(); fc.onList != nil && r.Method == http.MethodGet && q.Get("list-type") == "2" {
+			fc.onList(q.Get("continuation-token"))
 		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
@@ -649,4 +653,58 @@ func TestBackendReplaysOnAStaleConnection(t *testing.T) {
 			t.Fatalf("request %d (%s): HTTP %d", i, req.method, r.status)
 		}
 	}
+}
+
+// TestPurgeDiffIgnoresConcurrentDeletes holds the spurious purge refusal seen under warp load: a
+// client delete (source, then primary) landing after the source's listing page was read and before
+// the primary's was made the diff report keys the primary never lacked. More of them than the
+// report limit must not hide a key that really is missing, either.
+func TestPurgeDiffIgnoresConcurrentDeletes(t *testing.T) {
+	src, dst := newFakeCluster(t), newFakeCluster(t)
+	for _, fc := range []*fakeCluster{src, dst} {
+		if err := fc.be.CreateBucket("b"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 1025 { // two listing pages: gofakes3 serves 1000 keys a page
+		k := fmt.Sprintf("k%04d", i)
+		src.put(t, "b", k, "x")
+		dst.put(t, "b", k, "x")
+	}
+	src.put(t, "b", "z-only-on-source", "x")
+	// Keys k1000..k1024 are deleted by a client just before the primary's second page is served,
+	// after the source's second page listed them.
+	dst.onList = func(token string) {
+		if token == "" {
+			return
+		}
+		for i := 1000; i < 1025; i++ {
+			k := fmt.Sprintf("k%04d", i)
+			for _, fc := range []*fakeCluster{src, dst} {
+				if _, err := fc.be.DeleteObject("b", k); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+		dst.onList = nil
+	}
+	missing, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != "z-only-on-source" {
+		t.Fatalf("missing = %v, want only z-only-on-source", missing)
+	}
+}
+
+func fakeBackend(t *testing.T, name string, fc *fakeCluster) backend {
+	t.Helper()
+	cl, err := upstream.New(name, config.Cluster{Type: "s3", Scheme: "http", Region: "us-east-1",
+		Endpoints: []string{strings.TrimPrefix(fc.srv.URL, "http://")}}, upstream.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cl.Transport.CloseIdleConnections)
+	cl.Creds.AccessKey, cl.Creds.Secret = "AK", "SK"
+	return backend{cl: cl}
 }
