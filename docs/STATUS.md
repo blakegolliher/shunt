@@ -112,6 +112,27 @@ Bench: docs/bench/poc4.md. Migration overhead on GET and PUT is below this box's
 
 Refusals observed live as designed: `purge-source` in `MIGRATING`, `cluster remove vast01` while the placement and then the tenant default named it. `cutover --window 15s` passed with verify still reading. All 100 objects written to vast01 before shunt existed read back byte for byte from vast02 through shunt after the purge.
 
+## Under load (2026-09-17, docs/bench/poc5-load.md)
+
+The whole demo was run inside a 15-minute `warp mixed` benchmark, 16 clients, through shunt.
+
+**VAST vast01 → vast02** (rate-capped at 160 requests/s, 96 MiB/s, on the shared lab):
+- **Errors:** 0 in 144,016 requests.
+- **Demo steps:** every one succeeded on its first attempt.
+- **Latency:** shunt adds about **1.5–2.5 ms at p50 and 3 ms at p99** on GET, STAT and DELETE, and nothing measurable on PUT.
+- **During the move:** dual deletes raise DELETE p50 by about 4 ms (p99 to about 40 ms); fallback reads add about 1 ms p50 to reads.
+- **CPU:** about half a core at that rate, mostly body relay and syscalls. The client write path (17%), a synchronous access log (4%) and per-request signing-key derivation (1.5%) are the first latency candidates.
+
+**MinIO → MinIO:**
+- **1 MiB objects:** 0 errors in 453,336 requests.
+- **40 MiB multipart objects:** 0 errors in 24,282 requests.
+
+**Garage → MinIO** errors came from Garage-issued version ids and a full local disk (backend-compat.md).
+
+**Two findings to fix:**
+1. **Spurious purge refusal under deletes.** `purge-source` can refuse spuriously while clients delete concurrently (seen once, on MinIO). A HEAD of each missing key on the source before refusing would remove it.
+2. **Version ids invented by Garage.** Version ids invented by a backend (Garage) break version-echoing clients after a move.
+
 ## Operator ergonomics (ADR-0010, 2026-09-16)
 
 After the two manual VAST runs, the lab path became all commands:

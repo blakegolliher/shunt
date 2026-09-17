@@ -18,3 +18,4 @@ Go micro-benchmarks: `make bench` writes `test/bench/new.txt`; `make bench-compa
 | `poc2.md` | POC-2 resign overhead vs poc1 |
 | `poc3.md` | POC-3 directory lookup, response rewriting, and the uploadId codec vs poc2 |
 | `poc4.md` | POC-4 added latency during migration |
+| `poc5-load.md` | POC-5 demo inside a 15-minute warp mixed run: VAST → VAST (rate-capped), MinIO → MinIO (1 MiB and 40 MiB multipart), Garage → MinIO; latency by migration phase, CPU profile, improvement candidates |
