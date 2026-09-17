@@ -6,6 +6,9 @@ package proxy
 //
 //	a successful write is immediately readable, with the bytes that were written;
 //	a successful delete stays deleted;
+//	a conditional write is answered by the whole bucket: create-once succeeds exactly when the key
+//	  is absent from both clusters, and update-if-current applies exactly to the current version
+//	  (ADR-0013), which the clients check outside the copy-in-flight window;
 //	once the dust settles, a listing names exactly the objects that are still there.
 //
 // The middle invariant has one honest exception, recorded in docs/adr/0004-migration-races.md: a
@@ -50,6 +53,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -62,8 +66,13 @@ const (
 	propertyKeys    = churnKeys + keptKeys
 	propertyWorkers = 8
 	opHeader        = "X-Property-Op"
-	propSource      = "acme-1111-data"
-	propTarget      = "acme-9000-data"
+	// Conditional writes, as a client that uses S3's create-once and update-if-current semantics
+	// sends them. While a bucket is mid-migration shunt judges both against the two clusters
+	// (ADR-0013); the model here says what the answer has to be.
+	opCreateOnce      = "PUT-IF-NONE-MATCH"
+	opUpdateIfCurrent = "PUT-IF-MATCH"
+	propSource        = "acme-1111-data"
+	propTarget        = "acme-9000-data"
 )
 
 // keptGroup says what the clients do to a kept key while the mover copies it.
@@ -234,7 +243,14 @@ func newPropertyRun(t *testing.T, seed int64, seedNote string, dur time.Duration
 	t.Helper()
 	putINM, deleteIfMatch := guard == "conditional", withdraw == "if-match"
 
-	m := newMixedRig(t, nil)
+	// The target's declared capability matches what the fake actually does: an operator records
+	// conditional_write: false for a backend that ignores If-None-Match: * (docs/reference/
+	// backend-compat.md), and shunt guards conditional writes itself on such a target (ADR-0013).
+	m := newMixedRig(t, nil, func(cs map[string]config.Cluster) {
+		cl := cs["minio"]
+		cl.Capabilities.ConditionalWrite = &putINM
+		cs["minio"] = cl
+	})
 	// A soak must not hold every request it served: an in-memory access log and the fakes' request
 	// history stalled the whole process for seconds, then a minute, in the first 60-minute run.
 	m.accessLog.discard()
@@ -362,8 +378,17 @@ func (r *propertyRun) pick(rnd *rand.Rand) (int, string) {
 	if groupOf(i) != notKept && !r.moverDone.Load() {
 		return i, http.MethodGet // kept keys stay on the source until the mover has had them
 	}
+	// Conditional writes stay out of the copy-in-flight window: a mover copy can put an object
+	// back for a moment (ADR-0004 race 1), and the answer to a condition would be ambiguous there.
+	quiet := !r.moving.Load()
 	switch n := rnd.Intn(10); {
-	case n < 4:
+	case n < 3:
+		return i, http.MethodPut
+	case n == 3 && quiet:
+		return i, opCreateOnce
+	case n == 4 && quiet:
+		return i, opUpdateIfCurrent
+	case n < 5:
 		return i, http.MethodPut
 	case n < 6:
 		return i, http.MethodDelete
@@ -405,6 +430,44 @@ func (r *propertyRun) client(t *testing.T, w int, rnd *rand.Rand, deadline time.
 				k.Present, k.Body, k.Deleted = false, "", time.Now()
 			default:
 				r.violation(t, actor, id, key(i), "delete-status", ev.Start, "", "DELETE %s: HTTP %d", key(i), code)
+			}
+		case opCreateOnce:
+			// Create-once: it must succeed exactly when the key is absent, wherever it lives.
+			body := fmt.Sprintf("c%d-%d", i, rnd.Int63())
+			code, _, err := r.doHeaders(http.MethodPut, key(i), []byte(body), id, map[string]string{"If-None-Match": "*"})
+			ev.Op, ev.Status, ev.Err, ev.Body = opCreateOnce, code, errString(err), body
+			r.rec.emit(ev)
+			switch {
+			case err != nil:
+				r.violation(t, actor, id, key(i), "put-transport", ev.Start, "", "%s %s: %v", opCreateOnce, key(i), err)
+			case !k.Present && code == 200:
+				k.Present, k.Body = true, body
+			case k.Present && code == 412:
+			default:
+				r.violation(t, actor, id, key(i), "create-once", ev.Start, "",
+					"%s %s over a key the model says is present=%v: HTTP %d", opCreateOnce, key(i), k.Present, code)
+			}
+		case opUpdateIfCurrent:
+			// Update-if-current: the ETag of what the client last wrote, so it must apply; a stale
+			// one must not, and neither must an update to a key that is gone.
+			stale := !k.Present || rnd.Intn(4) == 0
+			want := `"00000000000000000000000000000000"`
+			if !stale {
+				want = etagOf([]byte(k.Body))
+			}
+			body := fmt.Sprintf("u%d-%d", i, rnd.Int63())
+			code, _, err := r.doHeaders(http.MethodPut, key(i), []byte(body), id, map[string]string{"If-Match": want})
+			ev.Op, ev.Status, ev.Err, ev.Body = opUpdateIfCurrent, code, errString(err), body
+			r.rec.emit(ev)
+			switch {
+			case err != nil:
+				r.violation(t, actor, id, key(i), "put-transport", ev.Start, "", "%s %s: %v", opUpdateIfCurrent, key(i), err)
+			case !stale && code == 200:
+				k.Body = body
+			case stale && code == 412:
+			default:
+				r.violation(t, actor, id, key(i), "update-if-current", ev.Start, "",
+					"%s %s with a %s ETag over present=%v: HTTP %d", opUpdateIfCurrent, key(i), map[bool]string{true: "stale", false: "current"}[stale], k.Present, code)
 			}
 		default:
 			r.read(t, actor, id, i, k, ev)
@@ -759,8 +822,17 @@ func missing(a, b []string) []string {
 
 // do sends one client request through shunt without failing the test on a transport error.
 func (r *propertyRun) do(method, k string, body []byte, id string) (int, []byte, error) {
+	return r.doHeaders(method, k, body, id, nil)
+}
+
+// doHeaders is do with the client's own headers, for conditional writes.
+func (r *propertyRun) doHeaders(method, k string, body []byte, id string, extra map[string]string) (int, []byte, error) {
 	c := verify.Client{Endpoint: r.m.front.URL, Bucket: "data", Creds: sigv4.Credentials{AccessKey: acmeAK, Secret: acmeSK}, HTTP: fresh()}
-	rep, err := c.Do(context.Background(), method, k, body, map[string]string{opHeader: id})
+	hdr := map[string]string{opHeader: id}
+	for k, v := range extra {
+		hdr[k] = v
+	}
+	rep, err := c.Do(context.Background(), method, k, body, hdr)
 	return rep.Status, rep.Body, err
 }
 

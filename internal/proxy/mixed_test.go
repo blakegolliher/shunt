@@ -426,6 +426,15 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.fail(w, r, 412, "PreconditionFailed", bucket, key)
 			return
 		}
+		// If-Match on a write, as a backend that offers conditional updates judges it: against the
+		// copy this backend holds, which is why shunt judges it across both clusters (ADR-0013).
+		if im := r.Header.Get("If-Match"); im != "" {
+			cur, taken := objs[key]
+			if !taken || !etagMatches(im, etagOf(cur)) {
+				f.fail(w, r, 412, "PreconditionFailed", bucket, key)
+				return
+			}
+		}
 		objs[key] = body
 		f.wrote(bucket, key)
 		w.Header().Set("ETag", etagOf(body))

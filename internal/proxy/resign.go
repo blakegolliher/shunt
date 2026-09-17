@@ -133,6 +133,15 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.Metrics.RampWrites.WithLabelValues(directory.Key(o.tenant, info.Bucket), route.Cluster.String()).Inc()
 	}
 
+	// A conditional write while the bucket's objects are split across two clusters is judged
+	// against both, not only the cluster this write lands on (ADR-0013).
+	act, code, msg := h.conditionalWrite(ctx, r, o, info, p, clusters, cl, backend, class)
+	if code != "" {
+		h.answer(w, r, o, code, msg)
+		return nil, false
+	}
+	cond := act
+
 	// The placement's other cluster, for a read that falls back, a delete that goes to both, or a
 	// listing that merges.
 	var other *upstream.Cluster
@@ -200,6 +209,14 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			out.Header.Del(name)
 		}
 		out.Header.Del(headerDebug) // shunt's own request header; the backend never sees it
+		if cond.dropIfMatch {
+			out.Header.Del("If-Match") // shunt checked it against the other cluster (ADR-0013)
+			if cond.createOnly {
+				out.Header.Set("If-None-Match", "*")
+			} else {
+				out.Header.Del("If-None-Match")
+			}
+		}
 		out.Header.Del("X-Amz-Expected-Bucket-Owner")
 		out.Header.Del("X-Amz-Source-Expected-Bucket-Owner")
 		if copySource != "" {

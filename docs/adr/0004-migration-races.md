@@ -147,6 +147,8 @@ The window, the time and the counter are written to the placement as `cutover:`.
 
 It then aborts the source's in-progress multipart uploads, deletes every object and the bucket, and applies `CUTOVER → ACTIVE`, which drops the source. A client write cannot land on the source during the purge: no state after `MIGRATING` routes a write there.
 
+**Conditional writes are judged across both clusters (ADR-0013, POC-6).** A backend judges `If-None-Match` and `If-Match` against the copy it holds, and mid-migration the key may be on the other cluster: create-once answered 200 and made a second copy, update-if-current answered 412 over a current version. shunt now checks the other cluster before the write and converts or refuses accordingly, failing closed on 503.
+
 **Race 5, again: the ramp hash changed.** The POC-5 walkthrough measured an 80/20 write split at a ratio of 0.5. `InRange` used FNV-1a-64 directly, and FNV-1a barely moves its high bits for keys that differ only in their last bytes. `a/0000` … `a/0999` all fell under 0.5. The hash is now FNV-1a finished with murmur3's `fmix64`. A test holds sequential key shapes within ±4 % of 0.1, 0.5 and 0.9.
 
 Changing the function changes which keys are in range. A proxy that routed a running ramp with a different function than the one that started it would move keys back to the source, which is race 5's stale read, and two builds in one fleet would disagree about the same key. **So a ramp names its hash.** RAMPING start writes `ramp.hash: fnv1a-fmix64-v1` onto the placement, and the name stays for the life of the ramp. The name is a promise about exact values: `TestRampHashIsPinned` holds five keys to their hash outputs, so any change to the function needs a new name.
