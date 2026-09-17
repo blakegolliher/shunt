@@ -11,6 +11,7 @@ import (
 	"go.yaml.in/yaml/v4"
 
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 )
 
@@ -29,9 +30,9 @@ type File struct {
 type Entry struct {
 	AccessKey string   `yaml:"access_key"`
 	Secret    string   `yaml:"secret"`
-	SecretRef string   `yaml:"secret_ref"`
-	Tenant    string   `yaml:"tenant"`
-	Buckets   []string `yaml:"buckets"`
+	SecretRef string   `yaml:"secret_ref,omitempty"`
+	Tenant    string   `yaml:"tenant,omitempty"` // empty: the default tenant
+	Buckets   []string `yaml:"buckets,omitempty"`
 }
 
 // Static is an in-memory CredentialStore loaded once from a file.
@@ -74,7 +75,7 @@ func parse(data []byte) (*Static, error) {
 			return nil, fmt.Errorf("auth: %s.access_key: required", k)
 		}
 		if e.Tenant == "" {
-			return nil, fmt.Errorf("auth: %s.tenant: required", k)
+			e.Tenant = directory.DefaultTenant
 		}
 		if _, dup := s.byKey[e.AccessKey]; dup {
 			return nil, fmt.Errorf("auth: %s.access_key: duplicate access key", k)

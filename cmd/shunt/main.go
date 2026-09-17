@@ -38,7 +38,7 @@ func newRoot() *cobra.Command {
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
 	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory(),
-		newCluster(), newTenant(), newAdopt(), newExpand(), newRamp(), newMigrate(), newCutover(), newPurgeSource(), newStatus(), newVerify())
+		newCluster(), newTenant(), newAdopt(), newExpand(), newRamp(), newMigrate(), newCutover(), newPurgeSource(), newStatus(), newVerify(), newClient())
 	return root
 }
 

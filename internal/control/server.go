@@ -2,7 +2,9 @@ package control
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -10,6 +12,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -35,7 +40,9 @@ type Server struct {
 	Metrics  *telemetry.Metrics
 	// Token is the bearer token every request must carry. Empty: loopback peers only.
 	Token string
-	Log   *slog.Logger
+	// SecretsDir is where a secret given to `cluster add` is written, one 0600 file per cluster.
+	SecretsDir string
+	Log        *slog.Logger
 	// Now defaults to time.Now; Sleep to a context-aware wait. Tests replace both.
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -333,6 +340,9 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (string, directo
 type ClusterRequest struct {
 	Name    string         `json:"name"`
 	Cluster config.Cluster `json:"cluster"`
+	// Secret, when set, is stored by the server in SecretsDir and the cluster's secret_ref points at
+	// that file. It never reaches the directory, a log, or a response (ADR-0010).
+	Secret string `json:"secret,omitempty"`
 }
 
 func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
@@ -344,11 +354,47 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
 		return
 	}
-	if msg := s.checkCredentials(r.Context(), req.Name, req.Cluster); msg != "" {
+	if !clusterName.MatchString(req.Name) {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("cluster name %q: use lowercase letters, digits, - and _", req.Name))
+		return
+	}
+	stored := ""
+	if req.Secret != "" {
+		if s.SecretsDir == "" {
+			writeError(w, http.StatusConflict, "refused", "this shunt has no secrets directory (directory.secrets_dir); give the cluster a --secret-ref instead")
+			return
+		}
+		path, err := s.storeSecret(req.Name, req.Secret)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "unavailable", "storing the secret: "+err.Error())
+			return
+		}
+		stored = path
+		req.Cluster.Credentials.SecretRef = "file:" + path
+	}
+	discard := func() {
+		if stored != "" {
+			_ = os.Remove(stored) //nolint:errcheck // best effort: a refused add leaves no secret behind
+		}
+	}
+	inferType := req.Cluster.Type == ""
+	if inferType {
+		req.Cluster.Type = "s3" // provisional, so the definition builds; the cluster's own answer decides below
+	}
+	if req.Cluster.Region == "" {
+		req.Cluster.Region = regionFor(req.Cluster.Endpoints)
+	}
+	msg, server := s.checkCredentials(r.Context(), req.Name, req.Cluster)
+	if msg != "" {
+		discard()
 		writeError(w, http.StatusConflict, "refused", msg)
 		return
 	}
+	if inferType {
+		req.Cluster.Type = typeFromServer(server)
+	}
 	if err := s.Dir.PutCluster(r.Context(), req.Name, req.Cluster, actor(r)); err != nil {
+		discard()
 		var ce *config.Error
 		if errors.As(err, &ce) || strings.Contains(err.Error(), "clusters.") {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
@@ -361,6 +407,9 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		}
 		fail(w, err)
 		return
+	}
+	if stored != "" {
+		s.dropSecrets(req.Name, stored)
 	}
 	c, _ := s.Dir.Snapshot().Cluster(req.Name)
 	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
@@ -383,6 +432,7 @@ func (s *Server) removeCluster(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.dropSecrets(name, "")
 	writeJSON(w, http.StatusOK, map[string]string{"removed": name})
 }
 
@@ -449,23 +499,24 @@ func lostWriteWindow(key, cluster string) error {
 // the mover: an access key from one credential set and a secret from another. Anything short of a
 // signature or unknown-key answer passes: a key may be allowed its buckets without ListBuckets.
 // An invalid definition returns "" and is refused by the directory write that follows.
-func (s *Server) checkCredentials(ctx context.Context, name string, c config.Cluster) string {
+func (s *Server) checkCredentials(ctx context.Context, name string, c config.Cluster) (refusal, server string) {
 	defs := map[string]config.Cluster{name: c}
 	config.ApplyClusterDefaults(defs)
 	if config.ValidateClusters("clusters", defs) != nil {
-		return ""
+		return "", ""
 	}
 	cl, err := s.Clusters.Build(name, defs[name])
 	if err != nil {
-		return "the proxy cannot use this cluster: " + err.Error()
+		return "the proxy cannot use this cluster: " + err.Error(), ""
 	}
 	defer cl.Close()
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	reply, err := backend{cl}.do(ctx, http.MethodGet, "", "", nil, nil, nil)
 	if err != nil {
-		return fmt.Sprintf("cannot reach cluster %s to check its credentials: %v", name, err)
+		return fmt.Sprintf("cannot reach cluster %s to check its credentials: %v", name, err), ""
 	}
+	server = reply.header.Get("Server")
 	var e struct {
 		Message string `xml:"Message"`
 	}
@@ -473,15 +524,96 @@ func (s *Server) checkCredentials(ctx context.Context, name string, c config.Clu
 	ak, ref := c.Credentials.AccessKey, c.Credentials.SecretRef
 	switch s3.ClassifyCredentialError(reply.code, e.Message) {
 	case s3.FaultUnknownKey:
-		return fmt.Sprintf("cluster %s does not know access key %s (%s): check --access-key", name, ak, reply.code)
+		return fmt.Sprintf("cluster %s does not know access key %s (%s): check --access-key", name, ak, reply.code), server
 	case s3.FaultSignature:
 		msg := fmt.Sprintf("cluster %s rejected the signature (%s): access key %s exists, but the secret shunt serve reads from %s is not that key's secret", name, reply.code, ak, ref)
 		if strings.HasPrefix(ref, "env:") {
 			msg += "; an env: ref is read from shunt serve's environment as it was when serve started, so set " + strings.TrimPrefix(ref, "env:") + " there and restart serve, or use a file: ref"
 		}
-		return msg
+		if strings.HasPrefix(ref, "file:") && strings.HasPrefix(strings.TrimPrefix(ref, "file:"), s.SecretsDir+string(os.PathSeparator)) && s.SecretsDir != "" {
+			msg = fmt.Sprintf("cluster %s rejected the signature (%s): the secret key you entered is not the secret of access key %s", name, reply.code, ak)
+		}
+		return msg, server
 	}
-	return ""
+	return "", server
+}
+
+// clusterName is what a cluster may be called: it names a file in SecretsDir and a key in the directory.
+var clusterName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+
+// storeSecret writes a cluster's secret to a new 0600 file in SecretsDir and returns its path. Each
+// add gets a new file name, so a changed secret is a changed definition and the proxy rebuilds the
+// cluster with it; dropSecrets removes the old files once the add has landed.
+func (s *Server) storeSecret(name, secret string) (string, error) {
+	if err := os.MkdirAll(s.SecretsDir, 0o700); err != nil {
+		return "", err
+	}
+	var id [4]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	path := filepath.Join(s.SecretsDir, name+"-"+hex.EncodeToString(id[:]))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // name is checked against clusterName
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(secret); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, f.Close()
+}
+
+// dropSecrets removes the secret files shunt stored for a cluster, except keep.
+func (s *Server) dropSecrets(name, keep string) {
+	if s.SecretsDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(s.SecretsDir)
+	if err != nil {
+		return
+	}
+	own := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `-[0-9a-f]{8}$`)
+	for _, e := range entries {
+		path := filepath.Join(s.SecretsDir, e.Name())
+		if own.MatchString(e.Name()) && path != keep {
+			_ = os.Remove(path) //nolint:errcheck // best effort
+		}
+	}
+}
+
+// typeFromServer reads a cluster's type from its Server response header: VAST answers "vast 5.x",
+// MinIO "MinIO", AWS "AmazonS3"; anything else (Garage sends none) is a generic S3 backend.
+func typeFromServer(server string) string {
+	switch v := strings.ToLower(server); {
+	case strings.HasPrefix(v, "vast"):
+		return "vast"
+	case strings.Contains(v, "minio"):
+		return "minio"
+	case strings.Contains(v, "amazons3"):
+		return "aws"
+	}
+	return "s3"
+}
+
+// awsHost matches regional AWS S3 endpoints, e.g. s3.eu-west-1.amazonaws.com or s3-us-west-2.amazonaws.com.
+var awsHost = regexp.MustCompile(`^s3[.-]([a-z0-9-]+)\.amazonaws\.com(:\d+)?$`)
+
+// regionFor is the signing region when none is given: the one in an AWS regional endpoint name,
+// otherwise us-east-1, which VAST, MinIO and most S3 backends accept.
+func regionFor(endpoints []string) string {
+	if len(endpoints) > 0 {
+		if m := awsHost.FindStringSubmatch(endpoints[0]); m != nil {
+			return m[1]
+		}
+	}
+	return "us-east-1"
 }
 
 // logged wraps a mutating route so that every answer it refuses or fails is in serve's log with its

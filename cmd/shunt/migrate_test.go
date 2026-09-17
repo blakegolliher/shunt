@@ -265,3 +265,21 @@ func TestVerifyCommand(t *testing.T) {
 		t.Fatal("verify without a bucket and credentials was accepted")
 	}
 }
+
+// A bare bucket name is the default tenant's bucket; tenant/bucket still names a tenant, and the
+// default tenant is never shown.
+func TestBucketArguments(t *testing.T) {
+	for in, want := range map[string]string{"data01": "default/data01", "acme/data01": "acme/data01"} {
+		if got, err := placementKey(in); err != nil || got != want {
+			t.Errorf("placementKey(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "/data01", "acme/", "a/b/c"} {
+		if _, err := placementKey(bad); err == nil {
+			t.Errorf("placementKey(%q) accepted", bad)
+		}
+	}
+	if shown("default/data01") != "data01" || shown("acme/data01") != "acme/data01" {
+		t.Error("shown")
+	}
+}

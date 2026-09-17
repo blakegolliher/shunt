@@ -31,7 +31,7 @@ The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--
 
 - Every mutation goes through the directory write path (lock, re-read, version bump, rename) and appends one record to `<directory>.changes.jsonl` with actor `api:<peer address>`.
 - Every mutation is logged by `shunt serve`, with its actor: one INFO line on success (`bucket adopted`, `target recorded`, `ramp`, `migrate start`, `mover pass`, `cutover window started`, `cutover`, `source purged`, `migrate finish`, `tenant default changed`, plus `cluster added|updated|removed`), and one WARN line for any refusal or failure (`<operation> refused` or `<operation> failed`, with the code and reason). An operator watching serve's log sees every change, whichever host ran the command.
-- `{tenant}/{bucket}` is the client's view: the tenant of the access key and the bucket name the client uses.
+- `{tenant}/{bucket}` is the client's view: the tenant of the access key and the bucket name the client uses. A client key with no tenant belongs to tenant `default`; the CLI takes a bare bucket name for it and never shows it (ADR-0010).
 
 ## Routes
 
@@ -67,7 +67,13 @@ Returns `{"key", "placement", "clusters"}`: the placement as stored, plus the de
 
 ### `POST /v1/clusters`
 
-`{"name": "vast02", "cluster": {"type", "scheme", "region", "endpoints": [...], "credentials": {"access_key", "secret_ref"}, "capabilities": {"conditional_write", "conditional_delete"}, "tls": {...}}}`
+`{"name": "vast02", "cluster": {"type", "scheme", "region", "endpoints": [...], "credentials": {"access_key", "secret_ref"}, "capabilities": {"conditional_write", "conditional_delete"}, "tls": {...}}, "secret": "…"}`
+
+- **Name:** lowercase letters, digits, `-` and `_`.
+- **`secret`:** used in place of `credentials.secret_ref`. The server writes it to `directory.secrets_dir` as a 0600 file and points `secret_ref` at it. It is never stored in the directory, logged, or returned. A refused add removes the file; a replaced secret replaces the file; removing the cluster deletes it.
+- **`type`:** may be empty. It is then read from the cluster's `Server` header on the credential check: `vast`, `minio`, `aws`, otherwise `s3`.
+- **`region`:** may be empty. It is then `us-east-1`, or the region in an `s3.<region>.amazonaws.com` endpoint.
+- **`capabilities`:** may be left unset; `expand` measures them.
 
 Adds or replaces a cluster. Before the change is written, the running proxy builds the cluster and resolves `secret_ref` in its own environment. If the secret can't be resolved, the call is refused with the reason, so a cluster shunt cannot sign for is never added. Use `file:` refs for clusters added to a running shunt.
 
@@ -106,9 +112,10 @@ Prepares the target while the placement stays `ACTIVE`, in this order:
 1. Refuses if either bucket was ever versioned.
 2. Verifies the target bucket exists, or creates it with `create`.
 3. Runs a canary PUT, GET and DELETE of `.shunt-canary-<hex>`.
-4. Records `target` and its name on the placement.
+4. If the target cluster's `conditional_write` or `conditional_delete` is unset, measures it on a scratch object: a PUT with `If-None-Match: *` over it must get 412, and a DELETE with a wrong `If-Match` must get 412. It records the results on the cluster (`measured: true` in the answer). A capability set explicitly is left alone.
+5. Records `target` and its name on the placement.
 
-Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_write", "conditional_delete", "version"}`. Later `ramp` and `migrate` calls use the recorded target.
+Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_write", "conditional_delete", "measured", "version"}`. Later `ramp` and `migrate` calls use the recorded target.
 
 ### `POST /v1/placements/{tenant}/{bucket}/ramp`
 

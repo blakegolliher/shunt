@@ -1,5 +1,7 @@
 # Configuration reference
 
+**No config at all, for a lab:** `shunt serve --plaintext` runs from a state directory (`--state-dir`, default `shunt-data`), which it creates on first start. The directory holds the directory file, a `secrets/` folder, and `credentials.yaml` with one generated client key for the default tenant; `shunt client show` prints that key. The listeners default to `--listen 127.0.0.1:8008` and `--admin 127.0.0.1:9900`. The config file below is for everything else (TLS, tokens, domains), passed with `--config`, and the lab flags are refused alongside it (ADR-0010).
+
 YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are errors; every error names the offending key path. Schema: `internal/config/config.go`; rules: `internal/config/validate.go`; samples: `internal/config/testdata/`.
 
 ## `listener`
@@ -25,7 +27,7 @@ YAML, validated at startup and by `shunt check-config <file>`. Unknown keys are 
 | Key | Type | Rule |
 |---|---|---|
 | `mode` | `passthrough` / `resign` | Required. `resign` requires `credentials_file`; `passthrough` forbids it |
-| `credentials_file` | path | Required with `mode: resign`. YAML: `credentials: [{access_key, secret | secret_ref, tenant, buckets?}]`; inline `secret` is allowed because this file is the secret store (mode must be 0600; encrypted at rest is P3c) |
+| `credentials_file` | path | Required with `mode: resign`. YAML: `credentials: [{access_key, secret | secret_ref, tenant?, buckets?}]`; a key without `tenant` belongs to the default tenant, whose buckets the CLI addresses by bare name (ADR-0010); inline `secret` is allowed because this file is the secret store (mode must be 0600; encrypted at rest is P3c) |
 | `clock_skew` | duration | Default 15m |
 
 ## `proxy`
@@ -45,6 +47,7 @@ The clusters, tenants and placements that route each bucket (docs/DESIGN.md §1.
 | Key | Type | Default | Rule |
 |---|---|---|---|
 | `file` | path | | The directory file. Must exist and validate at startup; every cluster it names must build and resolve its `secret_ref` |
+| `secrets_dir` | path | `secrets/` next to `file` | Where shunt stores a secret given to `shunt cluster add` (one 0600 file per cluster, referenced as `file:`; ADR-0010) |
 | `poll_interval` | duration | 1s | How often `serve` re-checks the file for another writer's changes (SIGHUP reloads immediately) |
 
 Directory file schema (validated by `check-config` and `shunt directory validate`):

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,7 +31,10 @@ type Config struct {
 // It lives in its own file because shunt writes it (CreateBucket, DeleteBucket, set-state) and
 // must never rewrite the operator's config. Required in resign mode, forbidden in passthrough.
 type Directory struct {
-	File         string        `yaml:"file"`
+	File string `yaml:"file"`
+	// SecretsDir holds the cluster secrets shunt was given at `shunt cluster add` (one 0600 file each,
+	// referenced from the directory as file: refs). Default: a secrets/ directory next to File.
+	SecretsDir   string        `yaml:"secrets_dir"`
 	PollInterval time.Duration `yaml:"poll_interval"` // how often serve checks the file for other writers' changes
 }
 
@@ -331,6 +335,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Admin.Address == "" {
 		c.Admin.Address = defaultAdminAddress
+	}
+	if c.Directory.File != "" && c.Directory.SecretsDir == "" {
+		c.Directory.SecretsDir = filepath.Join(filepath.Dir(c.Directory.File), "secrets")
 	}
 	if c.Auth.ClockSkew == 0 {
 		c.Auth.ClockSkew = defaultClockSkew

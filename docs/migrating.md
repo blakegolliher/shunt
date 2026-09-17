@@ -5,6 +5,8 @@ keep using it, and how to empty and retire a cluster entirely. Clients are not r
 restarted, and not told. They keep the same endpoint, the same credentials and the same bucket name
 throughout.
 
+For a first try, README.md walks the whole move with nothing but commands: `shunt serve --plaintext`, `shunt cluster add <name> http://<host> --access-key …` (prompts for the secret), and bare bucket names. The examples below use an explicit tenant (`acme/data`), which only matters when one shunt serves several; a bare `data` means the default tenant's bucket.
+
 Everything below is one `shunt` binary. `shunt serve` runs the proxy. The other verbs call its control
 API on the admin listener (docs/reference/control-api.md; `--api`, default `http://127.0.0.1:9900`).
 Every verb takes `--json`. For the ten-step procedure with expected output, from adopting a bucket to

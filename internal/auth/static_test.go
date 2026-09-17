@@ -48,11 +48,22 @@ func TestParseAndLookup(t *testing.T) {
 	}
 }
 
+// A key that names no tenant belongs to the default tenant (ADR-0010).
+func TestNoTenantIsTheDefaultTenant(t *testing.T) {
+	s, err := parse([]byte("credentials:\n  - access_key: a\n    secret: s\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Lookup(context.Background(), "a")
+	if err != nil || c.Tenant != "default" {
+		t.Fatalf("tenant %q, err %v", c.Tenant, err)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := map[string]string{
 		"unknown key":   "credentials:\n  - access_key: a\n    secret: s\n    tenant: t\n    password: x\n",
 		"no access key": "credentials:\n  - secret: s\n    tenant: t\n",
-		"no tenant":     "credentials:\n  - access_key: a\n    secret: s\n",
 		"no secret":     "credentials:\n  - access_key: a\n    tenant: t\n",
 		"both secrets":  "credentials:\n  - access_key: a\n    secret: s\n    secret_ref: env:X\n    tenant: t\n",
 		"duplicate":     "credentials:\n  - {access_key: a, secret: s, tenant: t}\n  - {access_key: a, secret: s2, tenant: t}\n",

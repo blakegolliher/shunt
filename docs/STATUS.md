@@ -112,6 +112,16 @@ Bench: docs/bench/poc4.md. Migration overhead on GET and PUT is below this box's
 
 Refusals observed live as designed: `purge-source` in `MIGRATING`, `cluster remove vast01` while the placement and then the tenant default named it. `cutover --window 15s` passed with verify still reading. All 100 objects written to vast01 before shunt existed read back byte for byte from vast02 through shunt after the purge.
 
+## Operator ergonomics (ADR-0010, 2026-09-16)
+
+After the two manual VAST runs, the lab path became all commands:
+- **`shunt serve --plaintext` needs no config:** it creates a `shunt-data/` state directory with the directory file, a `secrets/` folder, and a generated client key that `shunt client show` prints.
+- **`shunt cluster add <name> http://host --access-key AK`** prompts for the secret. shunt stores it in `secrets/` (0600, referenced as `file:`), checks the pair against the cluster, and reads the type from the cluster's `Server` header.
+- **`shunt expand` measures conditional PUT and DELETE** on the target when the cluster doesn't state them.
+- **A client key without a tenant belongs to the default tenant,** whose buckets every verb takes by bare name. The CLI never shows the default tenant.
+
+README.md is that demo, rehearsed as written on Garage → MinIO: 52 objects read back with 0 mismatches throughout, then cutover, purge and cluster removal. `test/e2e/walkthrough.sh` still runs the explicit multi-tenant form.
+
 ## POC-5 by hand on VAST (2026-09-16)
 
 An operator ran the migration by hand on two lab VAST clusters over http, using only `shunt` and aws-cli commands. The source was vast01 (`10.0.0.1:80`, bucket `demo-source`), the target vast02 (bucket `demo-dest`), and shunt ran on the operator's host on `:8008`. Neither lab key could create buckets, so both buckets already existed and were emptied first.

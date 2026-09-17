@@ -30,6 +30,9 @@ type fakeCluster struct {
 	be        *s3mem.Backend
 	versioned map[string]bool
 	reject    string // when set, every request answers 403 with this error code
+	server    string // the Server response header, when set
+	condPut   bool   // honor If-None-Match: * on PUT over an existing object
+	condDel   bool   // honor a mismatched If-Match on DELETE
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -37,6 +40,26 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	fc := &fakeCluster{be: s3mem.New(), versioned: map[string]bool{}}
 	fake := gofakes3.New(fc.be, gofakes3.WithTimeSkewLimit(0)).Server()
 	fc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fc.server != "" && r.Method == http.MethodGet && r.URL.Path == "/" && fc.reject == "" {
+			w.Header().Set("Server", fc.server) // gofakes3 would answer as AmazonS3
+			_, _ = w.Write([]byte(`<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>`))
+			return
+		}
+		if bucket, key, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/"); ok && key != "" {
+			_, err := fc.be.HeadObject(bucket, key)
+			switch {
+			case fc.condPut && r.Method == http.MethodPut && r.Header.Get("If-None-Match") == "*" && err == nil,
+				fc.condDel && r.Method == http.MethodDelete && r.Header.Get("If-Match") != "" && err == nil:
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			if !fc.condPut {
+				r.Header.Del("If-None-Match") // a backend that ignores it
+			}
+			if !fc.condDel {
+				r.Header.Del("If-Match")
+			}
+		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>no</Message></Error>`))
@@ -126,7 +149,7 @@ func newRig(t *testing.T) *rig {
 		return err
 	}
 	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), log: &syncLog{}}
-	rg.ctl = &Server{Dir: dir, Clusters: reg, Metrics: telemetry.NewMetrics(), Log: slog.New(telemetry.NewConsoleHandler(rg.log, telemetry.ConsoleOptions{})),
+	rg.ctl = &Server{Dir: dir, Clusters: reg, Metrics: telemetry.NewMetrics(), SecretsDir: filepath.Join(t.TempDir(), "secrets"), Log: slog.New(telemetry.NewConsoleHandler(rg.log, telemetry.ConsoleOptions{})),
 		Now: func() time.Time { return time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC) },
 		Sleep: func(_ context.Context, d time.Duration) error {
 			rg.slept = append(rg.slept, d)
@@ -451,5 +474,129 @@ func BenchmarkStatus(b *testing.B) {
 	for b.Loop() {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
+	}
+}
+
+// A secret given to cluster add is stored by the server, 0600, and referenced as a file: ref; the
+// type comes from the cluster's Server header and the region defaults. A refused add stores nothing,
+// a replaced secret removes the old file, and removing the cluster removes its secret.
+func TestClusterAddStoresTheSecret(t *testing.T) {
+	rg := newRig(t)
+	rg.vast01.server = "vast 5.5.0.1"
+	def := rg.vast01.definition(true)
+	def.Type, def.Region, def.Credentials.SecretRef = "", "", ""
+	var out ClusterStatus
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "first-secret"}, &out)
+	if out.Type != "vast" || out.Region != "us-east-1" || !strings.HasPrefix(out.SecretRef, "file:"+rg.ctl.SecretsDir+"/vast01-") {
+		t.Fatalf("stored cluster: %+v", out)
+	}
+	first := strings.TrimPrefix(out.SecretRef, "file:")
+	if b, err := os.ReadFile(first); err != nil || string(b) != "first-secret" {
+		t.Fatalf("secret file: %q %v", b, err)
+	}
+	if st, err := os.Stat(first); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("secret file mode: %v %v", st.Mode(), err)
+	}
+	if raw, _ := os.ReadFile(rg.dir.Path()); strings.Contains(string(raw), "first-secret") {
+		t.Fatal("the secret reached the directory file")
+	}
+	if strings.Contains(rg.log.String(), "first-secret") {
+		t.Fatal("the secret reached the log")
+	}
+
+	rg.vast01.reject = "SignatureDoesNotMatch"
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "wrong"}, "the secret key you entered is not the secret of access key AK")
+	rg.vast01.reject = ""
+	if n := secretFiles(t, rg.ctl.SecretsDir); len(n) != 1 {
+		t.Fatalf("a refused add left secret files: %v", n)
+	}
+
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "second-secret"}, &out)
+	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 1 || "file:"+filepath.Join(rg.ctl.SecretsDir, files[0]) != out.SecretRef {
+		t.Fatalf("after replacing the secret: %v, ref %s", files, out.SecretRef)
+	}
+	rg.answers("POST", "/v1/clusters", ClusterRequest{Name: "../etc", Cluster: def, Secret: "x"}, http.StatusBadRequest, "bad_request")
+	rg.must("DELETE", "/v1/clusters/vast01", nil, nil)
+	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 0 {
+		t.Fatalf("removing the cluster left its secret: %v", files)
+	}
+	rg.ctl.SecretsDir = ""
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "x"}, "no secrets directory")
+}
+
+func secretFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func TestTypeAndRegionInference(t *testing.T) {
+	for server, want := range map[string]string{"vast 5.4.6.0": "vast", "MinIO": "minio", "AmazonS3": "aws", "": "s3", "garage": "s3"} {
+		if got := typeFromServer(server); got != want {
+			t.Errorf("typeFromServer(%q) = %q, want %q", server, got, want)
+		}
+	}
+	for ep, want := range map[string]string{"s3.eu-west-1.amazonaws.com:443": "eu-west-1", "s3-us-west-2.amazonaws.com:443": "us-west-2", "10.0.1.10:80": "us-east-1"} {
+		if got := regionFor([]string{ep}); got != want {
+			t.Errorf("regionFor(%q) = %q, want %q", ep, got, want)
+		}
+	}
+}
+
+// expand measures a target's conditional PUT and DELETE when the cluster does not state them, and
+// records what it found; a stated capability is left alone.
+func TestExpandMeasuresConditionals(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		condPut, condDel bool
+	}{{"honors both", true, true}, {"honors neither", false, false}, {"put only", true, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			rg := newRig(t)
+			if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+				t.Fatal(err)
+			}
+			if err := rg.vast02.be.CreateBucket("data01-001"); err != nil {
+				t.Fatal(err)
+			}
+			rg.vast02.condPut, rg.vast02.condDel = tc.condPut, tc.condDel
+			rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+			unstated := rg.vast02.definition(true)
+			unstated.Capabilities = config.Capabilities{}
+			rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: unstated}, nil)
+			rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+			var ex ExpandResult
+			rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02"}, &ex)
+			if !ex.Measured || ex.ConditionalWrite != tc.condPut || ex.ConditionalDelete != tc.condDel {
+				t.Fatalf("expand: %+v", ex)
+			}
+			c, _ := rg.dir.Snapshot().Cluster("vast02")
+			if c.Capabilities.ConditionalWriteOr(!tc.condPut) != tc.condPut || c.Capabilities.ConditionalDeleteOr(!tc.condDel) != tc.condDel {
+				t.Fatalf("recorded capabilities: %+v", c.Capabilities)
+			}
+			if objs, err := rg.vast02.be.ListBucket("data01-001", nil, gofakes3.ListBucketPage{}); err != nil || len(objs.Contents) != 0 {
+				t.Fatalf("probe objects left behind: %v %v", objs, err)
+			}
+		})
+	}
+	rg := newRig(t)
+	_ = rg.vast01.be.CreateBucket("data01")
+	_ = rg.vast02.be.CreateBucket("data01-001")
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	stated := rg.vast02.definition(true)
+	no := false
+	stated.Capabilities.ConditionalDelete = &no
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: stated}, nil)
+	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	var ex ExpandResult
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02"}, &ex)
+	if ex.Measured || !ex.ConditionalWrite {
+		t.Fatalf("a stated capability was measured over: %+v", ex)
 	}
 }

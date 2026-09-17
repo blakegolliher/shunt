@@ -161,7 +161,10 @@ type ExpandResult struct {
 	Canary            string `json:"canary"`
 	ConditionalWrite  bool   `json:"conditional_write"`
 	ConditionalDelete bool   `json:"conditional_delete"`
-	Version           int64  `json:"version"`
+	// Measured: the target's conditional-write capabilities were not set on the cluster, so expand
+	// measured them against the target bucket and recorded them.
+	Measured bool  `json:"measured,omitempty"`
+	Version  int64 `json:"version"`
 }
 
 func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
@@ -235,13 +238,32 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		fail(w, refuse("canary write/read/delete on %s/%s failed: %v", req.To, req.Name, err))
 		return
 	}
+	if target.Capabilities.ConditionalWrite == nil || target.Capabilities.ConditionalDelete == nil {
+		cw, cd, perr := probeConditionals(ctx, tb, req.Name)
+		if perr != nil {
+			fail(w, refuse("measuring conditional writes on %s/%s failed: %v; set --conditional-write and --conditional-delete on the cluster instead", req.To, req.Name, perr))
+			return
+		}
+		if target.Capabilities.ConditionalWrite == nil {
+			target.Capabilities.ConditionalWrite = &cw
+		}
+		if target.Capabilities.ConditionalDelete == nil {
+			target.Capabilities.ConditionalDelete = &cd
+		}
+		if err = s.Dir.PutCluster(r.Context(), req.To, target, actor(r)); err != nil {
+			fail(w, err)
+			return
+		}
+		res.Measured = true
+		res.ConditionalWrite, res.ConditionalDelete = *target.Capabilities.ConditionalWrite, *target.Capabilities.ConditionalDelete
+	}
 	if err := s.Dir.SetTarget(r.Context(), tenant, bucket, req.To, req.Name, actor(r)); err != nil {
 		fail(w, err)
 		return
 	}
 	res.Version = s.Dir.Snapshot().Version()
 	s.info(r, "target recorded", "placement", key, "target", req.To, "bucket", req.Name, "created_bucket", res.CreatedBucket, "canary", "ok",
-		"conditional_write", res.ConditionalWrite, "conditional_delete", res.ConditionalDelete, "version", res.Version)
+		"conditional_write", res.ConditionalWrite, "conditional_delete", res.ConditionalDelete, "measured", res.Measured, "version", res.Version)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -293,6 +315,35 @@ func canary(ctx context.Context, b backend, bucket string) (string, error) {
 		return key, fmt.Errorf("DELETE answered HTTP %d %s", del.status, del.code)
 	}
 	return key, nil
+}
+
+// probeConditionals measures what the mover's guards rely on (ADR-0004): whether the backend refuses
+// a PUT with If-None-Match: * over an existing object (412), and a DELETE whose If-Match names the
+// wrong ETag (412). It works on one scratch object, which it removes. A backend that ignores a header
+// simply does the write, which is the answer.
+func probeConditionals(ctx context.Context, b backend, bucket string) (conditionalWrite, conditionalDelete bool, err error) {
+	var id [8]byte
+	_, _ = rand.Read(id[:])
+	key := ".shunt-probe-" + hex.EncodeToString(id[:])
+	put, err := b.do(ctx, http.MethodPut, bucket, key, nil, []byte("shunt capability probe"), nil)
+	if err != nil {
+		return false, false, err
+	}
+	if put.status != http.StatusOK {
+		return false, false, fmt.Errorf("PUT answered HTTP %d %s", put.status, put.code)
+	}
+	defer func() { _, _ = b.do(context.WithoutCancel(ctx), http.MethodDelete, bucket, key, nil, nil, nil) }()
+	again, err := b.do(ctx, http.MethodPut, bucket, key, nil, []byte("overwritten"), map[string]string{"If-None-Match": "*"})
+	if err != nil {
+		return false, false, err
+	}
+	conditionalWrite = again.status == http.StatusPreconditionFailed
+	del, err := b.do(ctx, http.MethodDelete, bucket, key, nil, nil, map[string]string{"If-Match": `"00000000000000000000000000000000"`})
+	if err != nil {
+		return false, false, err
+	}
+	conditionalDelete = del.status == http.StatusPreconditionFailed
+	return conditionalWrite, conditionalDelete, nil
 }
 
 // RampRequest is one ramp step: a higher ratio, more prefixes, or both.

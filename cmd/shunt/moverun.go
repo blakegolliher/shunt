@@ -30,7 +30,7 @@ func newMigrateRun() *cobra.Command {
 		maxPasses      int
 	)
 	cmd := &cobra.Command{
-		Use:   "run <tenant/bucket>",
+		Use:   "run <bucket>",
 		Short: "Copy what the source still holds to the new primary: the mover",
 		Long: "Runs the mover in this process against the clusters the control API names, resolving their secret_refs\n" +
 			"here (the mover host needs the same env: or file: secrets as shunt serve). One pass lists the source and\n" +
@@ -66,7 +66,9 @@ func newMigrateRun() *cobra.Command {
 			}
 			one := ""
 			if len(args) == 1 {
-				one = args[0]
+				if one, err = placementKey(args[0]); err != nil {
+					return err
+				}
 			}
 			jobs, err := selectPlacements(dir, one, from, accept)
 			if err != nil {
@@ -125,7 +127,7 @@ func runMover(cmd *cobra.Command, api *apiClient, jobs []job, paths moverPaths, 
 	for i := range jobs {
 		j := jobs[i]
 		key := j.tenant + "/" + j.client
-		_, _ = fmt.Fprintf(out, "== %s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", key,
+		_, _ = fmt.Fprintf(out, "== %s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", shown(key),
 			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional), withdrawName(j.condDelete))
 		if !j.conditional {
 			_, _ = fmt.Fprintf(out, "   WARNING (accepted with --%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(key, j.dst.name))

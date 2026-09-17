@@ -30,20 +30,48 @@ import (
 )
 
 func newServe() *cobra.Command {
-	var cfgPath string
+	var (
+		cfgPath, stateDir, listen, adminAddr string
+		plaintext                            bool
+	)
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the proxy",
-		Args:  cobra.NoArgs,
+		Long: "With --config, runs from a config file (TLS, tokens, domains: production).\n" +
+			"Without one, `shunt serve --plaintext` runs a lab shunt from a state directory (--state-dir, created on\n" +
+			"first start): clusters, buckets, their secrets and a generated client key all live there, and every\n" +
+			"change after that is a command (`shunt cluster add`, `shunt adopt`, ...). `shunt client show` prints the\n" +
+			"client key. Plain http is never a default: it takes --plaintext, and every log line says so.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(cfgPath)
+			if cfgPath != "" {
+				for _, f := range []string{"plaintext", "state-dir", "listen", "admin"} {
+					if cmd.Flags().Changed(f) {
+						return fmt.Errorf("--%s applies only without --config; set it in %s instead", f, cfgPath)
+					}
+				}
+				cfg, err := config.Load(cfgPath)
+				if err != nil {
+					return err
+				}
+				return serve(cmd.Context(), cfg, cmd.ErrOrStderr())
+			}
+			if !plaintext {
+				return errors.New("shunt serve needs --config (a TLS listener), or --plaintext for a lab: shunt serve --plaintext [--state-dir shunt-data]")
+			}
+			cfg, err := labConfig(stateDir, listen, adminAddr, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
 			return serve(cmd.Context(), cfg, cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/shunt/shunt.yaml", "config file")
+	f := cmd.Flags()
+	f.StringVarP(&cfgPath, "config", "c", "", "config file")
+	f.BoolVar(&plaintext, "plaintext", false, "without --config: serve clients over plain http (labs only)")
+	f.StringVar(&stateDir, "state-dir", "shunt-data", "without --config: where the directory, secrets and client key live")
+	f.StringVar(&listen, "listen", "127.0.0.1:8008", "without --config: the S3 client listener")
+	f.StringVar(&adminAddr, "admin", "127.0.0.1:9900", "without --config: the admin and control API listener")
 	return cmd
 }
 
@@ -150,7 +178,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
-		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log}
+		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir}
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
 				return fmt.Errorf("admin.control_token_ref: %w", err)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
+	"github.com/blakegolliher/shunt/internal/directory"
 )
 
 // apiOptions are the flags every command that talks to a running shunt takes.
@@ -85,9 +86,9 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 		var e control.Error
 		if json.Unmarshal(data, &e) == nil && e.Message != "" {
 			if e.Code == "refused" && !strings.HasPrefix(e.Message, "refused") {
-				return fmt.Errorf("refused: %s", e.Message)
+				return fmt.Errorf("refused: %s", shownText(e.Message))
 			}
-			return fmt.Errorf("%s", e.Message)
+			return fmt.Errorf("%s", shownText(e.Message))
 		}
 		return fmt.Errorf("control API %s %s: HTTP %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
@@ -105,12 +106,48 @@ func printJSON(cmd *cobra.Command, v any) error {
 }
 
 // placementPath is the API path of a tenant/bucket argument.
-func placementPath(key string) (string, error) {
-	tenant, bucket, ok := strings.Cut(key, "/")
-	if !ok || tenant == "" || bucket == "" || strings.Contains(bucket, "/") {
-		return "", fmt.Errorf("%q: want <tenant>/<bucket>", key)
+func placementPath(arg string) (string, error) {
+	key, err := placementKey(arg)
+	if err != nil {
+		return "", err
 	}
+	tenant, bucket, _ := strings.Cut(key, "/")
 	return "/v1/placements/" + tenant + "/" + bucket, nil
+}
+
+// placementKey reads a bucket argument: a bare name is the default tenant's bucket, tenant/bucket
+// names a tenant explicitly.
+func placementKey(arg string) (string, error) {
+	tenant, bucket, ok := strings.Cut(arg, "/")
+	if !ok {
+		tenant, bucket = directory.DefaultTenant, arg
+	}
+	if tenant == "" || bucket == "" || strings.Contains(bucket, "/") {
+		return "", fmt.Errorf("%q: want <bucket>, or <tenant>/<bucket>", arg)
+	}
+	return directory.Key(tenant, bucket), nil
+}
+
+// shown is a placement key as an operator reads it: the default tenant's buckets by bare name.
+func shown(key string) string {
+	return strings.TrimPrefix(key, directory.DefaultTenant+"/")
+}
+
+// defaultTenantText rewrites the directory's reference paths for the default tenant into words, so a
+// one-team deployment never reads "tenants.default…" or "placements.default/…".
+var defaultTenantText = strings.NewReplacer(
+	"tenants."+directory.DefaultTenant+".default_cluster", "the default cluster for new buckets",
+	"placements."+directory.DefaultTenant+"/", "bucket ",
+	"`shunt migrate run "+directory.DefaultTenant+"/", "`shunt migrate run ",
+	" "+directory.DefaultTenant+"/", " ",
+)
+
+// shownText is an API message or reference list as an operator reads it.
+func shownText(s string) string {
+	if strings.HasPrefix(s, directory.DefaultTenant+"/") {
+		s = strings.TrimPrefix(s, directory.DefaultTenant+"/")
+	}
+	return defaultTenantText.Replace(s)
 }
 
 // waitContext bounds a call that may legitimately take a while, such as cutover's quiet window.

@@ -1,5 +1,7 @@
 # Walkthrough: moving a bucket from vast01 to vast02, live
 
+**Start with README.md** for the same move with no config file and no tenant: `shunt serve --plaintext`, clusters added from a URL with a prompted secret, and bare bucket names (ADR-0010). This page is the scripted, multi-tenant form that `test/e2e/walkthrough.sh` checks, with an explicit tenant `acme`, `file:` secret refs, and `shunt verify` as the client.
+
 Ten steps, each a copy-paste block followed by the output to expect. Bucket `data01` starts on cluster `vast01` and ends on cluster `vast02` as `data01-001`. One shunt serves it throughout on `:8008`. A client keeps reading and writing through that shunt from step 4 to the end, with the same endpoint and bucket name, and never sees an error.
 
 `test/e2e/walkthrough.sh` runs these same steps unattended and asserts each one. `make walkthrough` runs it on the e2e Garage (playing vast01) and MinIO (playing vast02), and CI does the same. **The output below is transcribed from a green `make walkthrough` run on 2026-09-16.** Only the endpoints, cluster types, regions, keys and timestamps were changed to their VAST form. Counts vary from run to run.

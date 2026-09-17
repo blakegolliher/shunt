@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
@@ -35,25 +40,55 @@ func newClusterAdd() *cobra.Command {
 		conditionalWrite, condDelete bool
 	)
 	cmd := &cobra.Command{
-		Use:   "add <name>",
+		Use:   "add <name> <url>",
 		Short: "Add a cluster, or replace its definition; the proxy uses it from the next request",
-		Long: "Adds a backend cluster to the directory. shunt builds it before the change lands, including resolving\n" +
-			"--secret-ref in the server's environment, so a cluster the proxy could not sign for is refused.\n" +
-			"Use file: secret refs for a live add: an env: ref must already be in shunt serve's environment.",
-		Args: cobra.ExactArgs(1),
+		Long: "Adds a backend cluster to the directory, e.g.\n\n" +
+			"  shunt cluster add vast01 http://10.0.1.10 --access-key AKIA...\n\n" +
+			"The URL gives the scheme, endpoint and port (80 or 443 by default). shunt prompts for the secret key\n" +
+			"(or reads one line from stdin when it is not a terminal) and stores it in its own secrets directory.\n" +
+			"Before anything is saved, shunt signs one request to the cluster with the key and secret and refuses\n" +
+			"a wrong pair. The type (vast, minio, aws, s3) is read from the cluster's Server header and the region\n" +
+			"defaults to us-east-1 (or the AWS region in an amazonaws.com host); --type and --region override.\n" +
+			"Conditional-write capabilities are measured by `shunt expand` unless given here.\n" +
+			"--secret-ref env:NAME|file:/path uses a secret you manage instead of prompting.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 2 {
+				if c.Scheme != "" || len(c.Endpoints) > 0 {
+					return errors.New("give the cluster as a URL or as --scheme and --endpoint, not both")
+				}
+				scheme, hostport, err := parseClusterURL(args[1])
+				if err != nil {
+					return err
+				}
+				c.Scheme, c.Endpoints = scheme, []string{hostport}
+			}
+			if c.Scheme == "" || len(c.Endpoints) == 0 {
+				return errors.New("give the cluster's URL, as in: shunt cluster add vast01 http://10.0.1.10 --access-key <key>")
+			}
+			if c.Credentials.AccessKey == "" {
+				return errors.New("--access-key is required")
+			}
 			if cmd.Flags().Changed("conditional-write") {
 				c.Capabilities.ConditionalWrite = &conditionalWrite
 			}
 			if cmd.Flags().Changed("conditional-delete") {
 				c.Capabilities.ConditionalDelete = &condDelete
 			}
+			req := control.ClusterRequest{Name: args[0], Cluster: c}
+			if c.Credentials.SecretRef == "" {
+				secret, err := readSecret(cmd, fmt.Sprintf("%s secret key: ", args[0]))
+				if err != nil {
+					return err
+				}
+				req.Secret = secret
+			}
 			api, err := o.client()
 			if err != nil {
 				return err
 			}
 			var out control.ClusterStatus
-			if callErr := api.call(cmd.Context(), "POST", "/v1/clusters", control.ClusterRequest{Name: args[0], Cluster: c}, &out); callErr != nil {
+			if callErr := api.call(cmd.Context(), "POST", "/v1/clusters", req, &out); callErr != nil {
 				return callErr
 			}
 			if o.json {
@@ -66,16 +101,59 @@ func newClusterAdd() *cobra.Command {
 	}
 	addAPIFlags(cmd, &o)
 	f := cmd.Flags()
-	f.StringVar(&c.Type, "type", "", "vast | minio | aws | s3")
-	f.StringVar(&c.Scheme, "scheme", "", "http | https (never defaulted)")
-	f.StringVar(&c.Region, "region", "", "the region shunt signs requests to this cluster with")
-	f.StringArrayVar(&c.Endpoints, "endpoint", nil, "host:port (repeatable)")
-	f.StringVar(&c.Credentials.AccessKey, "access-key", "", "the cluster's access key")
-	f.StringVar(&c.Credentials.SecretRef, "secret-ref", "", "env:NAME or file:/path holding the secret, resolved by shunt serve")
+	f.StringVar(&c.Credentials.AccessKey, "access-key", "", "the cluster's access key (required)")
+	f.StringVar(&c.Credentials.SecretRef, "secret-ref", "", "env:NAME or file:/path holding the secret, resolved by shunt serve, instead of prompting")
+	f.StringVar(&c.Type, "type", "", "vast | minio | aws | s3 (default: read from the cluster's Server header)")
+	f.StringVar(&c.Region, "region", "", "the signing region (default us-east-1, or the region in an amazonaws.com host)")
+	f.StringVar(&c.Scheme, "scheme", "", "instead of a URL: http | https")
+	f.StringArrayVar(&c.Endpoints, "endpoint", nil, "instead of a URL: host:port (repeatable)")
 	f.StringVar(&c.TLS.CA, "ca", "", "https: CA bundle to verify the cluster's certificate")
-	f.BoolVar(&conditionalWrite, "conditional-write", true, "the cluster honors If-None-Match: * on PUT (shunt probe measures it)")
-	f.BoolVar(&condDelete, "conditional-delete", false, "the cluster honors If-Match on DELETE (shunt probe measures it)")
+	f.BoolVar(&conditionalWrite, "conditional-write", true, "the cluster honors If-None-Match: * on PUT (default: measured by expand)")
+	f.BoolVar(&condDelete, "conditional-delete", false, "the cluster honors If-Match on DELETE (default: measured by expand)")
 	return cmd
+}
+
+// parseClusterURL reads http://host[:port] or https://host[:port] into a scheme and host:port.
+func parseClusterURL(raw string) (scheme, hostport string, err error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", "", fmt.Errorf("%q: want http://host[:port] or https://host[:port]", raw)
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.User != nil {
+		return "", "", fmt.Errorf("%q: give only the scheme, host and port", raw)
+	}
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+	}
+	return u.Scheme, net.JoinHostPort(u.Hostname(), port), nil
+}
+
+// readSecret prompts on the terminal without echo, or reads one line from stdin when it is not one
+// (so `printf '%s\n' "$SECRET" | shunt cluster add ...` works in scripts).
+func readSecret(cmd *cobra.Command, prompt string) (string, error) {
+	in := cmd.InOrStdin()
+	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) { //nolint:gosec // G115: a file descriptor fits in an int
+		_, _ = fmt.Fprint(cmd.ErrOrStderr(), prompt)
+		b, err := term.ReadPassword(int(f.Fd())) //nolint:gosec // G115: as above
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
+		if err != nil {
+			return "", err
+		}
+		return checkSecret(string(b))
+	}
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return checkSecret(strings.TrimRight(line, "\r\n"))
+}
+
+func checkSecret(s string) (string, error) {
+	if s == "" {
+		return "", errors.New("no secret key given")
+	}
+	return s, nil
 }
 
 func newClusterRemove() *cobra.Command {
@@ -108,10 +186,13 @@ func newTenant() *cobra.Command {
 	cmd := &cobra.Command{Use: "tenant", Short: "Change a tenant's settings"}
 	var o apiOptions
 	setDefault := &cobra.Command{
-		Use:   "set-default <tenant> <cluster>",
-		Short: "Point the cluster a tenant's new buckets land on elsewhere",
-		Args:  cobra.ExactArgs(2),
+		Use:   "set-default [tenant] <cluster>",
+		Short: "Point the cluster a tenant's new buckets land on elsewhere (the default tenant when none is named)",
+		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				args = []string{directory.DefaultTenant, args[0]}
+			}
 			api, err := o.client()
 			if err != nil {
 				return err
@@ -123,7 +204,11 @@ func newTenant() *cobra.Command {
 			if o.json {
 				return printJSON(cmd, out)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: new buckets now land on %s (directory version %v)\n", args[0], args[1], out["version"])
+			who := args[0] + ": new"
+			if args[0] == directory.DefaultTenant {
+				who = "New"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s buckets now land on %s (directory version %v)\n", who, args[1], out["version"])
 			return err
 		},
 	}
@@ -138,7 +223,7 @@ func newAdopt() *cobra.Command {
 		name string
 	)
 	cmd := &cobra.Command{
-		Use:   "adopt <cluster> <tenant/bucket>",
+		Use:   "adopt <cluster> <bucket>",
 		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -157,7 +242,7 @@ func newAdopt() *cobra.Command {
 			if o.json {
 				return printJSON(cmd, out)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", out.Key, out.Primary, out.Names[out.Primary])
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", shown(out.Key), out.Primary, out.Names[out.Primary])
 			return err
 		},
 	}
@@ -172,7 +257,7 @@ func newExpand() *cobra.Command {
 		req control.ExpandRequest
 	)
 	cmd := &cobra.Command{
-		Use:   "expand <tenant/bucket>",
+		Use:   "expand <bucket>",
 		Short: "Prepare a second cluster for a bucket: its bucket, a versioning check, and a canary",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -195,8 +280,12 @@ func newExpand() *cobra.Command {
 			if out.CreatedBucket {
 				created = "created"
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s (%s); canary write, read, delete ok; conditional_write %v, conditional_delete %v (directory version %d)\n",
-				out.Key, out.Target, out.Name, created, out.ConditionalWrite, out.ConditionalDelete, out.Version)
+			how := "as configured"
+			if out.Measured {
+				how = "measured"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s (%s); canary write, read, delete ok; conditional_write %v, conditional_delete %v (%s; directory version %d)\n",
+				shown(out.Key), out.Target, out.Name, created, out.ConditionalWrite, out.ConditionalDelete, how, out.Version)
 			return err
 		},
 	}
@@ -215,7 +304,7 @@ func newRamp() *cobra.Command {
 		from string
 	)
 	cmd := &cobra.Command{
-		Use:   "ramp <tenant/bucket>",
+		Use:   "ramp <bucket>",
 		Short: "Send a growing share of a bucket's writes to its new cluster",
 		Long: "Moves the placement into RAMPING, or raises an existing ramp. --ratio is the fraction of keys,\n" +
 			"chosen by a stable hash of the key, whose writes go to the new primary; --prefix names key\n" +
@@ -261,7 +350,7 @@ func newMigrateStart() *cobra.Command {
 		from string
 	)
 	cmd := &cobra.Command{
-		Use:   "start <tenant/bucket>",
+		Use:   "start <bucket>",
 		Short: "Send all new writes to the new cluster and serve reads from both",
 		Long: "Moves the placement into MIGRATING. From here every write lands on the new primary, reads fall\n" +
 			"back to the source when the primary does not have the object, deletes go to both, and listings\n" +
@@ -291,7 +380,7 @@ func newCutover() *cobra.Command {
 		from   string
 	)
 	cmd := &cobra.Command{
-		Use:   "cutover <tenant/bucket>",
+		Use:   "cutover <bucket>",
 		Short: "Stop reading the source, once the mover has converged and no read fell back for --window",
 		Long: "Moves a MIGRATING placement into CUTOVER: reads stop falling back and listings stop merging;\n" +
 			"deletes still reach the source, so it only ever loses keys. Refused unless the mover's last\n" +
@@ -316,7 +405,7 @@ func newCutover() *cobra.Command {
 func newPurgeSource() *cobra.Command {
 	var o apiOptions
 	cmd := &cobra.Command{
-		Use:   "purge-source <tenant/bucket>",
+		Use:   "purge-source <bucket>",
 		Short: "Delete the source bucket of a cut-over placement and forget the source",
 		Long: "Refused unless the placement is in CUTOVER with the evidence shunt cutover recorded, and unless the\n" +
 			"source holds no key the primary lacks. Then every in-progress upload on the source is aborted,\n" +
@@ -339,7 +428,7 @@ func newPurgeSource() *cobra.Command {
 				return printJSON(cmd, out)
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
-				out.Key, out.ObjectsDeleted, out.UploadsAborted, out.Source, out.Bucket, out.Version)
+				shown(out.Key), out.ObjectsDeleted, out.UploadsAborted, out.Source, out.Bucket, out.Version)
 			return err
 		},
 	}
@@ -353,7 +442,7 @@ func newMigrateFinish() *cobra.Command {
 		from string
 	)
 	cmd := &cobra.Command{
-		Use:   "finish <tenant/bucket>",
+		Use:   "finish <bucket>",
 		Short: "Forget the source of a cut-over placement without deleting its data",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -374,7 +463,7 @@ func newMigrateFinish() *cobra.Command {
 func newStatus() *cobra.Command {
 	var o apiOptions
 	cmd := &cobra.Command{
-		Use:   "status [tenant/bucket]",
+		Use:   "status [bucket]",
 		Short: "Show clusters, moving buckets, the write split, fallback reads, and mover progress",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -384,7 +473,11 @@ func newStatus() *cobra.Command {
 			}
 			q := ""
 			if len(args) == 1 {
-				q = "?bucket=" + url.QueryEscape(args[0])
+				key, kerr := placementKey(args[0])
+				if kerr != nil {
+					return kerr
+				}
+				q = "?bucket=" + url.QueryEscape(key)
 			}
 			var st control.Status
 			if err := api.call(cmd.Context(), "GET", "/v1/status"+q, nil, &st); err != nil {
@@ -408,7 +501,7 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 	_, _ = fmt.Fprintln(tw, "CLUSTER\tTYPE\tSCHEME\tENDPOINTS\tCOND.PUT\tUSED BY")
 	for i := range st.Clusters {
 		c := &st.Clusters[i]
-		used := strings.Join(c.References, ", ")
+		used := shownText(strings.Join(c.References, ", "))
 		if used == "" {
 			used = "-"
 		}
@@ -447,7 +540,7 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 				mover += ", converged"
 			}
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", p.Key, p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", shown(p.Key), p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
 	}
 	return tw.Flush()
 }
@@ -471,16 +564,16 @@ func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, op string
 	if res.CreatedBucket != "" {
 		_, _ = fmt.Fprintf(out, "created %s on %s\n", res.CreatedBucket, res.Primary)
 	}
-	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", res.Key, res.From, res.To, res.Version)
+	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", shown(res.Key), res.From, res.To, res.Version)
 	switch res.To {
 	case directory.StateRamping:
 		_, _ = fmt.Fprintf(out, "writes for %.0f%% of keys now land on %s; reads fall back to %s\n", 100*res.Ratio, res.Primary, res.Source)
 	case directory.StateMigrating:
-		_, _ = fmt.Fprintf(out, "all writes now land on %s; run `shunt migrate run %s` to copy what is still on %s\n", res.Primary, res.Key, res.Source)
+		_, _ = fmt.Fprintf(out, "all writes now land on %s; run `shunt migrate run %s` to copy what is still on %s\n", res.Primary, shown(res.Key), res.Source)
 	case directory.StateCutover:
-		_, _ = fmt.Fprintf(out, "%s is no longer read; `shunt purge-source %s` deletes it once you are satisfied\n", res.Source, res.Key)
+		_, _ = fmt.Fprintf(out, "%s is no longer read; `shunt purge-source %s` deletes it once you are satisfied\n", res.Source, shown(res.Key))
 	case directory.StateActive:
-		_, _ = fmt.Fprintf(out, "migration complete: %s is served entirely by %s\n", res.Key, res.Primary)
+		_, _ = fmt.Fprintf(out, "migration complete: %s is served entirely by %s\n", shown(res.Key), res.Primary)
 	}
 	if res.Warning != "" {
 		_, _ = fmt.Fprintf(out, "WARNING %s\n", res.Warning)

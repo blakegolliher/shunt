@@ -133,6 +133,10 @@ func References(f *File, cluster string) []string {
 // Key joins a tenant and bucket into the placement key.
 func Key(tenant, bucket string) string { return tenant + "/" + bucket }
 
+// DefaultTenant is the tenant of a client key that names none. A deployment with one team never
+// needs to mention tenants: its buckets are addressed by bare name (ADR-0010).
+const DefaultTenant = "default"
+
 // SplitKey splits a placement key.
 func SplitKey(k string) (tenant, bucket string, ok bool) {
 	tenant, bucket, ok = strings.Cut(k, "/")
