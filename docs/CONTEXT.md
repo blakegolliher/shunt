@@ -32,7 +32,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 
 | Item | Answer |
 |---|---|
-| Backend types in the first deployment (VAST / MinIO / AWS S3 / other) and how many of each | unknown (POC uses Garage + MinIO from test/e2e, plus the VAST lab endpoint below) |
+| Backend types in the first deployment (VAST / MinIO / AWS S3 / other) and how many of each | unknown (POC uses Garage + MinIO from test/e2e, plus two VAST clusters) |
 | AWS account and scratch bucket available for CI? env var names; region | unknown |
 | MinIO version and deployment shape (single node / distributed) for CI | `quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z`, single node, test/e2e/docker-compose.yml |
 | Postgres: managed (RDS etc.) or self-hosted (Patroni / CloudNativePG)? version; who runs HA | unknown (P3c) |
@@ -43,22 +43,22 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 
 | Item | Answer |
 |---|---|
-| VAST lab endpoint(s), scheme, port |  https://vast02.example.com:443 |
-| Scratch bucket name Claude Code may create/delete objects in | demo-dest |
+| VAST endpoint(s), scheme, port | operator-supplied (`VAST_ENDPOINT`); VAST serves S3 on https 443 and http 80 |
+| Scratch bucket name Claude Code may create/delete objects in | operator-supplied (`VAST_BUCKET`) |
 | Env var names holding access key / secret | VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY |
-| VAST version; virtual-host style domain configured? (which) | 5.x; no virtual-host domai |
-| Second cluster available for multi-cluster tests later? | https://vast03.example.com:443 |
+| VAST version; virtual-host style domain configured? (which) | 5.4 and 5.5; no virtual-host domain |
+| Second cluster available for multi-cluster tests later? | yes; VAST → VAST migration tested 2026-09-16 and 2026-09-17 (docs/STATUS.md) |
 | Garage / versitygw already installed locally? paths/ports | Garage `docker.io/dxflrs/garage:v2.3.0` via test/e2e compose only: S3 127.0.0.1:3900, admin 127.0.0.1:3903 (`/health` unauthenticated, other endpoints `/v2/*` with bearer token), region `garage`. No versitygw |
 
 ## Known VAST compatibility findings (pre-seed backend-compat.md)
 
 | Behavior | Known answer |
 |---|---|
-| Enforces `x-amz-content-sha256` mismatch? | yes, `400 XAmzContentSHA256Mismatch` (shunt probe, 2026-09-15, vast02) |
+| Enforces `x-amz-content-sha256` mismatch? | yes, `400 XAmzContentSHA256Mismatch` (shunt probe, 2026-09-15, VAST 5.4) |
 | Accepts `STREAMING-UNSIGNED-PAYLOAD-TRAILER`? | yes, and validates the trailer checksum (`400 BadDigest` on mismatch) |
 | Checksum headers honored (CRC32 / CRC32C / SHA1 / SHA256 / CRC64NVME) | all five validated (`400 BadDigest` on mismatch) |
 | `If-None-Match: *` on PUT? `If-Match` on PUT? | `If-None-Match: *` yes (412); `If-Match` **no**, a mismatched ETag is accepted |
-| Unsigned `GET /` returns (status)? | 200, empty `ListAllMyBucketsResult` owned by `Anonymous`. Also: the signing region is not enforced (a `nowhere-1` scope is accepted). TLS: self-signed factory cert (CN vms.example.com) that does not cover the endpoint name; POC-2 runs with verification disabled until a proper cert is installed. Full table: docs/reference/backend-compat.md |
+| Unsigned `GET /` returns (status)? | 200, empty `ListAllMyBucketsResult` owned by `Anonymous`. Also: the signing region is not enforced (a `nowhere-1` scope is accepted). TLS: self-signed factory cert that does not cover the endpoint name; POC-2 runs with verification disabled until a proper cert is installed. Full table: docs/reference/backend-compat.md |
 | GetObjectAttributes, HeadObject/GetObject `--part-number` known issues (Jira IDs) | unknown |
 | CORS, presigned URL, multipart edge cases already documented | unknown |
 

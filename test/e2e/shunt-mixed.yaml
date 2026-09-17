@@ -2,7 +2,7 @@
 # make run-mixed copies this file to test/e2e/data/shunt-mixed.yaml and resets
 # test/e2e/data/directory-mixed.yaml from directory-mixed.yaml with the Garage key filled in:
 # clusters are directory state since POC-5.
-# VAST joins this run only after `make check-tls-verify` passes (docs/STATUS.md).
+# VAST joins this run once `make check-tls-verify` passes (docs/STATUS.md); POC-5 has run on VAST over http.
 listener:
   address: "127.0.0.1:8443"
   domains: ["*.shunt.example.com"]

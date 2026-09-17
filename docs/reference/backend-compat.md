@@ -6,7 +6,7 @@ Probe run 2026-09-15 with shunt at POC-2.
 
 ## Summary
 
-| Check | Garage 2.3.0 | MinIO RELEASE.2025-07-23 | VAST 5.x (vast02) |
+| Check | Garage 2.3.0 | MinIO RELEASE.2025-07-23 | VAST 5.x |
 |---|---|---|---|
 | Rejects a wrong hex `x-amz-content-sha256` | yes, `400 InvalidDigest` | yes, `400 XAmzContentSHA256Mismatch` | yes, `400 XAmzContentSHA256Mismatch` |
 | Accepts `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | yes | yes | yes |
@@ -20,11 +20,11 @@ Probe run 2026-09-15 with shunt at POC-2.
 | `encoding-type=url` on a listing (DESIGN §2.5: the merge normalizes key encoding before comparing) | percent-encodes `/` in keys | **leaves keys verbatim** | not measured |
 | `x-amz-mp-parts-count` on a plain HEAD (DESIGN §2.5: the mover falls back to `GetObjectAttributes` or a `?partNumber=1` HEAD) | not sent | **not sent** (needs `partNumber`) | not measured |
 | `If-Match` on PUT | **no, mismatch accepted** | yes, 412 on mismatch | **no, mismatch accepted** |
-| `If-Match` on DELETE (`capabilities.conditional_delete`; probed 2026-09-16) | **no, a mismatch deletes (204)** | **no, a mismatch deletes (204)** | **yes, 412** (measured by `shunt expand` on vast02, VAST 5.4.6.0, 2026-09-17) |
-| `x-amz-version-id` on a PUT into an unversioned bucket (checked 2026-09-17) | **returns an id** (e.g. `792c5da2…`), and a GET with it works on Garage only | none (`VersionId: null`) | none (`VersionId: null`, vast01, VAST 5.5.0.1) |
+| `If-Match` on DELETE (`capabilities.conditional_delete`; probed 2026-09-16) | **no, a mismatch deletes (204)** | **no, a mismatch deletes (204)** | **yes, 412** (measured by `shunt expand`, VAST 5.4.6.0, 2026-09-17) |
+| `x-amz-version-id` on a PUT into an unversioned bucket (checked 2026-09-17) | **returns an id** (e.g. `792c5da2…`), and a GET with it works on Garage only | none (`VersionId: null`) | none (`VersionId: null`, VAST 5.5.0.1) |
 | Unsigned `GET /` | 403 | 403 | **200**, empty `ListAllMyBucketsResult` owned by `Anonymous` |
 | Enforces the signing region | yes (`garage`) | yes (`us-east-1`) | **no**: a signature scoped to `nowhere-1` is accepted |
-| TLS certificate | n/a, plaintext in e2e | n/a, plaintext in e2e | **self-signed factory certificate** (CN `vms.example.com`, SAN `*.example.com`), does not cover the endpoint name; probed and tested with verification disabled |
+| TLS certificate | n/a, plaintext in e2e | n/a, plaintext in e2e | **self-signed factory certificate**, does not cover the endpoint name; probed and tested with verification disabled |
 
 ## What shunt hides, and what it does not
 
@@ -34,7 +34,7 @@ shunt hides **which cluster serves a bucket and under which name**: bucket names
 
 - **Capability profile.** All three enforce the hex SHA-256 and accept and validate unsigned trailers, so `enforces_sha256: true` and `unsigned_trailer: true` (the defaults) are correct for all three. With these profiles shunt's ADR-0002 log-and-alert path is never reached on these backends; it stays for backends that fail the probe.
 - **Error codes differ by backend** for the same failure. shunt relays the backend's code unchanged in resign mode. Clients that match on `BadDigest` versus `XAmzContentChecksumMismatch` will see whatever the backend emits.
-- **Bad credentials, as each backend reports them (2026-09-16).** VAST and MinIO answer a wrong secret with `SignatureDoesNotMatch` and an unknown access key with `InvalidAccessKeyId`. Garage 2.3.0 answers `AccessDenied` for both, and names the fault in the message: `Forbidden: Invalid signature` or `Forbidden: No such key: <key>`. VAST answers `InvalidSecurity` to a valid key that isn't allowed the operation, CreateBucket in the lab. `s3.ClassifyCredentialError` reads all of these, and `shunt cluster add` and `shunt migrate run` use it to tell a credentials mistake from a permission denial.
+- **Bad credentials, as each backend reports them (2026-09-16).** VAST and MinIO answer a wrong secret with `SignatureDoesNotMatch` and an unknown access key with `InvalidAccessKeyId`. Garage 2.3.0 answers `AccessDenied` for both, and names the fault in the message: `Forbidden: Invalid signature` or `Forbidden: No such key: <key>`. VAST answers `InvalidSecurity` to a valid key that isn't allowed the operation, CreateBucket in the manual VAST runs. `s3.ClassifyCredentialError` reads all of these, and `shunt cluster add` and `shunt migrate run` use it to tell a credentials mistake from a permission denial.
 - **Conditional PUT and DELETE, in one place.** **Garage 2.3.0 ignores `If-None-Match: *` on PUT.** That is a fact about 2.3.0: re-run `make probe BACKEND=garage` after any Garage upgrade and update `capabilities.conditional_write`, because a later release may honor it. **Neither Garage 2.3.0 nor MinIO RELEASE.2025-07-23 honors `If-Match` on DELETE.** Both delete on a mismatch. The consequences are the lost-write window on migrations into Garage, which `shunt migrate start` refuses without `--accept-lost-write-window` (docs/migrating.md), and the mover's re-HEAD withdrawal on both backends (ADR-0004 races 1 and 2).
 - **Mover contract (docs/DESIGN.md §2.5, POC-4).** The mover prefers `If-None-Match: *` on PUT. Garage 2.3.0 ignores it, so a migration **into** Garage uses the HEAD-then-commit guard of ADR-0004 instead; MinIO and VAST honor it. The choice is made per cluster from `capabilities.conditional_write`, not from the backend's name. Neither Garage nor VAST honors `If-Match` on PUT; the mover does not use it.
 - **Listing key encoding is not portable (found by the POC-4 demo, 2026-09-15; a design rule in docs/DESIGN.md §2.5 since 2026-09-16).** With `encoding-type=url`, Garage 2.3.0 percent-encodes `/` in a key and MinIO returns it verbatim, so the same object arrives from the two clusters under two different spellings. A merged listing that compared them as strings reported every key twice. shunt now asks both sides for `encoding-type=url`, decodes the keys itself, merges the decoded names, and re-encodes on the way out according to what the **client** asked for (`internal/proxy/merge.go`). The one shape this cannot distinguish is a key that really contains a percent escape on a backend that ignores `encoding-type`; that is the backend's non-compliance, and shunt decodes it.
@@ -43,13 +43,13 @@ shunt hides **which cluster serves a bucket and under which name**: bucket names
 - **Version ids on unversioned buckets (2026-09-17).** Garage 2.3.0 returns an `x-amz-version-id` on every PUT, even into a bucket that was never versioned. MinIO and VAST return none. A client that stores that id and sends it on GET or DELETE works while the object lives on Garage. After a migration off Garage it fails, because the new backend answers `400 InvalidArgument: Invalid version id specified`. That's a 400, not a 404, so shunt does not fall back. warp's `mixed` benchmark does exactly this: 11,427 errors from ramp 0.5 onwards in the Garage → MinIO load test (docs/bench/poc5-load.md). Migrations between MinIO and VAST are unaffected. Hiding invented version ids, and falling back on this error during a move, are open design choices.
 - **Health checks (§2.8).** "Any HTTP response counts as alive" holds for all three. VAST answering 200 anonymously is not an error but means an unsigned `GET /` proves nothing about credentials.
 - **Region.** VAST accepts any scope region, so the cluster record's `region` only matters for backends that enforce it. The resign path signs with the cluster's configured region regardless (ADR-0001 amendment).
-- **TLS on VAST is TEMPORARY-insecure.** `tls.insecure_skip_verify: true` in `test/e2e/shunt-vast-resign.yaml`, `--insecure` on the probe, `-direct-insecure` on s3diff. Remove all three once the cluster has a certificate for `vast02.example.com` and set `tls.ca`.
+- **TLS on VAST is TEMPORARY-insecure.** `tls.insecure_skip_verify: true` in `test/e2e/shunt-vast-resign.yaml`, `--insecure` on the probe, `-direct-insecure` on s3diff. Remove all three once the cluster serves a certificate for its hostname, and set `tls.ca`.
 
 ## VAST specifics
 
 - **Signing region is not enforced.** A request signed for `nowhere-1` is accepted as readily as `us-east-1`. The cluster record's `region` is still what shunt signs with upstream.
 - **Unsigned `GET /` answers 200** with an empty `ListAllMyBucketsResult` owned by `Anonymous`, not 403. Health checks that treat any response as alive work; nothing about credentials can be inferred from it.
-- **TLS (checked 2026-09-15).** The cluster serves VAST's self-signed factory certificate: CN `vms.example.com`, SAN `*.example.com`, `vms.example.com`, and 33 IPs (10.0.0.3, 100.64.0.1–16, 100.64.1.1–16), valid to 2036. It covers neither `vast02.example.com` nor the address that name resolves to. A wildcard matches one label, so `*.example.com` cannot match it. The lab wildcard `*.lab.example.com` on the dev box would not match it either, and it expired 2026-09-02. Verification stays off until the cluster serves a certificate for its hostname.
+- **TLS (checked 2026-09-15).** The cluster serves VAST's self-signed factory certificate, which covers neither the cluster's hostname nor the address it resolves to. Verification stays off for https until the cluster serves a certificate for its hostname. Plain http on port 80 needs no certificate, and the POC-5 VAST → VAST runs used it.
 
 ## Raw probe output
 
@@ -99,7 +99,7 @@ MinIO   If-Match on DELETE                  NO (mismatch deleted the object, 204
 ### VAST (TLS verification disabled)
 
 ```
-endpoint                            https://vast02.example.com:443 (region us-east-1)
+endpoint                            https://vast.example.com:443 (region us-east-1)
 unsigned GET /                      200
 enforces x-amz-content-sha256       yes
 STREAMING-UNSIGNED-PAYLOAD-TRAILER  yes, checksum validated (400 BadDigest on mismatch)

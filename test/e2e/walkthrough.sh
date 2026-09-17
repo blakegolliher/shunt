@@ -15,7 +15,7 @@ set -euo pipefail
 
 SRC=; SRC_CREDS=; SRC_TYPE=vast; SRC_REGION=us-east-1; SRC_COND=true
 DST=; DST_CREDS=; DST_TYPE=vast; DST_REGION=us-east-1; DST_COND=true
-SRC_NAME=vast01; DST_NAME=vast02; TENANT=acme; BUCKET=data01
+SRC_NAME=vast01; DST_NAME=vast02; BUCKET=data01
 LISTEN=127.0.0.1:8008; ADMIN=127.0.0.1:9900; WINDOW=15s; OBJECTS=100; WORK=; RESET=0; KEEP=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +45,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 SHUNT=$ROOT/bin/shunt
 DST_BUCKET=$BUCKET-001
-KEY=$TENANT/$BUCKET
+KEY=$BUCKET   # the default tenant's bucket: the client key names no tenant (ADR-0010)
 [ -n "$WORK" ] || WORK=$(mktemp -d)
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
@@ -149,7 +149,6 @@ cat > "$WORK/credentials.yaml" <<EOF
 credentials:
   - access_key: $CLIENT_AK
     secret: $CLIENT_SK
-    tenant: $TENANT
 EOF
 chmod 600 "$WORK/credentials.yaml"
 printf 'version: 1\n' > "$WORK/directory.yaml"
@@ -224,7 +223,7 @@ checkpoint
 # ----------------------------------------------------------------------------------------------
 say "7. Ramp writes 50/50 by key hash"
 run "$SHUNT" ramp "$KEY" --ratio 0.5 || fail "ramp 0.5"
-hash=$(curl -fsS "$SHUNT_API/v1/placements/$KEY" | jq -r '.placement.ramp.hash')
+hash=$(curl -fsS "$SHUNT_API/v1/placements/default/$BUCKET" | jq -r '.placement.ramp.hash')
 [ "$hash" = fnv1a-fmix64-v1 ] || fail "the ramp does not record its hash (got $hash)"
 note "the ramp records the hash that splits its keys: ramp.hash $hash"
 
@@ -274,7 +273,7 @@ checkpoint
 say "10. Purge $BUCKET from $SRC_NAME and remove $SRC_NAME"
 run "$SHUNT" purge-source "$KEY" || fail "purge-source"
 refused "$SHUNT" cluster remove "$SRC_NAME"
-run "$SHUNT" tenant set-default "$TENANT" "$DST_NAME" || fail "tenant set-default"
+run "$SHUNT" tenant set-default "$DST_NAME" || fail "tenant set-default"
 run "$SHUNT" cluster remove "$SRC_NAME" || fail "cluster remove"
 run "$SHUNT" status "$KEY" || fail "status"
 if on_src s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then fail "$BUCKET still exists on $SRC_NAME"; fi

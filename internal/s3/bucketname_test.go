@@ -6,7 +6,7 @@ import (
 )
 
 func TestValidBucketName(t *testing.T) {
-	valid := []string{"abc", "my-bucket", "my.bucket", "a1b2c3", "e2e-a-3f9c-data", strings.Repeat("a", 63), "1bucket", "a-.b", "demo-dest"}
+	valid := []string{"abc", "my-bucket", "my.bucket", "a1b2c3", "e2e-a-3f9c-data", strings.Repeat("a", 63), "1bucket", "a-.b", "data01-001"}
 	invalid := []string{"", "ab", strings.Repeat("a", 64), "My-Bucket", "-bucket", "bucket-", "bucket.", ".bucket", "my..bucket",
 		"my_bucket", "192.168.5.4", "xn--bucket", "sthree-b", "amzn-s3-demo-x", "b-s3alias", "b--ol-s3", "b.mrap", "b--x-s3", "b--table-s3", "bu cket", "bücket"}
 	for _, n := range valid {

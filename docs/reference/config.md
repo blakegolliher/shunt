@@ -93,7 +93,7 @@ In resign mode clusters live in the directory file (above) and are added and rem
 | `endpoints` | list of host:port | No scheme in entries |
 | `endpoint` | host | dns mode |
 | `tls.ca` | path | Only with `scheme: https` |
-| `tls.insecure_skip_verify` | bool | Only with `scheme: https`. Disables upstream certificate verification; logged as a warning at startup. Temporary use only (the VAST lab cluster in POC-2, pending a valid certificate) |
+| `tls.insecure_skip_verify` | bool | Only with `scheme: https`. Disables upstream certificate verification; logged as a warning at startup. Temporary use only (a VAST cluster with its factory certificate in POC-2, pending a valid certificate) |
 | `credentials.access_key` | string | Required |
 | `credentials.secret_ref` | `env:NAME` / `file:/path` | Required; secrets are never inlined |
 | `storage_classes` | `native` / `emulated` | |

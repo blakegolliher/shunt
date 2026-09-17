@@ -142,8 +142,8 @@ PROPERTY_TIME    ?= 2m
 PROPERTY_TIMEOUT ?= 20m
 BACKEND      ?= garage
 MODE         ?= passthrough
-VAST_ENDPOINT ?= https://vast02.example.com:443
-VAST_BUCKET   ?= demo-dest
+VAST_ENDPOINT ?= https://vast.example.com:443
+VAST_BUCKET   ?= shunt-scratch
 ifeq ($(BACKEND),garage)
 S3_REGION := garage
 S3_ADDR   := 127.0.0.1:3900
@@ -159,7 +159,7 @@ S3_SK     := minioadmin
 S3_BACKEND_ARGS := -direct-addr $(S3_ADDR)
 PROBE_ARGS := --endpoint http://127.0.0.1:9000 --region us-east-1 --bucket probe-minio
 else ifeq ($(BACKEND),vast)
-# TEMPORARY -direct-insecure / --insecure: the VAST lab cluster serves a self-signed factory certificate.
+# TEMPORARY -direct-insecure / --insecure: a VAST cluster with its factory self-signed certificate does not cover its hostname.
 S3_REGION := us-east-1
 S3_AK     := $$VAST_ACCESS_KEY_ID
 S3_SK     := $$VAST_SECRET_ACCESS_KEY
@@ -212,10 +212,10 @@ walkthrough: build ## POC-5: the operator walkthrough, unattended, e2e Garage (a
 	  --dst http://127.0.0.1:9000 --dst-creds $(WALKTHROUGH_DIR)/minio.creds --dst-type minio --dst-region us-east-1 \
 	  --listen 127.0.0.1:8008 --admin 127.0.0.1:9908 $(WALKTHROUGH_ARGS)
 
-run-vast-resign: build ## run shunt in resign mode in front of the VAST lab cluster (foreground)
+run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster at VAST_ENDPOINT (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
 	cp $(E2E_DIR)/shunt-vast-resign.yaml $(E2E_DIR)/data/shunt-vast-resign.yaml
-	@sed "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" $(E2E_DIR)/directory-vast.yaml > $(E2E_DIR)/data/directory-vast.yaml
+	@sed -e "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" -e "s|VAST_HOSTPORT_SET_BY_ENV|$(patsubst https://%,%,$(VAST_ENDPOINT))|" -e "s/VAST_BUCKET_SET_BY_ENV/$(VAST_BUCKET)/g" $(E2E_DIR)/directory-vast.yaml > $(E2E_DIR)/data/directory-vast.yaml
 	$(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-vast-resign.yaml
 
 e2e-down: ## tear down the e2e backends and their data

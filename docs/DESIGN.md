@@ -621,13 +621,13 @@ The reference scenario: clients already use bucket `data01` on vast01 through `s
 | Step | Command | State after | What it checks |
 |---|---|---|---|
 | 1 | DNS TTL lowered; cert issued; shunt configured with cluster `vast01` and listener domain `s3.dc01.cooking.com` | — | `shunt doctor`: cert covers the domain and wildcard; vast01 reachable; clock skew |
-| 2 | `shunt adopt vast01 data01 --tenant acme --keys keys.yaml` | ACTIVE on vast01 | bucket exists; keys verified against vast01 with a signed HEAD |
+| 2 | `shunt adopt vast01 data01 --keys keys.yaml` | ACTIVE on vast01 | bucket exists; keys verified against vast01 with a signed HEAD |
 | 3 | DNS flip → shunt VIP | ACTIVE, traffic flowing through shunt | s3diff run through the new name; dashboards show vast01 only |
-| 4 | `shunt expand acme/data01 --to vast02` | ACTIVE, target recorded | vast02 probe ≥ vast01 profile; versioning off; `data01-001` created; canary write/read/delete |
-| 5 | `shunt ramp acme/data01 --ratio 0.05 --require-healthy` | RAMPING 0.05 | vast02 health green for the window; keys in range write to vast02, read vast02-then-vast01 |
+| 4 | `shunt expand data01 --to vast02` | ACTIVE, target recorded | vast02 probe ≥ vast01 profile; versioning off; `data01-001` created; canary write/read/delete |
+| 5 | `shunt ramp data01 --ratio 0.05 --require-healthy` | RAMPING 0.05 | vast02 health green for the window; keys in range write to vast02, read vast02-then-vast01 |
 | 6 | `--ratio 0.25`, `--ratio 1.0` as the hold policy allows | RAMPING → ratio 1 | target vs source error rate, p99, TTFB on the same op mix; hold on breach |
-| 7 | `shunt migrate start acme/data01` | MIGRATING | ratio is 1; the mover (`shunt migrate run`, test/mover until POC-5) copies vast01 → vast02 under the §2.5 contract |
-| 8 | `shunt cutover acme/data01` | CUTOVER → ACTIVE on vast02 | listing diff empty; fallback reads zero for the comfort window |
+| 7 | `shunt migrate start data01` | MIGRATING | ratio is 1; the mover (`shunt migrate run`, test/mover until POC-5) copies vast01 → vast02 under the §2.5 contract |
+| 8 | `shunt cutover data01` | CUTOVER → ACTIVE on vast02 | listing diff empty; fallback reads zero for the comfort window |
 
 Rollback at steps 2–3 is a DNS flip back. From step 5 on, rollback is a reconcile (target → source for the ramped key range), never just lowering the ratio.
 

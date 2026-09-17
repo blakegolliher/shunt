@@ -5,7 +5,7 @@ keep using it, and how to empty and retire a cluster entirely. Clients are not r
 restarted, and not told. They keep the same endpoint, the same credentials and the same bucket name
 throughout.
 
-For a first try, README.md walks the whole move with nothing but commands: `shunt serve --plaintext`, `shunt cluster add <name> http://<host> --access-key …` (prompts for the secret), and bare bucket names. The examples below use an explicit tenant (`acme/data`), which only matters when one shunt serves several; a bare `data` means the default tenant's bucket.
+For a first try, README.md walks the whole move with nothing but commands: `shunt serve --plaintext`, `shunt cluster add <name> http://<host> --access-key …` (prompts for the secret), and bare bucket names. The examples below use bare bucket names too. A bucket is named `tenant/bucket` only when one shunt serves several tenants (docs/reference/control-api.md).
 
 Everything below is one `shunt` binary. `shunt serve` runs the proxy. The other verbs call its control
 API on the admin listener (docs/reference/control-api.md; `--api`, default `http://127.0.0.1:9900`).
@@ -36,14 +36,14 @@ one is refused: a key that has already moved must not start being written on the
 shunt cluster add garage --type s3 --scheme http --region garage --endpoint 10.0.0.9:3900 \
   --access-key GK… --secret-ref file:/etc/shunt/garage.secret      # live; no restart
 shunt status                                  # clusters, what is moving, the write split, the mover
-shunt expand acme/data --to garage --create   # target bucket, versioning check, canary
-shunt ramp acme/data --ratio 0.01
-shunt ramp acme/data --ratio 0.25
-shunt ramp acme/data --ratio 1
-shunt migrate start acme/data                 # all writes on the new cluster; reads still fall back
-shunt migrate run acme/data --until-converged # copy until a pass copies nothing
-shunt cutover acme/data --window 60s          # stop reading the old cluster, once nothing falls back
-shunt purge-source acme/data                  # delete the old bucket; or `migrate finish` to keep it
+shunt expand data --to garage --create        # target bucket, versioning check, canary
+shunt ramp data --ratio 0.01
+shunt ramp data --ratio 0.25
+shunt ramp data --ratio 1
+shunt migrate start data                      # all writes on the new cluster; reads still fall back
+shunt migrate run data --until-converged      # copy until a pass copies nothing
+shunt cutover data --window 60s               # stop reading the old cluster, once nothing falls back
+shunt purge-source data                       # delete the old bucket; or `migrate finish` to keep it
 ```
 
 `shunt cluster add` checks the credentials before saving the cluster. It signs one request to the cluster with the access key you give and the secret `shunt serve` resolves, and refuses an unknown key or a secret that isn't that key's. `shunt migrate run` makes the same check before copying anything, using the secret *its own* process resolves. An `env:` secret_ref is read from each process's own environment, so a terminal holding a stale secret is caught at this point rather than partway through a copy.
@@ -83,11 +83,11 @@ it needs the same `env:` or `file:` secrets as the proxy. It reports each pass t
 what `shunt status` shows and what `cutover` checks.
 
 ```sh
-shunt migrate run acme/data --until-converged              # passes until one copies nothing (max --max-passes 10)
+shunt migrate run data --until-converged                   # passes until one copies nothing (max --max-passes 10)
 shunt migrate run --from minio                             # one pass over everything moving off minio
 shunt migrate run --from minio --accept-lost-write-window  # when the target lacks conditional PUT
-shunt migrate run acme/data --dry-run                      # list, do not copy
-shunt migrate run acme/data --cursor-dir /var/lib/shunt --ledger-dir /var/lib/shunt --ledger-bucket audit
+shunt migrate run data --dry-run                           # list, do not copy
+shunt migrate run data --cursor-dir /var/lib/shunt --ledger-dir /var/lib/shunt --ledger-bucket audit
 ```
 
 What it guarantees, and how (ADR-0004):
@@ -181,12 +181,12 @@ it.
 In `CUTOVER`, reads and listings use the new primary alone. Deletes still reach the source, so the
 source only ever loses keys. Then either:
 
-- `shunt purge-source acme/data`: refused unless the placement is in `CUTOVER` with recorded
+- `shunt purge-source data`: refused unless the placement is in `CUTOVER` with recorded
   evidence *and* a full listing of both buckets finds no source key that the primary lacks. It then
   aborts the source's in-progress multipart uploads, deletes every object and the bucket, and returns
   the placement to `ACTIVE` without a source. The refusal names the first 20 missing keys: run the
   mover again, or find out why they are missing, before retrying.
-- `shunt migrate finish acme/data`: returns to `ACTIVE` and leaves the source bucket untouched and
+- `shunt migrate finish data`: returns to `ACTIVE` and leaves the source bucket untouched and
   unreferenced, for you to keep or delete yourself.
 
 ## Removing a vendor entirely

@@ -46,10 +46,10 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
     {"name": "vast02", "type": "vast", "scheme": "http", "region": "us-east-1", "endpoints": ["10.0.0.2:80"],
      "access_key": "AKIA…", "secret_ref": "file:/etc/shunt/vast02.secret",
      "conditional_write": true, "conditional_delete": false,
-     "references": ["placements.acme/data01"]}
+     "references": ["placements.default/data01"]}
   ],
   "placements": [
-    {"key": "acme/data01", "state": "RAMPING", "primary": "vast02", "source": "vast01",
+    {"key": "default/data01", "state": "RAMPING", "primary": "vast02", "source": "vast01",
      "names": {"vast01": "data01", "vast02": "data01-001"}, "ratio": 0.5,
      "ramp_writes": {"primary": 4456, "source": 4353}, "fallback_reads": 37, "dual_deletes": {"both": 812},
      "mover": {"source": "vast01", "primary": "vast02", "pass": 2, "copied": 0, "skipped": 5210, "vanished": 3,
@@ -167,6 +167,6 @@ Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "vers
 `ramp`, `migrate`, `cutover` and `finish` return:
 
 ```json
-{"key": "acme/data01", "from": "RAMPING", "to": "MIGRATING", "version": 8, "primary": "vast02", "source": "vast01",
+{"key": "default/data01", "from": "RAMPING", "to": "MIGRATING", "version": 8, "primary": "vast02", "source": "vast01",
  "ratio": 1, "created_bucket": "", "warning": "", "cutover": null}
 ```

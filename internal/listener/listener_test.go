@@ -66,11 +66,11 @@ func TestSNISelection(t *testing.T) {
 	}
 	cases := map[string]string{
 		"b.shunt.example.com": "*.shunt.example.com",
-		"b.s3.example.net":           "*.s3.example.net",
-		"B.S3.EXAMPLE.NET":           "*.s3.example.net",
-		"special.example.org":        "special.example.org",
-		"other.example.org":          "*.shunt.example.com", // default
-		"":                           "*.shunt.example.com", // no SNI → default
+		"b.s3.example.net":    "*.s3.example.net",
+		"B.S3.EXAMPLE.NET":    "*.s3.example.net",
+		"special.example.org": "special.example.org",
+		"other.example.org":   "*.shunt.example.com", // default
+		"":                    "*.shunt.example.com", // no SNI → default
 	}
 	for name, want := range cases {
 		if got := cn(name); got != want {

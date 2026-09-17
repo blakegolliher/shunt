@@ -17,12 +17,12 @@ The scripts and the segment tool (`warp-segments.py`, `phase-latency.py`) are no
 
 ---
 
-## 1. VAST → VAST (vast01 → vast02): the result that counts
+## 1. VAST → VAST: the result that counts
 
 **Setup:**
-- **Clusters:** vast01 (VAST 5.5.0.1, `10.0.0.1:80`) → vast02 (VAST 5.4.6.0, `vast02.example.com:80`), over http.
+- **Clusters:** vast01 (VAST 5.5.0.1) → vast02 (VAST 5.4.6.0), both over http on port 80.
 - **Host:** shunt and warp on the dev box (AMD EPYC 7402P, 16 vCPUs, kernel 5.14.0-570.17.1.el9_6, go1.27.1).
-- **Load:** 16 clients, 1 MiB objects, 1,000 prepared, warp's default mix (45% GET, 30% STAT, 15% PUT, 10% DELETE), **rate-limited to 160 requests/s (96 MiB/s)** on the shared lab clusters. Uncapped, the same load reached 1.1–1.2 GiB/s direct to either cluster.
+- **Load:** 16 clients, 1 MiB objects, 1,000 prepared, warp's default mix (45% GET, 30% STAT, 15% PUT, 10% DELETE), **rate-limited to 160 requests/s (96 MiB/s)** because both clusters were shared with other work. Uncapped, the same load reached 1.1–1.2 GiB/s direct to either cluster.
 
 ### Errors: none
 

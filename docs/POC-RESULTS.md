@@ -1,6 +1,6 @@
 # POC results
 
-2026-09-16. The four claims of docs/POC.md, on Garage 2.3.0 and MinIO RELEASE.2025-07-23 (VAST 5.x where stated), with shunt, clients and backends on one host (docs/bench/poc1.md, "Disclosure"). **All four hold.** The `poc-3` and `poc-4` tags stay held until the VAST lab cluster serves a certificate for its hostname and VAST joins the mixed run and the demo.
+2026-09-16. The four claims of docs/POC.md, on Garage 2.3.0 and MinIO RELEASE.2025-07-23 (VAST 5.x where stated), with shunt, clients and backends on one host (docs/bench/poc1.md, "Disclosure"). **All four hold.** The POC-5 migration has also run VAST → VAST over http, by hand and under a warp load test, with 0 errors (docs/STATUS.md). The `poc-3` and `poc-4` tags stay held until a VAST cluster serves a certificate for its hostname, so the https runs can verify it.
 
 ## The claims, and the runs that proved them
 

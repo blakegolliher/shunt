@@ -18,7 +18,7 @@ Baseline: docs/bench/poc1.md (passthrough, same host, 2026-09-15). Resign runs: 
 | shunt → backend | plaintext HTTP/1.1, header-signed `UNSIGNED-PAYLOAD` |
 | Garage / MinIO | as in docs/bench/poc1.md |
 
-VAST is not benchmarked in POC-2: the lab cluster is across the network with TLS verification temporarily disabled, so its numbers would measure the network, not the proxy.
+VAST is not benchmarked in POC-2: the VAST cluster is across the network with TLS verification temporarily disabled, so its numbers would measure the network, not the proxy.
 
 ## Results: Garage 2.3.0, resign
 

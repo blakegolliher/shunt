@@ -1,12 +1,12 @@
 # Walkthrough: moving a bucket from vast01 to vast02, live
 
-**Start with README.md** for the same move with no config file and no tenant: `shunt serve --plaintext`, clusters added from a URL with a prompted secret, and bare bucket names (ADR-0010). This page is the scripted, multi-tenant form that `test/e2e/walkthrough.sh` checks, with an explicit tenant `acme`, `file:` secret refs, and `shunt verify` as the client.
+**Start with README.md** for the same move with no config file and no tenant: `shunt serve --plaintext`, clusters added from a URL with a prompted secret, and bare bucket names (ADR-0010). This page is the scripted form that `test/e2e/walkthrough.sh` checks, with a config file, `file:` secret refs, and `shunt verify` as the client. It uses the default tenant too: the client key names no tenant, and every command takes the bare bucket name.
 
 Ten steps, each a copy-paste block followed by the output to expect. Bucket `data01` starts on cluster `vast01` and ends on cluster `vast02` as `data01-001`. One shunt serves it throughout on `:8008`. A client keeps reading and writing through that shunt from step 4 to the end, with the same endpoint and bucket name, and never sees an error.
 
-`test/e2e/walkthrough.sh` runs these same steps unattended and asserts each one. `make walkthrough` runs it on the e2e Garage (playing vast01) and MinIO (playing vast02), and CI does the same. **The output below is transcribed from a green `make walkthrough` run on 2026-09-16.** Only the endpoints, cluster types, regions, keys and timestamps were changed to their VAST form. Counts vary from run to run.
+`test/e2e/walkthrough.sh` runs these same steps unattended and asserts each one. `make walkthrough` runs it on the e2e Garage (playing vast01) and MinIO (playing vast02), and CI does the same. **The output below is transcribed from a green `make walkthrough` run on 2026-09-17.** Only the endpoints, cluster types, regions, keys and timestamps were changed to their VAST form. Counts vary from run to run.
 
-**Not yet run on VAST.** The lab clusters in docs/CONTEXT.md (`vast02`, `vast03`) serve https on 443, and whether they also serve http is not known. Run `test/e2e/walkthrough.sh` against your two clusters first (the last section shows how).
+**Tested on VAST.** The same migration has run VAST → VAST over http, driven by hand through README.md's commands and inside a warp load test, with 0 errors (docs/STATUS.md, docs/bench/poc5-load.md). `test/e2e/walkthrough.sh` itself creates buckets, so run it against your clusters with keys allowed to (the last section shows how).
 
 Everything here is lab-grade on purpose. The client listener is plain http (`listener.plaintext: true`), and the debug route header is on. Neither belongs in production (docs/reference/config.md).
 
@@ -19,8 +19,8 @@ You need:
 - the two cluster addresses. Set them once:
 
 ```sh
-export VAST01=http://vast01.lab.example:80      # vast01's S3 VIP, http
-export VAST02=http://vast02.lab.example:80      # vast02's S3 VIP, http
+export VAST01=http://vast01.example.com:80      # vast01's S3 VIP, http
+export VAST02=http://vast02.example.com:80      # vast02's S3 VIP, http
 export SHUNT=http://127.0.0.1:8008              # where clients will reach shunt
 export SHUNT_API=http://127.0.0.1:9900          # shunt's admin listener; every operator verb uses it
 mkdir -p ~/shunt-lab && cd ~/shunt-lab && umask 077
@@ -38,7 +38,6 @@ cat > credentials.yaml <<EOF
 credentials:
   - access_key: $CLIENT_AK
     secret: $(cat client.secret)
-    tenant: acme
 EOF
 # aws-cli for this session: path-style addressing, and no default checksums on plain http
 printf '[default]\ns3 =\n  addressing_style = path\n' > aws.config
@@ -96,25 +95,25 @@ shunt.yaml: ok (auth resign; directory directory.yaml version 1: 0 clusters, 0 t
 ```sh
 shunt cluster add vast01 --type vast --scheme http --region us-east-1 --endpoint "${VAST01#http://}" \
   --access-key '<vast01 access key>' --secret-ref "file:$PWD/vast01.secret"
-shunt adopt vast01 acme/data01
-shunt status acme/data01
+shunt adopt vast01 data01
+shunt status data01
 ```
 
 Expected:
 
 ```
-cluster vast01: vast http://vast01.lab.example:80 region us-east-1 (conditional_write true, conditional_delete false)
-acme/data01: ACTIVE on vast01/data01
+cluster vast01: vast http://vast01.example.com:80 region us-east-1 (conditional_write true, conditional_delete false)
+data01: ACTIVE on vast01/data01
 directory version 3
 
 CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
-vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
+vast01   vast  http    vast01.example.com:80  true      the default cluster for new buckets, bucket data01
 
-BUCKET       STATE   RATIO  PRIMARY        SOURCE  WRITES P/S  FALLBACK READS  MOVER
-acme/data01  ACTIVE  -      vast01/data01  -       -           0               -
+BUCKET  STATE   RATIO  PRIMARY        SOURCE  WRITES P/S  FALLBACK READS  MOVER
+data01  ACTIVE  -      vast01/data01  -       -           0               -
 ```
 
-`adopt` checked that the bucket exists and was never versioned, created tenant `acme` with vast01 as its default, and wrote the placement. If you omit `--conditional-write`, it defaults to true, which VAST honors (docs/reference/backend-compat.md). `shunt probe` measures it.
+`adopt` checked that the bucket exists and was never versioned, made vast01 the default cluster for new buckets, and wrote the placement. The cluster's conditional-write and conditional-delete support is measured on the target by `expand` in step 6, unless you state it with `--conditional-write`/`--conditional-delete` (docs/reference/backend-compat.md).
 
 ## 3. Point a client at shunt, with the bucket name unchanged
 
@@ -167,42 +166,42 @@ Or skip this step and give `--create` to `shunt expand` in step 6.
 ```sh
 shunt cluster add vast02 --type vast --scheme http --region us-east-1 --endpoint "${VAST02#http://}" \
   --access-key '<vast02 access key>' --secret-ref "file:$PWD/vast02.secret"
-shunt expand acme/data01 --to vast02
+shunt expand data01 --to vast02
 kill -0 "$(cat shunt.pid)" && echo "same shunt process, no restart"
 ```
 
 Expected:
 
 ```
-cluster vast02: vast http://vast02.lab.example:80 region us-east-1 (conditional_write true, conditional_delete false)
-acme/data01: target vast02/data01-001 (exists); canary write, read, delete ok; conditional_write true, conditional_delete false (directory version 5)
+cluster vast02: vast http://vast02.example.com:80 region us-east-1 (conditional_write true, conditional_delete false)
+data01: target vast02/data01-001 (exists); canary write, read, delete ok; conditional_write true, conditional_delete true (measured; directory version 6)
 same shunt process, no restart
 ```
 
 Before the cluster was written to the directory, shunt built it and resolved its secret, so a typo in the secret path is refused here. `expand` did three things:
 - checked that `data01-001` exists and was never versioned;
 - wrote, read back and deleted a canary object there;
-- recorded vast02 as the bucket's target.
+- measured conditional PUT and DELETE on vast02, and recorded vast02 as the bucket's target.
 
 The name defaults to `<bucket>-NNN`, the lowest unused number.
 
 ## 7. Ramp writes 50/50 by key hash
 
 ```sh
-shunt ramp acme/data01 --ratio 0.5
+shunt ramp data01 --ratio 0.5
 ```
 
 Expected:
 
 ```
-acme/data01: ACTIVE -> RAMPING (directory version 6)
+data01: ACTIVE -> RAMPING (directory version 7)
 writes for 50% of keys now land on vast02; reads fall back to vast01
 ```
 
 The ramp records the hash that splits its keys. A shunt that doesn't implement that hash refuses the ramp's requests rather than splitting keys differently (ADR-0004):
 
 ```sh
-curl -s "$SHUNT_API/v1/placements/acme/data01" | jq -c .placement.ramp
+curl -s "$SHUNT_API/v1/placements/default/data01" | jq -c .placement.ramp
 ```
 
 ```
@@ -218,7 +217,7 @@ A short second verify run over 1,000 keys measures the split by itself:
 ```sh
 shunt verify --endpoint "$SHUNT" --bucket data01 --access-key "$CLIENT_AK" --secret-ref "file:$PWD/client.secret" \
   --debug-route --keys 1000 --duration 20s --cleanup
-shunt status acme/data01
+shunt status data01
 ```
 
 Expected:
@@ -226,22 +225,22 @@ Expected:
 ```
 verify: http://127.0.0.1:8008/data01, 8 workers over 1000 keys
 
-verify report: http://127.0.0.1:8008/data01 prefix verify/1789590296306112491/ seed 1789590296306112411
-  9027 operations in 24s: 3361 PUT, 3958 GET, 1708 DELETE
-  keys present at the end: 651, 646 read back after the workload stopped
+verify report: http://127.0.0.1:8008/data01 prefix verify/1789655639807397108/ seed 1789655639807396907
+  4729 operations in 29s: 1644 PUT, 2245 GET, 840 DELETE
+  keys present at the end: 609, 606 read back after the workload stopped
   errors: 0
-  writes by side: primary 1627 (48%), source 1734 (52%)
-  reads by side: primary 1213 (49%), source 1285 (51%)
-  writes by route: primary vast02 1627 (48%), source vast01 1734 (52%)
-  reads by route: primary vast02 1213 (49%), source vast01 1285 (51%)
-directory version 6
+  writes by side: primary 794 (48%), source 850 (52%)
+  reads by side: primary 620 (48%), source 685 (52%)
+  writes by route: primary vast02 794 (48%), source vast01 850 (52%)
+  reads by route: primary vast02 620 (48%), source vast01 685 (52%)
+directory version 7
 
 CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
-vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
-vast02   vast  http    vast02.lab.example:80  true      placements.acme/data01
+vast01   vast  http    vast01.example.com:80  true      the default cluster for new buckets, bucket data01
+vast02   vast  http    vast02.example.com:80  true      bucket data01
 
-BUCKET       STATE    RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
-acme/data01  RAMPING  0.50   vast02/data01-001  vast01/data01  4716/4439 (52%)  54              -
+BUCKET  STATE    RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
+data01  RAMPING  0.50   vast02/data01-001  vast01/data01  3209/2985 (52%)  36              -
 ```
 
 Reading the output:
@@ -253,7 +252,7 @@ Reading the output:
 Now send every write to vast02:
 
 ```sh
-shunt ramp acme/data01 --ratio 1.0
+shunt ramp data01 --ratio 1.0
 shunt verify --endpoint "$SHUNT" --bucket data01 --access-key "$CLIENT_AK" --secret-ref "file:$PWD/client.secret" \
   --debug-route --keys 1000 --duration 10s --cleanup
 ```
@@ -261,53 +260,53 @@ shunt verify --endpoint "$SHUNT" --bucket data01 --access-key "$CLIENT_AK" --sec
 Expected:
 
 ```
-acme/data01: RAMPING -> RAMPING (directory version 7)
+data01: RAMPING -> RAMPING (directory version 8)
 writes for 100% of keys now land on vast02; reads fall back to vast01
 …
   errors: 0
-  writes by side: primary 1469 (100%)
-  reads by side: primary 1198 (100%)
-  writes by route: primary vast02 1469 (100%)
-  reads by route: primary vast02 1198 (100%)
+  writes by side: primary 907 (100%)
+  reads by side: primary 773 (100%)
+  writes by route: primary vast02 907 (100%)
+  reads by route: primary vast02 773 (100%)
 ```
 
 ## 9. Move the rest with the mover, then cut over
 
 ```sh
-shunt migrate start acme/data01
-shunt purge-source acme/data01          # refused: not cut over yet
+shunt migrate start data01
+shunt purge-source data01               # refused: not cut over yet
 shunt cluster remove vast01             # refused: still in use
-shunt migrate run acme/data01 --until-converged --cursor-dir "$PWD" --ledger-dir "$PWD"
-shunt status acme/data01
-shunt cutover acme/data01 --window 60s
+shunt migrate run data01 --until-converged --cursor-dir "$PWD" --ledger-dir "$PWD"
+shunt status data01
+shunt cutover data01 --window 60s
 ```
 
 Expected:
 
 ```
-acme/data01: RAMPING -> MIGRATING (directory version 8)
-all writes now land on vast02; run `shunt migrate run acme/data01` to copy what is still on vast01
-shunt: refused: acme/data01 is MIGRATING; purge-source runs on a placement in CUTOVER
-shunt: refused: directory: cluster is still in use: cluster "vast01" is still referenced by tenants.acme.default_cluster, placements.acme/data01
-== acme/data01: vast01/data01 → vast02/data01-001 (If-None-Match guard, re-HEAD withdrawal)
+data01: RAMPING -> MIGRATING (directory version 9)
+all writes now land on vast02; run `shunt migrate run data01` to copy what is still on vast01
+shunt: refused: data01 is MIGRATING; purge-source runs on a placement in CUTOVER
+shunt: refused: directory: cluster is still in use: cluster "vast01" is still referenced by the default cluster for new buckets, bucket data01
+== data01: vast01/data01 → vast02/data01-001 (If-None-Match guard, re-HEAD withdrawal)
    pass 1
-   100 copied, 0 already there, 0 vanished, 0 failed, 1.5 MiB
+   100 copied, 0 already there, 0 vanished, 0 failed, 1.6 MiB
    pass 2
    0 copied, 100 already there, 0 vanished, 0 failed, 0 B
    converged: the last pass copied nothing
 
-mover: 100 copied, 100 already on the target, 0 vanished mid-copy, 0 failed, 1.5 MiB moved
-directory version 8
+mover: 100 copied, 100 already on the target, 0 vanished mid-copy, 0 failed, 1.6 MiB moved
+directory version 9
 
 CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
-vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
-vast02   vast  http    vast02.lab.example:80  true      placements.acme/data01
+vast01   vast  http    vast01.example.com:80  true      the default cluster for new buckets, bucket data01
+vast02   vast  http    vast02.example.com:80  true      bucket data01
 
-BUCKET       STATE      RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
-acme/data01  MIGRATING  -      vast02/data01-001  vast01/data01  9324/4447 (68%)  109             pass 2: 0 copied, 100 already there, 0 failed, converged
-acme/data01: waiting 1m0s for fallback reads to stay flat
-acme/data01: MIGRATING -> CUTOVER (directory version 9)
-vast01 is no longer read; `shunt purge-source acme/data01` deletes it once you are satisfied
+BUCKET  STATE      RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
+data01  MIGRATING  -      vast02/data01-001  vast01/data01  6573/2988 (69%)  85              pass 2: 0 copied, 100 already there, 0 failed, converged
+data01: waiting 1m0s for fallback reads to stay flat
+data01: MIGRATING -> CUTOVER (directory version 10)
+vast01 is no longer read; `shunt purge-source data01` deletes it once you are satisfied
 ```
 
 What each command did:
@@ -320,11 +319,11 @@ The script uses a 15s window. Use one that covers how often your clients read ol
 ## 10. Purge `data01` from vast01, and remove vast01
 
 ```sh
-shunt purge-source acme/data01
-shunt cluster remove vast01             # refused: acme still creates new buckets on vast01
-shunt tenant set-default acme vast02
+shunt purge-source data01
+shunt cluster remove vast01             # refused: new buckets still land on vast01
+shunt tenant set-default vast02
 shunt cluster remove vast01
-shunt status acme/data01
+shunt status data01
 as_vast01 s3api head-bucket --bucket data01 || echo "data01 is gone from vast01"
 rm -rf readback && as_client s3 cp --recursive --quiet s3://data01/seed/ readback/ && diff -r seed readback && echo "seed objects identical, now served from vast02"
 ```
@@ -332,17 +331,17 @@ rm -rf readback && as_client s3 cp --recursive --quiet s3://data01/seed/ readbac
 Expected:
 
 ```
-acme/data01: listing diff empty; deleted 100 objects and aborted 0 uploads from vast01/data01, deleted the bucket; ACTIVE on its primary (directory version 10)
-shunt: refused: directory: cluster is still in use: cluster "vast01" is still referenced by tenants.acme.default_cluster
-acme: new buckets now land on vast02 (directory version 11)
+data01: listing diff empty; deleted 100 objects and aborted 0 uploads from vast01/data01, deleted the bucket; ACTIVE on its primary (directory version 11)
+shunt: refused: directory: cluster is still in use: cluster "vast01" is still referenced by the default cluster for new buckets
+New buckets now land on vast02 (directory version 12)
 cluster vast01 removed; shunt no longer holds a connection to it
-directory version 12
+directory version 13
 
 CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
-vast02   vast  http    vast02.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
+vast02   vast  http    vast02.example.com:80  true      the default cluster for new buckets, bucket data01
 
-BUCKET       STATE   RATIO  PRIMARY            SOURCE  WRITES P/S       FALLBACK READS  MOVER
-acme/data01  ACTIVE  -      vast02/data01-001  -       9324/4447 (68%)  109             -
+BUCKET  STATE   RATIO  PRIMARY            SOURCE  WRITES P/S       FALLBACK READS  MOVER
+data01  ACTIVE  -      vast02/data01-001  -       6573/2988 (69%)  85              -
 
 An error occurred (404) when calling the HeadBucket operation: Not Found
 data01 is gone from vast01
@@ -360,14 +359,14 @@ kill -INT "$(cat verify.pid)"; sleep 2; sed -n '/^verify report/,$p' verify.log
 Expected:
 
 ```
-verify report: http://127.0.0.1:8008/data01 prefix verify/1789590291655124264/ seed 1789590291655124163
-  43733 operations in 87s: 17406 PUT, 17711 GET, 8616 DELETE
-  keys present at the end: 133, 129 read back after the workload stopped
+verify report: http://127.0.0.1:8008/data01 prefix verify/1789655634239839728/ seed 1789655634239839557
+  33135 operations in 119s: 13190 PUT, 13316 GET, 6629 DELETE
+  keys present at the end: 138, 134 read back after the workload stopped
   errors: 0
-  writes by side: primary 14695 (84%), source 2711 (16%)
-  reads by side: primary 9983 (84%), source 1904 (16%)
-  writes by route: primary vast01 1981 (11%), primary vast02 12714 (73%), source vast01 2711 (16%)
-  reads by route: primary vast01 1207 (10%), primary vast02 8776 (74%), source vast01 1904 (16%)
+  writes by side: primary 11053 (84%), source 2137 (16%)
+  reads by side: primary 7221 (83%), source 1465 (17%)
+  writes by route: primary vast01 1286 (10%), primary vast02 9767 (74%), source vast01 2137 (16%)
+  reads by route: primary vast01 721 (8%), primary vast02 6500 (75%), source vast01 1465 (17%)
 ```
 
 **`errors: 0`** is the claim: every write and every read succeeded, wherever the object lived at that moment. `verify` exits non-zero on any error. In the routes, `primary vast01` is before the ramp, `source vast01` is keys still on vast01 during the move, and `primary vast02` is after.
@@ -400,4 +399,4 @@ The script:
 | `cutover`: has not converged / no mover has reported | the mover's last pass copied something, or shunt restarted | `shunt migrate run … --until-converged` again |
 | `cutover`: reads still fall back | a client read an object only vast01 has during the window | run the mover again, then retry |
 | `purge-source`: keys on the source the primary lacks | the diff is not empty (it lists up to 20 keys) | run the mover while still in MIGRATING, or investigate those keys |
-| `cluster remove`: still referenced by … | a placement or tenant default still names it | finish or purge those placements; `shunt tenant set-default` |
+| `cluster remove`: still referenced by … | a placement or tenant default still names it | finish or purge those placements; `shunt tenant set-default <cluster>` |

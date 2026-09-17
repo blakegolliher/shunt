@@ -1,6 +1,6 @@
 # STATUS
 
-Current phase: **POC-5 (operator walkthrough) built and green on Garage → MinIO; POC-3, POC-4 and POC-5 untagged.** The tags wait on one thing: `make check-tls-verify` must pass, which needs a VAST certificate covering its hostname (carried gap below). VAST joins the mixed s3diff run and the VAST → MinIO demo at that point, and only then are `poc-3` and `poc-4` tagged.
+Current phase: **POC-5 (operator walkthrough) done, and tested on VAST.** A bucket has moved VAST → VAST over http by hand, and inside a 15-minute warp load test, with 0 client errors (below, and docs/bench/poc5-load.md); `make walkthrough` is green on Garage → MinIO. **POC-3, POC-4 and POC-5 are untagged.** The tags wait on one thing: `make check-tls-verify` must pass, which needs a VAST cluster serving a certificate for its hostname (carried gap below). VAST then joins the https mixed s3diff run and the VAST → MinIO demo, and `poc-3` and `poc-4` are tagged.
 
 ## POC track
 
@@ -9,9 +9,9 @@ Current phase: **POC-5 (operator walkthrough) built and green on Garage → MinI
 | POC-0 | `make all` green on clean checkout; `check-config` rejects every invalid sample naming the key; `make e2e-up` leaves Garage and MinIO healthy | done 2026-09-14 |
 | POC-1 | s3diff clean on Garage and MinIO (passthrough); unauthorized 5 GiB PUT fails before body bytes; mid-GET backend kill never a silent short read; bench in docs/bench/poc1.md | done 2026-09-15 |
 | POC-2 | s3diff clean across signing modes on every backend or a documented gap each; secret-leak test green; fuzz 30s clean; resign overhead in docs/bench/poc2.md | done 2026-09-15, tagged `poc-2` with carried gaps |
-| POC-3 | mixed-backend s3diff clean; same bucket name under two tenants isolated; ListBuckets spans clusters; no backend name leaks; uploadId round-trip | gate met on Garage + MinIO 2026-09-15; **tag held until the TLS gate passes and VAST joins the run** |
-| POC-4 | demo.sh green Garage → MinIO and VAST → MinIO/AWS; property test green; docs/bench/poc4.md | gate met on Garage ↔ MinIO 2026-09-15; **VAST → MinIO held behind the same TLS gate** |
-| POC-5 | the ten-step walkthrough runs from copy-paste commands with `shunt verify` at 0 errors throughout; `make walkthrough` green on Garage → MinIO and in CI; docs/walkthrough.md for VAST → VAST | `make walkthrough` green locally 2026-09-16; **CI job added, not yet run (no push); VAST → VAST documented, not run** |
+| POC-3 | mixed-backend s3diff clean; same bucket name under two tenants isolated; ListBuckets spans clusters; no backend name leaks; uploadId round-trip | gate met on Garage + MinIO 2026-09-15; VAST probed and s3diff'd on its own (POC-2); **tag held until the TLS gate passes and VAST joins the mixed https run** |
+| POC-4 | demo.sh green Garage → MinIO and VAST → MinIO/AWS; property test green; docs/bench/poc4.md | gate met on Garage ↔ MinIO 2026-09-15; the migration mechanics have since run VAST → VAST over http (POC-5); **VAST → MinIO demo.sh held behind the same TLS gate** |
+| POC-5 | the ten-step walkthrough runs from copy-paste commands with `shunt verify` at 0 errors throughout; `make walkthrough` green on Garage → MinIO and in CI; docs/walkthrough.md for VAST → VAST | `make walkthrough` green locally 2026-09-16; **VAST → VAST run by hand (2026-09-16) and under warp load (2026-09-17), 0 client errors**; CI job added, not yet run |
 
 After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order at P0's skipped items (docs/POC.md "After the POC").
 
@@ -116,7 +116,7 @@ Refusals observed live as designed: `purge-source` in `MIGRATING`, `cluster remo
 
 The whole demo was run inside a 15-minute `warp mixed` benchmark, 16 clients, through shunt.
 
-**VAST vast01 → vast02** (rate-capped at 160 requests/s, 96 MiB/s, on the shared lab):
+**VAST → VAST** (VAST 5.5 → VAST 5.4 over http, rate-capped at 160 requests/s, 96 MiB/s):
 - **Errors:** 0 in 144,016 requests.
 - **Demo steps:** every one succeeded on its first attempt.
 - **Latency:** shunt adds about **1.5–2.5 ms at p50 and 3 ms at p99** on GET, STAT and DELETE, and nothing measurable on PUT.
@@ -141,17 +141,17 @@ After the two manual VAST runs, the lab path became all commands:
 - **`shunt expand` measures conditional PUT and DELETE** on the target when the cluster doesn't state them.
 - **A client key without a tenant belongs to the default tenant,** whose buckets every verb takes by bare name. The CLI never shows the default tenant.
 
-README.md is that demo, rehearsed as written on Garage → MinIO: 52 objects read back with 0 mismatches throughout, then cutover, purge and cluster removal. `test/e2e/walkthrough.sh` still runs the explicit multi-tenant form.
+README.md is that demo, rehearsed as written on Garage → MinIO: 52 objects read back with 0 mismatches throughout, then cutover, purge and cluster removal. `test/e2e/walkthrough.sh` and docs/walkthrough.md use the default tenant as well (re-run green 2026-09-17).
 
 ## POC-5 by hand on VAST (2026-09-16)
 
-An operator ran the migration by hand on two lab VAST clusters over http, using only `shunt` and aws-cli commands. The source was vast01 (`10.0.0.1:80`, bucket `demo-source`), the target vast02 (bucket `demo-dest`), and shunt ran on the operator's host on `:8008`. Neither lab key could create buckets, so both buckets already existed and were emptied first.
+An operator ran the migration by hand between two VAST clusters over http, using only `shunt` and aws-cli commands. The source was vast01 (VAST 5.5), the target vast02 (VAST 5.4), and shunt ran on the operator's host on `:8008`. Neither key could create buckets, so both buckets already existed and were emptied first. A later run repeated it with the ADR-0010 commands (no config file, no tenant), with the same result.
 
 | Plan step | Result |
 |---|---|
 | 2 files straight to vast01; shunt started empty; `cluster add` + `adopt` | both read back byte for byte through shunt |
 | 10 more through shunt | all 12 on vast01 |
-| `cluster add vast02` live + `expand --name demo-dest` | canary write/read/delete ok, no restart |
+| `cluster add vast02` live + `expand` onto the existing target bucket | canary write/read/delete ok, no restart |
 | `ramp --ratio 0.5`; 20 more | 13 on vast02 and 7 on vast01, exactly the hash's prediction; all 32 read back |
 | `ramp --ratio 1.0`; 20 more | all 20 on vast02; all 52 read back from both clusters |
 | reader loop (a full `aws s3 cp --recursive` and byte compare every ~4 s) through `migrate start`, `migrate run --until-converged`, `cutover --window 60s`, `purge-source`, `tenant set-default`, `cluster remove` | 98+ passes, **0 mismatches, 0 failed requests**; the mover copied 19, then 0; the cutover window held with the reader running; purge found an empty diff and deleted vast01's bucket |
@@ -197,14 +197,14 @@ The one failure was operator-side, and the product made it hard to see. The move
   - `Makefile`, `-direct-insecure` in the `BACKEND=vast` s3diff and bench arguments
   - `Makefile`, `--insecure` in the `BACKEND=vast` probe arguments
 
-  **Blocker: the lab certificate.** VAST serves its factory certificate, CN `vms.example.com`, whose SAN is `*.example.com`, `vms.example.com`, and 33 IP addresses. A wildcard matches exactly one label, so `*.example.com` cannot match the four-label host `vast02.example.com`, and the host's address (10.0.0.2 on 2026-09-15) is not in the IP list. The lab wildcard on the dev box (`/path/to/lab-wildcard.crt`, `*.lab.example.com`) covers only one label below `lab.example.com` and expired 2026-09-02. The fix is a certificate whose SAN includes `vast02.example.com` or `*.vast02.example.com`, then `tls.ca` if it is not publicly issued.
+  **Blocker: the certificate.** VAST serves its self-signed factory certificate, whose names cover neither the cluster's S3 hostname nor its address (a wildcard matches exactly one label). The fix is a certificate whose SAN includes the S3 hostname, then `tls.ca` if it is not publicly issued. Plain http needs none, which is how POC-5 ran on VAST.
 
   **This is the POC-3 exit condition.** `make check-tls-verify` fails while any committed config or make target disables verification and prints each location; `make all` warns on every run until it passes. When it passes: add the VAST cluster to `test/e2e/shunt-mixed.yaml` and a placement to `test/e2e/directory-mixed.yaml`, re-run `make probe BACKEND=vast` and `make s3diff-mixed` with verification on, then tag `poc-3`.
 - **Copying from a bucket that is mid-migration is refused with 501.** Its objects are split across two clusters and the backend doing the copy can read only one of them. It clears as soon as the bucket is `CUTOVER`.
 - **Cutover evidence is per proxy.** `shunt cutover` reads the fallback-read counter of the proxy that serves the API, and the mover's progress is held in that proxy's memory (lost on restart; run the mover again). With several proxies, hold the window on each or check the fleet's `shunt_migration_fallback_reads_total` first; P4 aggregates it.
 - **The AWS SDK ships in `bin/shunt`** for `shunt migrate run` (ADR-0009). P5 moves the mover to a separate `shunt-mover` binary and the SDK leaves `bin/shunt` with it.
 - **P3c replaces the file directory behind the same API.** `shunt-control` serves `/v1/` from Postgres; the CLI verbs, docs/walkthrough.md and walkthrough.sh do not change. Until then the directory file must be writable by `shunt serve` for every operator verb, not only CreateBucket.
-- **VAST → VAST has run by hand, not by script.** The lab clusters serve http on 80 (see "POC-5 by hand on VAST"). `test/e2e/walkthrough.sh` has not run against them, because it needs keys allowed to create buckets. docs/walkthrough.md's output is still transcribed from the Garage → MinIO run with VAST names.
+- **On VAST, `test/e2e/walkthrough.sh` has not run.** The migration has (by hand and under load, above), but the script creates buckets and the keys used could not. docs/walkthrough.md's output is still transcribed from the Garage → MinIO run with VAST names.
 - **The CI walkthrough job has not run yet**: it was added without a push.
 - **Versioned buckets cannot be migrated at all** (DESIGN §9 item 4): entering `RAMPING` or `MIGRATING` is refused if either side has ever had versioning enabled, and the check fails closed.
 - **Copying between clusters is refused with 501** (ADR-0006, DESIGN §9 item 14). A client copying between two of its own buckets whose placements name different clusters gets a hard failure, because the backend cannot read the other cluster. A later phase decides whether shunt streams the copy itself.

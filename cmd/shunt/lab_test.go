@@ -26,10 +26,10 @@ func runIn(t *testing.T, stdin string, args ...string) (stdout, stderr string, e
 
 func TestParseClusterURL(t *testing.T) {
 	for in, want := range map[string][2]string{
-		"http://10.0.1.10":                               {"http", "10.0.1.10:80"},
-		"https://s3.example.net":                         {"https", "s3.example.net:443"},
-		"http://vast02.example.com:80": {"http", "vast02.example.com:80"},
-		"http://[fd00::1]:9000/":                         {"http", "[fd00::1]:9000"},
+		"http://10.0.1.10":                {"http", "10.0.1.10:80"},
+		"https://s3.example.net":          {"https", "s3.example.net:443"},
+		"http://s3.vast01.example.com:80": {"http", "s3.vast01.example.com:80"},
+		"http://[fd00::1]:9000/":          {"http", "[fd00::1]:9000"},
 	} {
 		scheme, hp, err := parseClusterURL(in)
 		if err != nil || scheme != want[0] || hp != want[1] {

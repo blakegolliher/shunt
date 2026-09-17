@@ -211,7 +211,7 @@ set-state demo               CUTOVER   -> ACTIVE
 - **The copy was manual.** POC-4 adds the mover, with `If-None-Match: *` so a client write is never overwritten, a resumable cursor, and a ledger.
 - **The bucket had to be quiet.** Dual writes during RAMPING, fallback reads during MIGRATING, and the listing merge are POC-4. Until then, migrate only what nobody is writing.
 - **Load is not spread within a bucket.** A bucket lives on one cluster. Spreading here means buckets across clusters; within a cluster it is round-robin across that cluster's endpoints, which this lab cannot show since each backend has one.
-- **VAST is not in this run.** It joins when `make check-tls-verify` passes; see docs/STATUS.md.
+- **VAST is not in this run.** It joins the https run when `make check-tls-verify` passes; the migration itself has run on VAST over http (docs/STATUS.md).
 
 ## Reset
 

@@ -113,7 +113,7 @@ X-Shunt-Debug: 1; listener.plaintext for labs, warned on every banner line; docs
 test/e2e/walkthrough.sh (verify from step 4 to 10, failing on any error), green on Garage → MinIO in CI; STATUS.md.
 ```
 
-Acceptance: `make walkthrough` green with verify at 0 errors and the ratio-0.5 split within 40–60%; the walkthrough job in CI; docs/walkthrough.md transcribed from a real run. VAST → VAST is documented, not yet run.
+Acceptance: `make walkthrough` green with verify at 0 errors and the ratio-0.5 split within 40–60%; the walkthrough job in CI; docs/walkthrough.md transcribed from a real run. VAST → VAST has since run over http: by hand, and under a warp load test (docs/STATUS.md, docs/bench/poc5-load.md).
 
 ---
 
