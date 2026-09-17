@@ -43,13 +43,13 @@ Every command answers `--help`. A bucket is named bare (`demo-source`). `tenant/
 
 ## Demo: move a live bucket between two clusters, by hand
 
-This is the demo as it was run by hand on two lab VAST clusters. A bucket starts on cluster **A**. Clients reach it through shunt. Half the writes, then all of them, move to cluster **B**. The mover copies what's left, shunt cuts over and deletes the old copy, and cluster A is dropped. A reader loop checks every object byte for byte throughout.
+A bucket starts on cluster **A**. Clients reach it through shunt, **with the key cluster A already gave them**. Half the writes, then all of them, move to cluster **B**. The mover copies what's left, shunt cuts over and deletes the old copy, cluster A is dropped, and shunt hands the clients to cluster B and gets out of the way. A reader loop checks every object byte for byte throughout.
 
-Every step is a command: no config file to write, nothing to edit.
+Every step is a command: no config file to write, nothing to edit. The transcripts below come from a run of exactly these commands; the same sequence has also been run by hand between two VAST clusters.
 
 **You need:**
 - **Two S3 clusters,** with an access key and secret key for each.
-- **An empty bucket on each:** `demo-source` on A and `demo-dest` on B. If your keys can create buckets, `aws s3 mb` does it; otherwise ask an admin.
+- **An empty bucket named `demo-source` on each.** The same name on both is what lets shunt hand the clients back at the end (step 14); S3 cannot rename a bucket. If your keys can create buckets, `aws s3 mb` does it; otherwise ask an admin.
 - **aws-cli.**
 - **Plain http.** Everything below runs over http, fine for a lab; see [docs/reference/config.md](docs/reference/config.md) for TLS.
 
@@ -82,24 +82,17 @@ shunt: created a client key SHUNT3F0C… in …/shunt-data/credentials.yaml; `sh
 ### Step 2: point aws-cli at the clusters and at shunt (T2, once)
 
 ```sh
-shunt client show                      # the access_key and secret your S3 client uses with shunt
-aws configure --profile shunt          # paste those two; region us-east-1; output format blank
-aws configure set endpoint_url http://127.0.0.1:8008 --profile shunt
-
 aws configure --profile clustera       # cluster A's access key and secret key; region us-east-1
 aws configure set endpoint_url http://A-HOST --profile clustera
 aws configure --profile clusterb       # cluster B's keys
 aws configure set endpoint_url http://B-HOST --profile clusterb
-for p in shunt clustera clusterb; do aws configure set s3.addressing_style path --profile $p; done
+for p in clustera clusterb; do aws configure set s3.addressing_style path --profile $p; done
 
 aws --profile clustera s3 ls s3://demo-source/ --summarize
-aws --profile clusterb s3 ls s3://demo-dest/ --summarize
+aws --profile clusterb s3 ls s3://demo-source/ --summarize
 ```
 
-- **`shunt`** is the client, and talks only to shunt.
-- **`clustera`** and **`clusterb`** talk to the clusters directly, to check where objects really are.
-
-Both listings should end in `Total Objects: 0`.
+**`clustera`** and **`clusterb`** talk to the clusters directly, to check where objects really are. The client profile comes in step 4, once shunt holds cluster A's key. Both listings should end in `Total Objects: 0`.
 
 ### Step 3: two files straight to cluster A (T2)
 
@@ -111,19 +104,42 @@ aws --profile clustera s3 ls s3://demo-source/demo/
 
 Expect `file-01` and `file-02`, each 1048576 bytes. Every file is also kept in `files/`, so later reads can be compared byte for byte.
 
-### Step 4: put shunt in front of the bucket (T2)
+### Step 4: put shunt in front of the bucket, with your clients' own key (T2)
 
 ```sh
 shunt cluster add clustera http://A-HOST --access-key A_ACCESS_KEY      # prompts for A's secret key
-shunt adopt clustera demo-source
+
+umask 077; cat > client-keys.yaml <<EOF                                # the key your clients already use
+credentials:
+  - access_key: A_ACCESS_KEY
+    secret: A_SECRET_KEY
+EOF
+shunt adopt clustera demo-source --keys client-keys.yaml
+
+shunt client show                      # shows the key shunt generated for itself at startup
+shunt client remove SHUNT…             # that key; your clients' key is the only one left
+
+aws configure --profile shunt          # cluster A's key and secret again; region us-east-1
+aws configure set endpoint_url http://127.0.0.1:8008 --profile shunt
+aws configure set s3.addressing_style path --profile shunt
 aws --profile shunt s3 ls s3://demo-source/demo/
 ```
 
-- **`cluster add`** takes the cluster's URL and access key, and asks for the secret key. Before it saves anything, it signs a request with that pair and refuses a wrong secret. It reads the cluster type from the cluster itself and keeps the secret in `shunt-data/secrets/`.
-- **`adopt`** serves the existing bucket through shunt under the same name.
-- **The listing** comes through shunt and shows the same two files.
+```
+cluster clustera: s3 http://A-HOST region us-east-1 (conditional_write true, conditional_delete false)
+client key A_ACCESS_KEY imported: clustera accepts it, and shunt now verifies clients with it
+demo-source: ACTIVE on clustera/demo-source
+client key SHUNT… removed; 1 key(s) left for these clients
+2026-09-17 10:59:55    1048576 file-01
+2026-09-17 10:59:56    1048576 file-02
+```
 
-T1 logs `cluster added` and `bucket adopted`.
+- **`cluster add`** takes the cluster's URL and access key, and asks for the secret key. Before it saves anything, it signs a request with that pair and refuses a wrong secret. It reads the cluster type from the cluster itself and keeps the secret in `shunt-data/secrets/`.
+- **`adopt --keys`** serves the existing bucket under the same name, **and imports the client keys cluster A already issued**. shunt checks each one against the cluster before storing it, and from then on verifies client signatures with it. So your clients keep the credentials they have: nothing on their side changes when shunt appears, and nothing changes when it leaves (step 14).
+- **`client remove`** drops the key shunt generated for itself at startup. Nothing uses it, and a key no cluster knows would block the handover at the end.
+- **The listing** comes through shunt, with cluster A's own key, and shows the same two files.
+
+T1 logs `cluster added`, `client key imported`, `bucket adopted` and `client key removed`.
 
 ### Step 5: ten more, through shunt (T2)
 
@@ -138,17 +154,29 @@ Expect `12`: all on cluster A, the only cluster so far.
 
 ```sh
 shunt cluster add clusterb http://B-HOST --access-key B_ACCESS_KEY      # prompts for B's secret key
-shunt expand demo-source --to clusterb --name demo-dest
+shunt expand demo-source --to clusterb --name demo-source
 shunt status demo-source
 ```
 
+```
+cluster clusterb: minio http://B-HOST region us-east-1 (conditional_write true, conditional_delete false)
+demo-source: target clusterb/demo-source (exists); canary write, read, delete ok; conditional_write true, conditional_delete false (measured; directory version 6)
+
+CLUSTER   TYPE   SCHEME  ENDPOINTS  COND.PUT  USED BY
+clustera  s3     http    A-HOST     true      the default cluster for new buckets, bucket demo-source
+clusterb  minio  http    B-HOST     true      bucket demo-source
+
+BUCKET       STATE   RATIO  PRIMARY               SOURCE                         WRITES P/S  FALLBACK READS  MOVER
+demo-source  ACTIVE  -      clustera/demo-source  (target clusterb/demo-source)  -           0               -
+```
+
 `expand` does four things:
-- checks that `demo-dest` exists on B;
+- checks that the bucket exists on B;
 - checks that it was never versioned;
 - writes, reads back and deletes a canary object;
 - measures whether B honours conditional writes, which the mover relies on.
 
-It then records `demo-dest` as the target. Clients see no change yet. The status shows both clusters, and `(target clusterb/demo-dest)`. `expand` also notes that on cluster B the bucket is `demo-dest`, not `demo-source`: that is the name clients would have to use if you ever take shunt out of the path (step 14). `--name demo-source` avoids it.
+It then records B as the target. Clients see no change yet. **`--name demo-source` keeps the name clients use.** Without it the bucket on B would be `demo-source-001`, which is fine while shunt is in front and is the one thing that cannot be undone later: a bucket cannot be renamed, so clients going direct would have to use that name (step 14). `expand` says so when the names differ.
 
 ### Step 7: send 50% of writes to cluster B (T2)
 
@@ -168,7 +196,7 @@ check() { rm -rf readback && mkdir readback && aws --profile shunt s3 cp --recur
   echo "read $(ls readback | wc -l), mismatched $bad"; }
 check
 for i in $(seq 13 32); do head -c 1048576 /dev/urandom > files/file-$i; aws --profile shunt s3 cp --quiet files/file-$i s3://demo-source/demo/file-$i; done
-echo "A: $(aws --profile clustera s3 ls s3://demo-source/demo/ | wc -l)  B: $(aws --profile clusterb s3 ls s3://demo-dest/demo/ | wc -l)"
+echo "A: $(aws --profile clustera s3 ls s3://demo-source/demo/ | wc -l)  B: $(aws --profile clusterb s3 ls s3://demo-source/demo/ | wc -l)"
 check
 shunt status demo-source
 ```
@@ -182,7 +210,7 @@ The 20 new files split by a hash of their names, **not exactly 10/10**. With the
 ```sh
 shunt ramp demo-source --ratio 1.0
 for i in $(seq 33 52); do head -c 1048576 /dev/urandom > files/file-$i; aws --profile shunt s3 cp --quiet files/file-$i s3://demo-source/demo/file-$i; done
-echo "A: $(aws --profile clustera s3 ls s3://demo-source/demo/ | wc -l)  B: $(aws --profile clusterb s3 ls s3://demo-dest/demo/ | wc -l)"
+echo "A: $(aws --profile clustera s3 ls s3://demo-source/demo/ | wc -l)  B: $(aws --profile clusterb s3 ls s3://demo-source/demo/ | wc -l)"
 check
 ```
 
@@ -216,7 +244,7 @@ What each command does:
 
 ```sh
 shunt purge-source demo-source
-aws --profile clusterb s3 ls s3://demo-dest/demo/ | wc -l
+aws --profile clusterb s3 ls s3://demo-source/demo/ | wc -l
 aws --profile clustera s3 ls s3://demo-source/
 ```
 
@@ -236,24 +264,60 @@ shunt status
 
 `cluster remove` is refused while anything still points at cluster A, and the refusal lists what does. That's why `set-default` comes first. `status` then lists only `clusterb`, and T3 keeps printing `mismatched 0`.
 
-Stop T3, then T1, with Ctrl-C. To start again from scratch, delete `shunt-data/`.
+Stop T3 with Ctrl-C. Leave shunt running for the last step.
 
-### Step 14: leave, when you want to (T2)
+### Step 14: hand the clients back and stop shunt (T2)
 
-shunt is not a one-way door. When a bucket has arrived on its cluster, `shunt step-out` checks, against the cluster itself, whether your clients could go straight to it:
+shunt is not a one-way door. `shunt step-out` asks cluster B whether your clients could talk to it directly, and changes nothing:
 
 ```sh
 shunt step-out
 ```
 
-It reads, and changes nothing. It is happy when every bucket is `ACTIVE` on one cluster **under the name your clients use**, nothing is mid-upload, and every client key shunt holds is one the cluster accepts on every bucket. Then it prints the three steps it can't do for you: point your S3 name at the cluster, wait out the DNS TTL, stop shunt. Until you stop it, pointing the name back is the undo.
+```
+step-out check for your clients: every bucket is on clusterb (http://B-HOST)
+  ok      bucket demo-source: ACTIVE on clusterb under the same name, no uploads in progress
+  BLOCKED client key A_ACCESS_KEY: clusterb does not know this access key: clients going direct would need keys clusterb issues, or shunt should hold clusterb's own keys from the start (docs/migrating.md)
 
-In this demo the check refuses, and says why: the client key is shunt's own, and cluster B's bucket is `demo-dest`, not `demo-source`. Both are choices made earlier:
+1 problem blocks stepping out. Fix them and run shunt step-out again.
+shunt: not ready to step out; nothing was changed
+```
 
-- **Keys.** Instead of the generated key, import the ones the cluster already issued: `shunt adopt clustera demo-source --keys keys.yaml` (a file of `access_key` and `secret` entries), then `shunt client remove <the generated key>`. Clients then use the credentials they already had, through shunt and afterwards.
-- **Names.** `shunt expand demo-source --to clusterb --name demo-source` keeps the name clients use.
+The bucket is fine: it kept its name (step 6). The key is not, and that is the one real cost of moving between clusters with separate credentials — cluster B never issued cluster A's key. Import B's key, drop A's, and point the client profile at the new key:
 
-Do both and step-out passes, so shunt can hand the clients back with nothing to change on their side. See [docs/migrating.md](docs/migrating.md).
+```sh
+shunt client add B_ACCESS_KEY --check clusterb     # prompts for B's secret key
+shunt client remove A_ACCESS_KEY
+aws configure --profile shunt                      # cluster B's key and secret now
+shunt step-out
+```
+
+```
+client key B_ACCESS_KEY imported: clusterb accepts it, and shunt now verifies clients with it
+client key A_ACCESS_KEY removed; 1 key(s) left for these clients
+
+step-out check for your clients: every bucket is on clusterb (http://B-HOST)
+  ok      bucket demo-source: ACTIVE on clusterb under the same name, no uploads in progress
+  ok      client key B_ACCESS_KEY: clusterb accepts it and it reaches every bucket
+
+READY: clients can use clusterb directly, with the keys and bucket names they use now. To step out:
+  1. Point the S3 name your clients use at clusterb (B-HOST) instead of shunt: its DNS records (lower the TTL a day ahead) or the VIP.
+  2. Wait out the TTL and watch shunt_requests_total on shunt's admin listener stop rising.
+  3. Stop shunt. Until then, pointing the name back at shunt undoes the step-out: nothing in shunt changed.
+```
+
+In a real deployment step 1 is a DNS change, and clients never notice. Here, do it by hand: stop shunt in T1 with Ctrl-C, point the client profile straight at cluster B, and read everything one more time.
+
+```sh
+aws configure set endpoint_url http://B-HOST --profile shunt
+check
+```
+
+```
+read 52, mismatched 0
+```
+
+All 52 files, the two written before shunt existed included, read back byte for byte from cluster B with no shunt in the path and the bucket name clients started with. If cluster B can be given the same key pair as A, even the key change goes away and clients notice nothing at all. To start again from scratch, delete `shunt-data/`.
 
 ### When something goes wrong
 
@@ -261,6 +325,7 @@ Do both and step-out passes, so shunt can hand the clients back with nothing to 
 |---|---|
 | `refused: … the secret key you entered is not the secret of access key …` | Re-run `shunt cluster add` with the right secret |
 | `refused: … does not know access key …` | The access key is wrong, or belongs to the other cluster |
+| `refused: … does not know this access key` on `adopt --keys` or `client add` | That client key is not one this cluster issued. Nothing was imported or adopted |
 | `refused: … cannot reach cluster …` | The URL is wrong, or the cluster isn't reachable from this host |
 | `refused: … still referenced by the default cluster for new buckets` | Run `shunt tenant set-default <cluster>` first |
 | `refused: … ignores If-None-Match: * on PUT` on `migrate start` | Cluster B can't refuse an overwrite, so the mover could clobber a client write. VAST and MinIO don't hit this. Read [docs/migrating.md](docs/migrating.md), then add `--accept-lost-write-window` to both `migrate start` and `migrate run` if you accept that |

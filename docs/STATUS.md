@@ -141,7 +141,7 @@ After the two manual VAST runs, the lab path became all commands:
 - **`shunt expand` measures conditional PUT and DELETE** on the target when the cluster doesn't state them.
 - **A client key without a tenant belongs to the default tenant,** whose buckets every verb takes by bare name. The CLI never shows the default tenant.
 
-README.md is that demo, rehearsed as written on Garage → MinIO: 52 objects read back with 0 mismatches throughout, then cutover, purge and cluster removal. `test/e2e/walkthrough.sh` and docs/walkthrough.md use the default tenant as well (re-run green 2026-09-17).
+README.md is that demo, rehearsed as written on Garage → MinIO: the clients hold cluster A's own key (`adopt --keys`, ADR-0012), 52 objects read back with 0 mismatches throughout, then cutover, purge, cluster removal, and a step-out that hands the clients to cluster B and stops shunt — the last 52 reads go straight to the cluster, same bucket name. `test/e2e/walkthrough.sh` and docs/walkthrough.md use the default tenant as well (re-run green 2026-09-17).
 
 ## POC-5 by hand on VAST (2026-09-16)
 
