@@ -53,7 +53,12 @@ up front rather than showing up later as a slow trickle of 404s. `--name` overri
 backend name, `<name>-NNN`. You can also skip `expand` and pass `--to`/`--create` to the first `ramp`
 or `migrate start`.
 
-**Conditional writes keep working.** A client using `If-None-Match: *` (create once) or `If-Match`
+**Copies and renames keep working.** A copy whose source is on the other cluster — including the
+copy-then-delete that S3A and Hadoop call a rename — is made by shunt itself, streaming, since no
+backend can see both sides (ADR-0014). A multipart source keeps its part layout, so its ETag shape
+survives; an object over 5 GiB has to be copied with a multipart copy.
+
+**Conditional writes keep working. A client using `If-None-Match: *` (create once) or `If-Match`
 (update if current) gets S3's answer throughout the move: shunt checks the other cluster before the
 write, since half the bucket lives there (ADR-0013). If neither cluster can be reached for that
 check the write is refused with 503 rather than answered from one side.

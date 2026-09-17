@@ -66,6 +66,37 @@ type fakeS3 struct {
 	before        func(*http.Request)  // called before a request is served, without the lock; set it under the lock
 	deleteStatus  int                  // > 0: every object DELETE fails with this status
 	mtime         map[string]time.Time // bucket/key -> when the object was last written
+	layout        map[string][][]byte  // bucket/key -> the parts it was written as, for a multipart object
+}
+
+// etagAt is the ETag the fake serves for one object: a multipart object carries the "-N" suffix S3
+// gives it, so a copy that keeps the part layout keeps the ETag's shape.
+func (f *fakeS3) etagAt(bucket, key string, data []byte) string {
+	if parts := f.layout[bucket+"/"+key]; len(parts) > 1 {
+		return fmt.Sprintf(`%s-%d"`, strings.TrimSuffix(etagOf(data), `"`), len(parts))
+	}
+	return etagOf(data)
+}
+
+// putMultipart seeds an object that was written as several parts, as a client's multipart upload
+// leaves it.
+func (f *fakeS3) putMultipart(t testing.TB, bucket, key string, parts [][]byte) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.buckets[bucket] == nil {
+		t.Fatalf("no bucket %s", bucket)
+	}
+	f.buckets[bucket][key] = bytes.Join(parts, nil)
+	f.layout[bucket+"/"+key] = parts
+	f.mtime[bucket+"/"+key] = time.Now()
+}
+
+// partsOf is the part layout the fake holds for an object, for a test to compare across clusters.
+func (f *fakeS3) partsOf(bucket, key string) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.layout[bucket+"/"+key]
 }
 
 // etagOf is the fake's ETag for an object: the hex MD5 of its bytes, quoted, as S3 gives a
@@ -115,7 +146,7 @@ func (s *statusWriter) Write(p []byte) (int, error) {
 
 func newFakeS3(t testing.TB, name, ak, secret string, buckets ...string) *fakeS3 {
 	f := &fakeS3{name: name, ak: ak, secret: secret, t: t, buckets: map[string]map[string][]byte{}, uploads: map[string]string{},
-		parts: map[string][][]byte{}, foreign: map[string]bool{}, deny: map[string]bool{}, mtime: map[string]time.Time{}}
+		parts: map[string][][]byte{}, foreign: map[string]bool{}, deny: map[string]bool{}, mtime: map[string]time.Time{}, layout: map[string][][]byte{}}
 	for _, b := range buckets {
 		f.buckets[b] = map[string][]byte{}
 	}
@@ -197,6 +228,29 @@ func (f *fakeS3) fail(w http.ResponseWriter, r *http.Request, status int, code, 
 	}
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<Error><Code>%s</Code><Message>%s for %s at %s</Message><Key>%s</Key><BucketName>%s</BucketName><Resource>%s</Resource><RequestId>R</RequestId><HostId>%s</HostId></Error>`,
 		code, code, bucket, r.Host, esc(key), bucket, esc(resource), f.name)
+}
+
+// parseTestRange reads "bytes=a-b" for the fake's ranged reads.
+func parseTestRange(rng string, size int) (first, last int, ok bool) {
+	spec, found := strings.CutPrefix(strings.TrimSpace(rng), "bytes=")
+	if !found {
+		return 0, 0, false
+	}
+	a, b, sep := strings.Cut(spec, "-")
+	first, err := strconv.Atoi(strings.TrimSpace(a))
+	if err != nil || first >= size {
+		return 0, 0, false
+	}
+	last = size - 1
+	if sep && strings.TrimSpace(b) != "" {
+		if last, err = strconv.Atoi(strings.TrimSpace(b)); err != nil {
+			return 0, 0, false
+		}
+	}
+	if last >= size {
+		last = size - 1
+	}
+	return first, last, last >= first
 }
 
 func esc(s string) string {
@@ -401,9 +455,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `<ListPartsResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId><Part><PartNumber>1</PartNumber></Part></ListPartsResult>`, bucket, esc(key), id)
 		case http.MethodPost:
 			objs[key] = bytes.Join(f.parts[id], nil)
+			f.layout[bucket+"/"+key] = f.parts[id]
 			f.wrote(bucket, key)
 			delete(f.uploads, id)
-			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<CompleteMultipartUploadResult><Location>http://%s/%s/%s</Location><Bucket>%s</Bucket><Key>%s</Key><ETag>"mp"</ETag></CompleteMultipartUploadResult>`, r.Host, bucket, esc(key), bucket, esc(key))
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<CompleteMultipartUploadResult><Location>http://%s/%s/%s</Location><Bucket>%s</Bucket><Key>%s</Key><ETag>%s</ETag></CompleteMultipartUploadResult>`,
+				r.Host, bucket, esc(key), bucket, esc(key), esc(f.etagAt(bucket, key, objs[key])))
 		case http.MethodDelete:
 			delete(f.uploads, id)
 			w.WriteHeader(http.StatusNoContent)
@@ -436,6 +492,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		objs[key] = body
+		delete(f.layout, bucket+"/"+key) // a plain PUT replaces a multipart object with one part
 		f.wrote(bucket, key)
 		w.Header().Set("ETag", etagOf(body))
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
@@ -444,9 +501,42 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.fail(w, r, 404, "NoSuchKey", bucket, key)
 			return
 		}
-		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-		w.Header().Set("ETag", etagOf(data))
+		parts := f.layout[bucket+"/"+key]
+		etag := f.etagAt(bucket, key, data)
+		// Read conditions, as a backend evaluates them against the copy it holds.
+		if im := r.Header.Get("If-Match"); im != "" && !etagMatches(im, etag) {
+			f.fail(w, r, 412, "PreconditionFailed", bucket, key)
+			return
+		}
+		if inm := r.Header.Get("If-None-Match"); inm != "" && etagMatches(inm, etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
 		w.Header().Set("Last-Modified", f.mtime[bucket+"/"+key].UTC().Format(http.TimeFormat))
+		if len(parts) > 1 {
+			w.Header().Set("X-Amz-Mp-Parts-Count", fmt.Sprint(len(parts)))
+		}
+		// A request for one part of a multipart object answers that part alone, as S3 does.
+		if n := q.Get("partNumber"); n != "" && len(parts) > 0 {
+			i, err := strconv.Atoi(n)
+			if err != nil || i < 1 || i > len(parts) {
+				f.fail(w, r, 416, "InvalidPartNumber", bucket, key)
+				return
+			}
+			data = parts[i-1]
+		}
+		if rng := r.Header.Get("Range"); rng != "" {
+			if a, b, ok := parseTestRange(rng, len(data)); ok {
+				data = data[a : b+1]
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, len(objs[key])))
+				w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data)
+				return
+			}
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 		_, _ = w.Write(data)
 	case r.Method == http.MethodDelete && f.deleteStatus > 0:
 		f.fail(w, r, f.deleteStatus, "ServiceUnavailable", bucket, key)
@@ -1032,9 +1122,9 @@ func TestCopySourceAndRefusedOps(t *testing.T) {
 		status                  int
 		code                    string
 	}{
-		{"PUT", "/data/x", "old/k", 501, "NotImplemented"}, // source on another cluster (carried gap)
-		{"PUT", "/data/x", "logs/k", 404, "NoSuchBucket"},  // another tenant's bucket
-		{"PUT", "/data/x", "nope/k", 404, "NoSuchBucket"},  // no such bucket
+		{"PUT", "/data/x", "old/missing", 404, "NoSuchKey"}, // a cross-cluster copy of an object that is not there
+		{"PUT", "/data/x", "logs/k", 404, "NoSuchBucket"},   // another tenant's bucket
+		{"PUT", "/data/x", "nope/k", 404, "NoSuchBucket"},   // no such bucket
 		{"PUT", "/data/x", "justabucket", 400, "InvalidArgument"},
 		{"GET", "/data?logging", "", 501, "NotImplemented"},
 		{"PUT", "/data?replication", "", 501, "NotImplemented"},
@@ -1053,8 +1143,10 @@ func TestCopySourceAndRefusedOps(t *testing.T) {
 			t.Errorf("%s %s (copy %q): %d %s", c.method, c.target, c.copySrc, r.StatusCode, r.body)
 		}
 	}
-	if m.upstreamCalls() != before {
-		t.Fatal("refused requests reached a backend")
+	// Only the cross-cluster copy above reaches a backend at all: one HEAD of the source cluster,
+	// which answers NoSuchKey (a copy shunt streams is tested in crosscopy_test.go).
+	if n := m.upstreamCalls() - before; n != 1 {
+		t.Fatalf("refused requests reached a backend %d times", n)
 	}
 	// Bucket policy passes through unrewritten (amendment 3).
 	r = m.acme(t, "GET", "/data?policy", nil)

@@ -57,7 +57,7 @@ func (h *Handler) conditionalWrite(ctx context.Context, r *http.Request, o *outc
 	if class != migrate.ClassWrite || !hasWritePrecondition(r.Header) {
 		return condAction{}, "", ""
 	}
-	if info.Op != s3.OpPutObject && info.Op != s3.OpCompleteMultipartUpload {
+	if info.Op != s3.OpPutObject && info.Op != s3.OpCompleteMultipartUpload && info.Op != s3.OpCopyObject {
 		return condAction{}, "", "" // no other op carries these preconditions on the object
 	}
 	// The placement's other cluster, when the bucket is mid-migration: the key may be there instead.

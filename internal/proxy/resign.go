@@ -162,9 +162,15 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 
 	copySource := ""
 	if v := r.Header.Get("X-Amz-Copy-Source"); v != "" {
-		cs, code, msg := rewriteCopySource(v, o.tenant, id.Credential, snap, cl.Name)
-		if code != "" {
+		cs, plan, code, msg := h.resolveCopySource(v, o.tenant, id.Credential, snap, clusters, cl)
+		switch {
+		case code != "":
 			h.answer(w, r, o, code, msg)
+			return nil, false
+		case plan != nil:
+			// The source is on another cluster, or on a bucket whose objects are split across two:
+			// no backend can do this copy, so shunt streams it (ADR-0014).
+			h.streamCopy(ctx, w, r, o, plan, cl, backend, cond)
 			return nil, false
 		}
 		copySource = cs
@@ -312,40 +318,4 @@ func rewriteUploadIDs(raw string) (query, cluster string, conflict bool) {
 		return raw, "", false
 	}
 	return strings.Join(parts, "&"), prefix, false
-}
-
-// rewriteCopySource resolves x-amz-copy-source ("[/]bucket/key[?versionId=…]") through the
-// directory. A source on another cluster cannot be copied by the backend: 501 until a later phase
-// decides whether shunt streams the copy (docs/STATUS.md carried gap).
-func rewriteCopySource(v, tenant string, cred sigv4.Credential, snap *directory.Snapshot, cluster string) (source string, code s3.Code, message string) {
-	lead, s := "", v
-	if strings.HasPrefix(s, "/") {
-		lead, s = "/", s[1:]
-	}
-	seg, rest, sep := s, "", "/"
-	if i := strings.IndexByte(s, '/'); i >= 0 {
-		seg, rest = s[:i], s[i+1:]
-	} else if i := strings.Index(strings.ToUpper(s), "%2F"); i >= 0 {
-		seg, rest, sep = s[:i], s[i+3:], s[i:i+3]
-	} else {
-		return "", s3.InvalidArgument, "x-amz-copy-source must name a bucket and a key."
-	}
-	bucket, err := url.PathUnescape(seg)
-	if err != nil {
-		return "", s3.InvalidArgument, "x-amz-copy-source is not valid."
-	}
-	sp, ok := snap.Lookup(tenant, bucket)
-	if !ok || !allowed(cred, bucket) {
-		return "", s3.NoSuchBucket, "The source bucket does not exist."
-	}
-	// A bucket mid-migration holds its objects on two clusters, and the backend doing the copy can
-	// only read one of them, so the copy is refused rather than answered with a confusing NoSuchKey
-	// for whichever objects have not moved yet (docs/DESIGN.md §9).
-	if sp.State == directory.StateRamping || sp.State == directory.StateMigrating {
-		return "", s3.NotImplemented, "Copying from a bucket that is being migrated is not supported yet."
-	}
-	if sp.Primary != cluster || sp.Names[cluster] == "" {
-		return "", s3.NotImplemented, "Copying between buckets on different clusters is not supported yet."
-	}
-	return lead + sp.Names[cluster] + sep + rest, "", ""
 }

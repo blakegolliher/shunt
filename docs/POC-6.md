@@ -13,7 +13,7 @@ cutover relies on.
 | # | Item | State |
 |---|---|---|
 | 1 | Conditional PUT across the ramp | **done** on this branch: ADR-0013, `internal/proxy/conditional.go`, property-test clients |
-| 2 | Cross-cluster CopyObject | not started; today 501 (`internal/proxy/resign.go:331`) |
+| 2 | Cross-cluster CopyObject | **done** on this branch: ADR-0014, `internal/proxy/crosscopy.go`, live on Garage → MinIO |
 | 3 | Version fence across proxies | not started; cutover evidence is per proxy (STATUS carried gap) |
 | 4 | Cutover refuses in-progress multipart uploads | not started; `cutover` checks state, convergence, fallback reads only |
 | 5 | Capability profiles measured vs assumed | partial: `expand` measures and reports `measured`, but provenance is not stored, `cluster add` does not probe, and nothing refuses an assumed profile |
@@ -36,27 +36,23 @@ The property test's guarded variant had a target that ignored the header while i
 support, and 5,682 client-visible violations followed in two minutes. A wrong profile is a
 correctness bug, not a tuning mistake.
 
-## Item 2 — cross-cluster CopyObject
+## Item 2 — cross-cluster CopyObject (done, ADR-0014)
 
-**Today:** `CopyObject` whose source resolves to another cluster answers 501, and so does any copy
-from a bucket that is mid-migration. S3A's rename (copy, then delete) therefore fails during a ramp,
-which is the common Hadoop/Spark commit path.
+shunt makes the copy itself whenever no backend can see both sides: another cluster, or a source
+bucket whose objects are split by a migration. It streams, keeps a multipart source's part layout,
+evaluates the copy-source conditions on the cluster that holds the source, and applies ADR-0013 to
+conditions on the destination. `UploadPartCopy` crosses clusters the same way.
 
-**Design sketch.** shunt streams the copy itself when the two sides resolve to different clusters:
-`GET` from the source cluster, `PUT` to the destination, one pooled buffer, no spooling to disk (a
-body buffer needs an ADR and a benchmark, CLAUDE.md). The mover's rules apply unchanged: the
-conditional guard of ADR-0004 so a client write is never overwritten, and the part layout of a
-multipart source reproduced, or the ETag change accepted and reported. Metadata (`x-amz-metadata-
-directive`, content type, tagging, storage class) follows the client's directive.
-
-**Open questions:** the size ceiling before shunt refuses rather than streams for minutes; whether a
-copy larger than some threshold should be answered with a multipart copy driven by shunt; how
-`x-amz-copy-source-if-*` is evaluated when the source is on the other cluster (ADR-0013's rule,
-applied to the source side); and what a failure halfway leaves behind (nothing, by construction:
-the destination write is one PUT).
-
-**Test:** S3A-style rename during a ramp — copy then delete, with the source and destination hashing
-to different sides — plus a multipart-source copy that keeps its part layout.
+The open questions, as answered:
+- **Size ceiling:** a single object over 5 GiB is refused with `EntityTooLarge`, because one PUT
+  cannot carry it; a multipart source of any size is copied part by part, so the ceiling only bites
+  an object that is genuinely one 5 GiB+ part.
+- **shunt-driven multipart above a threshold:** not needed. A multipart source already goes part by
+  part, and clients use `UploadPartCopy` for large copies, which now works.
+- **Halfway failure:** a streamed copy is one PUT and leaves nothing; a part-by-part copy aborts its
+  own upload on the destination.
+- **Tags are not carried** across a cross-cluster copy (`x-amz-tagging-directive`), written down in
+  ADR-0014 rather than left to be discovered.
 
 ## Item 3 — version fence across proxies
 

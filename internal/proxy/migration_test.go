@@ -352,18 +352,25 @@ func TestMergedListingNormalisesKeyEncodingAcrossBackends(t *testing.T) {
 	}
 }
 
-// A CopyObject whose source bucket is mid-migration is refused: the backend doing the copy can read
-// only its own cluster, and half the objects may still be on the other one.
-func TestCopyFromAMigratingBucketIsRefused(t *testing.T) {
+// A CopyObject whose source bucket is mid-migration used to be refused: no backend can read the
+// half of the bucket that is on the other cluster. shunt streams it instead (ADR-0014).
+func TestCopyFromAMigratingBucketIsStreamed(t *testing.T) {
 	m := newMixedRig(t, nil)
 	m.acme(t, "PUT", "/data/original", []byte("bytes"))
-	ramp(t, m, directory.Transition{To: directory.StateMigrating})
+	target := ramp(t, m, directory.Transition{To: directory.StateMigrating})
 
 	r := m.send(t, "PUT", "/data/copy", "", nil, acmeAK, acmeSK, map[string]string{"X-Amz-Copy-Source": "/data/original"})
-	if r.StatusCode != 501 || !strings.Contains(string(r.body), "being migrated") {
+	if r.StatusCode != 200 {
 		t.Fatalf("copy from a migrating bucket: %d %s", r.StatusCode, r.body)
 	}
-	m.noLeak(t, "refused copy", r)
+	// The source object is still only on the source cluster; the copy lands on the new primary.
+	if b, _ := m.minio.object(target, "copy"); string(b) != "bytes" {
+		t.Fatalf("the copy did not land on the primary: %q", b)
+	}
+	if b, _ := m.garage.object("acme-1111-data", "original"); string(b) != "bytes" {
+		t.Fatalf("the source object changed: %q", b)
+	}
+	m.noLeak(t, "streamed copy", r)
 
 	// Once it has cut over, the same copy works: everything is on one cluster again.
 	if err := m.dir.SetState(context.Background(), "acme", "data", directory.StateMigrating,
