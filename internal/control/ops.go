@@ -141,6 +141,7 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, _ := s.Dir.Snapshot().Lookup(tenant, bucket)
+	s.info(r, "bucket adopted", "placement", key, "cluster", req.Cluster, "bucket", req.Name, "state", p.State, "version", s.Dir.Snapshot().Version())
 	writeJSON(w, http.StatusOK, s.placementStatus(key, *p))
 }
 
@@ -239,6 +240,8 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.Version = s.Dir.Snapshot().Version()
+	s.info(r, "target recorded", "placement", key, "target", req.To, "bucket", req.Name, "created_bucket", res.CreatedBucket, "canary", "ok",
+		"conditional_write", res.ConditionalWrite, "conditional_delete", res.ConditionalDelete, "version", res.Version)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -319,6 +322,7 @@ func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.logTransition(r, "ramp", res, "prefixes", req.Prefixes)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -344,6 +348,7 @@ func (s *Server) migrateStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.logTransition(r, "migrate start", res, "accept_lost_write_window", req.AcceptLostWriteWindow)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -385,6 +390,10 @@ func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	s.progress[key] = req
 	s.mu.Unlock()
+	if req.Done {
+		s.info(r, "mover pass", "placement", key, "pass", req.Pass, "copied", req.Copied, "already_there", req.Skipped, "vanished", req.Vanished,
+			"failed", req.Failed, "bytes", req.Bytes, "converged", req.Converged)
+	}
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -427,6 +436,7 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before := counters(s.Metrics.FallbackReads, key, "")[""]
+	s.info(r, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before)
 	if err := s.sleep(r.Context(), window); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "cutover window interrupted: "+err.Error())
 		return
@@ -442,6 +452,7 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.logTransition(r, "cutover", res, "window", window.String(), "fallback_reads", after)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -504,7 +515,10 @@ func (s *Server) purgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.forget(key)
-	writeJSON(w, http.StatusOK, PurgeResult{Key: key, Source: p.Source, Bucket: srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, Version: s.Dir.Snapshot().Version()})
+	v := s.Dir.Snapshot().Version()
+	s.info(r, "source purged", "placement", key, "cluster", p.Source, "bucket", srcBucket, "objects_deleted", objects, "uploads_aborted", uploads,
+		"state", directory.StateActive, "primary", p.Primary, "version", v)
+	writeJSON(w, http.StatusOK, PurgeResult{Key: key, Source: p.Source, Bucket: srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, Version: v})
 }
 
 // finish drops the source from a CUTOVER placement without touching its data.
@@ -519,6 +533,7 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.forget(key)
+	s.logTransition(r, "migrate finish", res)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -526,4 +541,23 @@ func (s *Server) forget(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.progress, key)
+}
+
+// logTransition writes the success line for a state change.
+func (s *Server) logTransition(r *http.Request, op string, res TransitionResult, extra ...any) {
+	attrs := []any{"placement", res.Key, "from", res.From, "to", res.To, "primary", res.Primary}
+	if res.Source != "" {
+		attrs = append(attrs, "source", res.Source)
+	}
+	if res.Ratio > 0 {
+		attrs = append(attrs, "ratio", res.Ratio)
+	}
+	if res.CreatedBucket != "" {
+		attrs = append(attrs, "created_bucket", res.CreatedBucket)
+	}
+	attrs = append(attrs, extra...)
+	if res.Warning != "" {
+		attrs = append(attrs, "warning", res.Warning)
+	}
+	s.info(r, op, append(attrs, "version", res.Version)...)
 }

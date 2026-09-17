@@ -1,9 +1,16 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
@@ -93,5 +100,39 @@ func TestMoverRefusesATargetWithoutConditionalPut(t *testing.T) {
 		if jobs, err := selectPlacements(dir, "acme/data", "", false); err != nil || len(jobs) != 1 || !jobs[0].conditional {
 			t.Errorf("%s: a conditional target needs no flag: %v, %+v", state.name, err, jobs)
 		}
+	}
+}
+
+// Before copying, the mover checks each side's credentials in its own process, and says where a
+// wrong secret comes from rather than failing on the first listing with a raw SDK error.
+func TestCheckSideNamesTheSecretSource(t *testing.T) {
+	code := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if code == "" {
+			_, _ = w.Write([]byte(`<ListBucketResult><Name>b</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>no</Message></Error>`))
+	}))
+	defer srv.Close()
+	cl := s3.NewFromConfig(aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("AK", "SK", ""), RetryMaxAttempts: 1},
+		func(o *s3.Options) { o.BaseEndpoint = aws.String(srv.URL); o.UsePathStyle = true })
+	sd := side{name: "vast01", bucket: "b", cl: cl, accessKey: "AK", secretRef: "env:VAST01_SECRET"}
+	ctx := context.Background()
+	if err := checkSide(ctx, "source", sd); err != nil {
+		t.Fatalf("good credentials: %v", err)
+	}
+	code = "SignatureDoesNotMatch"
+	if err := checkSide(ctx, "source", sd); err == nil || !strings.Contains(err.Error(), "reads VAST01_SECRET from this terminal's environment") {
+		t.Fatalf("stale secret: %v", err)
+	}
+	code = "InvalidAccessKeyId"
+	if err := checkSide(ctx, "target", sd); err == nil || !strings.Contains(err.Error(), "does not know access key AK") {
+		t.Fatalf("unknown key: %v", err)
+	}
+	code = "AccessDenied"
+	if err := checkSide(ctx, "target", sd); err != nil {
+		t.Fatalf("a key that may not list is left to the copy: %v", err)
 	}
 }

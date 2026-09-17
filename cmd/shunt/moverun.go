@@ -130,6 +130,12 @@ func runMover(cmd *cobra.Command, api *apiClient, jobs []job, paths moverPaths, 
 		if !j.conditional {
 			_, _ = fmt.Fprintf(out, "   WARNING (accepted with --%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(key, j.dst.name))
 		}
+		if err := checkSide(cmd.Context(), "source", j.src); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		if err := checkSide(cmd.Context(), "target", j.dst); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
 		converged := false
 		for pass := 1; pass <= maxPasses; pass++ {
 			if maxPasses > 1 {

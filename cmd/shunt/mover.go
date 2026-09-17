@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	s3err "github.com/blakegolliher/shunt/internal/s3"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -48,9 +50,11 @@ import (
 const inlineLimit = 16 << 20
 
 type side struct {
-	name   string
-	bucket string
-	cl     *s3.Client
+	name      string
+	bucket    string
+	cl        *s3.Client
+	accessKey string
+	secretRef string
 }
 
 type job struct {
@@ -171,8 +175,8 @@ func selectPlacements(dir *directory.File, one, from string, acceptLoss bool) ([
 		}
 		jobs = append(jobs, job{
 			tenant: tenant, client: name,
-			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl},
-			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl},
+			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl, accessKey: dir.Clusters[p.Source].Credentials.AccessKey, secretRef: dir.Clusters[p.Source].Credentials.SecretRef},
+			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl, accessKey: dir.Clusters[p.Primary].Credentials.AccessKey, secretRef: dir.Clusters[p.Primary].Credentials.SecretRef},
 			conditional: dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
 			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
 			condDelete: dir.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
@@ -580,6 +584,30 @@ func isNotFound(err error) bool {
 	}
 	var api smithy.APIError
 	return errors.As(err, &api) && (api.ErrorCode() == "NotFound" || api.ErrorCode() == "NoSuchKey" || api.ErrorCode() == "404")
+}
+
+// checkSide lists one key of a side's bucket and turns a signature or unknown-key answer into an
+// error that says where the mover's secret comes from: the mover resolves secret_refs in its own
+// process, so a terminal with a stale env var fails here while shunt serve works. Other errors
+// (AccessDenied on a target the key may write but not list) are left to the copy that follows.
+func checkSide(ctx context.Context, role string, sd side) error {
+	_, err := sd.cl.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(sd.bucket), MaxKeys: aws.Int32(1)})
+	var api smithy.APIError
+	if !errors.As(err, &api) {
+		return nil
+	}
+	switch s3err.ClassifyCredentialError(api.ErrorCode(), api.ErrorMessage()) {
+	case s3err.FaultSignature:
+		msg := fmt.Sprintf("%s cluster %s rejected the mover's signature (%s): access key %s exists, but the secret this process reads from %s is not that key's secret",
+			role, sd.name, api.ErrorCode(), sd.accessKey, sd.secretRef)
+		if strings.HasPrefix(sd.secretRef, "env:") {
+			msg += "; the mover reads " + strings.TrimPrefix(sd.secretRef, "env:") + " from this terminal's environment, which must hold the same secret shunt serve uses"
+		}
+		return errors.New(msg)
+	case s3err.FaultUnknownKey:
+		return fmt.Errorf("%s cluster %s does not know access key %s (%s): the key is recorded on the cluster; re-add it with `shunt cluster add`", role, sd.name, sd.accessKey, api.ErrorCode())
+	}
+	return nil
 }
 
 func isPreconditionFailed(err error) bool {

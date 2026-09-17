@@ -60,10 +60,8 @@ var locationLeaks = map[string]string{
 // serve runs the proxy and admin servers until SIGTERM/SIGINT or ctx cancellation, then drains.
 // In resign mode it also reloads the directory file on SIGHUP and every directory.poll_interval.
 func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
-	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	log := newLogger(cfg, stderr)
 	if cfg.Listener.Plaintext {
-		// Every line serve logs from here on says so, not just one warning an operator can miss.
-		log = log.With("client_listener", "PLAINTEXT http (listener.plaintext: true; lab use only)")
 		log.Warn("the client listener is PLAINTEXT http: signatures, credentials in presigned URLs, and object bytes cross the network unencrypted; listener.plaintext is for labs")
 	}
 
@@ -112,7 +110,9 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		registry := upstream.NewRegistry(upstream.Options{}, config.ResolveSecret)
 		defer registry.Close()
 		rewrite := !cfg.KillSwitches.XMLRewriteDisable
+		started := false
 		applyClusters := func(f *directory.File) error {
+			before := registry.Load()
 			added, removed, aerr := registry.Apply(f.Clusters)
 			if aerr != nil {
 				log.Error("directory version refused: a cluster could not be built", "version", f.Version, "err", aerr.Error())
@@ -120,8 +120,16 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			}
 			for _, name := range added {
 				cl, _ := registry.Load().Get(name)
-				logCluster(log, cl, f.Clusters[name], rewrite)
+				event := "cluster added"
+				switch _, existed := before.Get(name); {
+				case !started:
+					event = "cluster ready"
+				case existed:
+					event = "cluster updated"
+				}
+				logCluster(log, event, cl, f.Clusters[name], rewrite)
 			}
+			started = true
 			for _, name := range removed {
 				log.Info("cluster removed", "cluster", name)
 			}
@@ -163,7 +171,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		}
 		defer cl.Close()
 		hcfg.Cluster = cl
-		logCluster(log, cl, cc, true)
+		logCluster(log, "cluster ready", cl, cc, true)
 	}
 	h := proxy.New(hcfg, cfg.Proxy.CopyBufferBytes)
 
@@ -248,14 +256,15 @@ func isLoopbackHost(host string) bool {
 }
 
 // logCluster reports one cluster as it goes live, with the warnings its definition earns.
-func logCluster(log *slog.Logger, cl *upstream.Cluster, cc config.Cluster, rewrite bool) {
-	log.Info("cluster", "cluster", cl.Name, "type", cl.Type, "scheme", cl.Scheme, "region", cl.Region, "endpoints", cl.Endpoints,
-		"id", cl.ID, "access_key", cc.Credentials.AccessKey, "enforces_sha256", cl.EnforcesSHA256, "unsigned_trailer", cl.UnsignedTrailer)
+func logCluster(log *slog.Logger, event string, cl *upstream.Cluster, cc config.Cluster, rewrite bool) {
+	log.Info(event, "cluster", cl.Name, "type", cl.Type, "scheme", cl.Scheme, "endpoints", cl.Endpoints, "region", cl.Region,
+		"access_key", cc.Credentials.AccessKey, "secret_ref", cc.Credentials.SecretRef, "id", cl.ID,
+		"enforces_sha256", cl.EnforcesSHA256, "unsigned_trailer", cl.UnsignedTrailer)
 	if cc.TLS.InsecureSkipVerify {
 		log.Warn("upstream TLS certificate verification is DISABLED (tls.insecure_skip_verify); temporary until the backend has a valid certificate", "cluster", cl.Name)
 	}
 	if cl.Scheme == "http" {
-		log.Warn("upstream scheme is http: bytes to the backend are plaintext (per-site decision, docs/DESIGN.md §2.9)", "cluster", cl.Name)
+		log.Warn("upstream scheme is http: requests to this cluster are unencrypted (per-site decision, docs/DESIGN.md §2.9)", "cluster", cl.Name)
 	}
 	if evidence, leaks := locationLeaks[cl.Type]; leaks && !rewrite {
 		log.Warn("CompleteMultipartUpload <Location> will expose the upstream endpoint to clients while kill_switches.xml_rewrite_disable is set (docs/reference/backend-compat.md)",
@@ -310,4 +319,30 @@ func warnUnknownRampHashes(log *slog.Logger, s *directory.Snapshot) {
 				"placement", key, "ramp_hash", r.Hash, "implemented", directory.RampHash)
 		}
 	}
+}
+
+// newLogger builds serve's logger in the configured format. With a plaintext client listener every
+// line says so: JSON lines carry client_listener="PLAINTEXT http (…)", console lines a [PLAINTEXT] tag.
+func newLogger(cfg *config.Config, stderr io.Writer) *slog.Logger {
+	format := cfg.Telemetry.LogFormat
+	if format == "auto" || format == "" {
+		format = "json"
+		if f, ok := stderr.(*os.File); ok {
+			if st, err := f.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
+				format = "console"
+			}
+		}
+	}
+	if format == "console" {
+		o := telemetry.ConsoleOptions{}
+		if cfg.Listener.Plaintext {
+			o.Tag = "PLAINTEXT"
+		}
+		return slog.New(telemetry.NewConsoleHandler(stderr, o))
+	}
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	if cfg.Listener.Plaintext {
+		log = log.With("client_listener", "PLAINTEXT http (listener.plaintext: true; lab use only)")
+	}
+	return log
 }

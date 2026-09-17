@@ -30,6 +30,7 @@ The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--
 | 503 | `unavailable` | the directory is read-only or its lock timed out |
 
 - Every mutation goes through the directory write path (lock, re-read, version bump, rename) and appends one record to `<directory>.changes.jsonl` with actor `api:<peer address>`.
+- Every mutation is logged by `shunt serve`, with its actor: one INFO line on success (`bucket adopted`, `target recorded`, `ramp`, `migrate start`, `mover pass`, `cutover window started`, `cutover`, `source purged`, `migrate finish`, `tenant default changed`, plus `cluster added|updated|removed`), and one WARN line for any refusal or failure (`<operation> refused` or `<operation> failed`, with the code and reason). An operator watching serve's log sees every change, whichever host ran the command.
 - `{tenant}/{bucket}` is the client's view: the tenant of the access key and the bucket name the client uses.
 
 ## Routes
@@ -58,7 +59,7 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
 }
 ```
 
-`ramp_writes`, `fallback_reads` and `dual_deletes` are this proxy's counters (`shunt_ramp_writes_total`, `shunt_migration_fallback_reads_total`, `shunt_migration_dual_delete_total`), read without creating series. `mover` is the last progress report, held in memory: it is lost when shunt restarts, and the next mover pass reports again.
+`fallback_reads` counts read requests (GET and HEAD) that the source served after the primary answered 404, not distinct objects: `aws s3 cp` of one object sends a HEAD then a GET, so it counts two; a recursive copy sends only GETs. `ramp_writes`, `fallback_reads` and `dual_deletes` are this proxy's counters (`shunt_ramp_writes_total`, `shunt_migration_fallback_reads_total`, `shunt_migration_dual_delete_total`), read without creating series. `mover` is the last progress report, held in memory: it is lost when shunt restarts, and the next mover pass reports again.
 
 ### `GET /v1/placements/{tenant}/{bucket}`
 
@@ -69,6 +70,14 @@ Returns `{"key", "placement", "clusters"}`: the placement as stored, plus the de
 `{"name": "vast02", "cluster": {"type", "scheme", "region", "endpoints": [...], "credentials": {"access_key", "secret_ref"}, "capabilities": {"conditional_write", "conditional_delete"}, "tls": {...}}}`
 
 Adds or replaces a cluster. Before the change is written, the running proxy builds the cluster and resolves `secret_ref` in its own environment. If the secret can't be resolved, the call is refused with the reason, so a cluster shunt cannot sign for is never added. Use `file:` refs for clusters added to a running shunt.
+
+It then signs one `ListBuckets` to the cluster with that access key and secret, and refuses the add when the cluster rejects them:
+
+- **Signature mismatch.** `SignatureDoesNotMatch`, or Garage's `AccessDenied: Invalid signature`: the key exists, but the secret shunt resolves isn't that key's secret. The refusal names the `secret_ref`. For an `env:` ref it adds that the variable is read from `shunt serve`'s environment as it was at startup.
+- **Unknown key.** `InvalidAccessKeyId`, or Garage's `AccessDenied: No such key`: the cluster has no such access key.
+- **Unreachable.** The cluster can't be reached at all.
+
+A plain `AccessDenied` passes, since a key may be allowed its buckets without being allowed `ListBuckets`. Every refusal is also logged by `shunt serve` as `cluster add refused`.
 
 ### `DELETE /v1/clusters/{name}`
 

@@ -112,10 +112,29 @@ Bench: docs/bench/poc4.md. Migration overhead on GET and PUT is below this box's
 
 Refusals observed live as designed: `purge-source` in `MIGRATING`, `cluster remove vast01` while the placement and then the tenant default named it. `cutover --window 15s` passed with verify still reading. All 100 objects written to vast01 before shunt existed read back byte for byte from vast02 through shunt after the purge.
 
-## Found and fixed in POC-5
+## POC-5 by hand on VAST (2026-09-16)
+
+An operator ran the migration by hand on two lab VAST clusters over http, using only `shunt` and aws-cli commands. The source was vast01 (`10.0.0.1:80`, bucket `demo-source`), the target vast02 (bucket `demo-dest`), and shunt ran on the operator's host on `:8008`. Neither lab key could create buckets, so both buckets already existed and were emptied first.
+
+| Plan step | Result |
+|---|---|
+| 2 files straight to vast01; shunt started empty; `cluster add` + `adopt` | both read back byte for byte through shunt |
+| 10 more through shunt | all 12 on vast01 |
+| `cluster add vast02` live + `expand --name demo-dest` | canary write/read/delete ok, no restart |
+| `ramp --ratio 0.5`; 20 more | 13 on vast02 and 7 on vast01, exactly the hash's prediction; all 32 read back |
+| `ramp --ratio 1.0`; 20 more | all 20 on vast02; all 52 read back from both clusters |
+| reader loop (a full `aws s3 cp --recursive` and byte compare every ~4 s) through `migrate start`, `migrate run --until-converged`, `cutover --window 60s`, `purge-source`, `tenant set-default`, `cluster remove` | 98+ passes, **0 mismatches, 0 failed requests**; the mover copied 19, then 0; the cutover window held with the reader running; purge found an empty diff and deleted vast01's bucket |
+
+The one failure was operator-side, and the product made it hard to see. The mover's first run failed with `SignatureDoesNotMatch`: its terminal still held an old vast01 secret, while `shunt serve` and aws-cli had the new one. Earlier in the run the same mix-up had produced a 403 on `adopt`. It is fixed below.
+
+
 
 - **The ramp split was not 50/50.** At ratio 0.5 the first live run measured 80/20. `InRange` used FNV-1a-64 directly, whose high bits barely move for keys differing only in their last bytes, so sequential keys (`a/0000…a/0999`) all fell on one side. The hash now goes through murmur3's `fmix64`; `TestInRangeSplitsSequentialKeys` holds five key shapes within ±4 % at 0.1, 0.5 and 0.9. Because changing the function would re-split a running ramp, a ramp now names its hash (`ramp.hash: fnv1a-fmix64-v1`, written at RAMPING start, pinned by `TestRampHashIsPinned`). A proxy that does not implement the named hash refuses the requests that hash would route (503) instead of re-splitting them (ADR-0004 amendment).
 - **shunt's signer signed a header it did not send.** A bodyless DELETE with `http.NoBody` listed `content-length` in `SignedHeaders`, but net/http sends no `Content-Length` on DELETE, and Garage refused it (`signed header content-length is not present`); MinIO and gofakes3 accepted it, so no earlier test saw it. It hit `purge-source` on Garage. `sigv4.Sign` now lists `content-length` only when the client sends it; `TestSignListsOnlyHeadersTheClientSends` round-trips every method and body shape through a real server.
+- **A credential mix-up surfaced late and unexplained (found on VAST by hand).** `cluster add` saved an access key from one credential set that shunt then paired with a secret from another, and nothing checked the pair until `adopt` got a 403. The mover's secret is read from its own terminal, so a stale variable there failed with a raw SDK error. Now `cluster add` signs one `ListBuckets` with the pair and refuses a wrong secret or an unknown key, naming the `secret_ref` and where it is read from. `migrate run` checks each side the same way before copying anything. Garage reports both faults as `AccessDenied` with the reason in the message, so the check reads code and message (`s3.ClassifyCredentialError`, docs/reference/backend-compat.md).
+- **The serve log was hard to read at a terminal.** `telemetry.log_format` (`auto`, the default, picks `console` on a terminal and JSON otherwise) writes `19:25:55 INFO  cluster added  cluster=g type=s3 …`, with a `[PLAINTEXT]` tag in place of the long attribute. Cluster lines now name the event: `cluster ready`, `cluster added`, `cluster updated`.
+- **Operator actions were invisible in serve's log (found on the second VAST run).** Only cluster changes were logged; adopt, expand, ramps, migrate, mover passes, cutover and purge showed up only in the terminal that ran them. Every control API mutation now logs one INFO line on success and one WARN line (`<operation> refused|failed`, with the reason) otherwise. A cluster or bucket name that doesn't exist is reported as such, not as `no such placement`.
+- **`shunt status` columns misaligned** when an endpoint name was long. The table now sizes columns to their contents, and the fallback column is labelled `FALLBACK READS`: it counts GET and HEAD requests, not objects.
 - **A refusal was indistinguishable from a failure in the CLI.** The API's `refused` code did not reach the terminal; the CLI now prints `refused: <reason>`, and an in-use cluster and an illegal transition answer `refused` rather than `conflict`.
 
 
@@ -154,7 +173,7 @@ Refusals observed live as designed: `purge-source` in `MIGRATING`, `cluster remo
 - **Cutover evidence is per proxy.** `shunt cutover` reads the fallback-read counter of the proxy that serves the API, and the mover's progress is held in that proxy's memory (lost on restart; run the mover again). With several proxies, hold the window on each or check the fleet's `shunt_migration_fallback_reads_total` first; P4 aggregates it.
 - **The AWS SDK ships in `bin/shunt`** for `shunt migrate run` (ADR-0009). P5 moves the mover to a separate `shunt-mover` binary and the SDK leaves `bin/shunt` with it.
 - **P3c replaces the file directory behind the same API.** `shunt-control` serves `/v1/` from Postgres; the CLI verbs, docs/walkthrough.md and walkthrough.sh do not change. Until then the directory file must be writable by `shunt serve` for every operator verb, not only CreateBucket.
-- **VAST → VAST is documented, not run.** The lab clusters serve https on 443; whether they serve http is unknown, and https to VAST waits on the certificate gap above. docs/walkthrough.md's output is transcribed from the Garage → MinIO run with VAST names.
+- **VAST → VAST has run by hand, not by script.** The lab clusters serve http on 80 (see "POC-5 by hand on VAST"). `test/e2e/walkthrough.sh` has not run against them, because it needs keys allowed to create buckets. docs/walkthrough.md's output is still transcribed from the Garage → MinIO run with VAST names.
 - **The CI walkthrough job has not run yet**: it was added without a push.
 - **Versioned buckets cannot be migrated at all** (DESIGN §9 item 4): entering `RAMPING` or `MIGRATING` is refused if either side has ever had versioning enabled, and the check fails closed.
 - **Copying between clusters is refused with 501** (ADR-0006, DESIGN §9 item 14). A client copying between two of its own buckets whose placements name different clusters gets a hard failure, because the backend cannot read the other cluster. A later phase decides whether shunt streams the copy itself.

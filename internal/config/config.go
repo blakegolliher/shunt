@@ -163,6 +163,10 @@ type Credentials struct {
 
 // Telemetry configures the access log and slow ring.
 type Telemetry struct {
+	// LogFormat is how serve writes its own log: "console" (one short line per event, for a
+	// person at a terminal), "json" (for machines), or "auto" (console when stderr is a terminal,
+	// json otherwise). The access log is always JSON.
+	LogFormat string    `yaml:"log_format"`
 	AccessLog AccessLog `yaml:"access_log"`
 	Slow      Slow      `yaml:"slow"`
 }
@@ -345,6 +349,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Directory.File != "" && c.Directory.PollInterval == 0 {
 		c.Directory.PollInterval = defaultPollInterval
+	}
+	if c.Telemetry.LogFormat == "" {
+		c.Telemetry.LogFormat = "auto"
 	}
 	if c.Telemetry.Slow.RingSize == 0 {
 		c.Telemetry.Slow.RingSize = defaultSlowRingSize

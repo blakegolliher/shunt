@@ -184,7 +184,7 @@ type Directory interface {
 var (
 	ErrExists       = errors.New("directory: placement already exists")
 	ErrInUse        = errors.New("directory: cluster is still in use")
-	ErrNotFound     = errors.New("directory: no such placement")
+	ErrNotFound     = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
 	ErrConflict     = errors.New("directory: placement changed concurrently")
 	ErrReadOnly     = errors.New("directory: directory file is not writable")
 	ErrLockTimeout  = errors.New("directory: timed out waiting for the directory lock")

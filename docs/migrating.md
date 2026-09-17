@@ -44,6 +44,8 @@ shunt cutover acme/data --window 60s          # stop reading the old cluster, on
 shunt purge-source acme/data                  # delete the old bucket; or `migrate finish` to keep it
 ```
 
+`shunt cluster add` checks the credentials before saving the cluster. It signs one request to the cluster with the access key you give and the secret `shunt serve` resolves, and refuses an unknown key or a secret that isn't that key's. `shunt migrate run` makes the same check before copying anything, using the secret *its own* process resolves. An `env:` secret_ref is read from each process's own environment, so a terminal holding a stale secret is caught at this point rather than partway through a copy.
+
 `expand` records the target. Without `--create` the bucket must already exist, so a typo is refused
 up front rather than showing up later as a slow trickle of 404s. `--name` overrides the generated
 backend name, `<name>-NNN`. You can also skip `expand` and pass `--to`/`--create` to the first `ramp`

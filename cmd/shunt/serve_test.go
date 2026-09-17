@@ -133,7 +133,9 @@ telemetry: { access_log: { enabled: false } }
 
 // A lab listener on plaintext http: requests are served without TLS, and every line serve logs
 // carries the plaintext marker so it cannot be missed in a startup banner.
-func TestServePlaintextListenerMarksEveryLine(t *testing.T) {
+// runPlaintextServe serves one plaintext request with the given log format and returns the log.
+func runPlaintextServe(t *testing.T, format string) string {
+	t.Helper()
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok")
 	}))
@@ -146,7 +148,7 @@ auth: { mode: passthrough }
 proxy: { cluster: be, drain_timeout: 2s }
 clusters:
   be: { type: s3, scheme: http, region: r, endpoints: ["` + strings.TrimPrefix(backend.URL, "http://") + `"], credentials: { access_key: a, secret_ref: env:S } }
-telemetry: { access_log: { enabled: false } }
+telemetry: { log_format: ` + format + `, access_log: { enabled: false } }
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -174,17 +176,39 @@ telemetry: { access_log: { enabled: false } }
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	return logs.String()
+}
+
+func TestServePlaintextListenerMarksEveryLine(t *testing.T) {
+	out := runPlaintextServe(t, "json")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) < 3 {
-		t.Fatalf("too few log lines:\n%s", logs.String())
+		t.Fatalf("too few log lines:\n%s", out)
 	}
 	for _, line := range lines {
 		if !strings.Contains(line, `"client_listener":"PLAINTEXT http`) {
 			t.Errorf("startup line without the plaintext marker: %s", line)
 		}
 	}
-	if !strings.Contains(logs.String(), `"level":"WARN","msg":"the client listener is PLAINTEXT http`) {
-		t.Errorf("no plaintext warning:\n%s", logs.String())
+	if !strings.Contains(out, `"level":"WARN","msg":"the client listener is PLAINTEXT http`) {
+		t.Errorf("no plaintext warning:\n%s", out)
+	}
+}
+
+// The console format is one short line per event, and a plaintext listener tags every one.
+func TestServeConsoleLogFormat(t *testing.T) {
+	out := runPlaintextServe(t, "console")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("too few log lines:\n%s", out)
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "{") || !strings.Contains(line, " [PLAINTEXT] ") {
+			t.Errorf("not a tagged console line: %s", line)
+		}
+	}
+	if !strings.Contains(out, "WARN  [PLAINTEXT] the client listener is PLAINTEXT http") || !strings.Contains(out, "INFO  [PLAINTEXT] shunt serving  version=") {
+		t.Errorf("console lines missing the warning or the banner:\n%s", out)
 	}
 }
 

@@ -110,6 +110,7 @@ Moved out of the config into the directory file in POC-3 (see `directory` above 
 
 | Key | Type | Default |
 |---|---|---|
+| `log_format` | `auto` / `json` / `console` | `auto`: `console` when serve's stderr is a terminal, `json` otherwise (a file, a pipe, journald). `console` writes one line per event for a person watching: `19:25:55 INFO  cluster added  cluster=g type=s3 endpoints=127.0.0.1:3900 …`, with a `[PLAINTEXT]` tag on every line when `listener.plaintext` is on (JSON lines carry `client_listener` instead). The access log is always JSON |
 | `access_log.enabled` | bool | false |
 | `access_log.path` | path | stdout |
 | `slow.ring_size` | int | 100 |

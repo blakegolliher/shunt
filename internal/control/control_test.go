@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +29,7 @@ type fakeCluster struct {
 	srv       *httptest.Server
 	be        *s3mem.Backend
 	versioned map[string]bool
+	reject    string // when set, every request answers 403 with this error code
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -34,6 +37,11 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	fc := &fakeCluster{be: s3mem.New(), versioned: map[string]bool{}}
 	fake := gofakes3.New(fc.be, gofakes3.WithTimeSkewLimit(0)).Server()
 	fc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if code := fc.reject; code != "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>no</Message></Error>`))
+			return
+		}
 		bucket, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if _, ok := r.URL.Query()["versioning"]; ok && r.Method == http.MethodGet {
 			if fc.versioned[bucket] {
@@ -75,6 +83,25 @@ type rig struct {
 	vast01 *fakeCluster
 	vast02 *fakeCluster
 	slept  []time.Duration
+	log    *syncLog
+}
+
+// syncLog is the control server's log, safe to read while handlers write.
+type syncLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
 
 func newRig(t *testing.T) *rig {
@@ -98,8 +125,8 @@ func newRig(t *testing.T) *rig {
 		_, _, err := reg.Apply(f.Clusters)
 		return err
 	}
-	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t)}
-	rg.ctl = &Server{Dir: dir, Clusters: reg, Metrics: telemetry.NewMetrics(),
+	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), log: &syncLog{}}
+	rg.ctl = &Server{Dir: dir, Clusters: reg, Metrics: telemetry.NewMetrics(), Log: slog.New(telemetry.NewConsoleHandler(rg.log, telemetry.ConsoleOptions{})),
 		Now: func() time.Time { return time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC) },
 		Sleep: func(_ context.Context, d time.Duration) error {
 			rg.slept = append(rg.slept, d)
@@ -267,6 +294,33 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 	if len(rg.slept) != 1 || rg.slept[0] != 5*time.Second {
 		t.Errorf("cutover windows waited: %v", rg.slept)
 	}
+
+	// Every operator action and every refusal is in the server's log, whoever ran it.
+	log := rg.log.String()
+	for _, want := range []string{
+		"INFO  bucket adopted  placement=acme/data01 cluster=vast01 bucket=data01",
+		"WARN  adopt refused  actor=api:127.0.0.1 placement=acme/data01 status=409 code=refused reason=\"bucket nope does not exist on vast01",
+		"INFO  target recorded  placement=acme/data01 target=vast02 bucket=data01-001",
+		"INFO  ramp  placement=acme/data01 from=ACTIVE to=RAMPING primary=vast02 source=vast01 ratio=0.5",
+		"WARN  ramp refused",
+		"INFO  migrate start  placement=acme/data01 from=RAMPING to=MIGRATING",
+		"WARN  mover report refused",
+		"INFO  mover pass  placement=acme/data01 pass=2 copied=0 already_there=1",
+		"WARN  cutover refused  actor=api:127.0.0.1 placement=acme/data01 status=409 code=refused reason=\"no mover has reported",
+		"INFO  cutover window started  placement=acme/data01 window=5s",
+		"INFO  cutover  placement=acme/data01 from=MIGRATING to=CUTOVER",
+		"WARN  purge-source refused",
+		"INFO  source purged  placement=acme/data01 cluster=vast01 bucket=data01",
+		"WARN  cluster remove refused  actor=api:127.0.0.1 cluster=vast01",
+		"INFO  tenant default changed  tenant=acme default_cluster=vast02",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("server log lacks %q", want)
+		}
+	}
+	if t.Failed() {
+		t.Logf("server log:\n%s", log)
+	}
 }
 
 func TestClusterAddRefusals(t *testing.T) {
@@ -287,6 +341,25 @@ func TestClusterAddRefusals(t *testing.T) {
 		t.Fatal("a refused cluster reached the directory")
 	}
 	rg.answers("DELETE", "/v1/clusters/nope", nil, http.StatusNotFound, "not_found")
+
+	// The cluster itself says the credentials are wrong: refused before anything is written, with
+	// the half that is wrong named. A key without ListBuckets permission still passes.
+	rg.vast01.reject = "SignatureDoesNotMatch"
+	envRef := rg.vast01.definition(true)
+	envRef.Credentials.SecretRef = "env:SHUNT_CONTROL_TEST_SECRET"
+	t.Setenv("SHUNT_CONTROL_TEST_SECRET", "stale")
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: envRef}, "set SHUNT_CONTROL_TEST_SECRET there and restart serve")
+	rg.vast01.reject = "InvalidAccessKeyId"
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, "does not know access key AK")
+	if _, ok := rg.dir.Snapshot().Cluster("vast01"); ok {
+		t.Fatal("a cluster with rejected credentials reached the directory")
+	}
+	rg.vast01.reject = "AccessDenied"
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.vast01.reject = ""
+	gone := rg.vast02.definition(true)
+	gone.Endpoints = []string{"127.0.0.1:1"}
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "gone", Cluster: gone}, "cannot reach cluster gone")
 }
 
 func TestMigrateRefusals(t *testing.T) {

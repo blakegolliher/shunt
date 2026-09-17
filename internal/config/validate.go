@@ -163,6 +163,11 @@ func (c *Config) validateDirectory(e *errs) {
 }
 
 func (c *Config) validateTelemetry(e *errs) {
+	switch c.Telemetry.LogFormat {
+	case "auto", "json", "console":
+	default:
+		e.add("telemetry.log_format", "must be one of auto|json|console, got %q", c.Telemetry.LogFormat)
+	}
 	if c.Telemetry.Slow.RingSize <= 0 {
 		e.add("telemetry.slow.ring_size", "must be positive")
 	}

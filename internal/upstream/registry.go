@@ -37,6 +37,24 @@ func (r *Registry) Close() { r.cur.Load().Close() }
 // Load returns the current Set. It is never nil and must not be modified.
 func (r *Registry) Load() *Set { return r.cur.Load() }
 
+// Build makes a cluster from its definition exactly as Apply would, secret resolved in this process,
+// without making it live. The caller closes it.
+func (r *Registry) Build(name string, def config.Cluster) (*Cluster, error) {
+	cl, err := New(name, def, r.opts)
+	if err != nil {
+		return nil, fmt.Errorf("cluster %s: %w", name, err)
+	}
+	if r.resolve != nil {
+		secret, rerr := r.resolve(def.Credentials.SecretRef)
+		if rerr != nil {
+			cl.Close()
+			return nil, fmt.Errorf("cluster %s: %w", name, rerr)
+		}
+		cl.Creds.Secret = secret
+	}
+	return cl, nil
+}
+
 // Apply makes clusters the live set. A cluster whose definition is unchanged keeps its *Cluster,
 // transport and pooled connections; a new or changed one is built and its secret resolved. Nothing
 // is swapped if any cluster fails, so a definition the proxy cannot sign for never goes live.
@@ -58,18 +76,11 @@ func (r *Registry) Apply(clusters map[string]config.Cluster) (added, removed []s
 		def := clusters[name]
 		cl, reuse := old.byName[name]
 		if !reuse || !reflect.DeepEqual(r.defs[name], def) {
-			cl, err = New(name, def, r.opts)
+			cl, err = r.Build(name, def)
 			if err != nil {
-				return fail(fmt.Errorf("cluster %s: %w", name, err))
+				return fail(err)
 			}
 			built = append(built, cl)
-			if r.resolve != nil {
-				secret, rerr := r.resolve(def.Credentials.SecretRef)
-				if rerr != nil {
-					return fail(fmt.Errorf("cluster %s: %w", name, rerr))
-				}
-				cl.Creds.Secret = secret
-			}
 			added = append(added, name)
 		}
 		if other, dup := next.byID[cl.ID]; dup {

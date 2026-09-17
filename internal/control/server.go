@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/blakegolliher/shunt/internal/s3"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -46,17 +49,17 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("GET /v1/placements/{tenant}/{bucket}", s.placement)
-	mux.HandleFunc("POST /v1/clusters", s.putCluster)
-	mux.HandleFunc("DELETE /v1/clusters/{name}", s.removeCluster)
-	mux.HandleFunc("POST /v1/tenants/{tenant}/default-cluster", s.setTenantDefault)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/adopt", s.adopt)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/expand", s.expand)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/ramp", s.ramp)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/migrate", s.migrateStart)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/mover-progress", s.moverProgress)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/cutover", s.cutover)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/purge-source", s.purgeSource)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/finish", s.finish)
+	mux.HandleFunc("POST /v1/clusters", s.logged("cluster add", s.putCluster))
+	mux.HandleFunc("DELETE /v1/clusters/{name}", s.logged("cluster remove", s.removeCluster))
+	mux.HandleFunc("POST /v1/tenants/{tenant}/default-cluster", s.logged("tenant set-default", s.setTenantDefault))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/adopt", s.logged("adopt", s.adopt))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/expand", s.logged("expand", s.expand))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/ramp", s.logged("ramp", s.ramp))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/migrate", s.logged("migrate start", s.migrateStart))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/mover-progress", s.logged("mover report", s.moverProgress))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/cutover", s.logged("cutover", s.cutover))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/purge-source", s.logged("purge-source", s.purgeSource))
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/finish", s.logged("migrate finish", s.finish))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
@@ -222,7 +225,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	want := r.URL.Query().Get("bucket")
 	if want != "" {
 		if _, ok := f.Placements[want]; !ok {
-			fail(w, fmt.Errorf("%s: %w", want, directory.ErrNotFound))
+			fail(w, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, want))
 			return
 		}
 	}
@@ -320,7 +323,7 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (string, directo
 	f := s.Dir.Snapshot().File()
 	p, ok := f.Placements[key]
 	if !ok {
-		fail(w, fmt.Errorf("%s: %w", key, directory.ErrNotFound))
+		fail(w, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key))
 		return key, p, f, false
 	}
 	return key, p, f, true
@@ -339,6 +342,10 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+		return
+	}
+	if msg := s.checkCredentials(r.Context(), req.Name, req.Cluster); msg != "" {
+		writeError(w, http.StatusConflict, "refused", msg)
 		return
 	}
 	if err := s.Dir.PutCluster(r.Context(), req.Name, req.Cluster, actor(r)); err != nil {
@@ -394,14 +401,16 @@ func (s *Server) setTenantDefault(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "default_cluster": req.Cluster, "version": s.Dir.Snapshot().Version()})
+	v := s.Dir.Snapshot().Version()
+	s.info(r, "tenant default changed", "tenant", tenant, "default_cluster", req.Cluster, "version", v)
+	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "default_cluster": req.Cluster, "version": v})
 }
 
 // backendFor returns the live cluster a placement role names.
 func (s *Server) backendFor(name string) (backend, error) {
 	cl, ok := s.Clusters.Load().Get(name)
 	if !ok {
-		return backend{}, fmt.Errorf("%w: cluster %q is not live in this proxy", directory.ErrNotFound, name)
+		return backend{}, fmt.Errorf("%w: no cluster named %q (shunt status lists the clusters)", directory.ErrNotFound, name)
 	}
 	return backend{cl: cl}, nil
 }
@@ -432,4 +441,102 @@ func sortedKeys[V any](m map[string]V) []string {
 // conditional PUT (ADR-0004 race 2).
 func lostWriteWindow(key, cluster string) error {
 	return &refusal{msg: migrate.RefuseLostWriteWindow(key, cluster).Error()}
+}
+
+// checkCredentials signs one ListBuckets to a cluster about to be added, with the access key given
+// and the secret this proxy resolves for its secret_ref, and returns a refusal when the cluster says
+// the pair is wrong. It catches the mistake that otherwise surfaces later as a 403 on adopt or in
+// the mover: an access key from one credential set and a secret from another. Anything short of a
+// signature or unknown-key answer passes: a key may be allowed its buckets without ListBuckets.
+// An invalid definition returns "" and is refused by the directory write that follows.
+func (s *Server) checkCredentials(ctx context.Context, name string, c config.Cluster) string {
+	defs := map[string]config.Cluster{name: c}
+	config.ApplyClusterDefaults(defs)
+	if config.ValidateClusters("clusters", defs) != nil {
+		return ""
+	}
+	cl, err := s.Clusters.Build(name, defs[name])
+	if err != nil {
+		return "the proxy cannot use this cluster: " + err.Error()
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	reply, err := backend{cl}.do(ctx, http.MethodGet, "", "", nil, nil, nil)
+	if err != nil {
+		return fmt.Sprintf("cannot reach cluster %s to check its credentials: %v", name, err)
+	}
+	var e struct {
+		Message string `xml:"Message"`
+	}
+	_ = xml.Unmarshal(reply.body, &e) //nolint:errcheck // no message is fine
+	ak, ref := c.Credentials.AccessKey, c.Credentials.SecretRef
+	switch s3.ClassifyCredentialError(reply.code, e.Message) {
+	case s3.FaultUnknownKey:
+		return fmt.Sprintf("cluster %s does not know access key %s (%s): check --access-key", name, ak, reply.code)
+	case s3.FaultSignature:
+		msg := fmt.Sprintf("cluster %s rejected the signature (%s): access key %s exists, but the secret shunt serve reads from %s is not that key's secret", name, reply.code, ak, ref)
+		if strings.HasPrefix(ref, "env:") {
+			msg += "; an env: ref is read from shunt serve's environment as it was when serve started, so set " + strings.TrimPrefix(ref, "env:") + " there and restart serve, or use a file: ref"
+		}
+		return msg
+	}
+	return ""
+}
+
+// logged wraps a mutating route so that every answer it refuses or fails is in serve's log with its
+// reason, next to the success line each handler writes: an operator watching `shunt serve` sees
+// every change and every refusal, whichever terminal ran the command.
+func (s *Server) logged(op string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &errorRecorder{ResponseWriter: w}
+		h(rec, r)
+		if s.Log == nil || rec.status < 400 {
+			return
+		}
+		var e Error
+		_ = json.Unmarshal(rec.body, &e) //nolint:errcheck // a non-JSON body just has no reason
+		event := op + " failed"
+		if e.Code == "refused" {
+			event = op + " refused"
+		}
+		attrs := []any{"actor", actor(r)}
+		if t, b := r.PathValue("tenant"), r.PathValue("bucket"); b != "" {
+			attrs = append(attrs, "placement", directory.Key(t, b))
+		} else if n := r.PathValue("name"); n != "" {
+			attrs = append(attrs, "cluster", n)
+		} else if t != "" {
+			attrs = append(attrs, "tenant", t)
+		}
+		s.Log.Warn(event, append(attrs, "status", rec.status, "code", e.Code, "reason", e.Message)...)
+	}
+}
+
+// info writes one success line for an operation, with who asked.
+func (s *Server) info(r *http.Request, event string, attrs ...any) {
+	if s.Log != nil {
+		s.Log.Info(event, append(attrs, "actor", actor(r))...)
+	}
+}
+
+// errorRecorder keeps the status and, for an error answer, the body (an Error, a few hundred bytes).
+type errorRecorder struct {
+	http.ResponseWriter
+	status int
+	body   []byte
+}
+
+func (e *errorRecorder) WriteHeader(code int) {
+	e.status = code
+	e.ResponseWriter.WriteHeader(code)
+}
+
+func (e *errorRecorder) Write(b []byte) (int, error) {
+	if e.status == 0 {
+		e.status = http.StatusOK
+	}
+	if e.status >= 400 && len(e.body) < 4096 {
+		e.body = append(e.body, b...)
+	}
+	return e.ResponseWriter.Write(b)
 }

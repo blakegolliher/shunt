@@ -81,7 +81,7 @@ nohup shunt serve -c shunt.yaml > shunt.log 2>&1 & echo $! > shunt.pid
 sleep 1; cat shunt.log
 ```
 
-Expected. Every startup line carries the plaintext marker:
+Expected. The log goes to a file here, so it is JSON; run `shunt serve` straight in a terminal and it prints one short line per event instead (`telemetry.log_format: auto`), each tagged `[PLAINTEXT]`. Every startup line carries the plaintext marker:
 
 ```
 shunt.yaml: ok (auth resign; directory directory.yaml version 1: 0 clusters, 0 tenants, 0 placements)
@@ -105,11 +105,11 @@ cluster vast01: vast http://vast01.lab.example:80 region us-east-1 (conditional_
 acme/data01: ACTIVE on vast01/data01
 directory version 3
 
-CLUSTER    TYPE   SCHEME ENDPOINTS                    COND.PUT USED BY
-vast01     vast   http   vast01.lab.example:80        true     tenants.acme.default_cluster, placements.acme/data01
+CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
+vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
 
-BUCKET             STATE     RATIO PRIMARY                SOURCE                 WRITES P/S          FALLBACK MOVER
-acme/data01        ACTIVE    -     vast01/data01          -                      -                   0        -
+BUCKET       STATE   RATIO  PRIMARY        SOURCE  WRITES P/S  FALLBACK READS  MOVER
+acme/data01  ACTIVE  -      vast01/data01  -       -           0               -
 ```
 
 `adopt` checked that the bucket exists and was never versioned, created tenant `acme` with vast01 as its default, and wrote the placement. If you omit `--conditional-write`, it defaults to true, which VAST honors (docs/reference/backend-compat.md). `shunt probe` measures it.
@@ -234,18 +234,18 @@ verify report: http://127.0.0.1:8008/data01 prefix verify/1789590296306112491/ s
   reads by route: primary vast02 1213 (49%), source vast01 1285 (51%)
 directory version 6
 
-CLUSTER    TYPE   SCHEME ENDPOINTS                    COND.PUT USED BY
-vast01     vast   http   vast01.lab.example:80        true     tenants.acme.default_cluster, placements.acme/data01
-vast02     vast   http   vast02.lab.example:80        true     placements.acme/data01
+CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
+vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
+vast02   vast  http    vast02.lab.example:80  true      placements.acme/data01
 
-BUCKET             STATE     RATIO PRIMARY                SOURCE                 WRITES P/S          FALLBACK MOVER
-acme/data01        RAMPING   0.50  vast02/data01-001      vast01/data01          4716/4439 (52%)     54       -
+BUCKET       STATE    RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
+acme/data01  RAMPING  0.50   vast02/data01-001  vast01/data01  4716/4439 (52%)  54              -
 ```
 
 Reading the output:
 - Writes are ~50/50, and reads succeed from both clusters with 0 errors.
 - `WRITES P/S` is shunt's own count (`shunt_ramp_writes_total`) of writes to the new primary and to the source.
-- `FALLBACK` counts reads the primary answered 404 and vast01 then served.
+- `FALLBACK READS` counts read requests (GET and HEAD) the primary answered 404 and vast01 then served. It counts requests, not objects: `aws s3 cp` of one object sends a HEAD and a GET.
 - The walkthrough script fails if the write split is outside 40–60%.
 
 Now send every write to vast02:
@@ -297,12 +297,12 @@ shunt: refused: directory: cluster is still in use: cluster "vast01" is still re
 mover: 100 copied, 100 already on the target, 0 vanished mid-copy, 0 failed, 1.5 MiB moved
 directory version 8
 
-CLUSTER    TYPE   SCHEME ENDPOINTS                    COND.PUT USED BY
-vast01     vast   http   vast01.lab.example:80        true     tenants.acme.default_cluster, placements.acme/data01
-vast02     vast   http   vast02.lab.example:80        true     placements.acme/data01
+CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
+vast01   vast  http    vast01.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
+vast02   vast  http    vast02.lab.example:80  true      placements.acme/data01
 
-BUCKET             STATE     RATIO PRIMARY                SOURCE                 WRITES P/S          FALLBACK MOVER
-acme/data01        MIGRATING -     vast02/data01-001      vast01/data01          9324/4447 (68%)     109      pass 2: 0 copied, 100 already there, 0 failed, converged
+BUCKET       STATE      RATIO  PRIMARY            SOURCE         WRITES P/S       FALLBACK READS  MOVER
+acme/data01  MIGRATING  -      vast02/data01-001  vast01/data01  9324/4447 (68%)  109             pass 2: 0 copied, 100 already there, 0 failed, converged
 acme/data01: waiting 1m0s for fallback reads to stay flat
 acme/data01: MIGRATING -> CUTOVER (directory version 9)
 vast01 is no longer read; `shunt purge-source acme/data01` deletes it once you are satisfied
@@ -336,18 +336,18 @@ acme: new buckets now land on vast02 (directory version 11)
 cluster vast01 removed; shunt no longer holds a connection to it
 directory version 12
 
-CLUSTER    TYPE   SCHEME ENDPOINTS                    COND.PUT USED BY
-vast02     vast   http   vast02.lab.example:80        true     tenants.acme.default_cluster, placements.acme/data01
+CLUSTER  TYPE  SCHEME  ENDPOINTS              COND.PUT  USED BY
+vast02   vast  http    vast02.lab.example:80  true      tenants.acme.default_cluster, placements.acme/data01
 
-BUCKET             STATE     RATIO PRIMARY                SOURCE                 WRITES P/S          FALLBACK MOVER
-acme/data01        ACTIVE    -     vast02/data01-001      -                      9324/4447 (68%)     109      -
+BUCKET       STATE   RATIO  PRIMARY            SOURCE  WRITES P/S       FALLBACK READS  MOVER
+acme/data01  ACTIVE  -      vast02/data01-001  -       9324/4447 (68%)  109             -
 
 An error occurred (404) when calling the HeadBucket operation: Not Found
 data01 is gone from vast01
 seed objects identical, now served from vast02
 ```
 
-`purge-source` refuses unless the placement is in `CUTOVER` with recorded evidence, and a full listing of both buckets finds no key on vast01 that vast02 lacks. It then aborts in-progress uploads, deletes the objects and the bucket, and drops vast01 from the placement. The `WRITES P/S` and `FALLBACK` columns are this shunt process's counters since it started, so they keep their totals.
+`purge-source` refuses unless the placement is in `CUTOVER` with recorded evidence, and a full listing of both buckets finds no key on vast01 that vast02 lacks. It then aborts in-progress uploads, deletes the objects and the bucket, and drops vast01 from the placement. The `WRITES P/S` and `FALLBACK READS` columns are this shunt process's counters since it started, so they keep their totals.
 
 Stop the client and read its report:
 

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -402,17 +403,27 @@ func newStatus() *cobra.Command {
 func printStatus(cmd *cobra.Command, st control.Status) error {
 	out := cmd.OutOrStdout()
 	_, _ = fmt.Fprintf(out, "directory version %d\n\n", st.Version)
-	_, _ = fmt.Fprintf(out, "%-10s %-6s %-6s %-28s %-8s %s\n", "CLUSTER", "TYPE", "SCHEME", "ENDPOINTS", "COND.PUT", "USED BY")
+	// Columns size to their widest value: endpoints and bucket names vary a lot between sites.
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "CLUSTER\tTYPE\tSCHEME\tENDPOINTS\tCOND.PUT\tUSED BY")
 	for i := range st.Clusters {
 		c := &st.Clusters[i]
-		_, _ = fmt.Fprintf(out, "%-10s %-6s %-6s %-28s %-8v %s\n", c.Name, c.Type, c.Scheme, strings.Join(c.Endpoints, ","), c.ConditionalWrite, strings.Join(c.References, ", "))
+		used := strings.Join(c.References, ", ")
+		if used == "" {
+			used = "-"
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%s\n", c.Name, c.Type, c.Scheme, strings.Join(c.Endpoints, ","), c.ConditionalWrite, used)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
 	}
 	_, _ = fmt.Fprintln(out)
 	if len(st.Placements) == 0 {
 		_, err := fmt.Fprintln(out, "no bucket is moving")
 		return err
 	}
-	_, _ = fmt.Fprintf(out, "%-18s %-9s %-5s %-22s %-22s %-19s %-8s %s\n", "BUCKET", "STATE", "RATIO", "PRIMARY", "SOURCE", "WRITES P/S", "FALLBACK", "MOVER")
+	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "BUCKET\tSTATE\tRATIO\tPRIMARY\tSOURCE\tWRITES P/S\tFALLBACK READS\tMOVER")
 	for i := range st.Placements {
 		p := &st.Placements[i]
 		ratio := "-"
@@ -436,9 +447,9 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 				mover += ", converged"
 			}
 		}
-		_, _ = fmt.Fprintf(out, "%-18s %-9s %-5s %-22s %-22s %-19s %-8.0f %s\n", p.Key, p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", p.Key, p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
 	}
-	return nil
+	return tw.Flush()
 }
 
 // transition posts one state change and prints what it did.
