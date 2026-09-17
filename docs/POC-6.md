@@ -23,7 +23,15 @@ cutover relies on.
 | — | README and walkthrough | updated per item as each lands |
 
 **ADR numbering:** 0010–0012 are taken (operator ergonomics, stepping out, importing client keys).
-POC-6 starts at **0013** (item 1, written), so items 2–5 take 0014 and up.
+POC-6 starts at **0013** (item 1, written), so items 2–5 take 0014 and up. ADR-0015 (embedded etcd)
+is the substrate for what comes after this list.
+
+**What comes after.** `docs/design/distributed.md` is §12 of the design: the same semantics at fleet
+scale, on an etcd control plane. The order is **POC-6 → P3c → P3d → P3e** (`docs/prompts/`). It
+matters for item 3 in particular: the fence is specified here in its single-control-plane form and
+P3c generalizes it, so the semantics decided here are the ones that ship. Items 1 and 2 are not
+optional groundwork for it — the fence only makes a correct single-proxy rule correct across a
+fleet.
 
 ## Item 1 — conditional writes (done, ADR-0013)
 
@@ -67,10 +75,35 @@ or a cutover is applied only when every live proxy acknowledges the version that
 the CLI waits, naming the proxies it is waiting for. The cutover window aggregates the fallback-read
 counters of all live proxies rather than one.
 
-**Open questions:** registration is per-proxy state in the directory — allowed (it is not per-object)
-but it makes the file a write target for every proxy, which the file backend serializes through one
-flock; what a dead proxy costs (expiry window vs a cutover that waits forever); whether the fleet
-counter belongs in the directory or is scraped from each proxy's metrics.
+**Decided when §12 landed on this branch.** Two of the sketch's open questions are now answered,
+because the answers are what makes P3c a swap rather than a rewrite:
+
+- **Liveness is control-plane state, not directory state.** The sketch's `proxies:` record would make
+  the directory file a write target for every proxy, serialized through one flock — fine at three
+  proxies, wrong at a thousand, and nothing the etcd form would inherit. Instead each proxy
+  heartbeats to the control API (`internal/control`, already the single writer for every mutation)
+  with its id, the directory version it serves, and its counters for non-ACTIVE placements. The
+  control node holds the fleet table in memory; §12.5 replaces that with a leased key. The protocol
+  is identical either way, which is the point. Cost of the in-memory form: a control-node restart
+  forgets the fleet and the fence waits one heartbeat interval to refill. Proxies gain one config
+  value, the control endpoint to heartbeat to.
+- **The fleet counter rides the heartbeat**, not Prometheus and not the directory. §12.6 is explicit
+  that Prometheus is the dashboard and never the decision path, and the counters exist only for
+  non-ACTIVE placements, so the heartbeat is bounded by migrations in flight rather than by buckets.
+
+**Still open:** what a dead proxy costs — the expiry window has to be short enough that a crashed
+proxy does not hold a cutover forever, and long enough that a slow one is not dropped from the fence
+while it is still serving traffic.
+
+**Read-widening, and how many fence rounds a ramp needs.** `internal/migrate.Decide` sends an
+out-of-range key during `RAMPING` to the source with no fallback, on the reasoning that "the target
+cannot have it" — true of one proxy, false of a fleet where another proxy already holds a wider rule
+and wrote it to the target. §12.6 fixes this with a two-phase ramp: widen reads at R1, move writes at
+R2. Making the out-of-range read `source → primary` permanently is that first phase done once instead
+of once per change, and it costs a second lookup only on a genuine miss. Item 3 should take that
+route and then let the property test say whether the write move still needs its own fence round. It
+almost certainly does — read-widening stops a stale read, not a split write — but the test decides
+it, not the sketch.
 
 **Test:** two proxies over one directory and a deliberately stale one: a ramp step and a cutover both
 refuse to apply until the stale proxy catches up or expires.
@@ -114,3 +147,15 @@ profile should probably carry the probe's date and shunt should say when it is o
 - **`purge-source` dry run:** print what would be deleted (counts and the first keys) and require a
   second call, or `--yes`, to delete. The listing diff it already computes is most of the work.
 - **README and walkthrough** are updated with each item that changes a command.
+
+## Acceptance
+
+From the original prompt, still the gate for the list:
+
+- the property test is green with the conditional-write and rename clients through a full ramp
+  (items 1 and 2 — met on this branch);
+- the stale-proxy fence test is green (item 3);
+- cutover refuses with an in-flight multipart upload, and `--abort-uploads` clears it (item 4);
+- an assumed capability profile cannot start a migration (item 5);
+- no secret appears in shell history, `ps`, or logs during the walkthrough, and `purge-source`
+  cannot delete without a dry run the operator has seen (the trailing items).

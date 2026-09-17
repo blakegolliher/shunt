@@ -127,7 +127,7 @@ Acceptance: `make walkthrough` green with verify at 0 errors and the ratio-0.5 s
 | Migration without per-object state or client change | POC-4 demo.sh + property test |
 | An operator can run a migration from copy-paste commands, live, and verify it | POC-5 walkthrough.sh + `shunt verify` |
 
-Not proven, on purpose: production resilience (ejection, hot reload, drain under load), scale of the directory (Postgres), tiering, packaging, telemetry beyond RED + slow ring, chaos. Each has a home in the full design.
+Not proven, on purpose: production resilience (ejection, hot reload, drain under load), scale of the directory (the distributed control plane, §12), tiering, packaging, telemetry beyond RED + slow ring, chaos. Each has a home in the full design.
 
 ## Deferred items and where they live
 
@@ -137,7 +137,7 @@ Not proven, on purpose: production resilience (ejection, hot reload, drain under
 | P2C/EWMA, ejection, retry table, dns endpoint mode, AWS 301 handling | P3a, P3b |
 | Compensating delete, credential hot reload, STS | P2 |
 | Capability profile auto-emit from probe | P3b |
-| Postgres, shunt-control, snapshots, audit table | P3c |
+| `shunt-control`, snapshots, audit trail (on embedded etcd, ADR-0015, not Postgres) | P3c |
 | Full metric catalog, traces, metering, eBPF/TCP_INFO | P4 |
 | ListObjects v1 and ListMultipartUploads merge, dual-delete metrics | P5 |
 | The mover as its own `shunt-mover` binary, taking the AWS SDK out of `bin/shunt` (ADR-0009) | P5 |

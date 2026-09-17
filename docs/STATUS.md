@@ -15,6 +15,21 @@ Current phase: **POC-5 (operator walkthrough) done, and tested on VAST.** A buck
 
 After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order at P0's skipped items (docs/POC.md "After the POC").
 
+## The `distributed` branch
+
+This branch carries the plan for everything past POC-5 and nothing that is green yet; `master` keeps
+what is done. Two bodies of work were merged into one path on 2026-09-17:
+
+- `docs/POC-6.md` — migration correctness hardening, items 1 and 2 done in code (ADR-0013,
+  ADR-0014), items 3–5 and the trailing items specified.
+- `docs/design/distributed.md` (§12 of the design) + `docs/adr/0015-embedded-etcd.md` +
+  `docs/prompts/P3c.md`, `P3d.md`, `P3e.md` — the fleet-scale form: `shunt-control` on embedded
+  etcd, the version fence, two-phase ramp, stale mode, movers as workers, web UI.
+
+Order: **POC-6 → P3c → P3d → P3e**. §1.5 of the design (Postgres control plane) and the P3c prompt in
+§7 are marked superseded in place. ADR-0015 is proposed, not accepted; no etcd dependency exists yet
+and `docs/deps.md` gains its lines in P3c.
+
 ## What exists
 
 - **POC-5: the operator walkthrough.** Clusters are directory state (ADR-0008): `clusters:` moved from the resign config into the directory file, and `upstream.Registry` swaps the live cluster set before any snapshot that names a new cluster is installed, so a cluster is added or removed without a restart and one shunt cannot sign for is refused. `internal/control` serves the control API under `/v1/` on the admin listener (bearer token from `admin.control_token_ref`, or loopback only), one handler per operation, every mutation through the directory write path (docs/reference/control-api.md). The operator verbs are its clients: `shunt cluster add|remove`, `tenant set-default`, `adopt`, `expand` (target bucket, versioning check, canary), `ramp`, `migrate start|run|finish`, `cutover` (converged mover and a flat fallback-read window, recorded on the placement), `purge-source` (CUTOVER, evidence, empty source − primary diff; then deletes the source bucket), and `status` (state, ratio, writes per side, fallback reads, mover progress), each with `--json`. `shunt migrate run` is the mover, promoted from `test/mover` with the same contract and refusals (ADR-0009: the AWS SDK now ships in `bin/shunt`). `CUTOVER` deletes go to both clusters so the source only loses keys (ADR-0004 amendment). `shunt verify` (`internal/verify`, shared with the property test) drives a checked read/write/delete workload and, with `features.debug_route_header`, tallies the side and cluster that served each request (ADR-0006 amendment). `listener.plaintext` serves plain http for labs and marks every log line. `test/e2e/walkthrough.sh` runs docs/walkthrough.md unattended; `make walkthrough` and a CI job run it on Garage → MinIO.

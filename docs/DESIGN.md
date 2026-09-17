@@ -85,6 +85,12 @@ client ──TLS──▶ listener ─▶ parse(bucket,key,op) ─▶ auth(verif
 
 ### 1.5 Control plane: Postgres behind a control service
 
+> **Superseded by §12 (ADR-0015, branch `distributed`).** Postgres is replaced by etcd embedded in
+> `shunt-control`. What survives unchanged: two binaries, snapshot-not-queries with a monotonic
+> version, defined outage behavior, and **no objects table, ever**. Read this section for those; read
+> `docs/design/distributed.md` for the substrate and the fleet protocol.
+
+
 - **Two binaries, one repo.** `shunt` (the proxy) and `shunt-control` (the control plane). Proxies are stateless and never hold a database connection. `shunt-control` is the only writer to Postgres and the only reader on behalf of proxies; the CLI (`shunt directory …`, `shunt tenant …`, `shunt migration …`) and the admin UI-to-be talk to it over an authenticated HTTP API.
 - **Snapshot, not queries.** The directory has a monotonically increasing `version`. Each proxy polls `GET /v1/directory?since=<version>` every few seconds (or subscribes to a change stream) and swaps in a new immutable in-memory snapshot. A request never waits on Postgres. Up to a few hundred thousand placements fit in memory as a full snapshot; past that, proxies switch to a per-bucket LRU with negative caching, filled from the control service — same interface, same version semantics.
 - **Outage behavior is defined.** Postgres or `shunt-control` down: proxies keep serving last-known-good; `CreateBucket`, state transitions, credential changes, and migration control return `503 ServiceUnavailable` with a clear message; a `shunt_directory_snapshot_age_seconds` gauge makes the staleness visible. Nothing already flowing stops.
@@ -382,6 +388,11 @@ Acceptance: mixed-backend s3diff clean; two tenants with the same bucket name ne
 
 ### P3c — Control service on Postgres
 
+> **Superseded by `docs/prompts/P3c.md`** (distributed control plane on embedded etcd, ADR-0015).
+> Kept here for the schema test, the outage-under-load acceptance, and the 100k-placement bound,
+> which carry over.
+
+
 ```
 Phase 3c: the product directory. Read docs/DESIGN.md §1.5 and §2.3. The file backend stays for dev; this phase adds the second implementation of the Directory interface and the service behind it. Use plan mode.
 
@@ -638,3 +649,15 @@ Invariant 3 is `adopt --keys` (ADR-0012): the keys the cluster issued are import
 **Stepping out again (ADR-0011).** The same four invariants, read backwards, say when shunt can leave: the clients' keys are the cluster's own (invariant 3), each bucket carries the name clients use (invariant 4, so `expand --name data01` rather than the default `data01-001`), every bucket of the tenant is on one cluster, and nothing is in flight. `shunt step-out` checks exactly that, against the cluster, and prints the DNS flip back. Inserting shunt is reversible on purpose: a migration tool nobody can leave is one fewer team starts.
 
 **Cross-DC note.** With shunt in dc01 and vast02 in dc02, the ramped 5 % crosses the inter-DC link; the ramp comparison will show that latency honestly, and the hold thresholds should be set with it in mind rather than tuned to hide it.
+
+---
+
+## 12. Distributed control plane
+
+See `docs/design/distributed.md` (supersedes §1.5; ADR-0015): embedded etcd in `shunt-control`, the
+version fence, the two-phase ramp, stale mode, fleet decisions, movers as workers, the operating
+surface, the limits, and what the property test must prove.
+
+Order of work: **POC-6 → P3c → P3d → P3e** (`docs/POC-6.md`, `docs/prompts/`). POC-6 fixes two things
+that are wrong on a single proxy today and fixes the fence's semantics; §12 generalizes them onto a
+fleet.
