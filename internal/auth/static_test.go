@@ -109,3 +109,22 @@ func BenchmarkLookup(b *testing.B) {
 		}
 	}
 }
+
+func TestTenantListsItsKeysInOrder(t *testing.T) {
+	s, err := parse([]byte(`
+credentials:
+  - { access_key: KEYB, secret: b }
+  - { access_key: KEYX, secret: x, tenant: other }
+  - { access_key: KEYA, secret: a }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.Tenant("default")
+	if len(got) != 2 || got[0].AccessKey != "KEYA" || got[1].AccessKey != "KEYB" || got[0].Secret != "a" {
+		t.Fatalf("Tenant(default) = %v", got)
+	}
+	if got := s.Tenant("nobody"); len(got) != 0 {
+		t.Fatalf("Tenant(nobody) = %v", got)
+	}
+}

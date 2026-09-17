@@ -286,6 +286,13 @@ func newExpand() *cobra.Command {
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s (%s); canary write, read, delete ok; conditional_write %v, conditional_delete %v (%s; directory version %d)\n",
 				shown(out.Key), out.Target, out.Name, created, out.ConditionalWrite, out.ConditionalDelete, how, out.Version)
+			if err != nil {
+				return err
+			}
+			if _, bucket, _ := strings.Cut(out.Key, "/"); out.Name != bucket {
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "note: on %s the bucket is named %s, not %s; to take shunt out of the path later, clients would have to use that name (--name %s keeps it; shunt step-out, ADR-0011)\n",
+					out.Target, out.Name, bucket, bucket)
+			}
 			return err
 		},
 	}

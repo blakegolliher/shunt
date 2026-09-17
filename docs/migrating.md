@@ -190,6 +190,34 @@ source only ever loses keys. Then either:
 - `shunt migrate finish data`: returns to `ACTIVE` and leaves the source bucket untouched and
   unreferenced, for you to keep or delete yourself.
 
+## Taking shunt out of the path
+
+Nothing about a migration keeps shunt in front of the clients afterwards. When a tenant's buckets
+have arrived on one cluster, clients can go back to talking to that cluster directly:
+
+```sh
+shunt step-out                                # read-only: what stands in the way, or how to leave
+```
+
+It checks, against the cluster itself, that every bucket is `ACTIVE` there under **the name clients
+use**, that nothing is in flight, and that every client key shunt holds is one the cluster accepts
+and can use on every bucket. It changes nothing and exits non-zero while anything blocks.
+
+Two of those are decided long before you run it:
+
+- **Keys.** In resign mode clients sign with keys shunt issued. If shunt holds the *cluster's* keys
+  instead (the brownfield case: clients keep the keys they already had, docs/DESIGN.md §11), they
+  keep working when shunt leaves. After a move to another cluster, the same key has to exist on that
+  cluster too.
+- **Names.** `expand` names the target bucket `<bucket>-001` by default, and a bucket created through
+  shunt gets a generated backend name. S3 cannot rename a bucket, so pass `--name <bucket>` at expand
+  time if you want the option of leaving later. `expand` prints a note when the names differ.
+
+When the check passes it prints the three steps shunt cannot take for you: point the clients' S3 name
+at the cluster (DNS or the VIP; lower the TTL a day ahead, and the cluster needs its own certificate
+for that name), wait out the TTL while `shunt_requests_total` stops rising, then stop shunt. Until you
+stop it, pointing the name back at shunt undoes the whole thing: step-out changed nothing.
+
 ## Removing a vendor entirely
 
 The same steps, once, for every bucket a cluster still holds:

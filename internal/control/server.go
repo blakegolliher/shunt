@@ -28,6 +28,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -42,6 +43,9 @@ type Server struct {
 	Token string
 	// SecretsDir is where a secret given to `cluster add` is written, one 0600 file per cluster.
 	SecretsDir string
+	// TenantKeys lists a tenant's client keys, secrets included, for step-out's direct checks. The
+	// file store answers today; P3c's store replaces the function.
+	TenantKeys func(tenant string) []sigv4.Credential
 	Log        *slog.Logger
 	// Now defaults to time.Now; Sleep to a context-aware wait. Tests replace both.
 	Now   func() time.Time
@@ -67,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/cutover", s.logged("cutover", s.cutover))
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/purge-source", s.logged("purge-source", s.purgeSource))
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/finish", s.logged("migrate finish", s.finish))
+	mux.HandleFunc("GET /v1/tenants/{tenant}/step-out", s.stepOut)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
@@ -512,7 +517,7 @@ func (s *Server) checkCredentials(ctx context.Context, name string, c config.Clu
 	defer cl.Close()
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	reply, err := backend{cl}.do(ctx, http.MethodGet, "", "", nil, nil, nil)
+	reply, err := backend{cl: cl}.do(ctx, http.MethodGet, "", "", nil, nil, nil)
 	if err != nil {
 		return fmt.Sprintf("cannot reach cluster %s to check its credentials: %v", name, err), ""
 	}

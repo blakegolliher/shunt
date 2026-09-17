@@ -158,6 +158,14 @@ Once allowed, it aborts the source's in-progress multipart uploads, deletes ever
 
 Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version"}`.
 
+### `GET /v1/tenants/{tenant}/step-out`
+
+Read-only: whether this tenant's clients could use their cluster directly, with shunt out of the path (ADR-0011). Changes nothing.
+
+It answers `{"tenant", "cluster", "scheme", "endpoints", "ready", "problems", "notes", "buckets": [{"bucket", "state", "cluster", "name", "problems", "notes"}], "keys": [{"access_key", "problems"}]}`. `ready` is true when no list of problems has an entry. Blockers: buckets on more than one cluster, a placement that is not `ACTIVE`, a bucket whose name on the cluster is not the client's bucket name, multipart uploads in progress, and a client key the cluster does not know, knows with another secret, or cannot use on a bucket. Each client key is checked by signing `ListBuckets` and a `HEAD` of every bucket **as that key** against the cluster. Notes are differences a client would notice without being blocked, such as buckets the key sees directly that shunt does not show.
+
+`shunt step-out [tenant]` prints this and exits non-zero while anything blocks.
+
 ### `POST /v1/placements/{tenant}/{bucket}/finish`
 
 `CUTOVER → ACTIVE` without deleting anything: the source bucket stays on its cluster and is no longer referenced. This is the path for a source you want to keep, or delete yourself later.

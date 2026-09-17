@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -281,5 +283,53 @@ func TestBucketArguments(t *testing.T) {
 	}
 	if shown("default/data01") != "data01" || shown("acme/data01") != "acme/data01" {
 		t.Error("shown")
+	}
+}
+
+// step-out prints how to take shunt out of the path when nothing blocks it, and exits non-zero,
+// naming what blocks, when something does.
+func TestStepOutCommand(t *testing.T) {
+	rg := newAPIRig(t)
+	for _, b := range []string{"data01", "logs-001"} {
+		if err := rg.vast02.CreateBucket(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rg.ctl.TenantKeys = func(string) []sigv4.Credential {
+		return []sigv4.Credential{{AccessKey: "CLIENTKEY", Secret: "s", Tenant: directory.DefaultTenant}}
+	}
+	rg.addCluster(t, "vast02", rg.ep02)
+	rg.must(t, "adopt", "vast02", "data01")
+
+	out := rg.must(t, "step-out")
+	for _, want := range []string{
+		"step-out check for your clients: every bucket is on vast02 (http://" + rg.ep02 + ")",
+		"ok      bucket data01: ACTIVE on vast02 under the same name, no uploads in progress",
+		"ok      client key CLIENTKEY: vast02 accepts it and it reaches every bucket",
+		"note    listing buckets directly as CLIENTKEY shows 1 that shunt does not: logs-001",
+		"READY: clients can use vast02 directly",
+		"1. Point the S3 name your clients use at vast02 (" + rg.ep02 + ")",
+		"3. Stop shunt.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("step-out output lacks %q:\n%s", want, out)
+		}
+	}
+
+	rg.must(t, "adopt", "vast02", "logs", "--name", "logs-001")
+	out, err := rg.cli(t, "step-out")
+	if !errors.Is(err, errNotReady) {
+		t.Fatalf("want errNotReady, got %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"BLOCKED bucket logs is named logs-001 on vast02: clients going direct would have to use that name",
+		"1 problem blocks stepping out.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("step-out output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "READY") || strings.Contains(out, "default/") {
+		t.Errorf("not ready, and the default tenant is never shown:\n%s", out)
 	}
 }

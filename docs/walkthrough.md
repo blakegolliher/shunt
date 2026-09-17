@@ -175,6 +175,7 @@ Expected:
 ```
 cluster vast02: vast http://vast02.example.com:80 region us-east-1 (conditional_write true, conditional_delete false)
 data01: target vast02/data01-001 (exists); canary write, read, delete ok; conditional_write true, conditional_delete true (measured; directory version 6)
+note: on vast02 the bucket is named data01-001, not data01; to take shunt out of the path later, clients would have to use that name (--name data01 keeps it; shunt step-out, ADR-0011)
 same shunt process, no restart
 ```
 
@@ -388,6 +389,27 @@ The script:
 - ends with `WALKTHROUGH GREEN`.
 
 `--reset` deletes `data01` on vast01 and `data01-001` on vast02 first. `--listen`, `--admin`, `--src-type`, `--src-region` and `--dst-*` adjust the rest. `make walkthrough` is this script on the e2e Garage and MinIO.
+
+## Leaving again
+
+`shunt step-out` checks whether the clients could use vast02 directly now, with shunt gone: every bucket `ACTIVE` on one cluster under the name clients use, nothing mid-upload, and every client key accepted by vast02. It changes nothing.
+
+```sh
+shunt step-out
+```
+
+Expected:
+
+```
+step-out check for your clients: every bucket is on vast02 (http://vast02.example.com:80)
+  BLOCKED bucket data01 is named data01-001 on vast02: clients going direct would have to use that name, and a bucket cannot be renamed; move it once more with --name data01
+  BLOCKED client key SHUNTLAB0000000000000001: vast02 does not know this access key: clients going direct would need keys vast02 issues, or shunt should hold vast02's own keys from the start (docs/migrating.md)
+
+2 problems block stepping out. Fix them and run shunt step-out again.
+shunt: not ready to step out; nothing was changed
+```
+
+Both reasons are choices made earlier in this page: the bucket is `data01-001` on vast02, not `data01`, and the client key is one shunt issued rather than one vast02 knows. Expand with `--name data01`, and give shunt the clusters' own client keys, and the same check passes and prints how to hand the clients back (ADR-0011, docs/migrating.md).
 
 ## When something is refused
 

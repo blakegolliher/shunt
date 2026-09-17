@@ -2,6 +2,8 @@
 
 shunt is an S3 front-end proxy. Clients talk to one endpoint and one bucket name, and shunt decides which backend cluster actually holds each bucket. That lets you move a bucket from one cluster to another **while clients keep reading and writing it**, with no client change, no downtime and no per-object bookkeeping.
 
+When the move is done, shunt can get out of the way: `shunt step-out` checks whether your clients could talk to the cluster directly again, and tells you what stands in the way if they can't. Coming in costs no client change, and so does leaving (ADR-0011).
+
 **Status: proof of concept.** It has run on Garage, MinIO and VAST. The design is in [docs/DESIGN.md](docs/DESIGN.md), progress and known gaps in [docs/STATUS.md](docs/STATUS.md), and the POC track in [docs/POC.md](docs/POC.md). It is not production software yet.
 
 ## Build
@@ -31,6 +33,7 @@ make all            # build, lint, tests, -race, fuzz
 | `shunt purge-source <bucket>` | Delete the source copy and bucket, after checking the target has everything |
 | `shunt tenant set-default <cluster>` | Where new buckets are created |
 | `shunt status [bucket]` | Clusters, moving buckets, write split, fallback reads, mover progress |
+| `shunt step-out` | Check whether clients could use their cluster directly again, with shunt gone |
 
 Every command answers `--help`. A bucket is named bare (`demo-source`). `tenant/bucket` is only needed when one shunt serves several tenants. For production (TLS, tokens), run `shunt serve --config shunt.yaml` ([docs/reference/config.md](docs/reference/config.md)).
 
@@ -143,7 +146,7 @@ shunt status demo-source
 - writes, reads back and deletes a canary object;
 - measures whether B honours conditional writes, which the mover relies on.
 
-It then records `demo-dest` as the target. Clients see no change yet. The status shows both clusters, and `(target clusterb/demo-dest)`.
+It then records `demo-dest` as the target. Clients see no change yet. The status shows both clusters, and `(target clusterb/demo-dest)`. `expand` also notes that on cluster B the bucket is `demo-dest`, not `demo-source`: that is the name clients would have to use if you ever take shunt out of the path (step 14). `--name demo-source` avoids it.
 
 ### Step 7: send 50% of writes to cluster B (T2)
 
@@ -232,6 +235,18 @@ shunt status
 `cluster remove` is refused while anything still points at cluster A, and the refusal lists what does. That's why `set-default` comes first. `status` then lists only `clusterb`, and T3 keeps printing `mismatched 0`.
 
 Stop T3, then T1, with Ctrl-C. To start again from scratch, delete `shunt-data/`.
+
+### Step 14: leave, when you want to (T2)
+
+shunt is not a one-way door. When a bucket has arrived on its cluster, `shunt step-out` checks, against the cluster itself, whether your clients could go straight to it:
+
+```sh
+shunt step-out
+```
+
+It reads, and changes nothing. It is happy when every bucket is `ACTIVE` on one cluster **under the name your clients use**, nothing is mid-upload, and every client key shunt holds is one the cluster accepts on every bucket. Then it prints the three steps it can't do for you: point your S3 name at the cluster, wait out the DNS TTL, stop shunt. Until you stop it, pointing the name back is the undo.
+
+In this demo the check refuses, and says why: the client key is shunt's own, and cluster B's bucket is `demo-dest`, not `demo-source`. Both are choices made earlier: give shunt the cluster's keys rather than generated ones (as a brownfield insertion does, [docs/DESIGN.md](docs/DESIGN.md) §11), and expand with `--name demo-source` to keep the name. Do that, and shunt can hand the clients back with nothing to change on their side. See [docs/migrating.md](docs/migrating.md).
 
 ### When something goes wrong
 

@@ -197,7 +197,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 
 ### 2.10 Simplicity rules (these go into `CLAUDE.md` verbatim)
 
-- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.
@@ -630,5 +630,7 @@ The reference scenario: clients already use bucket `data01` on vast01 through `s
 | 8 | `shunt cutover data01` | CUTOVER → ACTIVE on vast02 | listing diff empty; fallback reads zero for the comfort window |
 
 Rollback at steps 2–3 is a DNS flip back. From step 5 on, rollback is a reconcile (target → source for the ramped key range), never just lowering the ratio.
+
+**Stepping out again (ADR-0011).** The same four invariants, read backwards, say when shunt can leave: the clients' keys are the cluster's own (invariant 3), each bucket carries the name clients use (invariant 4, so `expand --name data01` rather than the default `data01-001`), every bucket of the tenant is on one cluster, and nothing is in flight. `shunt step-out` checks exactly that, against the cluster, and prints the DNS flip back. Inserting shunt is reversible on purpose: a migration tool nobody can leave is one fewer team starts.
 
 **Cross-DC note.** With shunt in dc01 and vast02 in dc02, the ramped 5 % crosses the inter-DC link; the ramp comparison will show that latency honestly, and the hold thresholds should be set with it in mind rather than tuned to hide it.

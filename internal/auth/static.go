@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 
 	"go.yaml.in/yaml/v4"
 
@@ -109,3 +111,16 @@ func (s *Static) Lookup(_ context.Context, accessKey string) (sigv4.Credential, 
 
 // Len returns the number of credentials.
 func (s *Static) Len() int { return len(s.byKey) }
+
+// Tenant returns a tenant's credentials, secrets included, ordered by access key. The control API's
+// step-out check signs with them to ask a cluster what those clients could do without shunt.
+func (s *Static) Tenant(tenant string) []sigv4.Credential {
+	var out []sigv4.Credential
+	for _, c := range s.byKey {
+		if c.Tenant == tenant {
+			out = append(out, c)
+		}
+	}
+	slices.SortFunc(out, func(a, b sigv4.Credential) int { return strings.Compare(a.AccessKey, b.AccessKey) })
+	return out
+}

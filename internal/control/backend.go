@@ -25,8 +25,12 @@ import (
 const maxBackendBody = 8 << 20
 
 // backend is the control plane's S3 client for one cluster: the proxy's live cluster, with its
-// resolved credentials, signing every request with shunt's own signer.
-type backend struct{ cl *upstream.Cluster }
+// resolved credentials, signing every request with shunt's own signer. as, when set, signs with a
+// client's key instead: step-out asks the cluster what that client could do without shunt.
+type backend struct {
+	cl *upstream.Cluster
+	as *sigv4.Credentials
+}
 
 type backendReply struct {
 	status int
@@ -70,7 +74,11 @@ func (b backend) do(ctx context.Context, method, bucket, key string, query url.V
 		for k, v := range hdr {
 			req.Header.Set(k, v)
 		}
-		sigv4.Sign(req, b.cl.Creds, b.cl.Region, hex.EncodeToString(sum[:]), time.Now())
+		creds := b.cl.Creds
+		if b.as != nil {
+			creds = *b.as
+		}
+		sigv4.Sign(req, creds, b.cl.Region, hex.EncodeToString(sum[:]), time.Now())
 		// Every control-plane request is safe to send twice (object PUTs rewrite the same bytes,
 		// deletes and bucket creation accept an already-done outcome), so mark it idempotent. The
 		// transport then replays it on a new connection when a reused one turns out closed, which

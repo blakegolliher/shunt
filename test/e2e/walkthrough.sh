@@ -284,6 +284,12 @@ diff -r "$WORK/seed" "$WORK/readback" >/dev/null || fail "the seeded objects rea
 note "all $OBJECTS objects written to $SRC_NAME before shunt existed read back through shunt from $DST_NAME"
 checkpoint
 
+say "step-out: what stands between the clients and $DST_NAME"
+out=$($SHUNT step-out 2>&1) && fail "step-out passed, but the bucket is $DST_BUCKET on $DST_NAME and the client key is shunt's own"
+printf '%s\n' "$out" | sed 's/^/     /'
+grep -q "is named $DST_BUCKET on $DST_NAME" <<<"$out" || fail "step-out does not name the bucket-name difference"
+grep -q "client key $CLIENT_AK" <<<"$out" || fail "step-out does not check the client key against $DST_NAME"
+
 kill -INT "$VERIFY_PID"
 vrc=0; wait "$VERIFY_PID" || vrc=$?
 VERIFY_PID=

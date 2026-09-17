@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -35,6 +37,7 @@ type fakeCluster struct {
 	condPut   bool               // honor If-None-Match: * on PUT over an existing object
 	condDel   bool               // honor a mismatched If-Match on DELETE
 	onList    func(token string) // called before a ListObjectsV2 page is served, with its continuation token
+	keys      map[string]bool    // when set, an access key not in it answers 403 InvalidAccessKeyId
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -64,6 +67,14 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 		}
 		if q := r.URL.Query(); fc.onList != nil && r.Method == http.MethodGet && q.Get("list-type") == "2" {
 			fc.onList(q.Get("continuation-token"))
+		}
+		if fc.keys != nil {
+			_, cred, _ := strings.Cut(r.Header.Get("Authorization"), "Credential=")
+			if ak, _, _ := strings.Cut(cred, "/"); !fc.keys[ak] {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`<Error><Code>InvalidAccessKeyId</Code><Message>unknown key</Message></Error>`))
+				return
+			}
 		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
@@ -707,4 +718,80 @@ func fakeBackend(t *testing.T, name string, fc *fakeCluster) backend {
 	t.Cleanup(cl.Transport.CloseIdleConnections)
 	cl.Creds.AccessKey, cl.Creds.Secret = "AK", "SK"
 	return backend{cl: cl}
+}
+
+// TestStepOut checks what stands between a tenant's clients and their cluster, and that nothing it
+// finds is missed or invented: a renamed bucket, an upload in progress, a key the cluster does not
+// know, buckets on two clusters, a move under way; and a tenant with none of those is ready.
+func TestStepOut(t *testing.T) {
+	rg := newRig(t)
+	for _, b := range []string{"data01-001", "logs", "other"} {
+		if err := rg.vast02.be.CreateBucket(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rg.vast01.be.CreateBucket("moving"); err != nil {
+		t.Fatal(err)
+	}
+	rg.vast02.keys = map[string]bool{"AK": true, "SHARED": true}
+	keys := map[string][]sigv4.Credential{directory.DefaultTenant: {{AccessKey: "SHUNTONLY", Secret: "s", Tenant: directory.DefaultTenant}}}
+	rg.ctl.TenantKeys = func(tenant string) []sigv4.Credential { return keys[tenant] }
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast02", Name: "data01-001"}, nil)
+	rg.must("POST", "/v1/placements/default/logs/adopt", AdoptRequest{Cluster: "vast02"}, nil)
+	vast02, err := rg.ctl.backendFor("vast02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := vast02.do(context.Background(), http.MethodPost, "logs", "big", url.Values{"uploads": {""}}, nil, nil); err != nil || r.status != http.StatusOK {
+		t.Fatalf("starting an upload: %v %+v", err, r)
+	}
+
+	var so StepOut
+	rg.must("GET", "/v1/tenants/default/step-out", nil, &so)
+	if so.Ready || so.Cluster != "vast02" {
+		t.Fatalf("step-out: %+v", so)
+	}
+	wantProblems(t, so.Buckets[0].Problems, "named data01-001 on vast02", "--name data01")
+	wantProblems(t, so.Buckets[1].Problems, "multipart uploads in progress")
+	if len(so.Keys) != 1 {
+		t.Fatalf("keys: %+v", so.Keys)
+	}
+	wantProblems(t, so.Keys[0].Problems, "vast02 does not know this access key")
+
+	// Tenant team2: a key vast02 issued, a bucket under its own name, nothing in flight: ready.
+	keys["team2"] = []sigv4.Credential{{AccessKey: "SHARED", Secret: "s", Tenant: "team2"}}
+	rg.must("POST", "/v1/placements/team2/other/adopt", AdoptRequest{Cluster: "vast02"}, nil)
+	so = StepOut{}
+	rg.must("GET", "/v1/tenants/team2/step-out", nil, &so)
+	if !so.Ready || so.Cluster != "vast02" || len(so.Endpoints) != 1 || len(so.Keys) != 1 {
+		t.Fatalf("want ready: %+v", so)
+	}
+	wantProblems(t, so.Notes, "shows 2 that shunt does not: data01-001, logs")
+
+	// A bucket on a second cluster, and then a move under way, block it again.
+	rg.must("POST", "/v1/placements/team2/moving/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	so = StepOut{}
+	rg.must("GET", "/v1/tenants/team2/step-out", nil, &so)
+	if so.Ready || so.Cluster != "" || len(so.Keys) != 0 {
+		t.Fatalf("two clusters: %+v", so)
+	}
+	wantProblems(t, so.Problems, "on 2 clusters (vast01, vast02)")
+	rg.must("POST", "/v1/placements/team2/moving/ramp", RampRequest{Ratio: 0.5, To: "vast02", Create: true}, nil)
+	so = StepOut{}
+	rg.must("GET", "/v1/tenants/team2/step-out", nil, &so)
+	wantProblems(t, so.Buckets[0].Problems, "is RAMPING")
+
+	rg.answers("GET", "/v1/tenants/nobody/step-out", nil, http.StatusNotFound, "not_found")
+}
+
+func wantProblems(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	all := strings.Join(got, "\n")
+	for _, w := range want {
+		if !strings.Contains(all, w) {
+			t.Errorf("want %q in:\n%s", w, all)
+		}
+	}
 }
