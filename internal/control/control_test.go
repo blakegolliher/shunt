@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -598,5 +599,54 @@ func TestExpandMeasuresConditionals(t *testing.T) {
 	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02"}, &ex)
 	if ex.Measured || !ex.ConditionalWrite {
 		t.Fatalf("a stated capability was measured over: %+v", ex)
+	}
+}
+
+// TestBackendReplaysOnAStaleConnection holds the keep-alive race MinIO produces after answering a
+// conditional PUT with 412: the connection is closed after the next request is sent and before it
+// is answered. Go replays only requests it knows are idempotent, so a PUT or DELETE failed with a
+// bare EOF and expand refused spuriously.
+func TestBackendReplaysOnAStaleConnection(t *testing.T) {
+	type connKey struct{}
+	var mu sync.Mutex
+	served := map[any]int{}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := r.Context().Value(connKey{})
+		mu.Lock()
+		served[c]++
+		n := served[c]
+		mu.Unlock()
+		if n > 1 { // every connection answers one request, then drops the next unanswered
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Config.ConnContext = func(ctx context.Context, c net.Conn) context.Context { return context.WithValue(ctx, connKey{}, c) }
+	srv.Start()
+	defer srv.Close()
+
+	cl, err := upstream.New("stale", config.Cluster{Type: "s3", Scheme: "http", Region: "us-east-1",
+		Endpoints: []string{strings.TrimPrefix(srv.URL, "http://")}}, upstream.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Transport.CloseIdleConnections()
+	cl.Creds.Secret = "secret"
+	b := backend{cl: cl}
+	for i, req := range []struct {
+		method string
+		body   []byte
+	}{{http.MethodDelete, nil}, {http.MethodDelete, nil}, {http.MethodPut, []byte("body")}, {http.MethodPut, []byte("body")}} {
+		r, err := b.do(context.Background(), req.method, "b", "k", nil, req.body, nil)
+		if err != nil {
+			t.Fatalf("request %d (%s): %v", i, req.method, err)
+		}
+		if r.status != http.StatusNoContent {
+			t.Fatalf("request %d (%s): HTTP %d", i, req.method, r.status)
+		}
 	}
 }

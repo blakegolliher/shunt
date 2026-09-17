@@ -71,6 +71,12 @@ func (b backend) do(ctx context.Context, method, bucket, key string, query url.V
 			req.Header.Set(k, v)
 		}
 		sigv4.Sign(req, b.cl.Creds, b.cl.Region, hex.EncodeToString(sum[:]), time.Now())
+		// Every control-plane request is safe to send twice (object PUTs rewrite the same bytes,
+		// deletes and bucket creation accept an already-done outcome), so mark it idempotent. The
+		// transport then replays it on a new connection when a reused one turns out closed, which
+		// MinIO does after answering a conditional PUT with 412; otherwise a PUT or DELETE fails with
+		// a bare EOF. A nil value is never sent, and it is set after signing, so it is not signed.
+		req.Header["Idempotency-Key"] = nil
 		resp, err := b.cl.Transport.RoundTrip(req)
 		if err != nil {
 			if upstream.IsConnectError(err) {
