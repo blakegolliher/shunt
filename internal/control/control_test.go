@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 
+	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -794,4 +796,64 @@ func wantProblems(t *testing.T, got []string, want ...string) {
 			t.Errorf("want %q in:\n%s", w, all)
 		}
 	}
+}
+
+// Importing the cluster's own client keys is what lets clients keep their credentials: through
+// shunt, and again when shunt steps out. A key the cluster does not know is refused.
+func TestImportClientKeys(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.vast01.keys = map[string]bool{"AK": true, "CLUSTERKEY": true}
+	var stored []sigv4.Credential
+	rg.ctl.AddKey = func(c sigv4.Credential) error { stored = append(stored, c); return nil }
+	rg.ctl.TenantKeys = func(string) []sigv4.Credential { return stored }
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+
+	// adopt --keys: a key vast01 does not know is refused, and nothing is adopted or stored.
+	rg.refused("POST", "/v1/placements/default/data01/adopt",
+		AdoptRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "NOPE", Secret: "s"}}}, "does not know this access key")
+	if len(stored) != 0 {
+		t.Fatalf("a refused key was stored: %+v", stored)
+	}
+	if _, ok := rg.dir.Snapshot().Lookup("default", "data01"); ok {
+		t.Fatal("the bucket was adopted although its keys were refused")
+	}
+
+	rg.must("POST", "/v1/placements/default/data01/adopt",
+		AdoptRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "CLUSTERKEY", Secret: "s", Buckets: []string{"data01"}}}}, nil)
+	if len(stored) != 1 || stored[0].AccessKey != "CLUSTERKEY" || stored[0].Tenant != "default" || len(stored[0].Buckets) != 1 {
+		t.Fatalf("stored: %+v", stored)
+	}
+	if !strings.Contains(rg.log.String(), "client key imported") || strings.Contains(rg.log.String(), "secret") {
+		t.Fatalf("one INFO line, and never a secret:\n%s", rg.log.String())
+	}
+
+	// With the cluster's own key, step-out is ready: clients could leave shunt behind.
+	var so StepOut
+	rg.must("GET", "/v1/tenants/default/step-out", nil, &so)
+	if !so.Ready {
+		t.Fatalf("want ready with an imported key: %+v", so)
+	}
+
+	// The same key twice, and a shunt with no credentials file, are both refused.
+	rg.ctl.AddKey = func(sigv4.Credential) error { return fmt.Errorf("%w: twice", auth.ErrDuplicateKey) }
+	rg.refused("POST", "/v1/tenants/default/client-keys", ClientKeyRequest{AccessKey: "CLUSTERKEY", Secret: "s"}, "already holds access key CLUSTERKEY")
+	rg.ctl.AddKey = nil
+	rg.refused("POST", "/v1/tenants/default/client-keys", ClientKeyRequest{AccessKey: "CLUSTERKEY", Secret: "s"}, "no credentials file")
+
+	// Removing a key: the lab key shunt generated for itself, once the real ones are in.
+	rg.ctl.RemoveKey = func(ak string) error {
+		stored = slices.DeleteFunc(stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
+		return nil
+	}
+	rg.answers("DELETE", "/v1/tenants/default/client-keys/NOSUCHKEY", nil, http.StatusNotFound, "not_found")
+	var removed ClientKeyResult
+	rg.must("DELETE", "/v1/tenants/default/client-keys/CLUSTERKEY", nil, &removed)
+	if removed.Left != 0 || len(stored) != 0 {
+		t.Fatalf("after removing the only key: %+v %+v", removed, stored)
+	}
+	rg.ctl.RemoveKey = nil
+	rg.refused("DELETE", "/v1/tenants/default/client-keys/CLUSTERKEY", nil, "cannot change its client keys")
 }

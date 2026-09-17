@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,13 +45,7 @@ func TestCheckConfigInvalidDirectoryNamesKey(t *testing.T) {
 
 func run(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
-	var out, errb bytes.Buffer
-	root := newRoot()
-	root.SetOut(&out)
-	root.SetErr(&errb)
-	root.SetArgs(args)
-	err = root.Execute()
-	return out.String(), errb.String(), err
+	return runIn(t, "", args...)
 }
 
 func TestVersion(t *testing.T) {

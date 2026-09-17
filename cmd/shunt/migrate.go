@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,8 +16,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.yaml.in/yaml/v4"
 	"golang.org/x/term"
 
+	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -219,15 +222,25 @@ func newTenant() *cobra.Command {
 
 func newAdopt() *cobra.Command {
 	var (
-		o    apiOptions
-		name string
+		o        apiOptions
+		name     string
+		keysFile string
 	)
 	cmd := &cobra.Command{
 		Use:   "adopt <cluster> <bucket>",
 		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11)",
-		Args:  cobra.ExactArgs(2),
+		Long: "Takes over a bucket that already exists on a cluster, keeping its name.\n\n" +
+			"--keys imports the client keys that cluster already issued, in the credentials-file schema\n" +
+			"(access_key and secret per entry). shunt checks each against the cluster and then verifies\n" +
+			"client signatures with them, so clients keep the credentials they have today and keep them\n" +
+			"if shunt is taken out of the path later (shunt step-out, ADR-0012).",
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := placementPath(args[1])
+			if err != nil {
+				return err
+			}
+			keys, err := readClientKeys(keysFile)
 			if err != nil {
 				return err
 			}
@@ -236,11 +249,16 @@ func newAdopt() *cobra.Command {
 				return err
 			}
 			var out control.PlacementStatus
-			if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name}, &out); callErr != nil {
+			if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name, Keys: keys}, &out); callErr != nil {
 				return callErr
 			}
 			if o.json {
 				return printJSON(cmd, out)
+			}
+			for _, k := range keys {
+				if _, perr := fmt.Fprintf(cmd.OutOrStdout(), "client key %s imported: %s accepts it, and shunt now verifies clients with it\n", k.AccessKey, args[0]); perr != nil {
+					return perr
+				}
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", shown(out.Key), out.Primary, out.Names[out.Primary])
 			return err
@@ -248,7 +266,37 @@ func newAdopt() *cobra.Command {
 	}
 	addAPIFlags(cmd, &o)
 	cmd.Flags().StringVar(&name, "name", "", "the bucket's name on the cluster (default: the same name)")
+	cmd.Flags().StringVar(&keysFile, "keys", "", "a credentials-file `path` of client keys the cluster already issued, to import")
 	return cmd
+}
+
+// readClientKeys reads a credentials file of keys to import. It is the operator's own file, in the
+// same schema as auth.credentials_file, so an existing one can be handed to adopt as it is.
+func readClientKeys(path string) ([]control.ClientKeyRequest, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // an operator-named file
+	if err != nil {
+		return nil, err
+	}
+	var f auth.File
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(f.Credentials) == 0 {
+		return nil, fmt.Errorf("%s: no credentials in it", path)
+	}
+	keys := make([]control.ClientKeyRequest, 0, len(f.Credentials))
+	for _, e := range f.Credentials {
+		if e.Secret == "" {
+			return nil, fmt.Errorf("%s: access key %s has no secret; shunt verifies client signatures, so it needs the secret itself", path, e.AccessKey)
+		}
+		keys = append(keys, control.ClientKeyRequest{AccessKey: e.AccessKey, Secret: e.Secret, Buckets: e.Buckets})
+	}
+	return keys, nil
 }
 
 func newExpand() *cobra.Command {

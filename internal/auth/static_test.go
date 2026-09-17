@@ -128,3 +128,88 @@ credentials:
 		t.Fatalf("Tenant(nobody) = %v", got)
 	}
 }
+
+func TestAddStoresAKeyAndKeepsTheFileReadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.yaml")
+	t.Setenv("SHUNT_TEST_IMPORT_SECRET", "ref-secret")
+	if err := os.WriteFile(path, []byte("credentials:\n  - { access_key: OLD, secret_ref: 'env:SHUNT_TEST_IMPORT_SECRET', tenant: acme }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Add(sigv4.Credential{AccessKey: "IMPORTED", Secret: "its-secret", Buckets: []string{"data"}}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Lookup(context.Background(), "IMPORTED")
+	if err != nil || c.Secret != "its-secret" || c.Tenant != "default" || len(c.Buckets) != 1 {
+		t.Fatalf("Lookup after Add = %+v, %v", c, err)
+	}
+	if err := s.Add(sigv4.Credential{AccessKey: "IMPORTED", Secret: "again"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("second Add = %v, want ErrDuplicateKey", err)
+	}
+
+	// The file is rewritten 0600, the ref stays a ref, and a fresh Load sees both keys.
+	st, err := os.Stat(path)
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v, %v", st.Mode().Perm(), err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "env:SHUNT_TEST_IMPORT_SECRET") || strings.Contains(string(body), "ref-secret") {
+		t.Fatalf("a secret_ref must stay a ref:\n%s", body)
+	}
+	again, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Len() != 2 {
+		t.Fatalf("after reload: %d keys\n%s", again.Len(), body)
+	}
+	if c, err := again.Lookup(context.Background(), "OLD"); err != nil || c.Secret != "ref-secret" || c.Tenant != "acme" {
+		t.Fatalf("the existing key after a rewrite: %+v, %v", c, err)
+	}
+}
+
+func TestAddWithoutAFileIsRefused(t *testing.T) {
+	s, err := parse([]byte("credentials:\n  - { access_key: K, secret: s }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Add(sigv4.Credential{AccessKey: "NEW", Secret: "s"}); !errors.Is(err, errNoFile) {
+		t.Fatalf("Add without a file = %v", err)
+	}
+}
+
+func TestRemoveDropsAKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.yaml")
+	if err := os.WriteFile(path, []byte("credentials:\n  - { access_key: LAB, secret: lab }\n  - { access_key: REAL, secret: real }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("LAB"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Lookup(context.Background(), "LAB"); !errors.Is(err, sigv4.ErrUnknownAccessKey) {
+		t.Fatalf("a removed key still resolves: %v", err)
+	}
+	if err := s.Remove("LAB"); !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("removing it twice = %v", err)
+	}
+	again, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Len() != 1 {
+		t.Fatalf("after reload: %d keys", again.Len())
+	}
+	if c, err := again.Lookup(context.Background(), "REAL"); err != nil || c.Secret != "real" {
+		t.Fatalf("the key that stays: %+v, %v", c, err)
+	}
+}

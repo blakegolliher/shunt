@@ -205,10 +205,18 @@ and can use on every bucket. It changes nothing and exits non-zero while anythin
 
 Two of those are decided long before you run it:
 
-- **Keys.** In resign mode clients sign with keys shunt issued. If shunt holds the *cluster's* keys
-  instead (the brownfield case: clients keep the keys they already had, docs/DESIGN.md §11), they
-  keep working when shunt leaves. After a move to another cluster, the same key has to exist on that
-  cluster too.
+- **Keys.** In resign mode clients sign with keys shunt holds. Import the ones the cluster already
+  issued and clients never change credentials at all:
+
+  ```sh
+  shunt adopt vast01 data --keys keys.yaml    # access_key + secret entries, checked against vast01
+  shunt client add AKIA… --check vast01       # one more later; prompts for the secret
+  shunt client remove SHUNT…                  # drop the key `serve --plaintext` generated
+  ```
+
+  Each key is checked against the cluster before it is stored, and a refused key refuses the adopt.
+  After a move to another cluster, the same key has to exist on that cluster too, or clients get new
+  keys at that point; `shunt step-out` says which case you are in.
 - **Names.** `expand` names the target bucket `<bucket>-001` by default, and a bucket created through
   shunt gets a generated backend name. S3 cannot rename a bucket, so pass `--name <bucket>` at expand
   time if you want the option of leaving later. `expand` prints a note when the names differ.

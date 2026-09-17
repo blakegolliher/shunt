@@ -158,6 +158,16 @@ Once allowed, it aborts the source's in-progress multipart uploads, deletes ever
 
 Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version"}`.
 
+### `POST /v1/tenants/{tenant}/client-keys`
+
+Imports one client key: `{"access_key", "secret", "buckets"?, "cluster"?}` (ADR-0012). The key is checked against `cluster`, or the tenant's default cluster when that is empty, by signing `ListBuckets` with it; an unknown key or a wrong secret is refused. It is then stored in shunt's credentials file (0600, rewritten atomically) and used to verify client signatures from the next request on. Answers `{"access_key", "tenant", "checked"}`; the secret is never logged, returned, or readable through the API.
+
+`shunt adopt <cluster> <bucket> --keys <file>` sends one of these per entry before the placement is written, and `shunt client add <access-key>` sends one, prompting for the secret.
+
+### `DELETE /v1/tenants/{tenant}/client-keys/{access_key}`
+
+Drops a key shunt holds, for a key that has been replaced or the key `serve --plaintext` generated. Answers `{"access_key", "tenant", "left"}`, `left` being the tenant's remaining keys. `shunt client remove <access-key>`.
+
 ### `GET /v1/tenants/{tenant}/step-out`
 
 Read-only: whether this tenant's clients could use their cluster directly, with shunt out of the path (ADR-0011). Changes nothing.

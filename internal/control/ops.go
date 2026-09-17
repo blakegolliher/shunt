@@ -109,6 +109,9 @@ func (s *Server) transition(r *http.Request, key string, p directory.Placement, 
 type AdoptRequest struct {
 	Cluster string `json:"cluster"`
 	Name    string `json:"name,omitempty"` // backend bucket name; default the client bucket name
+	// Keys are the cluster's own client keys, imported so that clients keep the credentials they
+	// already use (ADR-0012). Each is checked against Cluster before the placement is written.
+	Keys []ClientKeyRequest `json:"keys,omitempty"`
 }
 
 func (s *Server) adopt(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +138,15 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) {
 	case !exists:
 		fail(w, refuse("bucket %s does not exist on %s; adopt takes over a bucket that is already there", req.Name, req.Cluster))
 		return
+	}
+	for _, k := range req.Keys {
+		k.Cluster = req.Cluster
+		res, kerr := s.storeKey(ctx, tenant, k)
+		if kerr != nil {
+			fail(w, kerr)
+			return
+		}
+		s.info(r, "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
 	}
 	if err := s.Dir.Adopt(r.Context(), tenant, bucket, req.Cluster, req.Name, actor(r)); err != nil {
 		fail(w, err)

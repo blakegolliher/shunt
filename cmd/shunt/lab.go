@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
+	"github.com/blakegolliher/shunt/internal/control"
+	"github.com/blakegolliher/shunt/internal/directory"
 )
 
 // labConfig prepares a state directory for `shunt serve --plaintext` and returns the config it
@@ -108,6 +111,89 @@ func newClient() *cobra.Command {
 		},
 	}
 	show.Flags().StringVar(&stateDir, "state-dir", "shunt-data", "the state directory `shunt serve --plaintext` uses")
-	cmd.AddCommand(show)
+	cmd.AddCommand(show, newClientAdd(), newClientRemove())
+	return cmd
+}
+
+// newClientAdd imports a key clients already use on a cluster, so they keep their own credentials
+// while shunt is in front of it, and when shunt leaves again (ADR-0012).
+func newClientAdd() *cobra.Command {
+	var (
+		o       apiOptions
+		req     control.ClientKeyRequest
+		tenant  string
+		buckets []string
+	)
+	cmd := &cobra.Command{
+		Use:   "add <access-key>",
+		Short: "Import a client key a cluster already issued, so clients keep their own credentials",
+		Long: "Prompts for the secret key (or reads one line from stdin), checks the pair against the cluster,\n" +
+			"and stores it in shunt's credentials file. shunt then verifies client signatures with it, so the\n" +
+			"clients that use this key on the cluster can use it through shunt unchanged, and can go back to\n" +
+			"the cluster unchanged when shunt steps out (shunt step-out).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req.AccessKey, req.Buckets = args[0], buckets
+			secret, err := readSecret(cmd, "secret key for "+req.AccessKey+": ")
+			if err != nil {
+				return err
+			}
+			req.Secret = secret
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.ClientKeyResult
+			if callErr := api.call(cmd.Context(), "POST", "/v1/tenants/"+url.PathEscape(tenant)+"/client-keys", req, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			where := "stored; it was not checked against a cluster"
+			if out.Checked != "" {
+				where = out.Checked + " accepts it"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "client key %s imported: %s, and shunt now verifies clients with it\n", out.AccessKey, where)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	f := cmd.Flags()
+	f.StringVar(&tenant, "tenant", directory.DefaultTenant, "the tenant whose clients use this key")
+	f.StringVar(&req.Cluster, "check", "", "the `cluster` to check the key against (default: the tenant's default cluster)")
+	f.StringSliceVar(&buckets, "buckets", nil, "limit this key to these `buckets` through shunt")
+	return cmd
+}
+
+// newClientRemove drops a client key shunt holds: one that was replaced, or the key `serve
+// --plaintext` generated once the clients' own keys are imported (ADR-0012).
+func newClientRemove() *cobra.Command {
+	var (
+		o      apiOptions
+		tenant string
+	)
+	cmd := &cobra.Command{
+		Use:   "remove <access-key>",
+		Short: "Drop a client key shunt holds; clients using it are refused from then on",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.ClientKeyResult
+			if callErr := api.call(cmd.Context(), "DELETE", "/v1/tenants/"+url.PathEscape(tenant)+"/client-keys/"+url.PathEscape(args[0]), nil, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "client key %s removed; %d key(s) left for these clients\n", out.AccessKey, out.Left)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().StringVar(&tenant, "tenant", directory.DefaultTenant, "the tenant whose key this is")
 	return cmd
 }

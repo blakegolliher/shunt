@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -331,5 +332,65 @@ func TestStepOutCommand(t *testing.T) {
 	}
 	if strings.Contains(out, "READY") || strings.Contains(out, "default/") {
 		t.Errorf("not ready, and the default tenant is never shown:\n%s", out)
+	}
+}
+
+// Importing the keys a cluster already issued: clients keep their own credentials through shunt,
+// and keep them when shunt steps out (ADR-0012).
+func TestClientKeyImport(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	var stored []sigv4.Credential
+	rg.ctl.AddKey = func(c sigv4.Credential) error { stored = append(stored, c); return nil }
+	rg.ctl.TenantKeys = func(string) []sigv4.Credential { return stored }
+	rg.addCluster(t, "vast01", rg.ep01)
+
+	keys := filepath.Join(t.TempDir(), "keys.yaml")
+	if err := os.WriteFile(keys, []byte("credentials:\n  - { access_key: CLUSTERKEY, secret: cluster-secret }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := rg.must(t, "adopt", "vast01", "data01", "--keys", keys)
+	for _, want := range []string{"client key CLUSTERKEY imported: vast01 accepts it", "data01: ACTIVE on vast01/data01"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("adopt --keys output lacks %q:\n%s", want, out)
+		}
+	}
+	if len(stored) != 1 || stored[0].AccessKey != "CLUSTERKEY" || stored[0].Secret != "cluster-secret" {
+		t.Fatalf("stored: %+v", stored)
+	}
+
+	// A second key, typed at the prompt, checked against the tenant's default cluster.
+	out, stderr, err := runIn(t, "second-secret\n", "client", "add", "OTHERKEY", "--api", rg.url)
+	if err != nil {
+		t.Fatalf("client add: %v\n%s%s", err, out, stderr)
+	}
+	if !strings.Contains(out, "client key OTHERKEY imported: vast01 accepts it") {
+		t.Errorf("client add output: %q", out)
+	}
+	if len(stored) != 2 || stored[1].Secret != "second-secret" {
+		t.Fatalf("stored: %+v", stored)
+	}
+	if strings.Contains(out+stderr, "second-secret") {
+		t.Error("the secret must never be printed")
+	}
+
+	// Removing the key shunt generated for itself, once the clients' own key is in.
+	rg.ctl.RemoveKey = func(ak string) error {
+		stored = slices.DeleteFunc(stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
+		return nil
+	}
+	out = rg.must(t, "client", "remove", "CLUSTERKEY")
+	if !strings.Contains(out, "client key CLUSTERKEY removed; 1 key(s) left") {
+		t.Errorf("client remove output: %q", out)
+	}
+
+	// A keys file without secrets cannot work: shunt verifies client signatures itself.
+	if err := os.WriteFile(keys, []byte("credentials:\n  - { access_key: NOSECRET, secret_ref: 'env:X' }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := rg.cli(t, "adopt", "vast01", "logs", "--keys", keys); err == nil || !strings.Contains(out, "has no secret") {
+		t.Fatalf("want a clear error about the missing secret: %v\n%s", err, out)
 	}
 }

@@ -3,12 +3,14 @@ package control
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 
+	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -157,6 +159,7 @@ func (s *Server) checkKeys(ctx context.Context, out *StepOut) {
 				extra = append(extra, name)
 			}
 		}
+		slices.Sort(extra) // a backend's listing order is its own; the note must not depend on it
 		if len(extra) > 0 {
 			out.Notes = append(out.Notes, fmt.Sprintf("listing buckets directly as %s shows %d that shunt does not: %s", k.AccessKey, len(extra), strings.Join(extra, ", ")))
 		}
@@ -221,4 +224,96 @@ func (s *Server) uploadsInProgress(ctx context.Context, cluster, bucket string) 
 		return 0, err
 	}
 	return len(page.Uploads), nil
+}
+
+// ClientKeyRequest imports one key clients already use, so they keep their own credentials when
+// shunt goes in front of a cluster, and when it leaves again (ADR-0012, docs/DESIGN.md §11).
+type ClientKeyRequest struct {
+	AccessKey string   `json:"access_key"`
+	Secret    string   `json:"secret"`
+	Buckets   []string `json:"buckets,omitempty"` // optional allowlist, as in the credentials file
+	// Cluster checks the key there before storing it: it must be a key that cluster knows, with
+	// this secret. Empty: the tenant's default cluster, or no check when it has none.
+	Cluster string `json:"cluster,omitempty"`
+}
+
+// ClientKeyResult is what an import stored, never the secret.
+type ClientKeyResult struct {
+	AccessKey string `json:"access_key"`
+	Tenant    string `json:"tenant"`
+	Checked   string `json:"checked,omitempty"` // the cluster that accepted the key
+	Left      int    `json:"left,omitempty"`    // after a removal: the tenant's remaining keys
+}
+
+func (s *Server) importKey(w http.ResponseWriter, r *http.Request) {
+	var req ClientKeyRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := s.storeKey(r.Context(), r.PathValue("tenant"), req)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	s.info(r, "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
+	writeJSON(w, http.StatusOK, res)
+}
+
+// storeKey checks a client key against a cluster and stores it. The secret is never logged, never
+// returned, and reaches the proxy's credential store only after the cluster has accepted it.
+func (s *Server) storeKey(ctx context.Context, tenant string, req ClientKeyRequest) (ClientKeyResult, error) {
+	res := ClientKeyResult{AccessKey: req.AccessKey, Tenant: tenant}
+	switch {
+	case s.AddKey == nil:
+		return res, refuse("this shunt cannot import client keys: it has no credentials file to write to")
+	case req.AccessKey == "" || req.Secret == "":
+		return res, refuse("a client key needs an access key and its secret")
+	}
+	cluster := req.Cluster
+	if cluster == "" {
+		cluster = s.Dir.Snapshot().File().Tenants[tenant].DefaultCluster
+	}
+	if cluster != "" {
+		b, err := s.backendFor(cluster)
+		if err != nil {
+			return res, err
+		}
+		cctx, cancel := context.WithTimeout(ctx, backendTimeout)
+		defer cancel()
+		as := backend{cl: b.cl, as: &sigv4.Credentials{AccessKey: req.AccessKey, Secret: req.Secret}}
+		if _, problem := listBucketsAs(cctx, as); problem != "" {
+			return res, refuse("%s", problem)
+		}
+		res.Checked = cluster
+	}
+	if err := s.AddKey(sigv4.Credential{AccessKey: req.AccessKey, Secret: req.Secret, Tenant: tenant, Buckets: req.Buckets}); err != nil {
+		if errors.Is(err, auth.ErrDuplicateKey) {
+			return res, refuse("shunt already holds access key %s; remove it from the credentials file to replace it", req.AccessKey)
+		}
+		return res, err
+	}
+	return res, nil
+}
+
+func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
+	tenant, accessKey := r.PathValue("tenant"), r.PathValue("access_key")
+	if s.RemoveKey == nil {
+		fail(w, refuse("this shunt cannot change its client keys: it has no credentials file to write to"))
+		return
+	}
+	held := false
+	for _, k := range s.TenantKeys(tenant) {
+		held = held || k.AccessKey == accessKey
+	}
+	if !held {
+		fail(w, notFound("no client key %s here (shunt client show lists them)", accessKey))
+		return
+	}
+	if err := s.RemoveKey(accessKey); err != nil {
+		fail(w, err)
+		return
+	}
+	left := len(s.TenantKeys(tenant))
+	s.info(r, "client key removed", "tenant", tenant, "access_key", accessKey, "keys_left", left)
+	writeJSON(w, http.StatusOK, ClientKeyResult{AccessKey: accessKey, Tenant: tenant, Left: left})
 }

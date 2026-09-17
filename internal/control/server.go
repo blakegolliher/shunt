@@ -46,7 +46,13 @@ type Server struct {
 	// TenantKeys lists a tenant's client keys, secrets included, for step-out's direct checks. The
 	// file store answers today; P3c's store replaces the function.
 	TenantKeys func(tenant string) []sigv4.Credential
-	Log        *slog.Logger
+	// AddKey stores one client key: a key clients already use on a cluster, so that inserting shunt
+	// and removing it again cost no client change (ADR-0012). nil: this shunt cannot import keys.
+	AddKey func(c sigv4.Credential) error
+	// RemoveKey drops a client key shunt holds: a replaced key, or the generated lab key once the
+	// clients' own keys are imported. nil: this shunt cannot change its client keys.
+	RemoveKey func(accessKey string) error
+	Log       *slog.Logger
 	// Now defaults to time.Now; Sleep to a context-aware wait. Tests replace both.
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -72,6 +78,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/purge-source", s.logged("purge-source", s.purgeSource))
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/finish", s.logged("migrate finish", s.finish))
 	mux.HandleFunc("GET /v1/tenants/{tenant}/step-out", s.stepOut)
+	mux.HandleFunc("POST /v1/tenants/{tenant}/client-keys", s.logged("client key import", s.importKey))
+	mux.HandleFunc("DELETE /v1/tenants/{tenant}/client-keys/{access_key}", s.logged("client key remove", s.removeKey))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
@@ -147,6 +155,16 @@ type refusal struct{ msg string }
 func (r *refusal) Error() string { return r.msg }
 
 func refuse(format string, a ...any) error { return &refusal{msg: fmt.Sprintf(format, a...)} }
+
+// missing is a 404 in its own words: it answers as directory.ErrNotFound without carrying the
+// directory's prefix into a message about something else, such as a client key.
+type missing struct{ msg string }
+
+func (m *missing) Error() string { return m.msg }
+
+func (m *missing) Is(target error) bool { return target == directory.ErrNotFound }
+
+func notFound(format string, a ...any) error { return &missing{msg: fmt.Sprintf(format, a...)} }
 
 // fail maps an error to its HTTP answer.
 func fail(w http.ResponseWriter, err error) {

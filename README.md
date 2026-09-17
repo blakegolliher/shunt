@@ -24,7 +24,9 @@ make all            # build, lint, tests, -race, fuzz
 | `shunt client show` | Print the client access key and secret your S3 client uses with shunt |
 | `shunt cluster add <name> <url> --access-key <key>` | Add a cluster; prompts for the secret key and checks it; reads the type from the cluster |
 | `shunt cluster remove <name>` | Drop a cluster nothing uses any more |
-| `shunt adopt <cluster> <bucket>` | Serve an existing bucket through shunt under the same name |
+| `shunt adopt <cluster> <bucket> [--keys <file>]` | Serve an existing bucket through shunt under the same name, with the cluster's own client keys |
+| `shunt client add <access-key> --check <cluster>` | Import a key clients already use, so their credentials don't change |
+| `shunt client remove <access-key>` | Drop a key shunt holds (the generated lab key, once real ones are in) |
 | `shunt expand <bucket> --to <cluster> [--name <bucket>]` | Prepare a target bucket on another cluster: checks, canary, measured capabilities |
 | `shunt ramp <bucket> --ratio <0..1>` | Send that share of writes (by key hash) to the target |
 | `shunt migrate start <bucket>` | All writes to the target; reads fall back to the source |
@@ -246,7 +248,12 @@ shunt step-out
 
 It reads, and changes nothing. It is happy when every bucket is `ACTIVE` on one cluster **under the name your clients use**, nothing is mid-upload, and every client key shunt holds is one the cluster accepts on every bucket. Then it prints the three steps it can't do for you: point your S3 name at the cluster, wait out the DNS TTL, stop shunt. Until you stop it, pointing the name back is the undo.
 
-In this demo the check refuses, and says why: the client key is shunt's own, and cluster B's bucket is `demo-dest`, not `demo-source`. Both are choices made earlier: give shunt the cluster's keys rather than generated ones (as a brownfield insertion does, [docs/DESIGN.md](docs/DESIGN.md) §11), and expand with `--name demo-source` to keep the name. Do that, and shunt can hand the clients back with nothing to change on their side. See [docs/migrating.md](docs/migrating.md).
+In this demo the check refuses, and says why: the client key is shunt's own, and cluster B's bucket is `demo-dest`, not `demo-source`. Both are choices made earlier:
+
+- **Keys.** Instead of the generated key, import the ones the cluster already issued: `shunt adopt clustera demo-source --keys keys.yaml` (a file of `access_key` and `secret` entries), then `shunt client remove <the generated key>`. Clients then use the credentials they already had, through shunt and afterwards.
+- **Names.** `shunt expand demo-source --to clusterb --name demo-source` keeps the name clients use.
+
+Do both and step-out passes, so shunt can hand the clients back with nothing to change on their side. See [docs/migrating.md](docs/migrating.md).
 
 ### When something goes wrong
 

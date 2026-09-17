@@ -631,6 +631,8 @@ The reference scenario: clients already use bucket `data01` on vast01 through `s
 
 Rollback at steps 2–3 is a DNS flip back. From step 5 on, rollback is a reconcile (target → source for the ramped key range), never just lowering the ratio.
 
+Invariant 3 is `adopt --keys` (ADR-0012): the keys the cluster issued are imported, checked against it, and used to verify client signatures, so no client changes credentials going in — or coming out.
+
 **Stepping out again (ADR-0011).** The same four invariants, read backwards, say when shunt can leave: the clients' keys are the cluster's own (invariant 3), each bucket carries the name clients use (invariant 4, so `expand --name data01` rather than the default `data01-001`), every bucket of the tenant is on one cluster, and nothing is in flight. `shunt step-out` checks exactly that, against the cluster, and prints the DNS flip back. Inserting shunt is reversible on purpose: a migration tool nobody can leave is one fewer team starts.
 
 **Cross-DC note.** With shunt in dc01 and vast02 in dc02, the ramped 5 % crosses the inter-DC link; the ramp comparison will show that latency honestly, and the hold thresholds should be set with it in mind rather than tuned to hide it.
