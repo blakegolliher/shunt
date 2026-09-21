@@ -38,11 +38,16 @@ jobs:
         run: make e2e-up COMPOSE="docker compose"
       - name: make walkthrough
         run: make walkthrough
+      - name: make readme-demo
+        # The README's hand-run demo, steps 1-14, unattended: the branch must never break it.
+        run: make readme-demo
       - name: logs
         if: failure()
         run: |
           cat test/e2e/data/walkthrough/run/shunt.log || true
           cat test/e2e/data/walkthrough/run/verify.log || true
+          cat test/e2e/data/readme-demo/shunt.log || true
+          cat test/e2e/data/readme-demo/reader.log || true
       - name: e2e down
         if: always()
         run: make e2e-down COMPOSE="docker compose"

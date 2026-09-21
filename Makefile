@@ -212,6 +212,9 @@ walkthrough: build ## POC-5: the operator walkthrough, unattended, e2e Garage (a
 	  --dst http://127.0.0.1:9000 --dst-creds $(WALKTHROUGH_DIR)/minio.creds --dst-type minio --dst-region us-east-1 \
 	  --listen 127.0.0.1:8008 --admin 127.0.0.1:9908 $(WALKTHROUGH_ARGS)
 
+readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cluster A) -> MinIO (as cluster B); needs make e2e-up
+	$(E2E_DIR)/readme-demo.sh $(README_DEMO_ARGS)
+
 run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster at VAST_ENDPOINT (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
 	cp $(E2E_DIR)/shunt-vast-resign.yaml $(E2E_DIR)/data/shunt-vast-resign.yaml
