@@ -15,6 +15,13 @@ type Transition struct {
 	Prefixes []string // RAMPING: key prefixes whose writes go to the new primary
 	// Cutover is the evidence `shunt cutover` checked, recorded on MIGRATING → CUTOVER.
 	Cutover *CutoverEvidence
+	// Hold writes a step that moves writes to the new primary as a hold first (ADR-0016): the ramp in
+	// force is kept and the step is recorded as ramp.hold. A held MIGRATING step is RAMPING with
+	// hold.ratio 1 until the control node writes MIGRATING itself.
+	Hold bool
+	// Release undoes a hold that did not reach every proxy: the step is dropped, and a placement held
+	// from ACTIVE goes back to ACTIVE with its target recorded, as it was before the step.
+	Release bool
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -55,8 +62,17 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
 	}
+	if t.Release {
+		return release(p)
+	}
 	if !slices.Contains(States, t.To) {
 		return fail("unknown state %q; states are %s", t.To, strings.Join(States, ", "))
+	}
+	if t.Hold && t.To != StateRamping && t.To != StateMigrating {
+		return fail("only a step to RAMPING or MIGRATING is held")
+	}
+	if p.Ramp != nil && p.Ramp.Hold != nil && t.Hold {
+		return fail("a held step is already in progress; it completes or is released first")
 	}
 	if !legal[[2]string{p.State, t.To}] {
 		next := next(p.State)
@@ -130,8 +146,22 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		if r.Ratio == old.Ratio && len(r.Prefixes) == len(old.Prefixes) {
 			return fail("the ramp step changes nothing; give a higher ratio or a new prefix")
 		}
+		if h := old.Hold; h != nil && !t.Hold {
+			// Completing a held step: it may move only the keys that were held, never more.
+			for _, pre := range r.Prefixes {
+				if !slices.Contains(old.Prefixes, pre) && !slices.Contains(h.Prefixes, pre) {
+					return fail("prefix %q was not part of the held step; a held step completes as it was held, or is released", pre)
+				}
+			}
+			if r.Ratio > h.Ratio && r.Ratio > old.Ratio {
+				return fail("ratio %v is beyond the held step's %v; a held step completes as it was held, or is released", r.Ratio, h.Ratio)
+			}
+		}
 		np.Ramp = &r
 	case t.To == StateMigrating:
+		if p.Held() && p.Ramp.Hold.Ratio < 1 && !t.Hold {
+			return fail("a held ramp step is in progress; it completes or is released before MIGRATING")
+		}
 		np.Ramp = nil
 	case t.To == StateCutover:
 		np.Cutover = t.Cutover
@@ -141,5 +171,37 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		}
 		np.Source, np.Cutover = "", nil
 	}
+	if t.Hold {
+		// Keep the ramp in force (none, leaving ACTIVE) and record the step as its hold.
+		base := Ramp{Hash: RampHash}
+		if p.State == StateRamping && p.Ramp != nil {
+			base = *p.Ramp
+			base.Prefixes = slices.Clone(p.Ramp.Prefixes)
+		}
+		h := &RampHold{Ratio: 1}
+		if np.Ramp != nil {
+			h = &RampHold{Ratio: np.Ramp.Ratio, Prefixes: slices.Clone(np.Ramp.Prefixes)}
+		}
+		base.Hold = h
+		np.State, np.Ramp = StateRamping, &base
+	}
 	return np, nil
 }
+
+// release undoes a held step (Transition.Release, ADR-0016).
+func release(p Placement) (Placement, error) {
+	if p.State != StateRamping || p.Ramp == nil || p.Ramp.Hold == nil {
+		return p, &TransitionError{From: p.State, To: p.State, Reason: "there is no held step to release"}
+	}
+	np := p.clone()
+	if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 {
+		// Held from ACTIVE: nothing was ever routed to the target. Back to ACTIVE, target recorded.
+		np.State, np.Primary, np.Source, np.Target, np.Ramp = StateActive, p.Source, "", p.Primary, nil
+		return np, nil
+	}
+	np.Ramp.Hold = nil
+	return np, nil
+}
+
+// Held reports whether p has a ramp step written but not yet in force.
+func (p *Placement) Held() bool { return p.Ramp != nil && p.Ramp.Hold != nil }

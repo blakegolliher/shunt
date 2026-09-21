@@ -345,6 +345,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case key == "" && q.Has("policy"):
 		_, _ = w.Write([]byte(`{"Version":"2012-10-17","Statement":[]}`))
 	case key == "" && q.Has("versioning"):
+		_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`)) // never versioned, as S3 answers it
 	case key == "" && q.Has("uploads"):
 		fmt.Fprintf(w, `<ListMultipartUploadsResult><Bucket>%s</Bucket><UploadIdMarker></UploadIdMarker>`, bucket)
 		ids := make([]string, 0, len(f.uploads))

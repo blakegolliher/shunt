@@ -33,6 +33,14 @@ func (h *Handler) answer(w http.ResponseWriter, r *http.Request, o *outcome, cod
 	writeErrorMessage(w, code, e.Status, msg, r.URL.Path, o.rid)
 }
 
+// refuseWrite answers a write shunt will not route yet with 503 and Retry-After, which every SDK
+// retries (ADR-0016): a held ramp step, or a stale proxy.
+func (h *Handler) refuseWrite(w http.ResponseWriter, r *http.Request, o *outcome, bucket, reason, msg string) {
+	h.Metrics.RefusedWrites.WithLabelValues(directory.Key(o.tenant, bucket), reason).Inc()
+	w.Header().Set("Retry-After", "1")
+	h.answer(w, r, o, s3.ServiceUnavailable, msg)
+}
+
 // listBuckets synthesizes ListBuckets from the directory: every bucket of the tenant, on every
 // cluster, and nothing else. No upstream request is made. prefix is honored; the response is one
 // final page.

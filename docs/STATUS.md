@@ -17,11 +17,18 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
-This branch carries the plan for everything past POC-5 and nothing that is green yet; `master` keeps
-what is done. Two bodies of work were merged into one path on 2026-09-17:
+This branch carries everything past POC-5; `master` keeps what is done and tagged. Two bodies of
+work were merged into one path on 2026-09-17:
 
-- `docs/POC-6.md` — migration correctness hardening, items 1 and 2 done in code (ADR-0013,
-  ADR-0014), items 3–5 and the trailing items specified.
+- `docs/POC-6.md` — migration correctness hardening. Items 1, 2 and 3 done in code (ADR-0013
+  conditional writes, ADR-0014 cross-cluster copy, ADR-0016 the version fence); items 4, 5 and the
+  trailing items specified.
+
+**Guards on this branch.** `make readme-demo` runs the README's hand-run demo, steps 1 to 14,
+unattended, and fails on any count or transcript line the README states that comes out different;
+it runs in CI next to `make walkthrough`. `make fleet` runs two real proxies over one directory
+(ADR-0016). All three are green on the fence build (2026-09-21), and the README demo's output is
+unchanged from before the fence: a single proxy has no members, so nothing is held or waited on.
 - `docs/design/distributed.md` (§12 of the design) + `docs/adr/0015-embedded-etcd.md` +
   `docs/prompts/P3c.md`, `P3d.md`, `P3e.md` — the fleet-scale form: `shunt-control` on embedded
   etcd, the version fence, two-phase ramp, stale mode, movers as workers, web UI.
@@ -222,6 +229,7 @@ The one failure was operator-side, and the product made it hard to see. The move
 
   **This is the POC-3 exit condition.** `make check-tls-verify` fails while any committed config or make target disables verification and prints each location; `make all` warns on every run until it passes. When it passes: add the VAST cluster to `test/e2e/shunt-mixed.yaml` and a placement to `test/e2e/directory-mixed.yaml`, re-run `make probe BACKEND=vast` and `make s3diff-mixed` with verification on, then tag `poc-3`.
 - **Copying from a bucket that is mid-migration is refused with 501.** Its objects are split across two clusters and the backend doing the copy can read only one of them. It clears as soon as the bucket is `CUTOVER`.
+- **Resolved on `distributed` (ADR-0016): cutover evidence is fleet-wide.** Kept for `master`:
 - **Cutover evidence is per proxy.** `shunt cutover` reads the fallback-read counter of the proxy that serves the API, and the mover's progress is held in that proxy's memory (lost on restart; run the mover again). With several proxies, hold the window on each or check the fleet's `shunt_migration_fallback_reads_total` first; P4 aggregates it.
 - **The AWS SDK ships in `bin/shunt`** for `shunt migrate run` (ADR-0009). P5 moves the mover to a separate `shunt-mover` binary and the SDK leaves `bin/shunt` with it.
 - **P3c replaces the file directory behind the same API.** `shunt-control` serves `/v1/` from Postgres; the CLI verbs, docs/walkthrough.md and walkthrough.sh do not change. Until then the directory file must be writable by `shunt serve` for every operator verb, not only CreateBucket.

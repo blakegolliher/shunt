@@ -30,6 +30,144 @@ type TransitionResult struct {
 	CreatedBucket string                     `json:"created_bucket,omitempty"`
 	Warning       string                     `json:"warning,omitempty"`
 	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
+	// The fleet (ADR-0016). Held: the step was written as a hold first and completed once every
+	// proxy had it. Proxies: member proxies the change had to reach, besides this one. WaitingOn:
+	// members that have not installed it yet, so it is not in effect everywhere (pending).
+	Held      bool     `json:"held,omitempty"`
+	Proxies   int      `json:"proxies,omitempty"`
+	WaitingOn []string `json:"waiting_on,omitempty"`
+	// Silent: members past their lease, not waited for; they refuse writes on moving buckets
+	// themselves until they are back and have the change.
+	Silent []string `json:"silent,omitempty"`
+}
+
+// parseWait reads a request's wait for the fleet: a Go duration, default 30s.
+func parseWait(w http.ResponseWriter, v string) (time.Duration, bool) {
+	if v == "" {
+		return defaultFenceWait, true
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("wait %q: want a non-negative duration such as 30s", v))
+		return 0, false
+	}
+	return d, true
+}
+
+// settle waits for version v to reach every live member and records who still lacks it.
+func (s *Server) settle(r *http.Request, res *TransitionResult, v int64, wait time.Duration) {
+	waiting, _ := s.fenceRound(r.Context(), v, false, wait) //nolint:errcheck // a canceled wait just leaves the change pending
+	res.WaitingOn = waiting
+	if ms, err := s.members(); err == nil {
+		for _, m := range ms {
+			if m.Live {
+				res.Proxies++
+			} else {
+				res.Silent = append(res.Silent, m.ID)
+			}
+		}
+	}
+}
+
+// precondition refuses a fenced change while the fleet has not installed the current version: the
+// previous change is not in effect everywhere, and the next step must start from one that is.
+func (s *Server) precondition(r *http.Request, strict bool, wait time.Duration) error {
+	v := s.Dir.Snapshot().Version()
+	waiting, err := s.fenceRound(r.Context(), v, strict, wait)
+	if err != nil {
+		return err
+	}
+	if len(waiting) > 0 {
+		hint := "; they install it within a heartbeat once they can reach this proxy"
+		if strict {
+			hint = "; a bucket's first step waits for every proxy, live or not, because one cut off before it would still write every key to the source. A proxy that is gone for good: `shunt proxy forget <id>`"
+		}
+		return refuse("directory version %d is not on every proxy yet, %s (after %s)%s", v, waitingOn(waiting), wait, hint)
+	}
+	return nil
+}
+
+// fencedStep applies a step that moves writes or reads for keys that already exist (a ramp step,
+// migrate start) under ADR-0016: the fleet must be at the current version first; a step that moves
+// writes to the new primary is held until every proxy has the hold when the fleet has members; and
+// the answer says which members have not installed the step yet. A hold that does not reach every
+// member is released, so the step either happens everywhere or nowhere.
+func (s *Server) fencedStep(r *http.Request, key string, p directory.Placement, f *directory.File, t directory.Transition, create, acceptLoss bool, wait time.Duration) (TransitionResult, error) {
+	leaving := p.State == directory.StateActive
+	if err := s.precondition(r, leaving, wait); err != nil {
+		return TransitionResult{}, err
+	}
+	moves := t.To == directory.StateRamping ||
+		(t.To == directory.StateMigrating && (p.State != directory.StateRamping || p.Ramp == nil || p.Ramp.Ratio < 1 || p.Held()))
+	hold := false
+	if moves {
+		var err error
+		if hold, err = s.counted(leaving); err != nil {
+			return TransitionResult{}, err
+		}
+	}
+	if !hold {
+		res, err := s.transition(r, key, p, f, t, create, acceptLoss)
+		if err != nil {
+			return res, err
+		}
+		s.settle(r, &res, res.Version, wait)
+		return res, nil
+	}
+
+	// Anything that would refuse the completed step refuses before the hold is written.
+	if np, err := directory.Apply(p, withDefaultName(key, p, t)); err != nil {
+		return TransitionResult{}, err
+	} else if np.State == directory.StateMigrating && !f.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+		return TransitionResult{}, lostWriteWindow(key, np.Primary)
+	}
+	tenant, bucket, _ := directory.SplitKey(key)
+	th := t
+	th.Hold = true
+	held, err := s.transition(r, key, p, f, th, create, acceptLoss)
+	if err != nil {
+		return held, err
+	}
+	s.info(r, "ramp step held", "placement", key, "version", held.Version, "to", t.To, "ratio", t.Ratio, "prefixes", t.Prefixes)
+	release := func(why string) error {
+		if rerr := s.Dir.SetState(context.WithoutCancel(r.Context()), tenant, bucket, directory.StateRamping, directory.Transition{Release: true}, actor(r)); rerr != nil {
+			return fmt.Errorf("%s, and releasing the hold failed: %w; release it with the same command once the fleet is back", why, rerr)
+		}
+		s.info(r, "held step released", "placement", key, "reason", why)
+		return refuse("%s; the held step was released and nothing changed", why)
+	}
+	waiting, err := s.fenceRound(r.Context(), held.Version, leaving, wait)
+	switch {
+	case err != nil:
+		return TransitionResult{}, release("waiting for the fleet was interrupted: " + err.Error())
+	case len(waiting) > 0:
+		return TransitionResult{}, release(fmt.Sprintf("the held step did not reach every proxy within %s, %s", wait, waitingOn(waiting)))
+	}
+	f2 := s.Dir.Snapshot().File()
+	p2, ok := f2.Placements[key]
+	if !ok || !p2.Held() {
+		return TransitionResult{}, fmt.Errorf("%w: %s changed while its step was held", directory.ErrConflict, key)
+	}
+	t2 := t
+	t2.Target, t2.Name = "", ""
+	res, err := s.transition(r, key, p2, f2, t2, false, acceptLoss)
+	if err != nil {
+		return res, release("completing the held step failed: " + err.Error())
+	}
+	res.From, res.Held = p.State, true
+	res.CreatedBucket = held.CreatedBucket
+	s.settle(r, &res, res.Version, wait)
+	return res, nil
+}
+
+// withDefaultName fills the backend name a first step gets when neither expand nor the request
+// named one, as transition does.
+func withDefaultName(key string, p directory.Placement, t directory.Transition) directory.Transition {
+	if p.State == directory.StateActive && p.Target == "" && t.Target != "" && t.Name == "" {
+		tenant, bucket, _ := directory.SplitKey(key)
+		t.Name = directory.BackendName(tenant, bucket, 0)
+	}
+	return t
 }
 
 // transition applies t to a placement with every check a state change needs: the target bucket
@@ -365,6 +503,7 @@ type RampRequest struct {
 	To       string   `json:"to,omitempty"`   // leaving ACTIVE without expand: the target cluster
 	Name     string   `json:"name,omitempty"` // and its backend bucket
 	Create   bool     `json:"create,omitempty"`
+	Wait     string   `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
@@ -376,11 +515,15 @@ func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "a ramp step needs a ratio in (0, 1] or at least one prefix")
 		return
 	}
+	wait, ok := parseWait(w, req.Wait)
+	if !ok {
+		return
+	}
 	key, p, f, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
-	res, err := s.transition(r, key, p, f, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes}, req.Create, false)
+	res, err := s.fencedStep(r, key, p, f, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes}, req.Create, false, wait)
 	if err != nil {
 		fail(w, err)
 		return
@@ -395,6 +538,7 @@ type MigrateRequest struct {
 	Name                  string `json:"name,omitempty"`
 	Create                bool   `json:"create,omitempty"`
 	AcceptLostWriteWindow bool   `json:"accept_lost_write_window,omitempty"`
+	Wait                  string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) migrateStart(w http.ResponseWriter, r *http.Request) {
@@ -402,11 +546,15 @@ func (s *Server) migrateStart(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	wait, ok := parseWait(w, req.Wait)
+	if !ok {
+		return
+	}
 	key, p, f, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
-	res, err := s.transition(r, key, p, f, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name}, req.Create, req.AcceptLostWriteWindow)
+	res, err := s.fencedStep(r, key, p, f, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		fail(w, err)
 		return
@@ -463,6 +611,7 @@ func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
 // CutoverRequest asks to stop reading the source, after a quiet window.
 type CutoverRequest struct {
 	Window string `json:"window,omitempty"` // Go duration; default 60s
+	Wait   string `json:"wait,omitempty"`   // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
@@ -479,12 +628,20 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		}
 		window = d
 	}
+	wait, ok := parseWait(w, req.Wait)
+	if !ok {
+		return
+	}
 	key, p, f, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
 	if p.State != directory.StateMigrating {
 		fail(w, refuse("%s is %s; cutover happens from MIGRATING", key, p.State))
+		return
+	}
+	if err := s.precondition(r, false, wait); err != nil {
+		fail(w, err)
 		return
 	}
 	s.mu.Lock()
@@ -498,13 +655,31 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		fail(w, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done))
 		return
 	}
-	before := counters(s.Metrics.FallbackReads, key, "")[""]
-	s.info(r, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before)
-	if err := s.sleep(r.Context(), window); err != nil {
+	// The window counts fallback reads on this proxy and on every live member (ADR-0016).
+	before, beats, err := s.fleetFallbackReads(key)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	s.info(r, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before, "members", len(beats))
+	if serr := s.sleep(r.Context(), window); serr != nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "cutover window interrupted: "+serr.Error())
+		return
+	}
+	silent, err := s.awaitReports(r.Context(), beats, wait)
+	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "cutover window interrupted: "+err.Error())
 		return
 	}
-	after := counters(s.Metrics.FallbackReads, key, "")[""]
+	if len(silent) > 0 {
+		fail(w, refuse("proxies %s did not report after the %s window, so their reads are not evidence of quiet; run cutover again once they are back", strings.Join(silent, ", "), window))
+		return
+	}
+	after, _, err := s.fleetFallbackReads(key)
+	if err != nil {
+		fail(w, err)
+		return
+	}
 	if after != before {
 		fail(w, refuse("reads still fall back to the source of %s: %v fallback reads during the %s window; something the mover has not copied is still being read", key, after-before, window))
 		return
@@ -515,6 +690,7 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.settle(r, &res, res.Version, wait)
 	s.logTransition(r, "cutover", res, "window", window.String(), "fallback_reads", after)
 	writeJSON(w, http.StatusOK, res)
 }
@@ -540,6 +716,12 @@ func (s *Server) purgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	case p.Cutover == nil:
 		fail(w, refuse("%s has no cutover evidence: it was cut over without shunt cutover's convergence and fallback checks, so its source is not purged", key))
+		return
+	}
+	// A proxy that has not installed the cutover still reads the source on a miss: it must have it
+	// before the source is deleted.
+	if err := s.precondition(r, false, defaultFenceWait); err != nil {
+		fail(w, err)
 		return
 	}
 	src, err := s.backendFor(p.Source)
@@ -595,6 +777,7 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	s.settle(r, &res, res.Version, defaultFenceWait)
 	s.forget(key)
 	s.logTransition(r, "migrate finish", res)
 	writeJSON(w, http.StatusOK, res)
@@ -617,6 +800,15 @@ func (s *Server) logTransition(r *http.Request, op string, res TransitionResult,
 	}
 	if res.CreatedBucket != "" {
 		attrs = append(attrs, "created_bucket", res.CreatedBucket)
+	}
+	if res.Held {
+		attrs = append(attrs, "held", true)
+	}
+	if res.Proxies > 0 {
+		attrs = append(attrs, "members", res.Proxies)
+	}
+	if len(res.WaitingOn) > 0 {
+		attrs = append(attrs, "pending", true, "waiting_on", res.WaitingOn)
 	}
 	attrs = append(attrs, extra...)
 	if res.Warning != "" {

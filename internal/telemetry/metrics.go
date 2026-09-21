@@ -30,6 +30,13 @@ type Metrics struct {
 	FallbackReads *prometheus.CounterVec   // shunt_migration_fallback_reads_total{bucket}
 	DualDelete    *prometheus.CounterVec   // shunt_migration_dual_delete_total{bucket,outcome}
 	ListingMerge  *prometheus.HistogramVec // shunt_listing_merge_seconds{bucket}
+	RefusedWrites *prometheus.CounterVec   // shunt_migration_refused_writes_total{bucket,reason}
+
+	// The fleet (POC-6, ADR-0016). Members and fence wait are exported by the control node only;
+	// stale by members only.
+	FleetMembers *prometheus.GaugeVec // shunt_fleet_members{state}
+	FleetStale   prometheus.Gauge     // shunt_fleet_stale
+	FenceWait    prometheus.Histogram // shunt_fleet_fence_wait_seconds
 }
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
@@ -110,10 +117,24 @@ func NewMetrics() *Metrics {
 			Name: "shunt_listing_merge_seconds", Help: "Time to serve one merged ListObjectsV2 page from both clusters.",
 			Buckets: durationBuckets,
 		}, []string{"bucket"}),
+		RefusedWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_migration_refused_writes_total", Help: "Writes answered 503 + Retry-After instead of routed: a held ramp step, or a stale proxy.",
+		}, []string{"bucket", "reason"}),
+		FleetMembers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_fleet_members", Help: "Control node: registered member proxies, by whether their heartbeat is within the lease.",
+		}, []string{"state"}),
+		FleetStale: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_fleet_stale", Help: "Member: 1 while this proxy's lease with the control node has lapsed.",
+		}),
+		FenceWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "shunt_fleet_fence_wait_seconds", Help: "Control node: time for one fenced change to reach every live member.",
+			Buckets: durationBuckets,
+		}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
-		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge,
+		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
+		m.FleetMembers, m.FleetStale, m.FenceWait,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

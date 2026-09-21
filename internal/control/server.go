@@ -57,8 +57,19 @@ type Server struct {
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
 
+	// The fleet (ADR-0016). ControlNode, when set, makes this proxy a member whose control node is
+	// that endpoint: its own API then refuses every mutation. Otherwise this proxy is the control
+	// node: FleetFile is where member ids are kept, LeaseTTL how long a silent member stays live
+	// (plus a margin), FencePoll how often a fenced change checks the fleet.
+	ControlNode string
+	FleetFile   string
+	LeaseTTL    time.Duration
+	DropMargin  time.Duration // default 5s; tests shorten it
+	FencePoll   time.Duration
+
 	mu       sync.Mutex
 	progress map[string]Progress // placement key → the mover's last report (in memory only)
+	fleet    fleet
 }
 
 // Handler returns the /v1/ routes, one handler per operation.
@@ -80,9 +91,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/tenants/{tenant}/step-out", s.stepOut)
 	mux.HandleFunc("POST /v1/tenants/{tenant}/client-keys", s.logged("client key import", s.importKey))
 	mux.HandleFunc("DELETE /v1/tenants/{tenant}/client-keys/{access_key}", s.logged("client key remove", s.removeKey))
+	mux.HandleFunc("POST /v1/fleet/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("GET /v1/fleet", s.fleetList)
+	mux.HandleFunc("DELETE /v1/fleet/{id}", s.logged("proxy forget", s.forgetProxy))
+	s.fleet.path = s.FleetFile
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
+			return
+		}
+		if s.ControlNode != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			s.memberOnly(w)
 			return
 		}
 		mux.ServeHTTP(w, r)

@@ -21,6 +21,7 @@ type Config struct {
 	Proxy     Proxy              `yaml:"proxy"`
 	Clusters  map[string]Cluster `yaml:"clusters"` // passthrough only; resign-mode clusters live in the directory file
 	Directory Directory          `yaml:"directory"`
+	Control   Control            `yaml:"control"`
 	Telemetry Telemetry          `yaml:"telemetry"`
 	Features  Features           `yaml:"features"`
 	// KillSwitches turn off behavior that is normally on; they are not feature flags (CLAUDE.md).
@@ -36,6 +37,18 @@ type Directory struct {
 	// referenced from the directory as file: refs). Default: a secrets/ directory next to File.
 	SecretsDir   string        `yaml:"secrets_dir"`
 	PollInterval time.Duration `yaml:"poll_interval"` // how often serve checks the file for other writers' changes
+}
+
+// Control places this proxy in a fleet (ADR-0016). With Endpoint set, the proxy is a member: it
+// sends the control node a heartbeat, refuses mutations on its own control API, and goes stale
+// (refusing writes on moving buckets) when its lease lapses. Without it, the proxy is its own
+// control node, and LeaseTTL is how long it keeps a silent member live.
+type Control struct {
+	Endpoint          string        `yaml:"endpoint"`  // the control node's admin listener, http(s)://host:port
+	TokenRef          string        `yaml:"token_ref"` // env:NAME or file:/path: the control node's admin.control_token_ref
+	ProxyID           string        `yaml:"proxy_id"`  // default: <hostname>-<admin port>
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+	LeaseTTL          time.Duration `yaml:"lease_ttl"`
 }
 
 // Listener is the client-facing TLS listener (docs/DESIGN.md §2.9).
@@ -189,17 +202,19 @@ type Slow struct {
 
 // Defaults applied before validation. Everything that is safe to default is here; scheme is not.
 const (
-	defaultListenerAddress = ":443"
-	defaultAdminAddress    = "127.0.0.1:9900"
-	defaultCopyBufferBytes = 256 << 10
-	defaultIdleTimeout     = 60 * time.Second
-	defaultMetadataTimeout = 30 * time.Second
-	defaultDrainTimeout    = 30 * time.Second
-	defaultClockSkew       = 15 * time.Minute
-	defaultSlowRingSize    = 100
-	defaultSlowThreshold   = 500 * time.Millisecond
-	defaultMinTLSVersion   = "1.2"
-	defaultPollInterval    = time.Second
+	defaultListenerAddress   = ":443"
+	defaultAdminAddress      = "127.0.0.1:9900"
+	defaultCopyBufferBytes   = 256 << 10
+	defaultIdleTimeout       = 60 * time.Second
+	defaultMetadataTimeout   = 30 * time.Second
+	defaultDrainTimeout      = 30 * time.Second
+	defaultClockSkew         = 15 * time.Minute
+	defaultSlowRingSize      = 100
+	defaultSlowThreshold     = 500 * time.Millisecond
+	defaultMinTLSVersion     = "1.2"
+	defaultPollInterval      = time.Second
+	defaultHeartbeatInterval = time.Second
+	defaultLeaseTTL          = 10 * time.Second
 )
 
 // errEmpty is returned when the input has no YAML document.
@@ -356,6 +371,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Directory.File != "" && c.Directory.PollInterval == 0 {
 		c.Directory.PollInterval = defaultPollInterval
+	}
+	if c.Control.HeartbeatInterval == 0 {
+		c.Control.HeartbeatInterval = defaultHeartbeatInterval
+	}
+	if c.Control.LeaseTTL == 0 {
+		c.Control.LeaseTTL = defaultLeaseTTL
 	}
 	if c.Telemetry.LogFormat == "" {
 		c.Telemetry.LogFormat = "auto"

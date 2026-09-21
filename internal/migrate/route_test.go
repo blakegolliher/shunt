@@ -230,3 +230,58 @@ func TestRampHashIsPinned(t *testing.T) {
 		}
 	}
 }
+
+// TestHeldKeys is ADR-0016's routing: a key inside a held step but outside the ramp in force is
+// refused for writes and read target first; a key outside both still goes to the source only, and
+// a key inside the ramp is untouched by the hold.
+func TestHeldKeys(t *testing.T) {
+	p := &directory.Placement{State: directory.StateRamping, Primary: "minio", Source: "garage",
+		Ramp: &directory.Ramp{Hash: directory.RampHash, Prefixes: []string{"old/"}, Hold: &directory.RampHold{Prefixes: []string{"new/"}}}}
+	cases := []struct {
+		key   string
+		class OpClass
+		want  Route
+	}{
+		{"new/a", ClassWrite, Route{Cluster: Primary, Held: true}},
+		{"new/a", ClassRead, Route{Cluster: Primary, Fallback: true}},
+		{"new/a", ClassDelete, Route{Cluster: Primary, Both: true}},
+		{"new/a", ClassList, Route{Cluster: Primary, Merge: true}},
+		{"old/a", ClassWrite, Route{Cluster: Primary}},
+		{"old/a", ClassRead, Route{Cluster: Primary, Fallback: true}},
+		{"other/a", ClassWrite, Route{Cluster: Source}},
+		{"other/a", ClassRead, Route{Cluster: Source}},
+	}
+	for _, c := range cases {
+		got, err := Decide(p, c.class, c.key)
+		if err != nil || got != c.want {
+			t.Errorf("%s class %d: got %+v %v, want %+v", c.key, c.class, got, err, c.want)
+		}
+	}
+
+	// Held from ACTIVE with hold.ratio 1 (a held migrate start): every write is held.
+	all := &directory.Placement{State: directory.StateRamping, Primary: "minio", Source: "garage",
+		Ramp: &directory.Ramp{Hash: directory.RampHash, Hold: &directory.RampHold{Ratio: 1}}}
+	for _, k := range []string{"a", "b/c", "zzz"} {
+		if got, _ := Decide(all, ClassWrite, k); !got.Held {
+			t.Errorf("%s: not held under hold.ratio 1: %+v", k, got)
+		}
+	}
+
+	// A hash-split hold holds exactly the keys between the two ratios.
+	hp := &directory.Placement{State: directory.StateRamping, Primary: "minio", Source: "garage",
+		Ramp: &directory.Ramp{Hash: directory.RampHash, Ratio: 0.3, Hold: &directory.RampHold{Ratio: 0.6}}}
+	for i := range 2000 {
+		k := fmt.Sprintf("k/%04d", i)
+		in03, _ := InRange(&directory.Ramp{Hash: directory.RampHash, Ratio: 0.3}, k)
+		in06, _ := InRange(&directory.Ramp{Hash: directory.RampHash, Ratio: 0.6}, k)
+		got, _ := Decide(hp, ClassWrite, k)
+		switch {
+		case in03 && (got.Held || got.Cluster != Primary):
+			t.Fatalf("%s is in force and was routed %+v", k, got)
+		case !in03 && in06 && !got.Held:
+			t.Fatalf("%s is between the ratios and was not held: %+v", k, got)
+		case !in06 && (got.Held || got.Cluster != Source):
+			t.Fatalf("%s is outside the hold and was routed %+v", k, got)
+		}
+	}
+}

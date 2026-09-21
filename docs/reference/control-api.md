@@ -1,6 +1,6 @@
 # Control API
 
-shunt's operator verbs (`shunt cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`) are clients of this API. It is served under `/v1/` on the **admin listener** (`admin.address`, default `127.0.0.1:9900`), next to `/-/metrics`. ADR-0008 records the decision. P3c serves the same routes from `shunt-control`, so the CLI and anything scripted against it keep working.
+shunt's operator verbs (`shunt cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `proxy`) are clients of this API. It is served under `/v1/` on the **admin listener** (`admin.address`, default `127.0.0.1:9900`), next to `/-/metrics`. ADR-0008 records the decision. P3c serves the same routes from `shunt-control`, so the CLI and anything scripted against it keep working.
 
 ## Authentication
 
@@ -119,15 +119,15 @@ Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_writ
 
 ### `POST /v1/placements/{tenant}/{bucket}/ramp`
 
-`{"ratio": 0.5, "prefixes": ["runs/2026-09/"], "to": "", "name": "", "create": false}`
+`{"ratio": 0.5, "prefixes": ["runs/2026-09/"], "to": "", "name": "", "create": false, "wait": "30s"}`
 
-Enters or raises `RAMPING`. A key's writes go to the new primary when its hash is below `ratio` or it starts with one of the `prefixes`. The ratio and prefix set only grow (ADR-0004 race 5). Entering `RAMPING` records the hash as `ramp.hash` (`fnv1a-fmix64-v1`). Raising a ramp whose recorded hash this build does not implement is refused, because it would re-split keys. `to`, `name` and `create` are only needed when `expand` has not recorded a target. Returns a transition result (below).
+A fenced change (see [The fleet](#the-fleet)). Enters or raises `RAMPING`. A key's writes go to the new primary when its hash is below `ratio` or it starts with one of the `prefixes`. The ratio and prefix set only grow (ADR-0004 race 5). Entering `RAMPING` records the hash as `ramp.hash` (`fnv1a-fmix64-v1`). Raising a ramp whose recorded hash this build does not implement is refused, because it would re-split keys. `to`, `name` and `create` are only needed when `expand` has not recorded a target. Returns a transition result (below).
 
 ### `POST /v1/placements/{tenant}/{bucket}/migrate`
 
-`{"accept_lost_write_window": false, "to": "", "name": "", "create": false}`
+`{"accept_lost_write_window": false, "to": "", "name": "", "create": false, "wait": "30s"}`
 
-Enters `MIGRATING`. Refused if the target does not honor `If-None-Match: *` (`conditional_write: false`), unless `accept_lost_write_window` is set (ADR-0004 race 2).
+A fenced change (see [The fleet](#the-fleet)); held when the ramp is below 1. Enters `MIGRATING`. Refused if the target does not honor `If-None-Match: *` (`conditional_write: false`), unless `accept_lost_write_window` is set (ADR-0004 race 2).
 
 ### `POST /v1/placements/{tenant}/{bucket}/mover-progress`
 
@@ -137,20 +137,18 @@ Sent by `shunt migrate run` every 1,000 objects and at the end of each pass. Ref
 
 ### `POST /v1/placements/{tenant}/{bucket}/cutover`
 
-`{"window": "60s"}`
+`{"window": "60s", "wait": "30s"}`
 
-Enters `CUTOVER`, but only once both of these hold:
+A fenced change (see [The fleet](#the-fleet)). Enters `CUTOVER`, but only once both of these hold:
 - the placement is `MIGRATING` and its latest mover report is `converged` (a whole pass copied nothing and failed nothing);
-- this proxy's fallback-read counter for the bucket does not move during `window`.
+- the fallback-read counter for the bucket, summed over this proxy and every live member, does not move during `window`. Every member that was live at the start must report twice after the window ends; one that does not is refused by name, since a silent proxy is no evidence of quiet (ADR-0016).
 
 The call blocks for the window. It records `{"at", "window", "fallback_reads"}` on the placement as `cutover`.
-
-With several proxies, the window has to hold on each of them: this API reads only its own proxy's counter.
 
 ### `POST /v1/placements/{tenant}/{bucket}/purge-source`
 
 Deletes the source bucket, then returns the placement to `ACTIVE` on its primary. Refused unless all of these hold:
-- the placement is `CUTOVER`;
+- the placement is `CUTOVER`, and every live member has installed the current directory version (a proxy that has not seen the cutover still reads the source on a miss);
 - it carries `cutover` evidence;
 - a full listing of both buckets finds no source key that the primary lacks, each candidate confirmed by a HEAD that finds it absent on the primary and then present on the source. The refusal names the first 20 keys it finds.
 
@@ -186,5 +184,28 @@ It answers `{"tenant", "cluster", "scheme", "endpoints", "ready", "problems", "n
 
 ```json
 {"key": "default/data01", "from": "RAMPING", "to": "MIGRATING", "version": 8, "primary": "vast02", "source": "vast01",
- "ratio": 1, "created_bucket": "", "warning": "", "cutover": null}
+ "ratio": 1, "created_bucket": "", "warning": "", "cutover": null,
+ "held": true, "proxies": 2, "waiting_on": [], "silent": ["proxy-c"]}
 ```
+
+The last four are only present with fleet members (ADR-0016): `held`, the step was written as a hold first; `proxies`, live members that have the change; `waiting_on`, live members that have not installed it yet within `wait` (the change is written, but pending); `silent`, members past their lease that were not waited for.
+
+## The fleet
+
+Several proxies can serve one directory file (ADR-0016). One is the **control node**: the proxy these routes are called on. The others are **members**: their config names the control node in `control.endpoint`, they send it a heartbeat, and their own `/v1/` refuses every mutation with 409, naming the control node. A proxy without `control.endpoint` is its own control node with no members, which is what `shunt serve --plaintext` and every single-proxy lab run.
+
+- **Fenced changes** (`ramp`, `migrate`, `cutover`; `finish` and `purge-source` wait too) first wait until every live member has the current version, and are refused with the ids they are waiting on if one does not within `wait`. A bucket's **first** step waits for every member, live or not, because one cut off before it would still write every key to the source; `DELETE /v1/fleet/{id}` removes a member that is gone for good.
+- **The hold.** With members, a step that moves writes to the new primary is written twice: once as `ramp.hold`, where the keys it moves answer writes with `503` + `Retry-After: 1`, and again as the step itself once every member has the hold. If the hold does not reach every member within `wait`, it is released and the call is refused: nothing changed.
+- **Stale mode.** A member whose last acknowledged heartbeat is older than `control.lease_ttl` refuses writes and deletes on buckets that are not `ACTIVE` with `503` + `Retry-After: 1`, reads every key of such a bucket target-first-then-source (it may have missed a step), and serves everything else. A heartbeat renews the lease only once the member has installed the version the control node answered with. Its `/-/healthz` stays 200: a control-node outage must not drain the fleet. `/-/fleet` on a member reports `{"id", "control_node", "stale", "last_ack", "applied"}`.
+
+### `POST /v1/fleet/{id}/heartbeat`
+
+Sent by a member every `control.heartbeat_interval`: `{"started", "applied", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only. The first one from an id makes it a member, recorded in `<directory file>.fleet.yaml` (ids only) so membership survives a control-node restart. Answers `{"version", "lease_ttl"}`; a member whose version is behind reloads the directory at once.
+
+### `GET /v1/fleet`
+
+`{"version", "lease_ttl", "members": [{"id", "live", "applied", "started", "seen", "fallback_reads"}]}`. A member is `live` while its last heartbeat is within `lease_ttl` + 5 s. `shunt proxy list`.
+
+### `DELETE /v1/fleet/{id}`
+
+Forgets a member that is gone for good. Refused while it is live: a running proxy re-joins on its next heartbeat. `shunt proxy forget <id>`.

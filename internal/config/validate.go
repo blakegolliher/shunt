@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -56,6 +58,7 @@ func (c *Config) Validate() error {
 	c.validateAuth(&e)
 	c.validateProxy(&e)
 	c.validateDirectory(&e)
+	c.validateControl(&e)
 	c.validateTelemetry(&e)
 	c.validateClusters(&e)
 	if len(e) == 0 {
@@ -159,6 +162,38 @@ func (c *Config) validateDirectory(e *errs) {
 	}
 	if d.PollInterval < 0 {
 		e.add("directory.poll_interval", "must not be negative")
+	}
+}
+
+var proxyIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func (c *Config) validateControl(e *errs) {
+	ct := c.Control
+	if ct.Endpoint != "" {
+		u, err := url.Parse(ct.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			e.add("control.endpoint", "want the control node's admin listener as http(s)://host:port, got %q", ct.Endpoint)
+		}
+		if c.Auth.Mode != "resign" {
+			e.add("control.endpoint", "a fleet shares a directory, which only resign mode has")
+		}
+	}
+	if ref := ct.TokenRef; ref != "" {
+		if !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") {
+			e.add("control.token_ref", "must be env:NAME or file:/path; a token is never inline")
+		}
+		if ct.Endpoint == "" {
+			e.add("control.token_ref", "only used with control.endpoint")
+		}
+	}
+	if ct.ProxyID != "" && !proxyIDPattern.MatchString(ct.ProxyID) {
+		e.add("control.proxy_id", "want 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit; got %q", ct.ProxyID)
+	}
+	if ct.HeartbeatInterval <= 0 {
+		e.add("control.heartbeat_interval", "must be positive")
+	}
+	if ct.LeaseTTL < 3*ct.HeartbeatInterval {
+		e.add("control.lease_ttl", "must be at least three heartbeat intervals (%v), got %v: one lost heartbeat must not make a proxy stale", 3*ct.HeartbeatInterval, ct.LeaseTTL)
 	}
 }
 

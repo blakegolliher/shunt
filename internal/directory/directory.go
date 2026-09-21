@@ -39,6 +39,17 @@ type Ramp struct {
 	Hash     string   `yaml:"hash" json:"hash"`
 	Ratio    float64  `yaml:"ratio,omitempty" json:"ratio,omitempty"`
 	Prefixes []string `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
+	// Hold is a ramp step that has been written but is not in force yet (ADR-0016). A key inside
+	// Hold but outside the ramp is held: its writes are refused with 503 until the step reaches
+	// every proxy, so no proxy writes it to the target while another still writes it to the source.
+	// Split by the same Hash.
+	Hold *RampHold `yaml:"hold,omitempty" json:"hold,omitempty"`
+}
+
+// RampHold is the ramp a held step moves to: a ratio, prefixes, or both.
+type RampHold struct {
+	Ratio    float64  `yaml:"ratio,omitempty" json:"ratio,omitempty"`
+	Prefixes []string `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
 }
 
 // RampHash is the ramp hash this build writes and routes by: FNV-1a 64 over the key, finished with
@@ -77,6 +88,11 @@ func (p Placement) clone() Placement {
 	if p.Ramp != nil {
 		r := *p.Ramp
 		r.Prefixes = slices.Clone(p.Ramp.Prefixes)
+		if p.Ramp.Hold != nil {
+			h := *p.Ramp.Hold
+			h.Prefixes = slices.Clone(p.Ramp.Hold.Prefixes)
+			r.Hold = &h
+		}
 		c.Ramp = &r
 	}
 	if p.Cutover != nil {

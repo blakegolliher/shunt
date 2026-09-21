@@ -4,7 +4,7 @@ Read docs/DESIGN.md before every task. docs/CONTEXT.md is ground truth about the
 
 ## Simplicity rules (docs/DESIGN.md §2.10, verbatim)
 
-- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `proxy`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.

@@ -166,6 +166,8 @@ The process is: shift writes first, serve old data from the old place, backfill,
 | LIST (ListObjects, ListObjectsV2, ListMultipartUploads) | primary | sorted merge of both, primary wins on collision; continuation token = base64 `{p:…, s:…, last:…}` | same merge | primary |
 | Bucket-level config ops | primary | primary | primary | primary |
 
+**Several proxies (ADR-0016).** The table holds for one proxy at a time; a fleet reads one directory, and a step reaches each proxy on its own schedule. So a routing change is in effect only once every proxy has installed it (the version fence), and with more than one proxy a step that moves writes to the new primary is written first as a **hold** (`ramp.hold`): the keys it moves answer writes with `503` + `Retry-After` and read primary-then-source until every proxy has the hold, and only then does the step move them. No proxy ever writes a key to the target while another still writes it to the source, so the "source only" cell above stays true. A proxy that loses its lease with the control node refuses writes on every non-ACTIVE bucket until it is back.
+
 A write carrying `If-None-Match` or `If-Match` is judged against **both** clusters while the bucket is `RAMPING` or `MIGRATING`, because the cluster it lands on may not hold the key (ADR-0013): shunt `HEAD`s the other cluster first, refuses a create-once whose object exists there, converts an update-if-current whose current version is there into a create-only write on the destination, and answers 503 when it cannot check. `CUTOVER` needs none of this: the source is a subset of the primary by then.
 
 The listing merge normalizes key encoding before comparing. Backends disagree on how a listed key is spelled: under `encoding-type=url` Garage percent-encodes `/` and MinIO does not, so the same object arrives from two clusters as two different strings. The merge asks both sides for `encoding-type=url`, decodes every key, compares and orders the decoded names, and re-encodes on the way out according to what the client asked for (docs/reference/backend-compat.md).
@@ -205,7 +207,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 
 ### 2.10 Simplicity rules (these go into `CLAUDE.md` verbatim)
 
-- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `proxy`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.

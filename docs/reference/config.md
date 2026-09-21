@@ -50,6 +50,18 @@ The clusters, tenants and placements that route each bucket (docs/DESIGN.md §1.
 | `secrets_dir` | path | `secrets/` next to `file` | Where shunt stores a secret given to `shunt cluster add` (one 0600 file per cluster, referenced as `file:`; ADR-0010) |
 | `poll_interval` | duration | 1s | How often `serve` re-checks the file for another writer's changes (SIGHUP reloads immediately) |
 
+## `control`
+
+Where this proxy sits in a fleet of proxies sharing one directory file (ADR-0016). Omitted, the proxy is its own control node with no members, which is every single-proxy deployment.
+
+| Key | Type | Default | Rule |
+|---|---|---|---|
+| `endpoint` | URL | | The control node's admin listener, `http(s)://host:port`. Set, this proxy is a **member**: it sends the control node a heartbeat, its own control API refuses mutations, and it goes stale when its lease lapses. Resign mode only |
+| `token_ref` | `env:NAME` / `file:/path` | | The control node's `admin.control_token_ref`, for the heartbeat. Only with `endpoint` |
+| `proxy_id` | string | `<hostname>-<admin port>` | This member's id: 1-64 letters, digits, `.`, `_`, `-`. Stable across restarts, so a restarted proxy is the same member |
+| `heartbeat_interval` | duration | 1s | How often a member reports the directory version it has installed |
+| `lease_ttl` | duration | 10s | At least three heartbeats. A member whose last acknowledged heartbeat is older refuses writes on moving buckets; the control node counts a member live for this long plus 5 s |
+
 Directory file schema (validated by `check-config` and `shunt directory validate`):
 
 ```yaml
@@ -69,6 +81,7 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
     primary: vast-a
     source: minio-1               # required unless ACTIVE, forbidden in ACTIVE
     ramp: { hash: fnv1a-fmix64-v1, ratio: 0.05, prefixes: ["2026-09/"] }   # RAMPING only; hash written at RAMPING start, never changed (ADR-0004)
+    #   ramp.hold: { ratio: 0.25 }  # a step written but not yet on every proxy: its keys' writes answer 503 (ADR-0016)
     target: vast-b                # ACTIVE only: recorded by `shunt expand`, used by the next ramp or migrate
     names: { vast-a: acme-7f3a-data, vast-b: data-001 }   # cluster → backend bucket name
     cutover: { at: 2026-09-16T20:31:00Z, window: 60s, fallback_reads: 37 }   # CUTOVER only: `shunt cutover` evidence
@@ -78,7 +91,7 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
     created: 2026-09-15T18:00:00Z
 ```
 
-Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write.
+Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write. A control node with fleet members also keeps `<file>.fleet.yaml`: member ids only (ADR-0016).
 
 ## `clusters.<name>`
 

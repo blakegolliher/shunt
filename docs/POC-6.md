@@ -14,7 +14,7 @@ cutover relies on.
 |---|---|---|
 | 1 | Conditional PUT across the ramp | **done** on this branch: ADR-0013, `internal/proxy/conditional.go`, property-test clients |
 | 2 | Cross-cluster CopyObject | **done** on this branch: ADR-0014, `internal/proxy/crosscopy.go`, live on Garage → MinIO |
-| 3 | Version fence across proxies | not started; cutover evidence is per proxy (STATUS carried gap) |
+| 3 | Version fence across proxies | **done** on this branch: ADR-0016, `internal/control/fleet.go`, the hold (`ramp.hold`), stale mode, `shunt proxy`, fleet property test, `make fleet` live |
 | 4 | Cutover refuses in-progress multipart uploads | not started; `cutover` checks state, convergence, fallback reads only |
 | 5 | Capability profiles measured vs assumed | partial: `expand` measures and reports `measured`, but provenance is not stored, `cluster add` does not probe, and nothing refuses an assumed profile |
 | — | Secrets never on argv | **already true**: prompt or stdin, `--secret-ref env:/file:`, `--keys <file>` |
@@ -62,51 +62,39 @@ The open questions, as answered:
 - **Tags are not carried** across a cross-cluster copy (`x-amz-tagging-directive`), written down in
   ADR-0014 rather than left to be discovered.
 
-## Item 3 — version fence across proxies
+## Item 3 — version fence across proxies (done, ADR-0016)
 
-**Today:** each proxy polls the directory file (1 s) and serves whatever version it has read. A ramp
-change or a cutover applies the moment it is written, so for up to a poll interval two proxies can
-route the same key differently, and `cutover` reads the fallback-read counter of the one proxy that
-served the API call. With several proxies that evidence is not evidence.
+One proxy is the fleet's **control node**; the others are **members** (`control.endpoint`) that
+heartbeat to it with the directory version they have installed. A ramp step, `migrate start` or
+`cutover` is in effect only once every live member has it, and the CLI names the ones it is waiting
+on. With members, a step that moves writes is written first as a **hold** (`ramp.hold`): the keys
+it moves answer writes with 503 + `Retry-After` until every member has the hold, then move. A hold
+that does not reach every member is released, so a step happens everywhere or nowhere. A bucket's
+first step waits for every member, live or not (`shunt proxy forget` for one that is gone). A
+member that loses its lease refuses writes on moving buckets and reads them target-first. Cutover
+counts fallback reads across the fleet. **With one proxy nothing changes**: no members, no hold,
+no waits, and the README demo's output is byte for byte what it was.
 
-**Design sketch.** Proxies register in the directory (`proxies:` with an id, a start time, and the
-version each serves, refreshed on every poll and expired after a few missed intervals). A ramp step
-or a cutover is applied only when every live proxy acknowledges the version that precedes it, and
-the CLI waits, naming the proxies it is waiting for. The cutover window aggregates the fallback-read
-counters of all live proxies rather than one.
+Decisions and what changed on the way:
 
-**Decided when §12 landed on this branch.** Two of the sketch's open questions are now answered,
-because the answers are what makes P3c a swap rather than a rewrite:
+- **The hold replaces read-widening.** The recommendation made when §12 landed (make out-of-range
+  reads `source → primary` permanently) was withdrawn: widening reads fixes a stale read, not the
+  split write, where two proxies send the same key to different clusters and the older copy wins.
+  The hold closes both, and `migrate.Decide`'s source-only read stays correct unchanged.
+- **Liveness is control-plane memory; membership is persisted** (`<directory>.fleet.yaml`, ids
+  only). A lease that erased membership would let a proxy partitioned before a bucket's first step
+  vanish from the one check that must wait for it.
+- **Stale does not drain.** A control-node outage makes every member stale at once; draining them
+  would turn it into a data-path outage.
+- **Found by the fleet property test**, both real violations, both fixed: a member back from
+  silence renewed its lease before installing the steps it missed and wrote a moved key to the
+  source (lost write); and a silent member read moved keys source-only (stale read).
 
-- **Liveness is control-plane state, not directory state.** The sketch's `proxies:` record would make
-  the directory file a write target for every proxy, serialized through one flock — fine at three
-  proxies, wrong at a thousand, and nothing the etcd form would inherit. Instead each proxy
-  heartbeats to the control API (`internal/control`, already the single writer for every mutation)
-  with its id, the directory version it serves, and its counters for non-ACTIVE placements. The
-  control node holds the fleet table in memory; §12.5 replaces that with a leased key. The protocol
-  is identical either way, which is the point. Cost of the in-memory form: a control-node restart
-  forgets the fleet and the fence waits one heartbeat interval to refill. Proxies gain one config
-  value, the control endpoint to heartbeat to.
-- **The fleet counter rides the heartbeat**, not Prometheus and not the directory. §12.6 is explicit
-  that Prometheus is the dashboard and never the decision path, and the counters exist only for
-  non-ACTIVE placements, so the heartbeat is bounded by migrations in flight rather than by buckets.
-
-**Still open:** what a dead proxy costs — the expiry window has to be short enough that a crashed
-proxy does not hold a cutover forever, and long enough that a slow one is not dropped from the fence
-while it is still serving traffic.
-
-**Read-widening, and how many fence rounds a ramp needs.** `internal/migrate.Decide` sends an
-out-of-range key during `RAMPING` to the source with no fallback, on the reasoning that "the target
-cannot have it" — true of one proxy, false of a fleet where another proxy already holds a wider rule
-and wrote it to the target. §12.6 fixes this with a two-phase ramp: widen reads at R1, move writes at
-R2. Making the out-of-range read `source → primary` permanently is that first phase done once instead
-of once per change, and it costs a second lookup only on a genuine miss. Item 3 should take that
-route and then let the property test say whether the write move still needs its own fence round. It
-almost certainly does — read-widening stops a stale read, not a split write — but the test decides
-it, not the sketch.
-
-**Test:** two proxies over one directory and a deliberately stale one: a ramp step and a cutover both
-refuse to apply until the stale proxy catches up or expires.
+Evidence: `internal/control/fleet_test.go` (fence, hold, release, strict first step, forget,
+restart, fleet cutover); `internal/proxy/fleet_property_test.go` (10 runs: 0 violations in about
+264,000 operations with the fence; its negative control, without it, fails 10 of 10);
+`test/e2e/fleet.sh` (`make fleet`, two real proxies with SIGSTOP on each side); `make readme-demo`
+and `make walkthrough` green on the same build.
 
 ## Item 4 — cutover and in-progress multipart uploads
 
@@ -154,7 +142,7 @@ From the original prompt, still the gate for the list:
 
 - the property test is green with the conditional-write and rename clients through a full ramp
   (items 1 and 2 — met on this branch);
-- the stale-proxy fence test is green (item 3);
+- the stale-proxy fence test is green (item 3 — met on this branch);
 - cutover refuses with an in-flight multipart upload, and `--abort-uploads` clears it (item 4);
 - an assumed capability profile cannot start a migration (item 5);
 - no secret appears in shell history, `ps`, or logs during the walkthrough, and `purge-source`

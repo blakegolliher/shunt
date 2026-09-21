@@ -52,6 +52,10 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	m.FallbackReads.WithLabelValues("acme/data").Inc()
 	m.DualDelete.WithLabelValues("acme/data", "both").Inc()
 	m.ListingMerge.WithLabelValues("acme/data").Observe(0.01)
+	m.RefusedWrites.WithLabelValues("acme/data", "hold").Inc()
+	m.FleetMembers.WithLabelValues("live").Set(1)
+	m.FleetStale.Set(0)
+	m.FenceWait.Observe(0.01)
 	families, err := m.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +76,8 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 			t.Logf("catalog row %s has no registered metric yet", name)
 		}
 	}
-	if len(registered) != 15 {
-		t.Errorf("POC-4 registers exactly fifteen shunt_ metrics, got %d: %v", len(registered), registered)
+	// POC-4's fifteen, plus POC-6's four for the fleet (ADR-0016).
+	if len(registered) != 19 {
+		t.Errorf("POC-6 registers exactly nineteen shunt_ metrics, got %d: %v", len(registered), registered)
 	}
 }

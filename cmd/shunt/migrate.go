@@ -357,6 +357,7 @@ func newRamp() *cobra.Command {
 		o    apiOptions
 		req  control.RampRequest
 		from string
+		wait time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "ramp <bucket>",
@@ -373,8 +374,9 @@ func newRamp() *cobra.Command {
 			if req.Ratio < 0 || req.Ratio > 1 {
 				return fmt.Errorf("--ratio %v is outside 0..1", req.Ratio)
 			}
+			req.Wait = wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, "/ramp", req, time.Minute)
+				return transition(cmd, api, o, key, "/ramp", req, time.Minute+3*wait)
 			})
 		},
 	}
@@ -386,6 +388,7 @@ func newRamp() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name on --to (default: a generated name)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
+	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
 	return cmd
 }
 
@@ -403,6 +406,7 @@ func newMigrateStart() *cobra.Command {
 		o    apiOptions
 		req  control.MigrateRequest
 		from string
+		wait time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "start <bucket>",
@@ -412,8 +416,9 @@ func newMigrateStart() *cobra.Command {
 			"are merged. That is the state the mover copies in: `shunt migrate run`.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			req.Wait = wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, "/migrate", req, time.Minute)
+				return transition(cmd, api, o, key, "/migrate", req, time.Minute+3*wait)
 			})
 		},
 	}
@@ -425,6 +430,7 @@ func newMigrateStart() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name on --to")
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
+	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
 	return cmd
 }
 
@@ -433,6 +439,7 @@ func newCutover() *cobra.Command {
 		o      apiOptions
 		window time.Duration
 		from   string
+		wait   time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "cutover <bucket>",
@@ -447,13 +454,14 @@ func newCutover() *cobra.Command {
 				if !o.json {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: waiting %s for fallback reads to stay flat\n", key, window)
 				}
-				return transition(cmd, api, o, key, "/cutover", control.CutoverRequest{Window: window.String()}, window+2*time.Minute)
+				return transition(cmd, api, o, key, "/cutover", control.CutoverRequest{Window: window.String(), Wait: wait.String()}, window+2*time.Minute+3*wait)
 			})
 		},
 	}
 	addAPIFlags(cmd, &o)
 	cmd.Flags().DurationVar(&window, "window", 60*time.Second, "how long fallback reads must stay flat")
 	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket migrating off this cluster")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to report and to have the change")
 	return cmd
 }
 
@@ -630,10 +638,30 @@ func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, op string
 	case directory.StateActive:
 		_, _ = fmt.Fprintf(out, "migration complete: %s is served entirely by %s\n", shown(res.Key), res.Primary)
 	}
+	printFleet(out, res)
 	if res.Warning != "" {
 		_, _ = fmt.Fprintf(out, "WARNING %s\n", res.Warning)
 	}
 	return nil
+}
+
+// printFleet says where a change is in effect when this shunt has fleet members (ADR-0016). With
+// none, it prints nothing: one proxy has every change the moment it is written.
+func printFleet(out io.Writer, res control.TransitionResult) {
+	if res.Held {
+		_, _ = fmt.Fprintf(out, "the keys this step moves paused their writes until every proxy had it\n")
+	}
+	switch {
+	case len(res.WaitingOn) > 0:
+		_, _ = fmt.Fprintf(out, "PENDING: not yet installed on %s. The change is written and each proxy applies it as it catches up;\n"+
+			"the next step on this bucket is refused until they all have it (`shunt proxy list`)\n", strings.Join(res.WaitingOn, ", "))
+	case res.Proxies > 0:
+		_, _ = fmt.Fprintf(out, "in effect on every live proxy (this one and %d member(s))\n", res.Proxies)
+	}
+	if len(res.Silent) > 0 {
+		_, _ = fmt.Fprintf(out, "silent, not waited for: %s. A silent proxy refuses writes to moving buckets on its own and installs\n"+
+			"the change when it is back; one that is gone for good: `shunt proxy forget <id>`\n", strings.Join(res.Silent, ", "))
+	}
 }
 
 // forEach runs fn for the named bucket, or with --from for every bucket that cluster serves (ACTIVE)

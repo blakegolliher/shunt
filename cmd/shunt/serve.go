@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -121,6 +122,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	}
 	var dir *directory.FileDir
 	var ctl *control.Server
+	var member *control.Membership
 	if cfg.Auth.Mode == "resign" {
 		store, err := auth.Load(cfg.Auth.CredentialsFile)
 		if err != nil {
@@ -178,7 +180,14 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
-		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, TenantKeys: store.Tenant, AddKey: store.Add, RemoveKey: store.Remove}
+		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, TenantKeys: store.Tenant, AddKey: store.Add, RemoveKey: store.Remove,
+			ControlNode: cfg.Control.Endpoint, FleetFile: dir.Path() + ".fleet.yaml", LeaseTTL: cfg.Control.LeaseTTL}
+		if cfg.Control.Endpoint != "" {
+			if member, err = newMembership(cfg, dir, metrics, log); err != nil {
+				return err
+			}
+			hcfg.Stale = member.Stale
+		}
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
 				return fmt.Errorf("admin.control_token_ref: %w", err)
@@ -217,6 +226,13 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	adm := admin.New(metrics.Registry, slow)
 	if ctl != nil {
 		adm.Mount("/v1/", ctl.Handler())
+	}
+	if member != nil {
+		adm.Mount("/-/fleet", member)
+		mctx, stop := context.WithCancel(ctx)
+		defer stop()
+		go member.Run(mctx)
+		log.Info("fleet member", "proxy", member.ID, "control", member.Endpoint, "heartbeat", member.Interval.String(), "lease_ttl", member.LeaseTTL.String())
 	}
 	admSrv := adm.Listen(cfg.Admin.Address)
 
@@ -273,6 +289,30 @@ wait:
 	_ = admSrv.Shutdown(dctx)
 	log.Info("stopped")
 	return nil
+}
+
+// newMembership builds this proxy's side of the fleet (ADR-0016). The id defaults to the host name
+// and the admin port, which is stable across restarts, so a restarted proxy is the same member.
+func newMembership(cfg *config.Config, dir *directory.FileDir, metrics *telemetry.Metrics, log *slog.Logger) (*control.Membership, error) {
+	m := &control.Membership{Endpoint: cfg.Control.Endpoint, ID: cfg.Control.ProxyID, Interval: cfg.Control.HeartbeatInterval,
+		LeaseTTL: cfg.Control.LeaseTTL, Dir: dir, Metrics: metrics, Log: log, Client: &http.Client{Timeout: cfg.Control.HeartbeatInterval}}
+	if ref := cfg.Control.TokenRef; ref != "" {
+		tok, err := config.ResolveSecret(ref)
+		if err != nil {
+			return nil, fmt.Errorf("control.token_ref: %w", err)
+		}
+		m.Token = tok
+	}
+	if m.ID == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
+		}
+		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
+		m.ID = strings.NewReplacer(" ", "-", "/", "-").Replace(host) + "-" + port
+	}
+	metrics.FleetStale.Set(1) // until the first heartbeat is answered
+	return m, nil
 }
 
 func isLoopbackHost(host string) bool {

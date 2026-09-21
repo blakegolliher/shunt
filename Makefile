@@ -215,6 +215,9 @@ walkthrough: build ## POC-5: the operator walkthrough, unattended, e2e Garage (a
 readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cluster A) -> MinIO (as cluster B); needs make e2e-up
 	$(E2E_DIR)/readme-demo.sh $(README_DEMO_ARGS)
 
+fleet: build ## POC-6 item 3: two proxies over one directory, fence, hold, stale mode (ADR-0016); needs make e2e-up
+	$(E2E_DIR)/fleet.sh $(FLEET_ARGS)
+
 run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster at VAST_ENDPOINT (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }
 	cp $(E2E_DIR)/shunt-vast-resign.yaml $(E2E_DIR)/data/shunt-vast-resign.yaml

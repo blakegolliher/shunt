@@ -66,6 +66,9 @@ type Route struct {
 	Fallback bool // read: on 404 from Cluster, try the other side
 	Both     bool // delete: send to both sides
 	Merge    bool // list: merge both sides into one answer
+	// Held: a write to a key inside a ramp step that has not reached every proxy (ADR-0016). It is
+	// refused with 503 and Retry-After rather than sent anywhere.
+	Held bool
 }
 
 // Side names one of a placement's two clusters.
@@ -115,6 +118,18 @@ func Decide(p *directory.Placement, class OpClass, key string) (Route, error) {
 				return Route{}, err
 			}
 			if !in {
+				held, err := InHold(p.Ramp, key)
+				if err != nil {
+					return Route{}, err
+				}
+				switch {
+				case held && class == ClassWrite:
+					// No proxy writes a held key to the target until every proxy holds it (ADR-0016).
+					return Route{Cluster: Primary, Held: true}, nil
+				case held:
+					// Another proxy may already have the completed step and have written the key there.
+					return Route{Cluster: Primary, Fallback: true}, nil
+				}
 				// A key whose writes still go to the source is read there too: the target cannot have it.
 				return Route{Cluster: Source}, nil
 			}
@@ -164,6 +179,15 @@ func InRange(r *directory.Ramp, key string) (bool, error) {
 		return false, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, r.Hash, directory.RampHash)
 	}
 	return rampHash(key) < uint64(r.Ratio*float64(math.MaxUint64)), nil
+}
+
+// InHold reports whether a key falls inside the ramp's held step (directory.Ramp.Hold), split by
+// the same hash. A key already in the ramp is in force, not held; callers ask InRange first.
+func InHold(r *directory.Ramp, key string) (bool, error) {
+	if r == nil || r.Hold == nil {
+		return false, nil
+	}
+	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes}, key)
 }
 
 // rampHash is directory.RampHash, fnv1a-fmix64-v1. Its values are pinned by a test: changing them

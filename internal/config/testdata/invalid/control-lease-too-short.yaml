@@ -1,0 +1,5 @@
+# expect: control.lease_ttl
+listener: { address: ":8008", plaintext: true }
+auth: { mode: resign, credentials_file: creds.yaml }
+directory: { file: d.yaml }
+control: { endpoint: "http://10.0.0.1:9900", heartbeat_interval: 1s, lease_ttl: 2s }

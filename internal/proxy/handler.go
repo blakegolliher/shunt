@@ -48,6 +48,10 @@ type Handler struct {
 	MetadataTimeout time.Duration // metadata ops: total deadline
 	Via             string        // e.g. "1.1 shunt/0.1.0"
 	Log             *slog.Logger  // alerts (compensation, rewrite overflow, directory failures); nil means none
+	// Stale reports whether this proxy has lost its lease with the control node (ADR-0016): writes
+	// and deletes on a moving bucket are then refused. nil: this proxy is its own control node and
+	// is never stale.
+	Stale func() bool
 
 	pool    *bufPool   // body copy buffers
 	scratch *bufPool   // rewritten-response scratch (ADR-0006)

@@ -178,15 +178,20 @@ before `purge-source`.
 `shunt cutover` moves `MIGRATING → CUTOVER` only when both of these hold:
 
 - the mover's last reported pass copied nothing and failed nothing, and
-- this proxy served no fallback read of the bucket during `--window` (default 60s).
+- no proxy served a fallback read of the bucket during `--window` (default 60s): this one, and every live fleet member.
 
 The call waits out the window, then records the evidence on the placement (`cutover:` in the
 directory). Choose a window that covers your clients' read patterns. A bucket that is read once an
 hour needs an hour-long window, or a scripted read of its cold keys during a shorter one.
 
-**With several proxies,** the fallback counter is per proxy: hold the window on each proxy's API, or
-check `shunt_migration_fallback_reads_total` across the fleet before cutting over. P4 aggregates
-it.
+**With several proxies** (ADR-0016), run every command against the control node: the proxy the
+others name in `control.endpoint`. Each step is in effect only once every member has installed
+it, and the command says so, or names the members it is still waiting on. A step that moves writes
+pauses the writes of the keys it moves (503 with `Retry-After`, retried by every SDK) for a couple
+of heartbeats while it reaches every member. The cutover window counts fallback reads on every
+live member, and refuses if one stops reporting during it. A bucket's first step waits for every
+member, even a silent one: check `shunt proxy list` first, and `shunt proxy forget <id>` a proxy
+that is gone for good.
 
 In `CUTOVER`, reads and listings use the new primary alone. Deletes still reach the source, so the
 source only ever loses keys. Then either:

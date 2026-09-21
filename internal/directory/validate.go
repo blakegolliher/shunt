@@ -149,8 +149,16 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 		if p.Ramp.Ratio < 0 || p.Ramp.Ratio > 1 {
 			e.add(k+".ramp.ratio", "must be within [0, 1], got %v", p.Ramp.Ratio)
 		}
-		if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 {
+		if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 && p.Ramp.Hold == nil {
 			e.add(k+".ramp", "needs a ratio or at least one prefix")
+		}
+		if h := p.Ramp.Hold; h != nil {
+			if h.Ratio < 0 || h.Ratio > 1 {
+				e.add(k+".ramp.hold.ratio", "must be within [0, 1], got %v", h.Ratio)
+			}
+			if h.Ratio == 0 && len(h.Prefixes) == 0 {
+				e.add(k+".ramp.hold", "needs a ratio or at least one prefix")
+			}
 		}
 	} else if p.State == StateRamping {
 		e.add(k+".ramp", "required in state RAMPING")

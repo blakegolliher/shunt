@@ -803,3 +803,96 @@ func TestPrepareAndOnInstallHooks(t *testing.T) {
 		t.Fatalf("OnInstall versions: %v", installed)
 	}
 }
+
+// TestHeldSteps covers ADR-0016's hold: a step written as a hold keeps the ramp in force, completes
+// only to what it held, and a release puts the placement back exactly as it was.
+func TestHeldSteps(t *testing.T) {
+	clusters := sampleClusters(t)
+	valid := func(name string, p Placement) {
+		t.Helper()
+		f := &File{Version: 1, Clusters: clusters, Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{"acme/data": p}}
+		if err := validate(f); err != nil {
+			t.Errorf("%s produced an invalid placement: %v\n%+v", name, err, p)
+		}
+	}
+	a := active("garage")
+	a.Target, a.Names["minio"] = "minio", "data2" // expanded
+
+	// ACTIVE, held: RAMPING with nothing in force and the step in hold.
+	h, err := Apply(a, Transition{To: StateRamping, Ratio: 0.5, Hold: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.State != StateRamping || h.Primary != "minio" || h.Source != "garage" || h.Ramp.Ratio != 0 || h.Ramp.Hold == nil || h.Ramp.Hold.Ratio != 0.5 || h.Ramp.Hash != RampHash || !h.Held() {
+		t.Fatalf("held from ACTIVE: %+v ramp %+v", h, h.Ramp)
+	}
+	valid("held from ACTIVE", h)
+	if _, err := Apply(h, Transition{To: StateRamping, Ratio: 0.8, Hold: true}); err == nil {
+		t.Error("a second hold on top of a hold accepted")
+	}
+	if _, err := Apply(h, Transition{To: StateRamping, Ratio: 0.8}); err == nil {
+		t.Error("completing a held step beyond what it held accepted")
+	}
+	if _, err := Apply(h, Transition{To: StateMigrating}); err == nil {
+		t.Error("MIGRATING over a held ramp step accepted")
+	}
+	done, err := Apply(h, Transition{To: StateRamping, Ratio: 0.5})
+	if err != nil || done.Ramp.Ratio != 0.5 || done.Ramp.Hold != nil || done.Held() {
+		t.Fatalf("completing the hold: %+v %v", done.Ramp, err)
+	}
+	valid("completed hold", done)
+
+	// Releasing a hold from ACTIVE restores ACTIVE with the target recorded.
+	back, err := Apply(h, Transition{Release: true})
+	if err != nil || back.State != StateActive || back.Primary != "garage" || back.Source != "" || back.Target != "minio" || back.Ramp != nil || back.Names["minio"] != "data2" {
+		t.Fatalf("release from ACTIVE: %+v %v", back, err)
+	}
+	valid("released to ACTIVE", back)
+	if _, err := Apply(back, Transition{Release: true}); err == nil {
+		t.Error("release with nothing held accepted")
+	}
+
+	// A held step on a running ramp keeps the ramp in force; a prefix step holds its prefix.
+	hp, err := Apply(done, Transition{To: StateRamping, Prefixes: []string{"runs/"}, Hold: true})
+	if err != nil || hp.Ramp.Ratio != 0.5 || hp.Ramp.Hold == nil || hp.Ramp.Hold.Ratio != 0.5 || !slices.Equal(hp.Ramp.Hold.Prefixes, []string{"runs/"}) {
+		t.Fatalf("held prefix step: %+v %v", hp.Ramp, err)
+	}
+	if _, err := Apply(hp, Transition{To: StateRamping, Prefixes: []string{"other/"}}); err == nil {
+		t.Error("completing a held prefix step with a different prefix accepted")
+	}
+	rel, err := Apply(hp, Transition{Release: true})
+	if err != nil || rel.State != StateRamping || rel.Ramp.Ratio != 0.5 || rel.Ramp.Hold != nil || len(rel.Ramp.Prefixes) != 0 {
+		t.Fatalf("release on a running ramp: %+v %v", rel.Ramp, err)
+	}
+	if hp.Ramp.Hold == nil {
+		t.Error("release mutated its input")
+	}
+
+	// migrate start, held: RAMPING with hold.ratio 1, then MIGRATING completes it.
+	hm, err := Apply(done, Transition{To: StateMigrating, Hold: true})
+	if err != nil || hm.State != StateRamping || hm.Ramp.Ratio != 0.5 || hm.Ramp.Hold == nil || hm.Ramp.Hold.Ratio != 1 {
+		t.Fatalf("held migrate start: %+v %v", hm.Ramp, err)
+	}
+	valid("held migrate start", hm)
+	m, err := Apply(hm, Transition{To: StateMigrating})
+	if err != nil || m.State != StateMigrating || m.Ramp != nil {
+		t.Fatalf("completing a held migrate start: %+v %v", m, err)
+	}
+	if _, err := Apply(a, Transition{To: StateCutover, Hold: true}); err == nil {
+		t.Error("a held CUTOVER accepted")
+	}
+
+	// The hold round-trips through the file format.
+	f := &File{Version: 1, Clusters: clusters, Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{"acme/data": hp}}
+	data, err := marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := g.Placements["acme/data"].Ramp.Hold; got == nil || got.Ratio != 0.5 || !slices.Equal(got.Prefixes, []string{"runs/"}) {
+		t.Errorf("hold after a round trip: %+v\n%s", got, data)
+	}
+}

@@ -18,7 +18,9 @@ Two reconciliations were made when this section landed in the repo, both recorde
   flock. Instead: proxies heartbeat to the control API, which holds the fleet table in memory in the
   single-node form and as a leased key (§12.5) in the etcd form. P3c then swaps the registry's
   storage, not its protocol.
-- **Read-widening is permanent, not per-change.** See §12.6.
+- ~~**Read-widening is permanent, not per-change.**~~ Withdrawn by ADR-0016: widening reads fixes
+  a stale read, not a split write. The hold in §12.6 closes both, and with it `Decide`'s
+  "source only" read stays correct unchanged.
 
 ## 12.1 Goals
 
@@ -93,7 +95,17 @@ Size: a million placements is roughly 300 MB of etcd state, inside the default q
 2. When R1 is committed (all live proxies acked), revision R2 moves writes to the new range.
 3. Optionally, when R2 is committed, R3 narrows reads back to the new range (a wider read rule is always safe, only slower on misses).
 
-*Reconciliation with the code as it stands.* This sequence assumes reads narrow to the write rule,
+**Amended by ADR-0016 (POC-6 item 3): the hold replaces reads-widen-first.** Widening reads at R1
+does not stop the split write: while R2 rolls out, one proxy writes a key to the target and another
+still writes it to the source, and the target's older copy wins the read. Instead R1 records the
+step as `ramp.hold`: the keys it moves answer writes with 503 + `Retry-After` and read
+target-then-source on every proxy that has R1. R2, once R1 is committed, moves their writes. No
+proxy writes a moving key to the target while another writes it to the source, and a proxy on R0
+reading such a key source-only is still right. A hold that does not commit within the wait is
+released (R1 undone), so a step happens everywhere or nowhere. With one proxy nothing is held.
+
+*Reconciliation with the code as it stands (superseded by the amendment above; kept for the
+record).* This sequence assumes reads narrow to the write rule,
 which is true today: `internal/migrate.Decide` routes an out-of-range key during `RAMPING` to the
 source with **no fallback**, because "the target cannot have it" — a statement that stops being true
 the moment any proxy in the fleet holds a wider rule. Making that read `source → primary`
@@ -105,6 +117,15 @@ before this is written down as settled; the fence stays until it does.
 The same sequence applies to ratio increases, prefix additions, and ACTIVE → RAMPING. Cutover only narrows reads (target-then-source → target-only) once all writes already land on the target, so it is single-phase; `purge-source` waits until cutover is committed.
 
 **Stale mode.** A proxy that cannot renew its lease for longer than the TTL enters stale mode: it keeps serving everything on ACTIVE placements from its local snapshot cache, and it refuses writes with 503 (and `Retry-After`) on any placement in RAMPING, MIGRATING, or CUTOVER until it has reconnected and applied the current revision. A partitioned proxy can reduce a migration's availability; it cannot corrupt one. Its readiness endpoint reports degraded so the L4 tier drains it. The same rule applies to a proxy starting while the control plane is unreachable: it serves from its cached snapshot in stale mode.
+
+*Amended by ADR-0016.* (1) Readiness does **not** drain a stale proxy: when the control plane is
+down every proxy is stale at once, and draining them all turns a control-plane outage into a
+data-path outage, which §12.1 forbids. Staleness is an alert (`shunt_fleet_stale`), not a
+routing signal. (2) Stale mode alone does not protect a bucket's **first** step: a proxy
+partitioned before it still sees the bucket ACTIVE and writes every key to the source. So a fence
+round that takes a bucket out of ACTIVE waits for every **member**, live or not, until it answers
+or is forgotten (`shunt proxy forget`), and membership must outlive the lease: in etcd that is a
+membership record beside the leased `/proxies/<id>` key, not the leased key alone.
 
 **Fleet-wide decisions.** Cutover windows, ramp holds, and convergence read counters carried on every live proxy's heartbeat, aggregated by the control node that runs the check. The counters exist only for non-ACTIVE placements, so heartbeat size is bounded by migrations in flight, not by buckets. Prometheus remains the dashboard and alerting path; it is never the decision path.
 
@@ -136,8 +157,8 @@ Requirements the runbook states plainly: three nodes on separate failure domains
 
 ## 12.9 What the property test must prove
 
-- Two-phase ramp: with two proxies where one lags by a revision, no key is written to one side and read source-only on the other. A model-checked test with a deliberately stale proxy.
-- Stale mode: a proxy whose lease is revoked mid-migration refuses transitional writes and serves ACTIVE placements; on reconnect it acks and resumes.
+- Two-phase ramp: with two proxies where one lags by a revision, no key is written to one side and read source-only on the other. A model-checked test with a deliberately stale proxy. *(File-backend form done in POC-6: `internal/proxy/fleet_property_test.go`, with a negative control that must fail without the fence; P3c reruns it against etcd.)*
+- Stale mode: a proxy whose lease is revoked mid-migration refuses transitional writes and serves ACTIVE placements; on reconnect it acks and resumes. *(Done in POC-6 for the file backend: the property test partitions a member mid-migration; `make fleet` does it with SIGSTOP. A reconnecting proxy renews only once it has installed the current version, ADR-0016.)*
 - Fence: a ramp change never advances to phase 2 while any live proxy lags; a proxy whose lease expires is dropped from the fence and lands in stale mode.
 - Quorum loss: kill two of three control nodes under load; data-path error rate on ACTIVE placements stays zero; transitional placements see only 503s with `Retry-After`; recovery restores everything with no operator action.
 - Mover claims: two movers on the same migration never copy conflicting content; a mover killed mid-range is taken over within one lease TTL.
