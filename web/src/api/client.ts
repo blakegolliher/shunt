@@ -186,7 +186,19 @@ export interface LedgerEntry {
   took?: string
 }
 
-export interface TelemetryPoint { start: string; end: string; p50_us: number; p90_us: number; p99_us: number; p999_us: number; max_us: number; count: number }
+export interface TelemetryPoint {
+  start: string
+  end: string
+  series: string
+  op: string
+  p50_us?: number
+  p90_us?: number
+  p99_us?: number
+  p999_us?: number
+  max_us?: number
+  count?: number
+  value?: number
+}
 
 export interface StreamEvent {
   id: string

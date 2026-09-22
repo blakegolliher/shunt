@@ -4,6 +4,7 @@ import { Buckets } from './screens/Buckets'
 import { Clusters } from './screens/Clusters'
 import { ControlPlane } from './screens/ControlPlane'
 import { Migrations } from './screens/Migrations'
+import { Telemetry } from './screens/Telemetry'
 import { useStore } from './store'
 
 const pages = ['Control plane', 'Clusters', 'Buckets', 'Migrations', 'Telemetry', 'Audit'] as const
@@ -35,6 +36,7 @@ export function App() {
     : page === 'Clusters' ? <Clusters />
       : page === 'Buckets' ? <Buckets onMigrate={(key) => { setMigration(key); setPage('Migrations') }} />
         : page === 'Migrations' ? <Migrations selected={migration} onSelect={setMigration} />
+          : page === 'Telemetry' ? <Telemetry />
           : <Card title={page}><p className="text-muted">This screen arrives in the next UI phase.</p></Card>
   return <div className="min-h-screen bg-ink-950 lg:grid lg:grid-cols-[240px_1fr]">
     <aside className="border-b border-ink-700 bg-ink-900 p-5 lg:min-h-screen lg:border-b-0 lg:border-r">

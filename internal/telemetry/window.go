@@ -25,6 +25,13 @@ const (
 	SeriesUpstreamTTFB  = "upstream_ttfb"  // SeriesUpstreamTTFB covers upstream request headers through response headers.
 	SeriesUpstreamTotal = "upstream_total" // SeriesUpstreamTotal covers upstream request headers through the last body byte.
 	SeriesProxyOverhead = "proxy_overhead" // SeriesProxyOverhead is client total less upstream total.
+
+	SeriesRequestsPerSecond  = "requests_per_second"   // SeriesRequestsPerSecond is the exact window count divided by its duration.
+	SeriesBytesInPerSecond   = "bytes_in_per_second"   // SeriesBytesInPerSecond is exact received bytes divided by window duration.
+	SeriesBytesOutPerSecond  = "bytes_out_per_second"  // SeriesBytesOutPerSecond is exact sent bytes divided by window duration.
+	SeriesErrors0PerSecond   = "errors_0_per_second"   // SeriesErrors0PerSecond counts requests with no response status.
+	SeriesErrors4xxPerSecond = "errors_4xx_per_second" // SeriesErrors4xxPerSecond counts client-error responses.
+	SeriesErrors5xxPerSecond = "errors_5xx_per_second" // SeriesErrors5xxPerSecond counts server-error responses.
 )
 
 // OpClass is the bounded operation dimension carried in window telemetry.
@@ -660,9 +667,59 @@ func (s *Store) Series(scope, series string, op OpClass, from, to time.Time) []S
 	return out
 }
 
+// CounterSeries returns one control-node-derived rate per retained 10-second window. Values come
+// from exact counters; only the conversion from a window total to per-second is performed here.
+func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Time) []ScalarPoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []ScalarPoint
+	for _, w := range s.ring[scope] {
+		if !from.IsZero() && w.End.Before(from) || !to.IsZero() && w.Start.After(to) {
+			continue
+		}
+		for _, c := range w.Counters {
+			if c.Op != op {
+				continue
+			}
+			seconds := w.End.Sub(w.Start).Seconds()
+			if seconds <= 0 {
+				continue
+			}
+			var total int64
+			switch series {
+			case SeriesRequestsPerSecond:
+				total = c.Requests
+			case SeriesBytesInPerSecond:
+				total = c.BytesIn
+			case SeriesBytesOutPerSecond:
+				total = c.BytesOut
+			case SeriesErrors0PerSecond:
+				total = c.Errors["0"]
+			case SeriesErrors4xxPerSecond:
+				total = c.Errors["4xx"]
+			case SeriesErrors5xxPerSecond:
+				total = c.Errors["5xx"]
+			default:
+				continue
+			}
+			out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Value: float64(total) / seconds})
+		}
+	}
+	return out
+}
+
 // SeriesPoint is one point returned by GET /v1/telemetry/series.
 type SeriesPoint struct {
 	Start time.Time `json:"start"`
 	End   time.Time `json:"end"`
 	Summary
+}
+
+// ScalarPoint is one exact-counter rate returned by GET /v1/telemetry/series.
+type ScalarPoint struct {
+	Start  time.Time `json:"start"`
+	End    time.Time `json:"end"`
+	Series string    `json:"series"`
+	Op     OpClass   `json:"op"`
+	Value  float64   `json:"value"`
 }

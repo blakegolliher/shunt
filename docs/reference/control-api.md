@@ -332,7 +332,8 @@ Server-sent events from this control node (ADR-0017): `Content-Type: text/event-
 ### `GET /v1/telemetry/series`
 
 Query parameters are `scope=fleet|cluster:<name>|proxy:<id>`,
-`series=client_total|upstream_ttfb|upstream_total|proxy_overhead`,
+`series=client_total|upstream_ttfb|upstream_total|proxy_overhead` or one of the exact-counter rates
+`requests_per_second|bytes_in_per_second|bytes_out_per_second|errors_0_per_second|errors_4xx_per_second|errors_5xx_per_second`,
 `op=all|read|write|list|delete|multipart|other` (default `all`), and optional RFC3339 `from` /
 `to`. The answer is a chronological slice of the 60-minute, 10-second-window ring:
 
@@ -346,6 +347,11 @@ Query parameters are `scope=fleet|cluster:<name>|proxy:<id>`,
 Percentiles are emitted by the control node from merged HdrHistogram sketches; clients never
 average percentiles. Values are integer microseconds. An unknown scope may validly have an empty
 `points` array; malformed scope, series, operation, or time filters answer 400.
+
+Counter-rate points have the same `start`, `end`, `series` and `op`, plus `value` instead of
+percentiles. The control node divides the exact counter by that window's duration; the browser
+plots `value` unchanged. `errors_0_per_second` means no response status was produced, normally a
+client disconnect before headers.
 
 ### `GET /v1/telemetry/latest`
 

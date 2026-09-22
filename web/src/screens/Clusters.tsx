@@ -46,7 +46,7 @@ export function Clusters() {
   useEffect(() => {
     if (!selected) return
     const query = new URLSearchParams({ scope: `cluster:${selected}`, series: 'client_total', op: 'other' })
-    void getTelemetrySeries(token, query).then((series) => setHistory(series.points.map((point) => point.p99_us))).catch(() => setHistory([]))
+    void getTelemetrySeries(token, query).then((series) => setHistory(series.points.map((point) => point.p99_us ?? 0))).catch(() => setHistory([]))
   }, [selected, token])
 
   const currentInput = useMemo(() => JSON.stringify(clusterInput(form)), [form])

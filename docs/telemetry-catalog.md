@@ -47,6 +47,9 @@ maximum and count in microseconds.
 
 Each window also carries exact counters by `op_class` and `cluster`: requests, request and
 response bytes, and errors by HTTP status class. The control node sums them for the same fleet,
-cluster and proxy scopes as the latency summaries.
+cluster and proxy scopes as the latency summaries. `/v1/telemetry/series` exposes these retained
+window counters as `requests_per_second`, `bytes_in_per_second`, `bytes_out_per_second`, and
+`errors_{0,4xx,5xx}_per_second`; the control node divides by the actual window duration and the UI
+renders the returned value without further aggregation.
 
 Deferred to P4: the full catalog (connection, auth, TLS, routing, TCP, runtime signals). Those rows are added when their phase begins, not before.

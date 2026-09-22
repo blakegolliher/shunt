@@ -81,6 +81,21 @@ func TestTelemetryReadModelsAndEvent(t *testing.T) {
 		t.Fatalf("series = %#v", series)
 	}
 
+	req = httptest.NewRequest(http.MethodGet, "/v1/telemetry/series?scope=fleet&series=requests_per_second&op=all", nil)
+	req.Header.Set("Authorization", "Bearer test")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request rate: %d %s", rec.Code, rec.Body.String())
+	}
+	series = TelemetrySeries{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &series); err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Points) != 1 || series.Points[0].Value == nil || *series.Points[0].Value != 0.2 {
+		t.Fatalf("request rate = %#v", series)
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/v1/telemetry/series?scope=nope&series=client_total", nil)
 	req.Header.Set("Authorization", "Bearer test")
 	rec = httptest.NewRecorder()

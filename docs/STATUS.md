@@ -83,6 +83,16 @@ filesystem:
   the browser mover operation against Garage → MinIO, saw it converge, read its ledger, and then
   cut over and purged. At the operator's request no Playwright dependency or automated browser run
   is committed; the full visual workflow is the next manual acceptance pass.
+- **UI-5 done (2026-09-22; visual/screenshot acceptance is manual by operator choice):** the
+  telemetry screen selects fleet, cluster or proxy scope, 5/15/60-minute windows and an operation
+  class; it shows current p99/rate/throughput tiles, request and byte rates, four emitted-percentile
+  small multiples, status-class errors, and a two-cluster p99 comparison. The control node now
+  exposes retained exact counters as per-second series; percentile and scalar chart-data tests prove
+  the browser plots API values unchanged, and refresh is driven only by telemetry SSE events. UI
+  build/lint and all 18 unit/accessibility tests, Go build/lint/test/race and fleet are green. Fleet
+  exposed non-empty request-rate histories for Garage and MinIO and matched the verifier's p99 by
+  6.43% (28,367 us versus 26,543 us). The dashboard screenshot is intentionally left for the
+  operator's manual end-to-end pass rather than adding a browser runner on this host.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

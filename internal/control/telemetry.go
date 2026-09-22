@@ -24,10 +24,26 @@ type LatestTelemetry struct {
 
 // TelemetrySeries is GET /v1/telemetry/series.
 type TelemetrySeries struct {
-	Scope  string                  `json:"scope"`
-	Series string                  `json:"series"`
-	Op     telemetry.OpClass       `json:"op"`
-	Points []telemetry.SeriesPoint `json:"points"`
+	Scope  string            `json:"scope"`
+	Series string            `json:"series"`
+	Op     telemetry.OpClass `json:"op"`
+	Points []TelemetryPoint  `json:"points"`
+}
+
+// TelemetryPoint is either one emitted latency summary or one exact-counter rate. Percentile
+// fields and Value are mutually exclusive on the wire.
+type TelemetryPoint struct {
+	Start  time.Time         `json:"start"`
+	End    time.Time         `json:"end"`
+	Series string            `json:"series"`
+	Op     telemetry.OpClass `json:"op"`
+	Count  int64             `json:"count,omitempty"`
+	P50    int64             `json:"p50_us,omitempty"`
+	P90    int64             `json:"p90_us,omitempty"`
+	P99    int64             `json:"p99_us,omitempty"`
+	P999   int64             `json:"p999_us,omitempty"`
+	Max    int64             `json:"max_us,omitempty"`
+	Value  *float64          `json:"value,omitempty"`
 }
 
 func (s *Server) publishTelemetry(ms []Member) error {
@@ -99,6 +115,9 @@ func validSeries(v string) bool {
 	switch v {
 	case telemetry.SeriesClientTotal, telemetry.SeriesUpstreamTTFB, telemetry.SeriesUpstreamTotal, telemetry.SeriesProxyOverhead:
 		return true
+	case telemetry.SeriesRequestsPerSecond, telemetry.SeriesBytesInPerSecond, telemetry.SeriesBytesOutPerSecond,
+		telemetry.SeriesErrors0PerSecond, telemetry.SeriesErrors4xxPerSecond, telemetry.SeriesErrors5xxPerSecond:
+		return true
 	}
 	return false
 }
@@ -137,7 +156,7 @@ func (s *Server) telemetrySeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validSeries(series) {
-		fail(w, bad("series %q: want client_total, upstream_ttfb, upstream_total, or proxy_overhead", series))
+		fail(w, bad("series %q: want a latency series or requests/bytes/error rate series", series))
 		return
 	}
 	if !validOp(op) {
@@ -162,9 +181,23 @@ func (s *Server) telemetrySeries(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	points := s.Telemetry.Series(scope, series, op, from, to)
+	var points []TelemetryPoint
+	if series == telemetry.SeriesClientTotal || series == telemetry.SeriesUpstreamTTFB ||
+		series == telemetry.SeriesUpstreamTotal || series == telemetry.SeriesProxyOverhead {
+		for _, point := range s.Telemetry.Series(scope, series, op, from, to) {
+			points = append(points, TelemetryPoint{Start: point.Start, End: point.End, Series: point.Series,
+				Op: point.Op, Count: point.Count, P50: point.P50, P90: point.P90, P99: point.P99,
+				P999: point.P999, Max: point.Max})
+		}
+	} else {
+		for _, point := range s.Telemetry.CounterSeries(scope, series, op, from, to) {
+			value := point.Value
+			points = append(points, TelemetryPoint{Start: point.Start, End: point.End, Series: point.Series,
+				Op: point.Op, Value: &value})
+		}
+	}
 	if points == nil {
-		points = []telemetry.SeriesPoint{}
+		points = []TelemetryPoint{}
 	}
 	writeJSON(w, http.StatusOK, TelemetrySeries{Scope: scope, Series: series, Op: op, Points: points})
 }

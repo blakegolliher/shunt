@@ -273,6 +273,12 @@ jq -e '[.windows[].scope] as $s | ($s | index("proxy:proxy-a")) != null and ($s 
   <<<"$telemetry" >/dev/null || fail "telemetry latest does not show two proxies, both clusters, and fleet"
 jq -e '.telemetry.within_tolerance == true and .latency_p50_us > 0 and .latency_p99_us >= .latency_p50_us' \
   verify-telemetry.json >/dev/null || fail "verify JSON has no passing p50/p99 telemetry comparison"
+for cluster in garage minio; do
+  curl -sf -H "Authorization: Bearer $TOKEN" \
+    "http://$C1_API/v1/telemetry/series?scope=cluster:$cluster&series=requests_per_second&op=all" \
+    | jq -e '.points | length > 0 and all(.[]; .value >= 0)' >/dev/null \
+    || fail "the telemetry dashboard request-rate series is empty for $cluster"
+done
 note "telemetry: two proxies, garage + minio, fleet; $(jq -r '"client p99 \(.telemetry.client_p99_us) us, fleet p99 \(.telemetry.fleet_p99_us) us, difference \(.telemetry.difference_percent)%"' verify-telemetry.json)"
 
 say "3. One control node dies, then two: quorum lost under a 256-worker workload on an ACTIVE bucket"
