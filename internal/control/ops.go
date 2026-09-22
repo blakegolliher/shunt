@@ -59,7 +59,7 @@ func parseWait(w http.ResponseWriter, v string) (time.Duration, bool) {
 func (s *Server) settle(r *http.Request, res *TransitionResult, v int64, wait time.Duration) {
 	waiting, _ := s.fenceRound(r.Context(), v, false, wait) //nolint:errcheck // a canceled wait just leaves the change pending
 	res.WaitingOn = waiting
-	if ms, err := s.members(); err == nil {
+	if ms, err := s.members(r.Context()); err == nil {
 		for _, m := range ms {
 			if m.Live {
 				res.Proxies++
@@ -115,7 +115,7 @@ func (s *Server) fencedStep(r *http.Request, key string, t directory.Transition,
 	hold := false
 	if moves {
 		var err error
-		if hold, err = s.counted(fromActive); err != nil {
+		if hold, err = s.counted(r.Context(), fromActive); err != nil {
 			return TransitionResult{}, err
 		}
 	}
@@ -449,7 +449,7 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		if target.Capabilities.ConditionalDelete == nil {
 			target.Capabilities.ConditionalDelete = &cd
 		}
-		if err = s.Dir.PutCluster(r.Context(), req.To, target, actor(r)); err != nil {
+		if err = s.Dir.PutCluster(r.Context(), req.To, target, "", actor(r)); err != nil {
 			fail(w, err)
 			return
 		}
@@ -705,7 +705,7 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The window counts fallback reads on this proxy and on every live member (ADR-0016).
-	before, beats, err := s.fleetFallbackReads(key)
+	before, beats, err := s.fleetFallbackReads(r.Context(), key)
 	if err != nil {
 		fail(w, err)
 		return
@@ -724,7 +724,7 @@ func (s *Server) cutover(w http.ResponseWriter, r *http.Request) {
 		fail(w, refuse("proxies %s did not report after the %s window, so their reads are not evidence of quiet; run cutover again once they are back", strings.Join(silent, ", "), window))
 		return
 	}
-	after, _, err := s.fleetFallbackReads(key)
+	after, _, err := s.fleetFallbackReads(r.Context(), key)
 	if err != nil {
 		fail(w, err)
 		return
@@ -864,4 +864,48 @@ func (s *Server) logTransition(r *http.Request, op string, res TransitionResult,
 		attrs = append(attrs, "warning", res.Warning)
 	}
 	s.info(r, op, append(attrs, "version", res.Version)...)
+}
+
+// CreateRequest is a member proxy's S3 CreateBucket, forwarded: the proxy claims the placement row
+// here, then creates the backend bucket itself (ADR-0015).
+type CreateRequest struct {
+	Cluster string `json:"cluster"`
+	Name    string `json:"name"` // backend bucket name
+	Actor   string `json:"actor,omitempty"`
+}
+
+// VersionResult is the answer to a change whose only outcome is a new directory version.
+type VersionResult struct {
+	Key     string `json:"key"`
+	Version int64  `json:"version"`
+}
+
+func (s *Server) createPlacement(w http.ResponseWriter, r *http.Request) {
+	var req CreateRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	who := actor(r)
+	if req.Actor != "" {
+		who = req.Actor + " via " + who
+	}
+	if err := s.Dir.Create(r.Context(), tenant, bucket, req.Cluster, req.Name, who); err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
+}
+
+func (s *Server) deletePlacement(w http.ResponseWriter, r *http.Request) {
+	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	who := actor(r)
+	if a := r.URL.Query().Get("actor"); a != "" {
+		who = a + " via " + who
+	}
+	if err := s.Dir.Delete(r.Context(), tenant, bucket, who); err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
 }

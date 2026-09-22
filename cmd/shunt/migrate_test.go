@@ -296,9 +296,7 @@ func TestStepOutCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rg.ctl.TenantKeys = func(string) []sigv4.Credential {
-		return []sigv4.Credential{{AccessKey: "CLIENTKEY", Secret: "s", Tenant: directory.DefaultTenant}}
-	}
+	rg.ctl.Keys = &stubKeys{stored: []sigv4.Credential{{AccessKey: "CLIENTKEY", Secret: "s", Tenant: directory.DefaultTenant}}}
 	rg.addCluster(t, "vast02", rg.ep02)
 	rg.must(t, "adopt", "vast02", "data01")
 
@@ -342,9 +340,8 @@ func TestClientKeyImport(t *testing.T) {
 	if err := rg.vast01.CreateBucket("data01"); err != nil {
 		t.Fatal(err)
 	}
-	var stored []sigv4.Credential
-	rg.ctl.AddKey = func(c sigv4.Credential) error { stored = append(stored, c); return nil }
-	rg.ctl.TenantKeys = func(string) []sigv4.Credential { return stored }
+	sk := &stubKeys{}
+	rg.ctl.Keys = sk
 	rg.addCluster(t, "vast01", rg.ep01)
 
 	keys := filepath.Join(t.TempDir(), "keys.yaml")
@@ -357,8 +354,8 @@ func TestClientKeyImport(t *testing.T) {
 			t.Errorf("adopt --keys output lacks %q:\n%s", want, out)
 		}
 	}
-	if len(stored) != 1 || stored[0].AccessKey != "CLUSTERKEY" || stored[0].Secret != "cluster-secret" {
-		t.Fatalf("stored: %+v", stored)
+	if len(sk.stored) != 1 || sk.stored[0].AccessKey != "CLUSTERKEY" || sk.stored[0].Secret != "cluster-secret" {
+		t.Fatalf("stored: %+v", sk.stored)
 	}
 
 	// A second key, typed at the prompt, checked against the tenant's default cluster.
@@ -369,18 +366,14 @@ func TestClientKeyImport(t *testing.T) {
 	if !strings.Contains(out, "client key OTHERKEY imported: vast01 accepts it") {
 		t.Errorf("client add output: %q", out)
 	}
-	if len(stored) != 2 || stored[1].Secret != "second-secret" {
-		t.Fatalf("stored: %+v", stored)
+	if len(sk.stored) != 2 || sk.stored[1].Secret != "second-secret" {
+		t.Fatalf("stored: %+v", sk.stored)
 	}
 	if strings.Contains(out+stderr, "second-secret") {
 		t.Error("the secret must never be printed")
 	}
 
 	// Removing the key shunt generated for itself, once the clients' own key is in.
-	rg.ctl.RemoveKey = func(ak string) error {
-		stored = slices.DeleteFunc(stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
-		return nil
-	}
 	out = rg.must(t, "client", "remove", "CLUSTERKEY")
 	if !strings.Contains(out, "client key CLUSTERKEY removed; 1 key(s) left") {
 		t.Errorf("client remove output: %q", out)
@@ -393,4 +386,39 @@ func TestClientKeyImport(t *testing.T) {
 	if out, err := rg.cli(t, "adopt", "vast01", "logs", "--keys", keys); err == nil || !strings.Contains(out, "has no secret") {
 		t.Fatalf("want a clear error about the missing secret: %v\n%s", err, out)
 	}
+}
+
+// stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
+type stubKeys struct {
+	stored   []sigv4.Credential
+	byTenant map[string][]sigv4.Credential // when set, Tenant answers from it instead of stored
+	addErr   error
+}
+
+func (k *stubKeys) Tenant(tenant string) []sigv4.Credential {
+	if k.byTenant != nil {
+		return k.byTenant[tenant]
+	}
+	var out []sigv4.Credential
+	for _, c := range k.stored {
+		if c.Tenant == tenant {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (k *stubKeys) All() []sigv4.Credential { return k.stored }
+
+func (k *stubKeys) Add(c sigv4.Credential) error {
+	if k.addErr != nil {
+		return k.addErr
+	}
+	k.stored = append(k.stored, c)
+	return nil
+}
+
+func (k *stubKeys) Remove(ak string) error {
+	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
+	return nil
 }

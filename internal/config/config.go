@@ -39,17 +39,26 @@ type Directory struct {
 	PollInterval time.Duration `yaml:"poll_interval"` // how often serve checks the file for other writers' changes
 }
 
-// Control places this proxy in a fleet (ADR-0016). With Endpoint set, the proxy is a member: it
-// sends the control node a heartbeat, refuses mutations on its own control API, and goes stale
-// (refusing writes on moving buckets) when its lease lapses. Without it, the proxy is its own
-// control node, and LeaseTTL is how long it keeps a silent member live.
+// Control makes this proxy a member of a fleet run by shunt-control (ADR-0015, ADR-0016): it
+// takes its directory, client keys and cluster secrets from the control plane, forwards bucket
+// creation there, sends it a heartbeat, and goes stale (refusing writes on moving buckets) when
+// its lease lapses. With Endpoints empty, the proxy is a single-node lab that reads a directory
+// file on this host.
 type Control struct {
-	Endpoint          string        `yaml:"endpoint"`  // the control node's admin listener, http(s)://host:port
-	TokenRef          string        `yaml:"token_ref"` // env:NAME or file:/path: the control node's admin.control_token_ref
+	Endpoints []string `yaml:"endpoints"` // shunt-control API addresses, http://host:port; any one is enough
+	TokenRef  string   `yaml:"token_ref"` // env:NAME or file:/path: the control plane's bearer token
+	// Plaintext: the control channel is http, so directory versions, cluster secrets and client
+	// keys cross the network in the clear. TLS for it is deferred (ADR-0015); until then this must
+	// be stated, as listener.plaintext must, and every startup line says so.
+	Plaintext         bool          `yaml:"plaintext"`
 	ProxyID           string        `yaml:"proxy_id"`  // default: <hostname>-<admin port>
+	CacheDir          string        `yaml:"cache_dir"` // the last directory this proxy installed, served after a restart with the control plane down (0700)
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 	LeaseTTL          time.Duration `yaml:"lease_ttl"`
 }
+
+// Member reports whether this proxy belongs to a fleet.
+func (c Control) Member() bool { return len(c.Endpoints) > 0 }
 
 // Listener is the client-facing TLS listener (docs/DESIGN.md §2.9).
 type Listener struct {

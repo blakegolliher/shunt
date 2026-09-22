@@ -1,5 +1,4 @@
 # expect: control.proxy_id
 listener: { address: ":8008", plaintext: true }
-auth: { mode: resign, credentials_file: creds.yaml }
-directory: { file: d.yaml }
-control: { endpoint: "http://10.0.0.1:9900", proxy_id: "proxy 1/a" }
+auth: { mode: resign }
+control: { endpoints: ["http://10.0.0.1:9901"], plaintext: true, cache_dir: /var/lib/shunt/cache, proxy_id: "proxy 1/a" }

@@ -1,0 +1,11 @@
+# A fleet member: no directory file and no credentials file on this host; both come from
+# shunt-control (ADR-0015). The control channel is http, stated as such.
+listener: { address: "0.0.0.0:8443", tls: { cert: /etc/shunt/tls.pem, key: /etc/shunt/tls.key } }
+admin: { address: "10.0.0.12:9900" }
+auth: { mode: resign }
+control:
+  endpoints: ["http://10.0.0.11:9901", "http://10.0.0.21:9901", "http://10.0.0.31:9901"]
+  token_ref: file:/etc/shunt/control.token
+  plaintext: true
+  proxy_id: proxy-b
+  cache_dir: /var/lib/shunt/cache

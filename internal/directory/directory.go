@@ -187,17 +187,37 @@ func marshal(f *File) ([]byte, error) {
 	return append([]byte("# shunt directory (ADR-0005). Written by shunt; hand edits must increment version.\n"), body...), nil
 }
 
-// Directory is one of the two named interface seams (CLAUDE.md): the file backend now, Postgres
-// behind shunt-control in P3c. Snapshot is lock-free and never nil; writes are serialized and
-// visible in the next Snapshot of the instance that made them.
+// Directory is one of the two named interface seams (CLAUDE.md): what the proxy's request path
+// needs of the directory. Snapshot is lock-free and never nil; writes are serialized and visible
+// in the next Snapshot of the instance that made them. Three implementations: FileDir (a file on
+// this host, ADR-0005), the control plane's store on etcd (internal/cp, ADR-0015), and a member
+// proxy's client of that store (internal/member), which forwards writes to the control plane.
 type Directory interface {
 	Snapshot() *Snapshot
 	// Create writes an ACTIVE placement on cluster under the backend bucket name.
 	Create(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// Delete removes a placement. Only ACTIVE placements can be deleted.
 	Delete(ctx context.Context, tenant, bucket, actor string) error
+}
+
+// Store is a Directory the control API can change: the operator mutations behind every verb
+// (ADR-0008). FileDir for a single-node lab; internal/cp for a fleet.
+type Store interface {
+	Directory
 	// SetState applies a transition if the placement is still in state from.
 	SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error
+	// Adopt takes over an existing backend bucket as an ACTIVE placement.
+	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
+	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.
+	SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
+	// SetTenantDefault changes where a tenant's new buckets are created.
+	SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error
+	// PutCluster adds or replaces a cluster. secret, when not empty, is the cluster's secret key for
+	// a store that keeps secrets itself (encrypted, internal/cp); FileDir refuses one, since the
+	// directory file carries only secret_refs (ADR-0008).
+	PutCluster(ctx context.Context, name string, c config.Cluster, secret, actor string) error
+	// RemoveCluster drops a cluster nothing references.
+	RemoveCluster(ctx context.Context, name, actor string) error
 }
 
 // Errors returned by Directory implementations.
@@ -207,6 +227,7 @@ var (
 	ErrNotFound     = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
 	ErrConflict     = errors.New("directory: placement changed concurrently")
 	ErrReadOnly     = errors.New("directory: directory file is not writable")
+	ErrSecretInline = errors.New("directory: the directory file carries only secret_refs, never a secret")
 	ErrLockTimeout  = errors.New("directory: timed out waiting for the directory lock")
 	errStaleVersion = errors.New("directory: file version did not increase")
 )
@@ -219,6 +240,10 @@ type Snapshot struct {
 	byKey   map[key]*Placement
 	buckets map[string][]string // tenant → sorted client bucket names
 }
+
+// NewSnapshot builds a snapshot from a validated file: the control plane's watch cache and a
+// member proxy build theirs from records that never came from a file (ADR-0015).
+func NewSnapshot(f *File) *Snapshot { return newSnapshot(f) }
 
 func newSnapshot(f *File) *Snapshot {
 	s := &Snapshot{file: f, byKey: make(map[key]*Placement, len(f.Placements)), buckets: map[string][]string{}}

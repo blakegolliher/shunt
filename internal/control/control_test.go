@@ -737,7 +737,7 @@ func TestStepOut(t *testing.T) {
 	}
 	rg.vast02.keys = map[string]bool{"AK": true, "SHARED": true}
 	keys := map[string][]sigv4.Credential{directory.DefaultTenant: {{AccessKey: "SHUNTONLY", Secret: "s", Tenant: directory.DefaultTenant}}}
-	rg.ctl.TenantKeys = func(tenant string) []sigv4.Credential { return keys[tenant] }
+	rg.ctl.Keys = &stubKeys{byTenant: keys}
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
 	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast02", Name: "data01-001"}, nil)
@@ -806,16 +806,15 @@ func TestImportClientKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	rg.vast01.keys = map[string]bool{"AK": true, "CLUSTERKEY": true}
-	var stored []sigv4.Credential
-	rg.ctl.AddKey = func(c sigv4.Credential) error { stored = append(stored, c); return nil }
-	rg.ctl.TenantKeys = func(string) []sigv4.Credential { return stored }
+	sk := &stubKeys{}
+	rg.ctl.Keys = sk
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
 
 	// adopt --keys: a key vast01 does not know is refused, and nothing is adopted or stored.
 	rg.refused("POST", "/v1/placements/default/data01/adopt",
 		AdoptRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "NOPE", Secret: "s"}}}, "does not know this access key")
-	if len(stored) != 0 {
-		t.Fatalf("a refused key was stored: %+v", stored)
+	if len(sk.stored) != 0 {
+		t.Fatalf("a refused key was stored: %+v", sk.stored)
 	}
 	if _, ok := rg.dir.Snapshot().Lookup("default", "data01"); ok {
 		t.Fatal("the bucket was adopted although its keys were refused")
@@ -823,8 +822,8 @@ func TestImportClientKeys(t *testing.T) {
 
 	rg.must("POST", "/v1/placements/default/data01/adopt",
 		AdoptRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "CLUSTERKEY", Secret: "s", Buckets: []string{"data01"}}}}, nil)
-	if len(stored) != 1 || stored[0].AccessKey != "CLUSTERKEY" || stored[0].Tenant != "default" || len(stored[0].Buckets) != 1 {
-		t.Fatalf("stored: %+v", stored)
+	if len(sk.stored) != 1 || sk.stored[0].AccessKey != "CLUSTERKEY" || sk.stored[0].Tenant != "default" || len(sk.stored[0].Buckets) != 1 {
+		t.Fatalf("stored: %+v", sk.stored)
 	}
 	if !strings.Contains(rg.log.String(), "client key imported") || strings.Contains(rg.log.String(), "secret") {
 		t.Fatalf("one INFO line, and never a secret:\n%s", rg.log.String())
@@ -838,22 +837,55 @@ func TestImportClientKeys(t *testing.T) {
 	}
 
 	// The same key twice, and a shunt with no credentials file, are both refused.
-	rg.ctl.AddKey = func(sigv4.Credential) error { return fmt.Errorf("%w: twice", auth.ErrDuplicateKey) }
+	sk.addErr = fmt.Errorf("%w: twice", auth.ErrDuplicateKey)
 	rg.refused("POST", "/v1/tenants/default/client-keys", ClientKeyRequest{AccessKey: "CLUSTERKEY", Secret: "s"}, "already holds access key CLUSTERKEY")
-	rg.ctl.AddKey = nil
+	sk.addErr = nil
+	rg.ctl.Keys = nil
 	rg.refused("POST", "/v1/tenants/default/client-keys", ClientKeyRequest{AccessKey: "CLUSTERKEY", Secret: "s"}, "no credentials file")
 
 	// Removing a key: the lab key shunt generated for itself, once the real ones are in.
-	rg.ctl.RemoveKey = func(ak string) error {
-		stored = slices.DeleteFunc(stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
-		return nil
-	}
+	rg.ctl.Keys = sk
 	rg.answers("DELETE", "/v1/tenants/default/client-keys/NOSUCHKEY", nil, http.StatusNotFound, "not_found")
 	var removed ClientKeyResult
 	rg.must("DELETE", "/v1/tenants/default/client-keys/CLUSTERKEY", nil, &removed)
-	if removed.Left != 0 || len(stored) != 0 {
-		t.Fatalf("after removing the only key: %+v %+v", removed, stored)
+	if removed.Left != 0 || len(sk.stored) != 0 {
+		t.Fatalf("after removing the only key: %+v %+v", removed, sk.stored)
 	}
-	rg.ctl.RemoveKey = nil
+	rg.ctl.Keys = nil
 	rg.refused("DELETE", "/v1/tenants/default/client-keys/CLUSTERKEY", nil, "cannot change its client keys")
+}
+
+// stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
+type stubKeys struct {
+	stored   []sigv4.Credential
+	byTenant map[string][]sigv4.Credential // when set, Tenant answers from it instead of stored
+	addErr   error
+}
+
+func (k *stubKeys) Tenant(tenant string) []sigv4.Credential {
+	if k.byTenant != nil {
+		return k.byTenant[tenant]
+	}
+	var out []sigv4.Credential
+	for _, c := range k.stored {
+		if c.Tenant == tenant {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (k *stubKeys) All() []sigv4.Credential { return k.stored }
+
+func (k *stubKeys) Add(c sigv4.Credential) error {
+	if k.addErr != nil {
+		return k.addErr
+	}
+	k.stored = append(k.stored, c)
+	return nil
+}
+
+func (k *stubKeys) Remove(ak string) error {
+	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
+	return nil
 }

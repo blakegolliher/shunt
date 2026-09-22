@@ -1,5 +1,4 @@
 # expect: control.token_ref
 listener: { address: ":8008", plaintext: true }
-auth: { mode: resign, credentials_file: creds.yaml }
-directory: { file: d.yaml }
-control: { endpoint: "http://10.0.0.1:9900", token_ref: "s3cr3t" }
+auth: { mode: resign }
+control: { endpoints: ["http://10.0.0.1:9901"], plaintext: true, token_ref: "s3cr3t", cache_dir: /var/lib/shunt/cache }

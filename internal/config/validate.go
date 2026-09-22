@@ -110,7 +110,7 @@ func (c *Config) validateAuth(e *errs) {
 	if !e.oneOf("auth.mode", a.Mode, authModes) {
 		return
 	}
-	if a.Mode == "resign" && a.CredentialsFile == "" {
+	if a.Mode == "resign" && a.CredentialsFile == "" && !c.Control.Member() {
 		e.add("auth.credentials_file", "required when auth.mode is resign")
 	}
 	if a.Mode == "passthrough" && a.CredentialsFile != "" {
@@ -152,8 +152,8 @@ func (c *Config) validateDirectory(e *errs) {
 	d := c.Directory
 	switch c.Auth.Mode {
 	case "resign":
-		if d.File == "" {
-			e.add("directory.file", "required in resign mode: the tenants and placements that route each bucket")
+		if d.File == "" && !c.Control.Member() {
+			e.add("directory.file", "required in resign mode: the tenants and placements that route each bucket (or control.endpoints, for a fleet member)")
 		}
 	case "passthrough":
 		if d.File != "" {
@@ -173,22 +173,39 @@ func ValidProxyID(id string) bool { return proxyIDPattern.MatchString(id) }
 
 func (c *Config) validateControl(e *errs) {
 	ct := c.Control
-	if ct.Endpoint != "" {
-		u, err := url.Parse(ct.Endpoint)
+	for i, ep := range ct.Endpoints {
+		u, err := url.Parse(ep)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || (u.Path != "" && u.Path != "/") {
-			e.add("control.endpoint", "want the control node's admin listener as http(s)://host:port, got %q", ct.Endpoint)
-		}
-		if c.Auth.Mode != "resign" {
-			e.add("control.endpoint", "a fleet shares a directory, which only resign mode has")
+			e.add(fmt.Sprintf("control.endpoints[%d]", i), "want a shunt-control API address as http(s)://host:port, got %q", ep)
+		} else if u.Scheme == "http" && !ct.Plaintext {
+			e.add(fmt.Sprintf("control.endpoints[%d]", i), "is http: the control channel would carry cluster secrets and client keys in the clear; state control.plaintext: true to accept that (TLS for it is deferred, ADR-0015)")
 		}
 	}
-	if ref := ct.TokenRef; ref != "" {
-		if !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") {
-			e.add("control.token_ref", "must be env:NAME or file:/path; a token is never inline")
+	if ct.Member() {
+		if c.Auth.Mode != "resign" {
+			e.add("control.endpoints", "a fleet member routes by the control plane's directory, which only resign mode has")
 		}
-		if ct.Endpoint == "" {
-			e.add("control.token_ref", "only used with control.endpoint")
+		if c.Directory.File != "" {
+			e.add("directory.file", "a fleet member takes its directory from the control plane (control.endpoints); remove directory")
 		}
+		if c.Auth.CredentialsFile != "" {
+			e.add("auth.credentials_file", "a fleet member takes its client keys from the control plane (control.endpoints); remove it")
+		}
+		if ct.CacheDir == "" {
+			e.add("control.cache_dir", "required for a fleet member: where the last installed directory is kept for a restart with the control plane down")
+		}
+	} else {
+		for _, k := range []struct {
+			set bool
+			key string
+		}{{ct.TokenRef != "", "control.token_ref"}, {ct.Plaintext, "control.plaintext"}, {ct.ProxyID != "", "control.proxy_id"}, {ct.CacheDir != "", "control.cache_dir"}} {
+			if k.set {
+				e.add(k.key, "only used with control.endpoints")
+			}
+		}
+	}
+	if ref := ct.TokenRef; ref != "" && !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") {
+		e.add("control.token_ref", "must be env:NAME or file:/path; a token is never inline")
 	}
 	if ct.ProxyID != "" && !ValidProxyID(ct.ProxyID) {
 		e.add("control.proxy_id", "want 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit; got %q", ct.ProxyID)

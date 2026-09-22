@@ -28,7 +28,6 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
-	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -36,48 +35,41 @@ import (
 // Server is the control API. Every mutation goes through Dir's write path, so it is serialized
 // with every other writer and appended to the change log.
 type Server struct {
-	Dir      *directory.FileDir
+	Dir      directory.Store
 	Clusters *upstream.Registry
 	Metrics  *telemetry.Metrics
 	// Token is the bearer token every request must carry. Empty: loopback peers only.
 	Token string
-	// SecretsDir is where a secret given to `cluster add` is written, one 0600 file per cluster.
+	// SecretsDir is where a lab proxy writes a secret given to `cluster add`, one 0600 file per
+	// cluster, and names it by a file: ref. Empty: the store keeps secrets itself (internal/cp).
 	SecretsDir string
-	// TenantKeys lists a tenant's client keys, secrets included, for step-out's direct checks. The
-	// file store answers today; P3c's store replaces the function.
-	TenantKeys func(tenant string) []sigv4.Credential
-	// AddKey stores one client key: a key clients already use on a cluster, so that inserting shunt
-	// and removing it again cost no client change (ADR-0012). nil: this shunt cannot import keys.
-	AddKey func(c sigv4.Credential) error
-	// RemoveKey drops a client key shunt holds: a replaced key, or the generated lab key once the
-	// clients' own keys are imported. nil: this shunt cannot change its client keys.
-	RemoveKey func(accessKey string) error
+	// Keys holds the client keys (ADR-0012). nil: this shunt cannot import or list keys.
+	Keys Keys
+	// ClusterSecrets resolves the cluster secret_refs only the control plane can (control:<name>),
+	// for GET /v1/directory and the mover. nil: every ref resolves on the reader's own host.
+	ClusterSecrets func() map[string]string
+	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab.
+	Fleet Fleet
+	// FencePoll is how often a fenced change re-reads the fleet; default 100ms.
+	FencePoll time.Duration
 	Log       *slog.Logger
 	// Now defaults to time.Now; Sleep to a context-aware wait. Tests replace both.
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
 
-	// The fleet (ADR-0016). ControlNode, when set, makes this proxy a member whose control node is
-	// that endpoint: its own API then refuses every mutation. Otherwise this proxy is the control
-	// node: FleetFile is where member ids are kept, LeaseTTL how long a silent member stays live
-	// (plus a margin), FencePoll how often a fenced change checks the fleet.
-	ControlNode string
-	FleetFile   string
-	LeaseTTL    time.Duration
-	DropMargin  time.Duration // default 5s; tests shorten it
-	FencePoll   time.Duration
-
 	mu       sync.Mutex
 	progress map[string]Progress // placement key → the mover's last report (in memory only)
-	fleet    fleet
-	steps    sync.Map // placement key → *sync.Mutex: one fenced step per bucket at a time
+	steps    sync.Map            // placement key → *sync.Mutex: one fenced step per bucket at a time
 }
 
 // Handler returns the /v1/ routes, one handler per operation.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", s.status)
+	mux.HandleFunc("GET /v1/directory", s.directoryHandler)
 	mux.HandleFunc("GET /v1/placements/{tenant}/{bucket}", s.placement)
+	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/create", s.logged("create", s.createPlacement))
+	mux.HandleFunc("DELETE /v1/placements/{tenant}/{bucket}", s.logged("delete", s.deletePlacement))
 	mux.HandleFunc("POST /v1/clusters", s.logged("cluster add", s.putCluster))
 	mux.HandleFunc("DELETE /v1/clusters/{name}", s.logged("cluster remove", s.removeCluster))
 	mux.HandleFunc("POST /v1/tenants/{tenant}/default-cluster", s.logged("tenant set-default", s.setTenantDefault))
@@ -98,10 +90,6 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
-			return
-		}
-		if s.ControlNode != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-			s.memberOnly(w)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -201,7 +189,7 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.As(err, &ce):
 		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-	case errors.Is(err, directory.ErrReadOnly), errors.Is(err, directory.ErrLockTimeout), errors.As(err, new(*errFleet)):
+	case errors.Is(err, directory.ErrReadOnly), errors.Is(err, directory.ErrLockTimeout), errors.Is(err, ErrUnavailable):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 	default:
 		writeError(w, http.StatusBadGateway, "backend", err.Error())
@@ -352,6 +340,9 @@ type PlacementDetail struct {
 	Key       string                    `json:"key"`
 	Placement directory.Placement       `json:"placement"`
 	Clusters  map[string]config.Cluster `json:"clusters"`
+	// Secrets resolves the clusters' control: secret_refs, which only the control plane can, so a
+	// mover on another host can sign (ADR-0015). Empty on a lab proxy, whose refs are env:/file:.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
@@ -360,9 +351,19 @@ func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := PlacementDetail{Key: key, Placement: p, Clusters: map[string]config.Cluster{}}
+	var secrets map[string]string
+	if s.ClusterSecrets != nil {
+		secrets = s.ClusterSecrets()
+	}
 	for _, name := range []string{p.Primary, p.Source, p.Target} {
 		if c, found := f.Clusters[name]; found {
 			d.Clusters[name] = c
+			if v, ok := secrets[c.Credentials.SecretRef]; ok {
+				if d.Secrets == nil {
+					d.Secrets = map[string]string{}
+				}
+				d.Secrets[c.Credentials.SecretRef] = v
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, d)
@@ -401,12 +402,12 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("cluster name %q: use lowercase letters, digits, - and _", req.Name))
 		return
 	}
-	stored := ""
-	if req.Secret != "" {
-		if s.SecretsDir == "" {
-			writeError(w, http.StatusConflict, "refused", "this shunt has no secrets directory (directory.secrets_dir); give the cluster a --secret-ref instead")
-			return
-		}
+	stored, secret := "", ""
+	if req.Secret != "" && s.SecretsDir == "" {
+		// The store keeps secrets itself (internal/cp): encrypted, named by a control: ref.
+		secret = req.Secret
+		req.Cluster.Credentials.SecretRef = "control:" + req.Name
+	} else if req.Secret != "" {
 		path, err := s.storeSecret(req.Name, req.Secret)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "unavailable", "storing the secret: "+err.Error())
@@ -436,8 +437,12 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	if inferType {
 		req.Cluster.Type = typeFromServer(server)
 	}
-	if err := s.Dir.PutCluster(r.Context(), req.Name, req.Cluster, actor(r)); err != nil {
+	if err := s.Dir.PutCluster(r.Context(), req.Name, req.Cluster, secret, actor(r)); err != nil {
 		discard()
+		if errors.Is(err, directory.ErrSecretInline) {
+			writeError(w, http.StatusConflict, "refused", "this shunt has no secrets directory (directory.secrets_dir) and its directory file carries only secret_refs; give the cluster a --secret-ref instead")
+			return
+		}
 		var ce *config.Error
 		if errors.As(err, &ce) || strings.Contains(err.Error(), "clusters.") {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())

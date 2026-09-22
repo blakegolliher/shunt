@@ -122,7 +122,9 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	}
 	var dir *directory.FileDir
 	var ctl *control.Server
-	var member *control.Membership
+	if cfg.Control.Member() {
+		return errors.New("fleet member mode (control.endpoints) is not built yet: this commit is the seams; internal/member lands next")
+	}
 	if cfg.Auth.Mode == "resign" {
 		store, err := auth.Load(cfg.Auth.CredentialsFile)
 		if err != nil {
@@ -180,16 +182,8 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
-		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, TenantKeys: store.Tenant, AddKey: store.Add, RemoveKey: store.Remove,
-			ControlNode: cfg.Control.Endpoint, FleetFile: dir.Path() + ".fleet.yaml", LeaseTTL: cfg.Control.LeaseTTL}
-		if cfg.Control.Endpoint != "" {
-			if member, err = newMembership(cfg, dir, metrics, log); err != nil {
-				return err
-			}
-			hcfg.Stale = member.Stale
-		} else {
-			warnHeldSteps(log, dir.Snapshot())
-		}
+		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{}}
+		warnHeldSteps(log, dir.Snapshot())
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
 				return fmt.Errorf("admin.control_token_ref: %w", err)
@@ -229,19 +223,6 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	if ctl != nil {
 		adm.Mount("/v1/", ctl.Handler())
 	}
-	if member != nil {
-		adm.Mount("/-/fleet", member)
-		mctx, stop := context.WithCancel(ctx)
-		defer stop()
-		// Join before serving: a proxy that serves first could route writes to a bucket whose first
-		// step the control node takes without waiting for it (ADR-0016).
-		if rerr := member.Register(mctx); rerr != nil {
-			log.Warn("fleet member could not register with its control node before serving: starting stale (writes on moving buckets are refused until it can)",
-				"proxy", member.ID, "control", member.Endpoint, "err", rerr.Error())
-		}
-		go member.Run(mctx)
-		log.Info("fleet member", "proxy", member.ID, "control", member.Endpoint, "heartbeat", member.Interval.String(), "lease_ttl", member.LeaseTTL.String())
-	}
 	admSrv := adm.Listen(cfg.Admin.Address)
 
 	log.Info("shunt serving", "version", version, "listen", cfg.Listener.Address, "admin", cfg.Admin.Address,
@@ -264,7 +245,6 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		tick = t.C
 	}
 
-	fleetErr := ""
 wait:
 	for {
 		select {
@@ -281,9 +261,6 @@ wait:
 			break wait
 		case <-tick:
 			reloadDirectory(dir, log, "poll")
-			if ctl != nil && member == nil {
-				fleetErr = publishFleet(ctl, log, fleetErr)
-			}
 		case <-hup:
 			reloadDirectory(dir, log, "SIGHUP")
 		}
@@ -314,48 +291,6 @@ func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
 				"placement", key, "ratio", p.Ramp.Ratio, "hold_ratio", p.Ramp.Hold.Ratio, "hold_prefixes", p.Ramp.Hold.Prefixes)
 		}
 	}
-}
-
-// publishFleet refreshes the control node's fleet gauges, logging an unreadable membership file
-// once per distinct error rather than every poll. It returns the error now in force.
-func publishFleet(ctl *control.Server, log *slog.Logger, last string) string {
-	msg := ""
-	if err := ctl.PublishFleet(); err != nil {
-		msg = err.Error()
-	}
-	if msg != "" && msg != last {
-		log.Error("fleet membership unreadable: fenced changes are refused until it is fixed (ADR-0016)", "err", msg)
-	}
-	return msg
-}
-
-// newMembership builds this proxy's side of the fleet (ADR-0016). The id defaults to the host name
-// and the admin port, which is stable across restarts, so a restarted proxy is the same member.
-func newMembership(cfg *config.Config, dir *directory.FileDir, metrics *telemetry.Metrics, log *slog.Logger) (*control.Membership, error) {
-	m := &control.Membership{Endpoint: cfg.Control.Endpoint, ID: cfg.Control.ProxyID, Interval: cfg.Control.HeartbeatInterval,
-		LeaseTTL: cfg.Control.LeaseTTL, Dir: dir, Metrics: metrics, Log: log, Client: &http.Client{Timeout: cfg.Control.HeartbeatInterval}}
-	if ref := cfg.Control.TokenRef; ref != "" {
-		tok, err := config.ResolveSecret(ref)
-		if err != nil {
-			return nil, fmt.Errorf("control.token_ref: %w", err)
-		}
-		m.Token = tok
-	}
-	if m.ID == "" {
-		host, err := os.Hostname()
-		if err != nil {
-			return nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
-		}
-		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
-		m.ID = defaultProxyID(host, port)
-	}
-	if !config.ValidProxyID(m.ID) {
-		// Refused here, not by every heartbeat: a member whose id the control node rejects is stale
-		// for as long as it runs.
-		return nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", m.ID)
-	}
-	metrics.FleetStale.Set(1) // until the first heartbeat is answered
-	return m, nil
 }
 
 // defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',

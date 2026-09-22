@@ -652,7 +652,7 @@ func TestClusterLifecycle(t *testing.T) {
 	}
 	vast02 := config.Cluster{Type: "vast", Scheme: "http", Region: "us-east-1", Endpoints: []string{"10.0.0.2:80"},
 		Credentials: config.Credentials{AccessKey: "AK2", SecretRef: "file:/etc/shunt/vast02.secret"}}
-	if err := d.PutCluster(ctx, "vast02", vast02, "api:test"); err != nil {
+	if err := d.PutCluster(ctx, "vast02", vast02, "", "api:test"); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := d.Snapshot().Cluster("vast02")
@@ -661,7 +661,7 @@ func TestClusterLifecycle(t *testing.T) {
 	}
 	bad := vast02
 	bad.Scheme = "ftp"
-	if err := d.PutCluster(ctx, "vast03", bad, "api:test"); err == nil || !strings.Contains(err.Error(), "clusters.vast03.scheme") {
+	if err := d.PutCluster(ctx, "vast03", bad, "", "api:test"); err == nil || !strings.Contains(err.Error(), "clusters.vast03.scheme") {
 		t.Fatalf("an invalid cluster was accepted: %v", err)
 	}
 	// garage is the default cluster of tenant acme: in use.
@@ -773,7 +773,7 @@ func TestPrepareAndOnInstallHooks(t *testing.T) {
 		return nil
 	}
 	broken := config.Cluster{Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"10.0.0.9:80"}, Credentials: config.Credentials{AccessKey: "A", SecretRef: "env:NOPE"}}
-	if err := d.PutCluster(ctx, "broken", broken, "t"); !errors.Is(err, refuse) {
+	if err := d.PutCluster(ctx, "broken", broken, "", "t"); !errors.Is(err, refuse) {
 		t.Fatalf("Prepare did not refuse the write: %v", err)
 	}
 	if on, _ := Load(path); on.Version != 1 {
@@ -784,7 +784,7 @@ func TestPrepareAndOnInstallHooks(t *testing.T) {
 	}
 	// Another writer adds the broken cluster; the reload is refused and the last good version stays.
 	other, _ := Open(path)
-	if err := other.PutCluster(ctx, "broken", broken, "t"); err != nil {
+	if err := other.PutCluster(ctx, "broken", broken, "", "t"); err != nil {
 		t.Fatal(err)
 	}
 	if changed, err := d.Reload(); changed || !errors.Is(err, refuse) {

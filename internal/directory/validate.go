@@ -62,6 +62,10 @@ func validTenant(name string) bool {
 	return true
 }
 
+// Validate checks a directory's structure and references: what Load checks of a file, for a
+// directory assembled from records (internal/cp, internal/member).
+func Validate(f *File) error { return validate(f) }
+
 // validate checks a directory file's structure: its clusters, and every reference to them. It
 // returns every failure joined, each naming its key. Transition legality is checked by Apply at
 // write time, not here: the validator only sees one state.

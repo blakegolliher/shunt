@@ -35,7 +35,7 @@ func newProxyList() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var fl control.Fleet
+			var fl control.FleetStatus
 			if err := api.call(cmd.Context(), "GET", "/v1/fleet", nil, &fl); err != nil {
 				return err
 			}
@@ -47,7 +47,7 @@ func newProxyList() *cobra.Command {
 				_, _ = fmt.Fprintf(out, "no member proxies: this shunt is the only one (directory version %d)\n", fl.Version)
 				return nil
 			}
-			_, _ = fmt.Fprintf(out, "directory version %d; a member is live while its heartbeat is within %s\n\n", fl.Version, fl.LeaseTTL)
+			_, _ = fmt.Fprintf(out, "directory version %d\n\n", fl.Version)
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "PROXY\tSTATE\tAPPLIED\tLAST HEARTBEAT")
 			for _, m := range fl.Members {

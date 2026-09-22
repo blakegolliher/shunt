@@ -228,6 +228,39 @@ func writeFileAtomically(path string, data []byte) error {
 	return nil
 }
 
+// All returns every credential, secrets included, ordered by access key: what the control plane
+// delivers to member proxies (internal/cp keeps its own store; a lab proxy answers from this one).
+func (s *Static) All() []sigv4.Credential {
+	m := *s.byKey.Load()
+	out := make([]sigv4.Credential, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	slices.SortFunc(out, func(a, b sigv4.Credential) int { return strings.Compare(a.AccessKey, b.AccessKey) })
+	return out
+}
+
+// Replace swaps in a whole set of credentials without a file: a member proxy installs the client
+// keys the control plane delivered with each directory version (ADR-0015). Add and Remove are
+// refused on such a store; keys change through the control plane.
+func (s *Static) Replace(creds []sigv4.Credential) {
+	next := make(map[string]sigv4.Credential, len(creds))
+	for _, c := range creds {
+		if c.Tenant == "" {
+			c.Tenant = directory.DefaultTenant
+		}
+		next[c.AccessKey] = c
+	}
+	s.byKey.Store(&next)
+}
+
+// NewEmpty returns a store with no keys and no file, filled by Replace.
+func NewEmpty() *Static {
+	s := &Static{}
+	s.Replace(nil)
+	return s
+}
+
 // Tenant returns a tenant's credentials, secrets included, ordered by access key. The control API's
 // step-out check signs with them to ask a cluster what those clients could do without shunt.
 func (s *Static) Tenant(tenant string) []sigv4.Credential {

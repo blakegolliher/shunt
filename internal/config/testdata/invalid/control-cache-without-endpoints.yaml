@@ -1,0 +1,5 @@
+# expect: control.cache_dir
+listener: { address: ":8008", plaintext: true }
+auth: { mode: resign, credentials_file: creds.yaml }
+directory: { file: d.yaml }
+control: { cache_dir: /var/lib/shunt/cache }

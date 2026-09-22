@@ -114,8 +114,8 @@ func (s *Server) stepOut(w http.ResponseWriter, r *http.Request) {
 // name. Buckets the key would list that shunt does not show are notes.
 func (s *Server) checkKeys(ctx context.Context, out *StepOut) {
 	var keys []sigv4.Credential
-	if s.TenantKeys != nil {
-		keys = s.TenantKeys(out.Tenant)
+	if s.Keys != nil {
+		keys = s.Keys.Tenant(out.Tenant)
 	}
 	if len(keys) == 0 {
 		out.Problems = append(out.Problems, "this shunt holds no client keys for these buckets to check")
@@ -264,7 +264,7 @@ func (s *Server) importKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) storeKey(ctx context.Context, tenant string, req ClientKeyRequest) (ClientKeyResult, error) {
 	res := ClientKeyResult{AccessKey: req.AccessKey, Tenant: tenant}
 	switch {
-	case s.AddKey == nil:
+	case s.Keys == nil:
 		return res, refuse("this shunt cannot import client keys: it has no credentials file to write to")
 	case req.AccessKey == "" || req.Secret == "":
 		return res, refuse("a client key needs an access key and its secret")
@@ -286,7 +286,7 @@ func (s *Server) storeKey(ctx context.Context, tenant string, req ClientKeyReque
 		}
 		res.Checked = cluster
 	}
-	if err := s.AddKey(sigv4.Credential{AccessKey: req.AccessKey, Secret: req.Secret, Tenant: tenant, Buckets: req.Buckets}); err != nil {
+	if err := s.Keys.Add(sigv4.Credential{AccessKey: req.AccessKey, Secret: req.Secret, Tenant: tenant, Buckets: req.Buckets}); err != nil {
 		if errors.Is(err, auth.ErrDuplicateKey) {
 			return res, refuse("shunt already holds access key %s; remove it from the credentials file to replace it", req.AccessKey)
 		}
@@ -297,23 +297,23 @@ func (s *Server) storeKey(ctx context.Context, tenant string, req ClientKeyReque
 
 func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
 	tenant, accessKey := r.PathValue("tenant"), r.PathValue("access_key")
-	if s.RemoveKey == nil {
+	if s.Keys == nil {
 		fail(w, refuse("this shunt cannot change its client keys: it has no credentials file to write to"))
 		return
 	}
 	held := false
-	for _, k := range s.TenantKeys(tenant) {
+	for _, k := range s.Keys.Tenant(tenant) {
 		held = held || k.AccessKey == accessKey
 	}
 	if !held {
 		fail(w, notFound("no client key %s here (shunt client show lists them)", accessKey))
 		return
 	}
-	if err := s.RemoveKey(accessKey); err != nil {
+	if err := s.Keys.Remove(accessKey); err != nil {
 		fail(w, err)
 		return
 	}
-	left := len(s.TenantKeys(tenant))
+	left := len(s.Keys.Tenant(tenant))
 	s.info(r, "client key removed", "tenant", tenant, "access_key", accessKey, "keys_left", left)
 	writeJSON(w, http.StatusOK, ClientKeyResult{AccessKey: accessKey, Tenant: tenant, Left: left})
 }

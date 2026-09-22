@@ -1,0 +1,4 @@
+# expect: control.cache_dir
+listener: { address: ":8008", plaintext: true }
+auth: { mode: resign }
+control: { endpoints: ["http://10.0.0.1:9901"], plaintext: true }

@@ -1,0 +1,5 @@
+# expect: directory.file
+listener: { address: ":8008", plaintext: true }
+auth: { mode: resign }
+directory: { file: d.yaml }
+control: { endpoints: ["http://10.0.0.1:9901"], plaintext: true, cache_dir: /var/lib/shunt/cache }

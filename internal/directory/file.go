@@ -53,7 +53,7 @@ type FileDir struct {
 	statErr string
 }
 
-var _ Directory = (*FileDir)(nil)
+var _ Store = (*FileDir)(nil)
 
 // Change is one line of the change log: the file backend's directory_changes (docs/DESIGN.md §2.5).
 type Change struct {
@@ -270,7 +270,10 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 
 // PutCluster adds a cluster, or replaces its definition. The proxy's Prepare hook builds it (and
 // resolves its secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused.
-func (d *FileDir) PutCluster(ctx context.Context, name string, c config.Cluster, actor string) error {
+func (d *FileDir) PutCluster(ctx context.Context, name string, c config.Cluster, secret, actor string) error {
+	if secret != "" {
+		return ErrSecretInline
+	}
 	return d.mutate(ctx, actor, "cluster-put", clusterKey(name), func(f *File) error {
 		if f.Clusters == nil {
 			f.Clusters = map[string]config.Cluster{}

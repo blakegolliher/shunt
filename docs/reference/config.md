@@ -52,15 +52,17 @@ The clusters, tenants and placements that route each bucket (docs/DESIGN.md §1.
 
 ## `control`
 
-Where this proxy sits in a fleet of proxies sharing one directory file (ADR-0016). Omitted, the proxy is its own control node with no members, which is every single-proxy deployment.
+Makes this proxy a **member** of a fleet run by `shunt-control` (ADR-0015, ADR-0016): it takes its directory, client keys and cluster secrets from the control plane, forwards bucket creation there, sends it a heartbeat, and goes stale (refusing writes on moving buckets) when its lease lapses. Omitted, the proxy is a single-node lab that reads a directory file on this host. A member has no `directory` block and no `auth.credentials_file`; both come from the control plane.
 
 | Key | Type | Default | Rule |
 |---|---|---|---|
-| `endpoint` | URL | | The control node's admin listener, `http(s)://host:port`. Set, this proxy is a **member**: it sends the control node a heartbeat, its own control API refuses mutations, and it goes stale when its lease lapses. Resign mode only |
-| `token_ref` | `env:NAME` / `file:/path` | | The control node's `admin.control_token_ref`, for the heartbeat. Only with `endpoint` |
+| `endpoints` | list of URLs | | `shunt-control` API addresses, `http://host:port`; any one is enough, the proxy tries the next on failure. Set, this proxy is a member. Resign mode only |
+| `token_ref` | `env:NAME` / `file:/path` | | The control plane's bearer token |
+| `plaintext` | bool | false | Required `true` while the endpoints are `http`: the control channel then carries directory versions, cluster secrets and client keys in the clear. TLS for it is deferred (ADR-0015); this key exists so that is stated, as `listener.plaintext` must be |
 | `proxy_id` | string | `<hostname>-<admin port>` | This member's id: 1-64 letters, digits, `.`, `_`, `-`. Stable across restarts, so a restarted proxy is the same member |
+| `cache_dir` | path | | Required. The last directory this proxy installed, kept 0700, and served after a restart with the control plane down (ACTIVE buckets only; moving ones refuse writes until the lease is back) |
 | `heartbeat_interval` | duration | 1s | How often a member reports the directory version it has installed |
-| `lease_ttl` | duration | 10s | At least three heartbeats. A member whose last acknowledged heartbeat is older refuses writes on moving buckets; the control node counts a member live for this long plus 5 s |
+| `lease_ttl` | duration | 10s | At least three heartbeats. A member whose last acknowledged heartbeat is older refuses writes on moving buckets |
 
 Directory file schema (validated by `check-config` and `shunt directory validate`):
 
@@ -91,7 +93,7 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
     created: 2026-09-15T18:00:00Z
 ```
 
-Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write. A control node with fleet members also keeps `<file>.fleet.yaml`: member ids only (ADR-0016).
+Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write.
 
 ## `clusters.<name>`
 
