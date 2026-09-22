@@ -17,6 +17,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 // fakeControl speaks the member's side of the control API: directory long-poll, heartbeat,
@@ -151,6 +152,8 @@ func newClient(t *testing.T, f *fakeControl) *Client {
 func TestMemberInstallsDirectoryAndKeys(t *testing.T) {
 	f := newFakeControl(t)
 	c := newClient(t, f)
+	c.Telemetry = telemetry.NewCollector()
+	c.Telemetry.Observe(telemetry.Observation{At: time.Now().Add(-11 * time.Second), Operation: "GetObject", Cluster: "vast01", Status: 200, ClientTotal: time.Millisecond})
 	prepared := 0
 	c.Prepare = func(fl *directory.File) error {
 		if _, err := c.Resolve("control:vast01"); err != nil {
@@ -214,9 +217,16 @@ func TestMemberInstallsDirectoryAndKeys(t *testing.T) {
 	}
 	f.mu.Lock()
 	n := len(f.beats)
+	var last control.Heartbeat
+	if n > 0 {
+		last = f.beats[n-1]
+	}
 	f.mu.Unlock()
 	if n < 2 {
 		t.Errorf("only %d heartbeats", n)
+	}
+	if last.Telemetry == nil || len(last.Telemetry.Sketches) == 0 {
+		t.Error("heartbeat carried no completed telemetry window")
 	}
 }
 

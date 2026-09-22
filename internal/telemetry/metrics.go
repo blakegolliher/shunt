@@ -34,9 +34,10 @@ type Metrics struct {
 
 	// The fleet (POC-6, ADR-0016). Members and fence wait are exported by the control node only;
 	// stale by members only.
-	FleetMembers *prometheus.GaugeVec // shunt_fleet_members{state}
-	FleetStale   prometheus.Gauge     // shunt_fleet_stale
-	FenceWait    prometheus.Histogram // shunt_fleet_fence_wait_seconds
+	FleetMembers   *prometheus.GaugeVec // shunt_fleet_members{state}
+	FleetStale     prometheus.Gauge     // shunt_fleet_stale
+	FenceWait      prometheus.Histogram // shunt_fleet_fence_wait_seconds
+	TelemetryMerge prometheus.Histogram // shunt_telemetry_merge_seconds
 }
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
@@ -130,11 +131,15 @@ func NewMetrics() *Metrics {
 			Name: "shunt_fleet_fence_wait_seconds", Help: "Control node: time for one fenced change to reach every live member.",
 			Buckets: durationBuckets,
 		}),
+		TelemetryMerge: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "shunt_telemetry_merge_seconds", Help: "Control node: time to decode and merge one completed fleet telemetry window.",
+			Buckets: prometheus.ExponentialBuckets(10e-6, 2.15443469, 16),
+		}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
 		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
-		m.FleetMembers, m.FleetStale, m.FenceWait,
+		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

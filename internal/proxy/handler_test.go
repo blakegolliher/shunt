@@ -432,6 +432,8 @@ func TestUpstreamDown(t *testing.T) {
 
 func TestMetricsAndSlowRing(t *testing.T) {
 	r := newRig(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }), time.Second)
+	windows := telemetry.NewCollector()
+	r.h.Telemetry = windows
 	resp, _ := fresh().Get(r.front.URL + "/b/k") //nolint:noctx // test
 	resp.Body.Close()                            //nolint:errcheck // test
 	fams, _ := r.h.Metrics.Registry.Gather()
@@ -446,6 +448,9 @@ func TestMetricsAndSlowRing(t *testing.T) {
 	}
 	if snap := r.h.Slow.Snapshot(); len(snap) != 1 || snap[0].Op != "GetObject" || snap[0].BytesOut != 2 {
 		t.Fatalf("slow ring: %+v", snap)
+	}
+	if window := windows.Completed(time.Now().Add(telemetry.WindowDuration)); window == nil || len(window.Sketches) != 4 || window.Counters[0].Requests != 1 {
+		t.Fatalf("telemetry window: %+v", window)
 	}
 }
 

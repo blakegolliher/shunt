@@ -8,6 +8,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 // waitFor polls until cond holds or the deadline passes.
@@ -43,12 +44,15 @@ func TestFleetLeasesAndMembership(t *testing.T) {
 	fa, fb := NewFleet(tc.nodes[0].Client(), time.Second), NewFleet(tc.nodes[1].Client(), time.Second)
 	fa.DropMargin, fb.DropMargin = 500*time.Millisecond, 500*time.Millisecond
 
-	ttl, err := fa.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 1, Applied: 3, FallbackReads: map[string]float64{"acme/data": 2}})
+	window := &telemetry.Window{Start: time.Now().Add(-20 * time.Second), End: time.Now().Add(-10 * time.Second)}
+	ttl, err := fa.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 1, Applied: 3, FallbackReads: map[string]float64{"acme/data": 2},
+		Host: "host-a", Version: "v1", Telemetry: window})
 	if err != nil || ttl != time.Second {
 		t.Fatalf("heartbeat: %v %v", ttl, err)
 	}
 	ms := members(t, fa)
-	if m := ms["p1"]; !m.Live || m.Applied != 3 || m.Seq != 1 || m.FallbackReads["acme/data"] != 2 || m.Seen.IsZero() {
+	if m := ms["p1"]; !m.Live || m.Applied != 3 || m.Seq != 1 || m.FallbackReads["acme/data"] != 2 || m.Seen.IsZero() ||
+		m.Host != "host-a" || m.Version != "v1" || m.Telemetry == nil || !m.Telemetry.Start.Equal(window.Start) {
 		t.Fatalf("after one heartbeat: %+v", m)
 	}
 	// Heartbeats may arrive at another node: it renews the same member.

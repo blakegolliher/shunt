@@ -24,7 +24,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
+
 	"github.com/blakegolliher/shunt/internal/sigv4"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 // Client sends SigV4-signed path-style requests for one bucket.
@@ -41,10 +44,11 @@ type Client struct {
 
 // Reply is one response, read whole.
 type Reply struct {
-	Status int
-	Body   []byte
-	Route  string // X-Shunt-Route: "<side> <cluster>", when asked for and given
-	Header http.Header
+	Status   int
+	Body     []byte
+	Route    string // X-Shunt-Route: "<side> <cluster>", when asked for and given
+	Header   http.Header
+	Duration time.Duration // HTTP round trip through the last response byte; excludes request signing
 }
 
 // Do sends one request for key with body (nil for none) and extra headers.
@@ -73,13 +77,14 @@ func (c *Client) Do(ctx context.Context, method, key string, body []byte, hdr ma
 	if hc == nil {
 		hc = http.DefaultClient
 	}
+	started := time.Now()
 	resp, err := hc.Do(req)
 	if err != nil {
 		return Reply{}, err
 	}
 	defer resp.Body.Close() //nolint:errcheck // read below
 	b, err := io.ReadAll(resp.Body)
-	return Reply{Status: resp.StatusCode, Body: b, Route: resp.Header.Get("X-Shunt-Route"), Header: resp.Header}, err
+	return Reply{Status: resp.StatusCode, Body: b, Route: resp.Header.Get("X-Shunt-Route"), Header: resp.Header, Duration: time.Since(started)}, err
 }
 
 func escapeKey(key string) string {
@@ -130,26 +135,30 @@ type Options struct {
 
 // Report is what a Run saw.
 type Report struct {
-	Endpoint      string           `json:"endpoint"`
-	Bucket        string           `json:"bucket"`
-	Prefix        string           `json:"prefix"`
-	Seed          int64            `json:"seed"`
-	Started       time.Time        `json:"started"`
-	Seconds       float64          `json:"seconds"`
-	Ops           int64            `json:"ops"`
-	Puts          int64            `json:"puts"`
-	Gets          int64            `json:"gets"`
-	Deletes       int64            `json:"deletes"`
-	Errors        int64            `json:"errors"`
-	ErrorSamples  []string         `json:"error_samples,omitempty"` // the first 50
-	Resurrections int64            `json:"resurrections_withdrawn"` // deleted keys seen again, then gone within the grace
-	Writes        map[string]int64 `json:"writes_by_route"`         // X-Shunt-Route of successful PUTs
-	Reads         map[string]int64 `json:"reads_by_route"`          // X-Shunt-Route of successful GETs
-	WriteSides    map[string]int64 `json:"writes_by_side"`          // primary | source | unrouted
-	ReadSides     map[string]int64 `json:"reads_by_side"`
-	Present       int              `json:"keys_present_at_end"`
-	ReadBack      int              `json:"keys_read_back_at_end"` // present keys read back whole after the workload stopped, less any whose last write the end cut off
-	CleanupErrors int64            `json:"cleanup_errors,omitempty"`
+	Endpoint      string               `json:"endpoint"`
+	Bucket        string               `json:"bucket"`
+	Prefix        string               `json:"prefix"`
+	Seed          int64                `json:"seed"`
+	Started       time.Time            `json:"started"`
+	Seconds       float64              `json:"seconds"`
+	Ops           int64                `json:"ops"`
+	Puts          int64                `json:"puts"`
+	Gets          int64                `json:"gets"`
+	Deletes       int64                `json:"deletes"`
+	Errors        int64                `json:"errors"`
+	ErrorSamples  []string             `json:"error_samples,omitempty"` // the first 50
+	Resurrections int64                `json:"resurrections_withdrawn"` // deleted keys seen again, then gone within the grace
+	Writes        map[string]int64     `json:"writes_by_route"`         // X-Shunt-Route of successful PUTs
+	Reads         map[string]int64     `json:"reads_by_route"`          // X-Shunt-Route of successful GETs
+	WriteSides    map[string]int64     `json:"writes_by_side"`          // primary | source | unrouted
+	ReadSides     map[string]int64     `json:"reads_by_side"`
+	Present       int                  `json:"keys_present_at_end"`
+	ReadBack      int                  `json:"keys_read_back_at_end"` // present keys read back whole after the workload stopped, less any whose last write the end cut off
+	CleanupErrors int64                `json:"cleanup_errors,omitempty"`
+	LatencyP50US  int64                `json:"latency_p50_us"`
+	LatencyP99US  int64                `json:"latency_p99_us"`
+	Telemetry     *TelemetryComparison `json:"telemetry,omitempty"`
+	LatencyWindow *telemetry.Window    `json:"-"`
 }
 
 type runner struct {
@@ -163,6 +172,8 @@ type runner struct {
 	samples []string
 	writes  map[string]int64
 	reads   map[string]int64
+	latency *hdrhistogram.Histogram
+	windows *telemetry.Collector
 }
 
 // Run drives the workload until Duration passes or ctx is done, and reports.
@@ -187,7 +198,8 @@ func Run(ctx context.Context, c *Client, o Options) Report {
 		ctx, cancel = context.WithTimeout(ctx, o.Duration)
 		defer cancel()
 	}
-	r := &runner{c: c, o: o, keys: make([]*Key, o.Keys), writes: map[string]int64{}, reads: map[string]int64{}}
+	r := &runner{c: c, o: o, keys: make([]*Key, o.Keys), writes: map[string]int64{}, reads: map[string]int64{},
+		latency: hdrhistogram.New(1, int64(120*time.Second/time.Microsecond), 3), windows: telemetry.NewCollector()}
 	for i := range r.keys {
 		r.keys[i] = &Key{}
 	}
@@ -205,6 +217,7 @@ func Run(ctx context.Context, c *Client, o Options) Report {
 	stopProgress()
 	readBack := r.readBack()
 	rep := r.report(start)
+	rep.LatencyWindow = r.windows.Completed(time.Now())
 	rep.ReadBack = readBack
 	if o.Cleanup {
 		rep.CleanupErrors = r.cleanup()
@@ -232,6 +245,39 @@ func (r *runner) tally(m map[string]int64, route string) {
 	r.mu.Unlock()
 }
 
+func verifyOperation(method string) string {
+	switch method {
+	case http.MethodGet:
+		return "GetObject"
+	case http.MethodPut:
+		return "PutObject"
+	case http.MethodDelete:
+		return "DeleteObject"
+	}
+	return "Unknown"
+}
+
+func (r *runner) do(ctx context.Context, method, key string, body []byte, hdr map[string]string) (Reply, error) {
+	rep, err := r.c.Do(ctx, method, key, body, hdr)
+	if err != nil {
+		return rep, err
+	}
+	d := rep.Duration
+	micros := d.Microseconds()
+	if micros < 1 {
+		micros = 1
+	}
+	if micros > int64(120*time.Second/time.Microsecond) {
+		micros = int64(120 * time.Second / time.Microsecond)
+	}
+	r.mu.Lock()
+	_ = r.latency.RecordValue(micros)
+	r.mu.Unlock()
+	r.windows.Observe(telemetry.Observation{At: time.Now(), Operation: verifyOperation(method), Cluster: "client", Status: rep.Status,
+		BytesIn: int64(len(body)), BytesOut: int64(len(rep.Body)), ClientTotal: d})
+	return rep, nil
+}
+
 func (r *runner) worker(ctx context.Context, rnd *rand.Rand) {
 	for ctx.Err() == nil {
 		i := rnd.Intn(len(r.keys))
@@ -256,7 +302,7 @@ func done(ctx context.Context, err error) bool {
 
 func (r *runner) put(ctx context.Context, i int, k *Key, rnd *rand.Rand) {
 	body := fmt.Sprintf("v%d-%d", i, rnd.Int63())
-	rep, err := r.c.Do(ctx, http.MethodPut, r.key(i), []byte(body), nil)
+	rep, err := r.do(ctx, http.MethodPut, r.key(i), []byte(body), nil)
 	if done(ctx, err) {
 		k.Unsure = true
 		return
@@ -275,7 +321,7 @@ func (r *runner) put(ctx context.Context, i int, k *Key, rnd *rand.Rand) {
 }
 
 func (r *runner) del(ctx context.Context, i int, k *Key) {
-	rep, err := r.c.Do(ctx, http.MethodDelete, r.key(i), nil, nil)
+	rep, err := r.do(ctx, http.MethodDelete, r.key(i), nil, nil)
 	if done(ctx, err) {
 		k.Unsure = true
 		return
@@ -293,7 +339,7 @@ func (r *runner) del(ctx context.Context, i int, k *Key) {
 }
 
 func (r *runner) get(ctx context.Context, i int, k *Key) {
-	rep, err := r.c.Do(ctx, http.MethodGet, r.key(i), nil, nil)
+	rep, err := r.do(ctx, http.MethodGet, r.key(i), nil, nil)
 	if done(ctx, err) {
 		return
 	}
@@ -323,7 +369,7 @@ func (r *runner) get(ctx context.Context, i int, k *Key) {
 func (r *runner) gone(ctx context.Context, i int) bool {
 	for end := time.Now().Add(r.o.Grace); time.Now().Before(end) && ctx.Err() == nil; {
 		time.Sleep(50 * time.Millisecond)
-		if rep, err := r.c.Do(context.WithoutCancel(ctx), http.MethodGet, r.key(i), nil, nil); err == nil && rep.Status == http.StatusNotFound {
+		if rep, err := r.do(context.WithoutCancel(ctx), http.MethodGet, r.key(i), nil, nil); err == nil && rep.Status == http.StatusNotFound {
 			return true
 		}
 	}
@@ -366,6 +412,8 @@ func (r *runner) report(start time.Time) Report {
 		Errors: r.errors.Load(), Resurrections: r.resurrections.Load(),
 		Writes: map[string]int64{}, Reads: map[string]int64{}, WriteSides: map[string]int64{}, ReadSides: map[string]int64{}}
 	r.mu.Lock()
+	rep.LatencyP50US = r.latency.ValueAtQuantile(50)
+	rep.LatencyP99US = r.latency.ValueAtQuantile(99)
 	rep.ErrorSamples = append([]string(nil), r.samples...)
 	for route, n := range r.writes {
 		rep.Writes[route] = n
@@ -435,7 +483,7 @@ func (r *runner) cleanup() int64 {
 	for i, k := range r.keys {
 		k.Lock()
 		if k.Present {
-			if rep, err := r.c.Do(ctx, http.MethodDelete, r.key(i), nil, nil); err != nil || rep.Status != http.StatusNoContent {
+			if rep, err := r.do(ctx, http.MethodDelete, r.key(i), nil, nil); err != nil || rep.Status != http.StatusNoContent {
 				errs++
 			} else {
 				k.Present = false

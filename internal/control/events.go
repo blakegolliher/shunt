@@ -29,7 +29,7 @@ const (
 	eventTypeFence     = "fence"
 	eventTypeFleet     = "fleet"
 	eventTypeReset     = "reset"
-	eventTypeTelemetry = "telemetry" // reserved for UI-1
+	eventTypeTelemetry = "telemetry" // a completed 10-second telemetry window was merged
 )
 
 // Event is one server-sent event.

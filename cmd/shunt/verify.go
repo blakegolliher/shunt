@@ -18,9 +18,11 @@ import (
 
 func newVerify() *cobra.Command {
 	var (
-		c                             verify.Client
-		o                             verify.Options
-		accessKey, secretRef, jsonOut string
+		c                               verify.Client
+		o                               verify.Options
+		accessKey, secretRef, jsonOut   string
+		telemetryURL, telemetryTokenRef string
+		telemetryTolerance              float64
 	)
 	cmd := &cobra.Command{
 		Use:   "verify",
@@ -46,6 +48,19 @@ func newVerify() *cobra.Command {
 			defer stop()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "verify: %s/%s, %d workers over %d keys\n", c.Endpoint, c.Bucket, o.Workers, o.Keys)
 			rep := verify.Run(ctx, &c, o)
+			if telemetryURL != "" {
+				telemetryToken := ""
+				if telemetryTokenRef != "" {
+					telemetryToken, err = config.ResolveSecret(telemetryTokenRef)
+					if err != nil {
+						return fmt.Errorf("--telemetry-token-ref: %w", err)
+					}
+				}
+				rep.Telemetry, err = verify.CompareTelemetry(ctx, telemetryURL, telemetryToken, rep.LatencyWindow, telemetryTolerance)
+				if err != nil {
+					return fmt.Errorf("verify telemetry cross-check: %w", err)
+				}
+			}
 			if jsonOut != "" {
 				b, _ := json.MarshalIndent(rep, "", "  ")                             //nolint:errcheck // plain data
 				if err := os.WriteFile(jsonOut, append(b, '\n'), 0o644); err != nil { //nolint:gosec // a report, no secrets
@@ -55,6 +70,9 @@ func newVerify() *cobra.Command {
 			printVerify(cmd, rep)
 			if rep.Errors > 0 {
 				return fmt.Errorf("verify: %d errors in %d operations", rep.Errors, rep.Ops)
+			}
+			if rep.Telemetry != nil && !rep.Telemetry.WithinTolerance {
+				return fmt.Errorf("verify telemetry cross-check: fleet p99 differs from the client by %.1f%% (limit %.1f%%)", rep.Telemetry.DifferencePct, rep.Telemetry.TolerancePct)
 			}
 			return nil
 		},
@@ -75,6 +93,9 @@ func newVerify() *cobra.Command {
 	f.DurationVar(&o.Interval, "interval", 10*time.Second, "progress line interval; 0 for none")
 	f.BoolVar(&o.Cleanup, "cleanup", false, "delete the keys still present when the run ends")
 	f.StringVar(&jsonOut, "json-out", "", "also write the report as JSON to this file")
+	f.StringVar(&telemetryURL, "telemetry-url", "", "control-node base URL whose fleet client_total p99 must match this client")
+	f.StringVar(&telemetryTokenRef, "telemetry-token-ref", "", "env:NAME or file:/path holding the control API bearer token")
+	f.Float64Var(&telemetryTolerance, "telemetry-tolerance", 10, "maximum percent difference between client and fleet p99")
 	return cmd
 }
 
@@ -84,6 +105,7 @@ func printVerify(cmd *cobra.Command, rep verify.Report) {
 	_, _ = fmt.Fprintf(out, "  %d operations in %.0fs: %d PUT, %d GET, %d DELETE\n", rep.Ops, rep.Seconds, rep.Puts, rep.Gets, rep.Deletes)
 	_, _ = fmt.Fprintf(out, "  keys present at the end: %d, %d read back after the workload stopped\n", rep.Present, rep.ReadBack)
 	_, _ = fmt.Fprintf(out, "  errors: %d\n", rep.Errors)
+	_, _ = fmt.Fprintf(out, "  client latency: p50 %d us, p99 %d us\n", rep.LatencyP50US, rep.LatencyP99US)
 	for _, s := range rep.ErrorSamples {
 		_, _ = fmt.Fprintf(out, "    %s\n", s)
 	}
@@ -98,5 +120,9 @@ func printVerify(cmd *cobra.Command, rep verify.Report) {
 		if len(t.routes) > 0 {
 			_, _ = fmt.Fprintf(out, "  %s by route: %s\n", t.what, verify.Share(t.routes))
 		}
+	}
+	if rep.Telemetry != nil {
+		_, _ = fmt.Fprintf(out, "  telemetry cross-check: client p99 %d us, fleet p99 %d us, difference %.1f%% (limit %.1f%%)\n",
+			rep.Telemetry.ClientP99US, rep.Telemetry.FleetP99US, rep.Telemetry.DifferencePct, rep.Telemetry.TolerancePct)
 	}
 }

@@ -25,7 +25,28 @@ Prefix: `shunt_`. Phase column is the full-design phase; the POC column says whi
 | `shunt_fleet_members` | gauge | `state` ∈ {`live`, `silent`} | proxies | — | Control plane (shunt-control) only: members that have registered, by whether their heartbeat is within the lease (ADR-0016). A `silent` member blocks the first step of any bucket's migration until it returns or is forgotten | P3c | POC-6 |
 | `shunt_fleet_stale` | gauge | — | — | — | Members only: 1 while this proxy's last acknowledged heartbeat is older than `control.lease_ttl`, so writes on moving buckets are refused; 0 otherwise (ADR-0016) | P3c | POC-6 |
 | `shunt_fleet_fence_wait_seconds` | histogram | — | seconds | 1ms … 60s, log-spaced, 16 buckets | Control plane (shunt-control) only: time from a fenced change being written to every live member reporting it installed, per fence round (ADR-0016) | P3c | POC-6 |
+| `shunt_telemetry_merge_seconds` | histogram | — | seconds | 10µs … 1s, log-spaced, 16 buckets | Control node only: time to decode and merge one completed 10 s fleet telemetry window into fleet, cluster and proxy summaries | P4 | UI-1 |
 
 The `bucket` label appears only on the migration metrics, and only while a bucket is not ACTIVE: a placement that returns to ACTIVE stops exporting them, so cardinality is bounded by the number of migrations in flight, not by the number of buckets.
+
+## Heartbeat-carried window series
+
+These are not Prometheus metrics and do not change the proxy's existing Prometheus surface. A
+proxy ships compressed HdrHistogram sketches for its last completed 10-second window; every
+control node merges them and emits the percentiles below through `/v1/telemetry`. `op_class` is
+one of `read`, `write`, `list`, `delete`, `multipart`, or `other`; `cluster` is the serving
+cluster (`none` when shunt answered without one). Every summary carries p50, p90, p99, p99.9,
+maximum and count in microseconds.
+
+| Series | Dimensions | Unit | Meaning |
+|---|---|---|---|
+| `client_total` | `op_class`, `cluster` | microseconds | First client request byte received to the last response byte written (the access log's total duration) |
+| `upstream_ttfb` | `op_class`, `cluster` | microseconds | Upstream request headers written to upstream response headers received |
+| `upstream_total` | `op_class`, `cluster` | microseconds | Upstream request headers written to the last upstream response body byte read |
+| `proxy_overhead` | `op_class`, `cluster` | microseconds | `client_total - upstream_total`, clamped at zero; proxy parsing, authentication, routing, signing, and client-side delivery around the upstream exchange |
+
+Each window also carries exact counters by `op_class` and `cluster`: requests, request and
+response bytes, and errors by HTTP status class. The control node sums them for the same fleet,
+cluster and proxy scopes as the latency summaries.
 
 Deferred to P4: the full catalog (connection, auth, TLS, routing, TCP, runtime signals). Those rows are added when their phase begins, not before.

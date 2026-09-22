@@ -271,12 +271,41 @@ Server-sent events from this control node (ADR-0017): `Content-Type: text/event-
 | `directory` | `{"version", "kind": "placement" \| "cluster" \| "tenant", "key", "op": "put" \| "delete", "record"}`, one per record that changed at that version (a cluster record carries `secret_ref`, never a secret), then `{"version", "kind": "version"}` once every record of the version has been sent |
 | `fence` | `{"operation", "kind", "placement" \| "cluster", "status", "phase", "waiting_on", "silent", "version"}`, every time an operation record changes, from any control node |
 | `fleet` | `{"id", "event": "joined" \| "left" \| "silent" \| "live" \| "applied", "applied", "version"}`, from the fleet table read once a second |
-| `telemetry` | reserved: a merged 10 s window is ready (UI-1) |
+| `telemetry` | a merged 10 s telemetry window is ready: `{"start", "end", "scopes"}` |
 | `reset` | `{"reason"}`: the id the client resumed from is not in this node's ring; reload the read models, then follow the stream |
 
 - Ids are `<epoch>:<seq>`, the epoch being this node's start, so an id from another node or an earlier run is recognized as foreign. Each node keeps its last 4 096 events. Resuming with `Last-Event-ID` (the header, or `?last_event_id=` for a client that cannot set one) replays what was missed when the id is in the ring, and sends `reset` first when it is not.
 - The bearer token is the only authentication, so a browser reads the stream with `fetch` and the `Authorization` header, not `EventSource`, which cannot send headers; a token never goes in a URL.
 - On `shunt-control` the route answers 503 `unavailable` until the node has loaded the directory (waiting for quorum); a client treats it as retry. At most 64 streams per node; the 65th is 503.
+
+## Telemetry
+
+### `GET /v1/telemetry/series`
+
+Query parameters are `scope=fleet|cluster:<name>|proxy:<id>`,
+`series=client_total|upstream_ttfb|upstream_total|proxy_overhead`,
+`op=all|read|write|list|delete|multipart|other` (default `all`), and optional RFC3339 `from` /
+`to`. The answer is a chronological slice of the 60-minute, 10-second-window ring:
+
+```json
+{"scope":"fleet","series":"client_total","op":"all","points":[
+  {"start":"2026-09-22T12:00:00Z","end":"2026-09-22T12:00:10Z","series":"client_total","op":"all",
+   "count":1842,"p50_us":940,"p90_us":1810,"p99_us":4220,"p999_us":7310,"max_us":9100}
+]}
+```
+
+Percentiles are emitted by the control node from merged HdrHistogram sketches; clients never
+average percentiles. Values are integer microseconds. An unknown scope may validly have an empty
+`points` array; malformed scope, series, operation, or time filters answer 400.
+
+### `GET /v1/telemetry/latest`
+
+Returns `{"windows": [...]}` with the newest completed window for every available scope: `fleet`,
+each `cluster:<name>`, and each `proxy:<id>`. A window has `scope`, `start`, `end`, a `series` array
+with the percentile records above, and `counters` by operation class (`requests`, `bytes_in`,
+`bytes_out`, and `errors` by status class). It is empty until the first 10-second window closes.
+The same read model is filled by member heartbeats on a fleet and directly by the proxy handler in
+a single-node lab.
 
 ## Views
 
@@ -347,11 +376,18 @@ A member's S3 `CreateBucket` and `DeleteBucket`, forwarded: `{"cluster", "name",
 
 ### `POST /v1/fleet/{id}/heartbeat`
 
-Sent by a member every `control.heartbeat_interval`: `{"started", "seq", "applied", "host", "version", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only; `host` is the member's host name and `version` its build. The first one from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"version", "lease_ttl"}`; a member whose version is behind fetches the directory at once. Unknown fields are refused, so control nodes are upgraded before proxies: an old node refuses a new proxy's `host` and `version`.
+Sent by a member every `control.heartbeat_interval`: `{"started", "seq", "applied", "host", "version", "fallback_reads": {"<tenant>/<bucket>": n}, "telemetry": {...}}`, with fallback counters for buckets that are not `ACTIVE` only; `host` is the member's host name and `version` its build. `telemetry` is the last non-empty completed 10-second window: compressed HdrHistogram sketches and plain counters, re-sent until another window closes. The first heartbeat from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"version", "lease_ttl"}`; a member whose version is behind fetches the directory at once. Unknown fields are refused, so control nodes are upgraded before proxies.
+
+The request decoder is capped at 1 MiB. `TestHeartbeatPayloadBound` fills all 6 operation classes ×
+4 series with a realistic 10,000-value latency spread: each compressed sketch is 2,592 bytes, the
+12-cluster JSON heartbeat is 1,025,921 bytes, and 13 clusters is 1,111,406 bytes. Twelve clusters
+active on one proxy within one window is therefore the tested dense ceiling; ordinary sparse
+sketches are a few hundred bytes. Plan and load-test a larger per-proxy active-cluster count before
+raising the cap.
 
 ### `GET /v1/fleet`
 
-`{"version", "members": [{"id", "live", "applied", "seq", "started", "seen", "since_seen", "host", "version", "fallback_reads"}]}`. `live`: the lease has not expired; a member that is not live is what the web UI shows as stale. `shunt proxy list`.
+`{"version", "members": [{"id", "live", "applied", "seq", "started", "seen", "since_seen", "host", "version", "fallback_reads", "telemetry"}]}`. `live`: the lease has not expired; a member that is not live is what the web UI shows as stale. `shunt proxy list`.
 
 ### `DELETE /v1/fleet/{id}`
 

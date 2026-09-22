@@ -17,6 +17,7 @@ One line per dependency saying why the stdlib wasn't enough (CLAUDE.md). Tool bi
 | `go.etcd.io/etcd/api/v3` | v3.7.1 | Apache-2.0 | `shunt-control` only: the API types the client exposes (member lists, status). |
 | `go.etcd.io/etcd/etcdutl/v3` | v3.7.1 | Apache-2.0 | `shunt-control only`: `snapshot restore`, offline, rebuilding a data directory from a snapshot file, which only this package does correctly (it rewrites the member and cluster ids). |
 | `github.com/johannesboyne/gofakes3` | v1.2.0 | MIT | **Test-only** (imported from `_test.go` files). In-process fake S3 so unit tests need no Docker. Pulls aws-sdk-go-v2, afero, bbolt into the test build only; `go build ./cmd/shunt` does not link them. |
+| `github.com/HdrHistogram/hdrhistogram-go` | v1.2.0 | MIT | Mergeable, compressible latency sketches with bounded relative error for 10-second proxy telemetry windows; the stdlib has neither a quantile sketch nor a wire format that can be merged without averaging percentiles. |
 
 ## Tool binaries (Makefile, ./bin)
 

@@ -52,6 +52,9 @@ func TestCleanRunHasNoErrors(t *testing.T) {
 	if rep.CleanupErrors != 0 {
 		t.Fatalf("cleanup: %d errors", rep.CleanupErrors)
 	}
+	if rep.LatencyP50US <= 0 || rep.LatencyP99US < rep.LatencyP50US {
+		t.Fatalf("latency report: p50=%d p99=%d", rep.LatencyP50US, rep.LatencyP99US)
+	}
 }
 
 // A backend that acknowledges writes it did not keep is caught by the model.

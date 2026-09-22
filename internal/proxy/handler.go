@@ -42,6 +42,7 @@ type Handler struct {
 
 	Domains         s3.Domains
 	Metrics         *telemetry.Metrics
+	Telemetry       *telemetry.Collector
 	Access          *telemetry.AccessLogger
 	Slow            *telemetry.SlowRing
 	IdleTimeout     time.Duration // data ops: abort when no bytes move for this long
@@ -118,10 +119,11 @@ type timings struct {
 	mu      sync.Mutex
 	connect time.Duration
 	ttfb    time.Duration
+	wrote   time.Time // upstream request headers written
 	first   time.Time // upstream first response byte
 }
 
-func (t *timings) set(connect, ttfb time.Duration, first time.Time) {
+func (t *timings) set(connect, ttfb time.Duration, wrote, first time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if connect > 0 {
@@ -130,15 +132,18 @@ func (t *timings) set(connect, ttfb time.Duration, first time.Time) {
 	if ttfb > 0 {
 		t.ttfb = ttfb
 	}
+	if !wrote.IsZero() {
+		t.wrote = wrote
+	}
 	if !first.IsZero() {
 		t.first = first
 	}
 }
 
-func (t *timings) get() (connect, ttfb time.Duration, first time.Time) {
+func (t *timings) get() (connect, ttfb time.Duration, wrote, first time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.connect, t.ttfb, t.first
+	return t.connect, t.ttfb, t.wrote, t.first
 }
 
 type buildError struct{ err error }
@@ -270,17 +275,20 @@ func (h *Handler) roundTrip(ctx context.Context, o *outcome, p *prepared, cl *up
 		ConnectStart: func(_, _ string) { tConnect = time.Now() },
 		ConnectDone: func(_, _ string, _ error) {
 			if !tConnect.IsZero() {
-				o.tm.set(time.Since(tConnect), 0, time.Time{})
+				o.tm.set(time.Since(tConnect), 0, time.Time{}, time.Time{})
 			}
 		},
-		WroteHeaders: func() { tWrote = time.Now() },
+		WroteHeaders: func() {
+			tWrote = time.Now()
+			o.tm.set(0, 0, tWrote, time.Time{})
+		},
 		GotFirstResponseByte: func() {
 			first := time.Now()
 			ttfb := time.Duration(0)
 			if !tWrote.IsZero() {
 				ttfb = first.Sub(tWrote)
 			}
-			o.tm.set(0, ttfb, first)
+			o.tm.set(0, ttfb, time.Time{}, first)
 		},
 	}
 	tctx := httptrace.WithClientTrace(ctx, trace)
@@ -474,7 +482,7 @@ func (h *Handler) finish(r *http.Request, o *outcome) {
 	}
 	o.recorded = true
 	total := time.Since(o.start)
-	connect, ttfb, tFirst := o.tm.get()
+	connect, ttfb, tWrote, tFirst := o.tm.get()
 	op := o.info.Op.String()
 	h.Metrics.RequestsTotal.WithLabelValues(op, telemetry.StatusClass(o.status), o.cluster, o.clusterType).Inc()
 	h.Metrics.RequestDuration.WithLabelValues(op).Observe(total.Seconds())
@@ -486,6 +494,15 @@ func (h *Handler) finish(r *http.Request, o *outcome) {
 	}
 	if o.bytesOut > 0 {
 		h.Metrics.BytesOut.WithLabelValues(op).Add(float64(o.bytesOut))
+	}
+	upstreamTotal := time.Duration(0)
+	if !tWrote.IsZero() && !o.tLast.IsZero() && !o.tLast.Before(tWrote) {
+		upstreamTotal = o.tLast.Sub(tWrote)
+	}
+	if h.Telemetry != nil {
+		h.Telemetry.Observe(telemetry.Observation{At: time.Now(), Operation: op, Cluster: o.cluster,
+			Status: o.status, BytesIn: o.bytesIn, BytesOut: o.bytesOut, ClientTotal: total,
+			UpstreamTTFB: ttfb, UpstreamTotal: upstreamTotal})
 	}
 	tlsVer := ""
 	if r.TLS != nil {

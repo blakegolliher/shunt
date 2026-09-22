@@ -19,6 +19,16 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/telemetry/series",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/telemetry/latest",
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/audit",
     "mutation": false
   },

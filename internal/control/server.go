@@ -63,6 +63,9 @@ type Server struct {
 	Node string
 	// Events, if set, is the stream GET /v1/events serves.
 	Events *Events
+	// Telemetry holds the merged 60-minute summary ring. A lab server feeds it from the local
+	// proxy collector; shunt-control feeds it from member heartbeats in PublishFleet.
+	Telemetry *telemetry.Store
 	// ConfirmKey keys the confirmation tokens dry runs issue; every control node shares one.
 	// Empty: a random key for this process, so a lab's tokens die with it.
 	ConfirmKey []byte

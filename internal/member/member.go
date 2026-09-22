@@ -58,6 +58,7 @@ type Client struct {
 	// OnInstall, if set, is called after every installed version.
 	OnInstall func(*directory.Snapshot)
 	Metrics   *telemetry.Metrics
+	Telemetry *telemetry.Collector
 	Now       func() time.Time
 
 	snap    atomic.Pointer[directory.Snapshot]
@@ -396,6 +397,9 @@ func (c *Client) beat(ctx context.Context) error {
 	sent := c.Now()
 	snap := c.Snapshot()
 	hb := control.Heartbeat{Started: c.started, Seq: c.seq.Add(1), Applied: snap.Version(), Host: c.cfg.Host, Version: c.cfg.Version}
+	if c.Telemetry != nil {
+		hb.Telemetry = c.Telemetry.Completed(c.Now())
+	}
 	f := snap.File()
 	for key := range f.Placements {
 		if f.Placements[key].State == directory.StateActive {

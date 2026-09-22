@@ -96,6 +96,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	}
 
 	metrics := telemetry.NewMetrics()
+	windows := telemetry.NewCollector()
 	slow := telemetry.NewSlowRing(cfg.Telemetry.Slow.RingSize, cfg.Telemetry.Slow.Threshold)
 	var accessOut *os.File
 	if cfg.Telemetry.AccessLog.Enabled {
@@ -117,7 +118,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	}
 
 	hcfg := proxy.Handler{
-		Domains: s3.NewDomains(cfg.Listener.Domains), Metrics: metrics, Access: access, Slow: slow,
+		Domains: s3.NewDomains(cfg.Listener.Domains), Metrics: metrics, Telemetry: windows, Access: access, Slow: slow,
 		IdleTimeout: cfg.Proxy.IdleTimeout, MetadataTimeout: cfg.Proxy.MetadataTimeout,
 		Via: "1.1 shunt/" + version, Log: log,
 	}
@@ -134,6 +135,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		}
 		defer registry.Close()
 		mem = m
+		m.Telemetry = windows
 		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir, hcfg.Stale = proxy.ModeResign, m.Keys(), registry, m, m.Stale
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
 		publishRouteState(metrics, m.Snapshot())
@@ -197,8 +199,10 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
+		telemetryStore := telemetry.NewStore(10 * time.Second)
+		telemetryStore.SetLocal("lab", windows)
 		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{},
-			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Ctx: ctx}
+			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx}
 		warnHeldSteps(log, dir.Snapshot())
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {

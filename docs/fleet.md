@@ -109,3 +109,10 @@ If a control node stops in the middle of a step, the keys that step moves keep a
 - **One datacenter per control plane.** Control nodes need a few milliseconds between them.
 - **Full snapshots.** Every change sends every member the whole directory; at hundreds of
   buckets that is kilobytes, at a million placements it is not. Deltas are deferred.
+- **Every control node reads every proxy heartbeat record once per second.** UI telemetry adds the
+  last completed 10-second window to that record, never a history. The dense payload test is
+  1,025,921 bytes at 6 operation classes × 4 series × 12 active clusters; at the 1,000-proxy design
+  target that artificial maximum is about 978 MiB/s of JSON read by **each** control node. Real
+  deployments must size this path from their active clusters and measured sparse payloads; the
+  supported request ceiling is 1 MiB, and the 60-minute history consists only of summaries in
+  each control node's memory.

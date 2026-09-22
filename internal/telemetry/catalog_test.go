@@ -56,6 +56,7 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	m.FleetMembers.WithLabelValues("live").Set(1)
 	m.FleetStale.Set(0)
 	m.FenceWait.Observe(0.01)
+	m.TelemetryMerge.Observe(0.001)
 	families, err := m.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -76,8 +77,8 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 			t.Logf("catalog row %s has no registered metric yet", name)
 		}
 	}
-	// POC-4's fifteen, plus POC-6's four for the fleet (ADR-0016).
-	if len(registered) != 19 {
-		t.Errorf("POC-6 registers exactly nineteen shunt_ metrics, got %d: %v", len(registered), registered)
+	// POC-4's fifteen, POC-6's four for the fleet, and UI-1's merge latency.
+	if len(registered) != 20 {
+		t.Errorf("UI-1 registers exactly twenty shunt_ metrics, got %d: %v", len(registered), registered)
 	}
 }

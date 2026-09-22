@@ -43,6 +43,14 @@ filesystem:
   confirmation token; `GET /v1/control` carries `last_compaction` and a join line; the route table
   is `docs/reference/control-routes.json`, generated from code. Operations run on the server's
   context, so a client that disconnects mid-step does not stop it.
+- **UI-1 done (2026-09-22):** proxies emit lazy HdrHistogram sketches and exact counters in
+  clock-aligned 10-second windows, carry the last completed window in their heartbeat, and control
+  nodes merge fleet, cluster and proxy p50/p90/p99/p99.9/max summaries into a 60-minute ring.
+  `GET /v1/telemetry/series` and `/v1/telemetry/latest` expose it and `GET /v1/events` announces
+  merged windows. Dense payload testing sets the documented ceiling at twelve clusters per proxy
+  (1,025,921 bytes below the 1 MiB heartbeat cap); the fleet-scale read cost is documented. `make
+  fleet` saw both proxies and both clusters and matched the verifier's client p99 within 6.51%
+  (26,559 us versus 24,831 us, under the 10% gate); build, lint, test and race are green.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

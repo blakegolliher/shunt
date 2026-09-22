@@ -230,6 +230,23 @@ done
 [ "$bad" = 0 ] || fail "$bad reads did not return the last acknowledged write"
 note "every key reads back, through both proxies, as its last acknowledged write"
 
+# Run the percentile comparison after the moving-key fence has settled. The alternating writer
+# above supplies proxy B and Garage scopes; this stable workload supplies an uncontaminated
+# client-versus-fleet window through proxy A and MinIO.
+if ! "$SHUNT" verify --endpoint "http://$A_LISTEN" --bucket fleet-a --access-key "$CLIENT_AK" --secret-ref "file:$WORK/secrets/client.secret" \
+  --workers 24 --keys 200 --duration 25s --interval 0 --cleanup --json-out verify-telemetry.json \
+  --telemetry-url "http://$C1_API" --telemetry-token-ref "file:$WORK/secrets/control.token" > verify-telemetry.log 2>&1; then
+  cat verify-telemetry.log
+  fail "verify telemetry cross-check failed"
+fi
+telemetry=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/telemetry/latest") || fail "GET /v1/telemetry/latest"
+jq -e '[.windows[].scope] as $s | ($s | index("proxy:proxy-a")) != null and ($s | index("proxy:proxy-b")) != null and
+       ($s | index("cluster:garage")) != null and ($s | index("cluster:minio")) != null and ($s | index("fleet")) != null' \
+  <<<"$telemetry" >/dev/null || fail "telemetry latest does not show two proxies, both clusters, and fleet"
+jq -e '.telemetry.within_tolerance == true and .latency_p50_us > 0 and .latency_p99_us >= .latency_p50_us' \
+  verify-telemetry.json >/dev/null || fail "verify JSON has no passing p50/p99 telemetry comparison"
+note "telemetry: two proxies, garage + minio, fleet; $(jq -r '"client p99 \(.telemetry.client_p99_us) us, fleet p99 \(.telemetry.fleet_p99_us) us, difference \(.telemetry.difference_percent)%"' verify-telemetry.json)"
+
 say "3. One control node dies, then two: quorum lost under a 256-worker workload on an ACTIVE bucket"
 stop c3
 sleep 2

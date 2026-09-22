@@ -12,6 +12,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 // The fleet (ADR-0016). The control plane keeps, per member proxy, the directory version it has
@@ -40,6 +41,9 @@ type Heartbeat struct {
 	// Host and Version say where the member runs and which build it is, for the fleet view.
 	Host    string `json:"host,omitempty"`
 	Version string `json:"version,omitempty"`
+	// Telemetry is the member's last completed 10-second window. It is re-sent until the next
+	// window closes, and the control node de-duplicates it by proxy and start time.
+	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
 }
 
 // HeartbeatAnswer tells a member the current version and its lease.
@@ -62,6 +66,7 @@ type Member struct {
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
 	Host          string             `json:"host,omitempty"`
 	Version       string             `json:"version,omitempty"` // the member's build
+	Telemetry     *telemetry.Window  `json:"telemetry,omitempty"`
 }
 
 // Fleet is the fleet table. Two implementations: the control plane's, on leased etcd keys
@@ -134,6 +139,9 @@ func (s *Server) PublishFleet(ctx context.Context) error {
 		return err
 	}
 	s.fleetEvents(ms)
+	if err := s.publishTelemetry(ms); err != nil {
+		return err
+	}
 	return nil
 }
 

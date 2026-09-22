@@ -27,6 +27,8 @@ func (s *Server) routes() []Route {
 		read("/v1/status", s.status, "status"),
 		read("/v1/directory", s.directoryHandler),
 		read("/v1/events", s.events),
+		read("/v1/telemetry/series", s.telemetrySeries),
+		read("/v1/telemetry/latest", s.telemetryLatest),
 		read("/v1/audit", s.audit),
 		read("/v1/fleet", s.fleetList, "proxy list"),
 		read("/v1/operations", s.listOperations),
