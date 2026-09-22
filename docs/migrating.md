@@ -184,8 +184,8 @@ The call waits out the window, then records the evidence on the placement (`cuto
 directory). Choose a window that covers your clients' read patterns. A bucket that is read once an
 hour needs an hour-long window, or a scripted read of its cold keys during a shorter one.
 
-**With several proxies** (ADR-0016), run every command against the control node: the proxy the
-others name in `control.endpoint`. Each step is in effect only once every member has installed
+**With several proxies** (ADR-0015, ADR-0016), run every command against the control plane
+(`--api` at any `shunt-control` node). Each step is in effect only once every member has installed
 it, and the command says so, or names the members it is still waiting on. A step that moves writes
 pauses the writes of the keys it moves (503 with `Retry-After`, retried by every SDK) for a couple
 of heartbeats while it reaches every member. The cutover window counts fallback reads on every

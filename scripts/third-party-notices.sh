@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regenerates the second half of THIRD_PARTY_NOTICES: the license and NOTICE text of every module
-# linked into bin/shunt, from `go-licenses report ./cmd/shunt`. The first half, code copied into
+# Regenerates the generated half of THIRD_PARTY_NOTICES: the license and NOTICE text of every module
+# linked into bin/shunt and, in a second section, into bin/shunt-control (which carries the etcd
+# tree the proxy must not, ADR-0015), from `go-licenses report`. The first half, code copied into
 # this repository (CLAUDE.md lift procedure), is maintained by hand above the marker and kept as is.
 # Test-tree programs (test/s3diff, test/bench) are not shipped and not listed.
 #
@@ -14,40 +15,54 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 awk -v m="$marker" '$0 == m { exit } { print }' "$out" > "$tmp/head"
-"$GO_LICENSES" report ./cmd/shunt 2> "$tmp/report.err" | sort > "$tmp/report.csv" || { cat "$tmp/report.err" >&2; exit 1; }
 
-# For each reported package, the nearest LICENSE* above its source directory, and any NOTICE* beside it.
-: > "$tmp/files"
-while IFS=, read -r pkg _ license; do
-  case "$pkg" in github.com/blakegolliher/shunt*) continue ;; esac
-  # go-licenses names a package or, when a module has no package at its root, the module.
-  dir=$("$GO" list -f '{{.Dir}}' "$pkg" 2>/dev/null || "$GO" list -m -f '{{.Dir}}' "$pkg")
-  while [ -n "$dir" ] && [ "$dir" != / ]; do
-    lic=$(find "$dir" -maxdepth 1 -type f \( -name 'LICENSE*' -o -name 'COPYING*' \) | sort | head -n 1)
-    if [ -n "$lic" ]; then
-      printf '%s\t%s\t%s\n' "$pkg" "$license" "$lic" >> "$tmp/files"
-      find "$dir" -maxdepth 1 -type f -name 'NOTICE*' | sort | while read -r n; do printf '%s\t%s\t%s\n' "$pkg" NOTICE "$n" >> "$tmp/files"; done
-      break
-    fi
-    dir=$(dirname "$dir")
-  done
-done < "$tmp/report.csv"
+# report <pkg> <csv-out> <files-out>: every module the package links, and the LICENSE/NOTICE files.
+report() {
+  "$GO_LICENSES" report "$1" 2> "$tmp/report.err" | sort > "$2" || { cat "$tmp/report.err" >&2; exit 1; }
+  : > "$3"
+  while IFS=, read -r pkg _ license; do
+    case "$pkg" in github.com/blakegolliher/shunt*) continue ;; esac
+    # go-licenses names a package or, when a module has no package at its root, the module.
+    dir=$("$GO" list -f '{{.Dir}}' "$pkg" 2>/dev/null || "$GO" list -m -f '{{.Dir}}' "$pkg")
+    while [ -n "$dir" ] && [ "$dir" != / ]; do
+      lic=$(find "$dir" -maxdepth 1 -type f \( -name 'LICENSE*' -o -name 'COPYING*' \) | sort | head -n 1)
+      if [ -n "$lic" ]; then
+        printf '%s\t%s\t%s\n' "$pkg" "$license" "$lic" >> "$3"
+        find "$dir" -maxdepth 1 -type f -name 'NOTICE*' | sort | while read -r n; do printf '%s\t%s\t%s\n' "$pkg" NOTICE "$n" >> "$3"; done
+        break
+      fi
+      dir=$(dirname "$dir")
+    done
+  done < "$2"
+}
 
-{
-  sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp/head"
+# section <binary> <csv> <files>: one generated section.
+section() {
   echo
-  echo "$marker"
+  echo "Every module linked into $1, with its license, from go-licenses report:"
   echo
-  echo "Every module linked into bin/shunt, with its license, from go-licenses report ./cmd/shunt:"
-  echo
-  sed 's/^/  /' "$tmp/report.csv"
-  sort -u -t$'\t' -k3,3 "$tmp/files" | sort -t$'\t' -k1,1 -k2,2 | while IFS=$'\t' read -r pkg kind file; do
+  sed 's/^/  /' "$2"
+  sort -u -t$'\t' -k3,3 "$3" | sort -t$'\t' -k1,1 -k2,2 | while IFS=$'\t' read -r pkg kind file; do
     echo
     echo "--------------------------------------------------------------------------------"
     echo "$pkg ($kind): ${file#"$("$GO" env GOMODCACHE)/"}"
     echo "--------------------------------------------------------------------------------"
     cat "$file"
   done
+}
+
+report ./cmd/shunt "$tmp/shunt.csv" "$tmp/shunt.files"
+report ./cmd/shunt-control "$tmp/control.csv" "$tmp/control.files"
+if grep -q 'go.etcd.io' "$tmp/shunt.csv"; then echo "bin/shunt links etcd; the proxy must not (ADR-0015)" >&2; exit 1; fi
+
+{
+  sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp/head"
+  echo
+  echo "$marker"
+  section bin/shunt "$tmp/shunt.csv" "$tmp/shunt.files"
+  echo
+  echo "==================== MODULES LINKED INTO bin/shunt-control (the control plane; etcd and its tree live here only, ADR-0015) ===================="
+  section bin/shunt-control "$tmp/control.csv" "$tmp/control.files"
 } > "$tmp/new"
 mv "$tmp/new" "$out"
-echo "THIRD_PARTY_NOTICES: $(grep -c . "$tmp/report.csv") packages, $(sort -u -t$'\t' -k3,3 "$tmp/files" | wc -l) license and notice files"
+echo "THIRD_PARTY_NOTICES: bin/shunt $(grep -c . "$tmp/shunt.csv") packages, bin/shunt-control $(grep -c . "$tmp/control.csv") packages"

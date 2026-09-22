@@ -96,6 +96,18 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
+// Authorize wraps another handler in the control API's authentication, for routes a control node
+// serves beside /v1/ under the same token (internal/cp).
+func (s *Server) Authorize(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <token>, or a loopback peer when no token is configured")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) authorized(r *http.Request) bool {
 	if s.Token != "" {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -162,6 +174,12 @@ type refusal struct{ msg string }
 func (r *refusal) Error() string { return r.msg }
 
 func refuse(format string, a ...any) error { return &refusal{msg: fmt.Sprintf(format, a...)} }
+
+// Refuse is a refusal a Fleet or Store implementation answers with: 409 and the reason.
+func Refuse(format string, a ...any) error { return refuse(format, a...) }
+
+// NotFound is a 404 a Fleet or Store implementation answers with.
+func NotFound(format string, a ...any) error { return notFound(format, a...) }
 
 // missing is a 404 in its own words: it answers as directory.ErrNotFound without carrying the
 // directory's prefix into a message about something else, such as a client key.
@@ -304,6 +322,12 @@ func (s *Server) placementStatus(key string, p directory.Placement) PlacementSta
 	return ps
 }
 
+// Counters reads a counter vector's series for one bucket without creating any, keyed by the
+// value of label (or "" when label is empty): what a member proxy reports in its heartbeat.
+func Counters(vec *prometheus.CounterVec, bucket, label string) map[string]float64 {
+	return counters(vec, bucket, label)
+}
+
 // counters reads a counter vector's series for one bucket without creating any, keyed by the
 // value of label (or "" when label is empty).
 func counters(vec *prometheus.CounterVec, bucket, label string) map[string]float64 {
@@ -428,7 +452,7 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	if req.Cluster.Region == "" {
 		req.Cluster.Region = regionFor(req.Cluster.Endpoints)
 	}
-	msg, server := s.checkCredentials(r.Context(), req.Name, req.Cluster)
+	msg, server := s.checkCredentials(r.Context(), req.Name, req.Cluster, req.Secret)
 	if msg != "" {
 		discard()
 		writeError(w, http.StatusConflict, "refused", msg)
@@ -547,13 +571,13 @@ func lostWriteWindow(key, cluster string) error {
 // the mover: an access key from one credential set and a secret from another. Anything short of a
 // signature or unknown-key answer passes: a key may be allowed its buckets without ListBuckets.
 // An invalid definition returns "" and is refused by the directory write that follows.
-func (s *Server) checkCredentials(ctx context.Context, name string, c config.Cluster) (refusal, server string) {
+func (s *Server) checkCredentials(ctx context.Context, name string, c config.Cluster, secret string) (refusal, server string) {
 	defs := map[string]config.Cluster{name: c}
 	config.ApplyClusterDefaults(defs)
 	if config.ValidateClusters("clusters", defs) != nil {
 		return "", ""
 	}
-	cl, err := s.Clusters.Build(name, defs[name])
+	cl, err := s.Clusters.BuildWith(name, defs[name], secret)
 	if err != nil {
 		return "the proxy cannot use this cluster: " + err.Error(), ""
 	}

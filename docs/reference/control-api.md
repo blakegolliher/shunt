@@ -1,6 +1,6 @@
 # Control API
 
-shunt's operator verbs (`shunt cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `proxy`) are clients of this API. It is served under `/v1/` on the **admin listener** (`admin.address`, default `127.0.0.1:9900`), next to `/-/metrics`. ADR-0008 records the decision. P3c serves the same routes from `shunt-control`, so the CLI and anything scripted against it keep working.
+shunt's operator verbs (`shunt cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `proxy`) are clients of this API. A fleet's control plane, `shunt-control`, serves it on every control node (`--api`, default `127.0.0.1:9901`; ADR-0015); a single-node lab proxy serves it itself under `/v1/` on its **admin listener** (`admin.address`, default `127.0.0.1:9900`), next to `/-/metrics` (ADR-0008). The routes and the CLI are the same on both.
 
 ## Authentication
 
@@ -192,20 +192,41 @@ The last four are only present with fleet members (ADR-0016): `held`, the step w
 
 ## The fleet
 
-Several proxies can serve one directory file (ADR-0016). One is the **control node**: the proxy these routes are called on. The others are **members**: their config names the control node in `control.endpoint`, they send it a heartbeat, and their own `/v1/` refuses every mutation with 409, naming the control node. A proxy without `control.endpoint` is its own control node with no members, which is what `shunt serve --plaintext` and every single-proxy lab run.
+Several proxies serve one directory when a control plane holds it: `shunt-control`, three nodes (one for a lab) with the directory in embedded etcd (ADR-0015). Every route above is served by every control node; the CLI's `--api` may point at any of them. A proxy whose config names them in `control.endpoints` is a **member**: it takes its directory, client keys and cluster secrets from `GET /v1/directory`, forwards bucket creation, sends a heartbeat, and serves no `/v1/` of its own. A proxy without `control.endpoints` is a single-node lab with the file backend, whose in-process API serves the routes above from the file and takes no members. How to run a fleet: docs/fleet.md; the control nodes: docs/how-to/run-shunt-control.md.
 
-- **Fenced changes** (`ramp`, `migrate`, `cutover`; `finish` and `purge-source` wait too) first wait until every live member has the current version, and are refused with the ids they are waiting on if one does not within `wait`. A bucket's **first** step waits for every member, live or not, because one cut off before it would still write every key to the source; `DELETE /v1/fleet/{id}` removes a member that is gone for good.
+- **Fenced changes** (`ramp`, `migrate`, `cutover`; `finish` and `purge-source` wait too) first wait until every live member has the current version, and are refused with the ids they are waiting on if one does not within `wait`. A bucket's **first** step waits for every member, live or not, because one cut off before it would still write every key to the source; `DELETE /v1/fleet/{id}` removes a member that is gone for good (ADR-0016).
 - **The hold.** With members, a step that moves writes to the new primary is written twice: once as `ramp.hold`, where the keys it moves answer writes with `503` + `Retry-After: 1`, and again as the step itself once every member has the hold. If the hold does not reach every member within `wait`, it is released and the call is refused: nothing changed.
-- **Stale mode.** A member whose last acknowledged heartbeat is older than `control.lease_ttl` refuses writes and deletes on buckets that are not `ACTIVE` with `503` + `Retry-After: 1`, reads every key of such a bucket target-first-then-source (it may have missed a step), and serves everything else. A heartbeat renews the lease only once the member has installed the version the control node answered with. Its `/-/healthz` stays 200: a control-node outage must not drain the fleet. `/-/fleet` on a member reports `{"id", "control_node", "stale", "last_ack", "applied"}`.
+- **Stale mode.** A member whose last acknowledged heartbeat is older than `control.lease_ttl` refuses writes and deletes on buckets that are not `ACTIVE` with `503` + `Retry-After: 1`, reads every key of such a bucket target-first-then-source (it may have missed a step), and serves everything else, ACTIVE buckets included. A heartbeat renews the lease only once the member has installed the version the control plane answered with. Its `/-/healthz` stays 200: a control-plane outage must not drain the fleet. `/-/fleet` on a member reports `{"id", "control_node", "stale", "last_ack", "applied"}`.
+- **Quorum loss.** With a minority of control nodes up, no route that writes answers (503 `unavailable`), heartbeats are not answered, so every member goes stale within `lease_ttl`; reads and writes on ACTIVE buckets continue on every proxy. Quorum back, everything resumes with no operator action.
+
+### `GET /v1/directory?since=<version>&wait=<duration>`
+
+The whole directory once it is newer than `since`, or 304 when `wait` runs out first (default 0: answer at once). A member long-polls it. The answer is the directory file's shape (`version`, `clusters`, `tenants`, `placements`) plus `credentials` (`[{"access_key", "secret", "tenant", "buckets"}]`, every client key) and `secrets` (`{"control:<cluster>": "<secret>"}`, the cluster secrets the control plane stores). It carries secrets, which is why the control channel must say `plaintext: true` while TLS for it is deferred (ADR-0015).
+
+### `POST /v1/placements/{tenant}/{bucket}/create`, `DELETE /v1/placements/{tenant}/{bucket}`
+
+A member's S3 `CreateBucket` and `DeleteBucket`, forwarded: `{"cluster", "name", "actor"}` claims the placement row under the backend name (the member then creates the backend bucket itself, as a lab proxy does), and the delete removes an ACTIVE row. Both answer `{"key", "version"}`; the member installs that version before it answers its client.
 
 ### `POST /v1/fleet/{id}/heartbeat`
 
-Sent by a member every `control.heartbeat_interval`: `{"started", "applied", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only. The first one from an id makes it a member, recorded in `<directory file>.fleet.yaml` (ids only) so membership survives a control-node restart. Answers `{"version", "lease_ttl"}`; a member whose version is behind reloads the directory at once.
+Sent by a member every `control.heartbeat_interval`: `{"started", "seq", "applied", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only. The first one from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"version", "lease_ttl"}`; a member whose version is behind fetches the directory at once.
 
 ### `GET /v1/fleet`
 
-`{"version", "lease_ttl", "members": [{"id", "live", "applied", "started", "seen", "fallback_reads"}]}`. A member is `live` while its last heartbeat is within `lease_ttl` + 5 s. `shunt proxy list`.
+`{"version", "members": [{"id", "live", "applied", "seq", "started", "seen", "since_seen", "fallback_reads"}]}`. `live`: the lease has not expired. `shunt proxy list`.
 
 ### `DELETE /v1/fleet/{id}`
 
-Forgets a member that is gone for good. Refused while it is live: a running proxy re-joins on its next heartbeat. `shunt proxy forget <id>`.
+Forgets a member that is gone for good. Refused while its lease is live: a running proxy re-joins on its next heartbeat. `shunt proxy forget <id>`.
+
+## The control plane's own routes
+
+Served by `shunt-control` only, under the same token, for its own lifecycle; the `shunt-control` verbs are their clients.
+
+| Route | Verb | Does |
+|---|---|---|
+| `GET /v1/control/status` | `status`, `member list` | `{"node", "version", "cluster": {"members": [{"name", "id", "peer_urls", "leader", "started"}], "quorum", "started", "has_quorum", "revision", "db_bytes", "db_in_use_bytes", "quota_bytes", "leader"}, "fleet": [...], "directory": <version>}` |
+| `POST /v1/control/members` | `join` | `{"name", "peer_url"}` adds a member and answers `{"initial_cluster", "encryption_key"}`: what the new node starts with. The key crosses the channel here |
+| `DELETE /v1/control/members/{name}` | `member remove` | Removes a member; the only member is refused |
+| `GET /v1/control/snapshot` | `snapshot save` | Streams a point-in-time snapshot of the store (secrets sealed) |
+| `POST /v1/control/defrag` | `defrag` | Compacts this node's database file in place |

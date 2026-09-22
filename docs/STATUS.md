@@ -18,24 +18,31 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 ## The `distributed` branch
 
 This branch carries everything past POC-5; `master` keeps what is done and tagged. Two bodies of
-work were merged into one path on 2026-09-17:
+work were merged into one path on 2026-09-17, and P3c was pulled ahead of POC-6 items 4–5 on
+2026-09-21 because multi-host is what is required and nothing in shunt may rely on a shared
+filesystem:
 
 - `docs/POC-6.md` — migration correctness hardening. Items 1, 2 and 3 done in code (ADR-0013
   conditional writes, ADR-0014 cross-cluster copy, ADR-0016 the version fence); items 4, 5 and the
   trailing items specified.
+- **P3c-1 done (ADR-0015 accepted, 2026-09-22):** `shunt-control`, the second binary, embeds etcd;
+  three nodes form a cluster (`init`, `join`, `member`, `snapshot`, `defrag`, `status`); the
+  directory, client keys and cluster secrets (sealed at rest) live in it, every change one
+  compare-and-swap transaction; proxies are members (`control.endpoints`) that take everything
+  from it, cache it locally, forward bucket creation, heartbeat, and share nothing with each other.
+  The fence of ADR-0016 runs on leased etcd keys. TLS for the control channel is deferred and the
+  channel says `plaintext` for it. `bin/shunt` links no etcd (`make build` proves it). Docs:
+  docs/fleet.md, docs/how-to/run-shunt-control.md, docs/runbooks/, docs/explanation/why-no-objects-table.md.
+- `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
+  left of the fleet-scale form: movers as workers, fleet decisions, the web UI, and the P3c-2
+  deferrals (deltas, object-storage bootstrap and audit export, TLS, the browser-client API).
 
 **Guards on this branch.** `make readme-demo` runs the README's hand-run demo, steps 1 to 14,
-unattended, and fails on any count or transcript line the README states that comes out different;
-it runs in CI next to `make walkthrough`. `make fleet` runs two real proxies over one directory
-(ADR-0016). All three are green on the fence build (2026-09-21), and the README demo's output is
-unchanged from before the fence: a single proxy has no members, so nothing is held or waited on.
-- `docs/design/distributed.md` (§12 of the design) + `docs/adr/0015-embedded-etcd.md` +
-  `docs/prompts/P3c.md`, `P3d.md`, `P3e.md` — the fleet-scale form: `shunt-control` on embedded
-  etcd, the version fence, two-phase ramp, stale mode, movers as workers, web UI.
-
-Order: **POC-6 → P3c → P3d → P3e**. §1.5 of the design (Postgres control plane) and the P3c prompt in
-§7 are marked superseded in place. ADR-0015 is proposed, not accepted; no etcd dependency exists yet
-and `docs/deps.md` gains its lines in P3c.
+unattended; `make walkthrough` the operator walkthrough; `make fleet` three control nodes and two
+proxies with quorum loss and a cache restart; `internal/proxy/fleet_property_test.go` the client's
+view across a lagging, then partitioned, member over a real control plane, with a negative control
+that must fail. All run in CI. The README demo's output is unchanged: a single proxy has no
+control plane, no members, and nothing held or waited on.
 
 ## What exists
 
@@ -239,6 +246,7 @@ The one failure was operator-side, and the product made it hard to see. The move
 - **Bucket logging, replication, inventory, analytics, and notification answer 501** in resign mode: their configurations name buckets as ARNs and carry per-backend account ids.
 - **Bucket policy passes through unrewritten**, so an ARN in a policy body can name the backend bucket (docs/reference/backend-compat.md).
 - **Vendor identity is deliberately not hidden** (decision of 2026-09-15): `Server`, `X-Minio-*`, `X-Vast-*`, `<HostId>`, Garage's `<Region>`, GetBucketLocation, and backend owner ids reach clients. shunt hides which cluster and which bucket name, not which kind of backend.
+- **Resolved on `distributed` (ADR-0015): a fleet member has no directory file; CreateBucket and DeleteBucket go to the control plane.** Kept for `master`:
 - **The directory file must be writable for CreateBucket and DeleteBucket.** On Kubernetes a ConfigMap is mounted read-only, so those answer 503 until P3c. Several proxies converge only within `directory.poll_interval` (default 1 s), so a bucket created on one is `NoSuchBucket` on another until then; ADR-0004 in POC-4 accounts for it.
 - Credentials file inline secrets; encrypted at rest is P3c.
 - Garage 2.3.0 rejects signed trailers directly; through shunt they work because shunt verifies them and forwards an unsigned trailer.

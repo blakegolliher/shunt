@@ -36,8 +36,10 @@ make all            # build, lint, tests, -race, fuzz
 | `shunt tenant set-default <cluster>` | Where new buckets are created |
 | `shunt status [bucket]` | Clusters, moving buckets, write split, fallback reads, mover progress |
 | `shunt step-out` | Check whether clients could use their cluster directly again, with shunt gone |
+| `shunt proxy list` / `forget <id>` | With several proxies: which have each change, which are silent, and forgetting one that is gone |
+| `shunt-control init` / `join` / `status` | The control plane a fleet of proxies runs on ([docs/how-to/run-shunt-control.md](docs/how-to/run-shunt-control.md)) |
 
-Every command answers `--help`. A bucket is named bare (`demo-source`). `tenant/bucket` is only needed when one shunt serves several tenants. For production (TLS, tokens), run `shunt serve --config shunt.yaml` ([docs/reference/config.md](docs/reference/config.md)).
+Every command answers `--help`. A bucket is named bare (`demo-source`). `tenant/bucket` is only needed when one shunt serves several tenants. For production (TLS, tokens), run `shunt serve --config shunt.yaml` ([docs/reference/config.md](docs/reference/config.md)). Several proxies on several hosts take their directory from `shunt-control`, the control plane, and share nothing with each other: [docs/fleet.md](docs/fleet.md).
 
 ---
 

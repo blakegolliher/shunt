@@ -105,7 +105,7 @@ func withdrawName(condDelete bool) string {
 // that ignores If-None-Match: * is refused unless acceptLoss, with the message shunt migrate start
 // gives: the check lives in both, because the mover can also run on a placement RAMPING at ratio 1,
 // which migrate start never saw. Any refusal stops the whole run before a byte is copied.
-func selectPlacements(dir *directory.File, one, from string, acceptLoss bool) ([]job, error) {
+func selectPlacements(dir *directory.File, secrets map[string]string, one, from string, acceptLoss bool) ([]job, error) {
 	clients := map[string]*s3.Client{}
 	client := func(name string) (*s3.Client, error) {
 		if c, ok := clients[name]; ok {
@@ -115,9 +115,14 @@ func selectPlacements(dir *directory.File, one, from string, acceptLoss bool) ([
 		if !ok {
 			return nil, fmt.Errorf("cluster %q is not configured", name)
 		}
-		secret, err := config.ResolveSecret(cc.Credentials.SecretRef)
-		if err != nil {
-			return nil, fmt.Errorf("cluster %s: %w", name, err)
+		// A control: secret came with the placement from the control plane (ADR-0015); the
+		// others resolve on this host, as they do for shunt serve.
+		secret, ok := secrets[cc.Credentials.SecretRef]
+		if !ok {
+			var err error
+			if secret, err = config.ResolveSecret(cc.Credentials.SecretRef); err != nil {
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
+			}
 		}
 		c := s3.NewFromConfig(aws.Config{
 			Region:                     cc.Region,

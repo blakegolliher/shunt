@@ -22,6 +22,12 @@ Two reconciliations were made when this section landed in the repo, both recorde
   a stale read, not a split write. The hold in §12.6 closes both, and with it `Decide`'s
   "source only" read stays correct unchanged.
 
+**P3c-1 (2026-09-22) built §12.3, §12.4, §12.5 and §12.7 in their first form** (ADR-0015 accepted with
+amendments: no etcd client port, a directory version key rather than the revision, a membership
+record beside the lease, sealed secrets, full snapshots, TLS deferred). What remains of §12 is P3d
+(movers as workers, fleet decisions), P3e (the web UI), and a P3c-2 for deltas, the object-storage
+bootstrap and audit export, and TLS.
+
 ## 12.1 Goals
 
 - Any number of proxies (design target: 1000 in one datacenter) served by one control plane.

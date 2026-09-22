@@ -45,9 +45,12 @@ all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 check-tls-verify: ## fail if any committed config or make target disables TLS verification (POC-3 preflight)
 	@scripts/check-tls-verify.sh
 
-build: ## compile ./cmd/shunt into ./bin/shunt
+build: ## compile ./cmd/shunt into ./bin/shunt and ./cmd/shunt-control into ./bin/shunt-control
 	@mkdir -p $(BIN)
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/shunt ./cmd/shunt
+	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/shunt-control ./cmd/shunt-control
+	@# bin/shunt links no etcd (ADR-0015): the control plane's dependency tree stays in shunt-control.
+	@if $(GO) version -m $(BIN)/shunt | grep -q 'go.etcd.io'; then echo 'bin/shunt links etcd; the proxy must not (ADR-0015)'; exit 1; fi
 
 test: ## unit tests
 	$(GO) test $(PKGS)
@@ -215,7 +218,7 @@ walkthrough: build ## POC-5: the operator walkthrough, unattended, e2e Garage (a
 readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cluster A) -> MinIO (as cluster B); needs make e2e-up
 	$(E2E_DIR)/readme-demo.sh $(README_DEMO_ARGS)
 
-fleet: build ## POC-6 item 3: two proxies over one directory, fence, hold, stale mode (ADR-0016); needs make e2e-up
+fleet: build ## P3c: three shunt-control nodes and two proxies sharing nothing: the fence, quorum loss, a cache restart (ADR-0015, ADR-0016); needs make e2e-up
 	$(E2E_DIR)/fleet.sh $(FLEET_ARGS)
 
 run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster at VAST_ENDPOINT (foreground)

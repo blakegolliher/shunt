@@ -73,6 +73,9 @@ func (s *Server) settle(r *http.Request, res *TransitionResult, v int64, wait ti
 // precondition refuses a fenced change while the fleet has not installed the current version: the
 // previous change is not in effect everywhere, and the next step must start from one that is.
 func (s *Server) precondition(r *http.Request, strict bool, wait time.Duration) error {
+	if err := s.Dir.Sync(r.Context()); err != nil {
+		return err
+	}
 	v := s.Dir.Snapshot().Version()
 	waiting, err := s.fenceRound(r.Context(), v, strict, wait)
 	if err != nil {
@@ -99,6 +102,9 @@ func (s *Server) fencedStep(r *http.Request, key string, t directory.Transition,
 	// step starts from what the previous one left.
 	unlock := s.lockStep(key)
 	defer unlock()
+	if err := s.Dir.Sync(r.Context()); err != nil {
+		return TransitionResult{}, err
+	}
 	f := s.Dir.Snapshot().File()
 	p, ok := f.Placements[key]
 	if !ok {

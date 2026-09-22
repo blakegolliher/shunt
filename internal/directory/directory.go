@@ -204,6 +204,9 @@ type Directory interface {
 // (ADR-0008). FileDir for a single-node lab; internal/cp for a fleet.
 type Store interface {
 	Directory
+	// Sync makes this instance's Snapshot current with the store before a decision is taken on
+	// it: a reload of the file, or a linearizable read of the version in etcd and a wait for it.
+	Sync(ctx context.Context) error
 	// SetState applies a transition if the placement is still in state from.
 	SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error
 	// Adopt takes over an existing backend bucket as an ACTIVE placement.

@@ -77,3 +77,34 @@ A stale member refuses writes only on buckets it knows are moving. A member cut 
   - `internal/proxy`: stale mode and held writes;
   - `internal/proxy/fleet_property_test.go`: two proxies over one directory file, B reloading 60 ms behind A and a member through the real `Membership` code, clients owning disjoint keys and writing, deleting and reading each through A or B at random across seven ramp steps and `migrate start`, with B partitioned from the control node for one step. Every read must return the last acknowledged write. Its negative control runs the same steps straight into the directory, without the fence, and must find a violation, and it finds about 20 per run. 10 runs of each: the fenced run held 0 violations in about 264,000 operations, and the unfenced run failed 10 of 10;
   - `test/e2e/fleet.sh`: two real proxies, with one paused by SIGSTOP.
+
+## Amendment (P3c-1, 2026-09-22): the fleet moved onto the control plane
+
+The first implementation kept the fleet table in the control proxy's memory with a membership
+file beside the directory file, and members read that directory file directly. That made a
+multi-host fleet depend on a shared filesystem, which shunt must never do. P3c-1 (ADR-0015)
+moved it:
+
+- **The control node is `shunt-control`**, not a proxy. Members name the control nodes in
+  `control.endpoints`; a proxy serves no operator API of its own in a fleet. The lab proxy's
+  in-process API remains for single-node use and takes no members (`control.NoFleet`).
+- **The fleet table is in etcd:** a persistent record per member (`/shunt/fleet/members/<id>`,
+  written by the first heartbeat, removed by `shunt proxy forget`) and a leased key per heartbeat
+  (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Membership outlives the lease, as this ADR
+  requires, and any control node serves any member's heartbeat.
+- **A member's directory, client keys and cluster secrets come from `GET /v1/directory`**, long
+  polled, and are kept in the member's own `cache_dir` for a restart with the control plane down.
+  `CreateBucket` and `DeleteBucket` through a member are forwarded to the control plane.
+- **The lease renews only once the member has installed the answered version** and a stale member
+  reads moving buckets target-first, as the review of the first implementation found necessary;
+  both carried over unchanged into `internal/member`.
+- **A fenced change syncs the control node's copy first** (`Store.Sync`): a node whose watch lags
+  another node's write takes its decision on the current directory, not its last one.
+- **Everything the fleet property test and `make fleet` proved before, they prove again** over a
+  real control plane: 0 violations in about 29,000 operations with the fence and a negative
+  control that fails without it; three control nodes and two proxies, with quorum lost under a
+  256-worker workload on an ACTIVE bucket at zero errors, a proxy restarted with the control plane
+  down serving from its cache, and the hold, the strict first step and forget as before.
+- **The gap left:** a brand-new member that cannot reach the control plane at startup starts stale
+  and unregistered, so a bucket's first step does not wait for it until it registers. A restarted
+  member is unaffected, since its id is already a member.

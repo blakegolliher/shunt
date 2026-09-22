@@ -52,6 +52,7 @@ func newMigrateRun() *cobra.Command {
 				}
 			}
 			dir := &directory.File{Clusters: map[string]config.Cluster{}, Placements: map[string]directory.Placement{}}
+			secrets := map[string]string{}
 			for _, key := range keys {
 				path, perr := placementPath(key)
 				if perr != nil {
@@ -63,6 +64,7 @@ func newMigrateRun() *cobra.Command {
 				}
 				dir.Placements[d.Key] = d.Placement
 				maps.Copy(dir.Clusters, d.Clusters)
+				maps.Copy(secrets, d.Secrets)
 			}
 			one := ""
 			if len(args) == 1 {
@@ -70,7 +72,7 @@ func newMigrateRun() *cobra.Command {
 					return err
 				}
 			}
-			jobs, err := selectPlacements(dir, one, from, accept)
+			jobs, err := selectPlacements(dir, secrets, one, from, accept)
 			if err != nil {
 				return err
 			}

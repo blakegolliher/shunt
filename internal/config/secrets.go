@@ -32,6 +32,8 @@ func ResolveSecret(ref string) (string, error) {
 			return "", fmt.Errorf("%w %q: file is empty", errSecretRef, ref)
 		}
 		return v, nil
+	case strings.HasPrefix(ref, "control:"):
+		return "", fmt.Errorf("%w %q: a control: secret is held by the control plane (shunt-control) and reaches a proxy with its directory; this process is neither", errSecretRef, ref)
 	}
 	return "", fmt.Errorf("%w %q: must start with env or file prefix", errSecretRef, ref)
 }

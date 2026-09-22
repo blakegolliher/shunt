@@ -298,8 +298,8 @@ func validateClusters(e *errs, prefix string, clusters map[string]Cluster) {
 		}
 		if ref := cl.Credentials.SecretRef; ref == "" {
 			e.add(k+".credentials.secret_ref", "required (env:NAME or file:/path)")
-		} else if !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") {
-			e.add(k+".credentials.secret_ref", "%q must start with env: or file:", ref)
+		} else if !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "file:") && !strings.HasPrefix(ref, "control:") {
+			e.add(k+".credentials.secret_ref", "%q must start with env:, file:, or control: (a secret the control plane stores, ADR-0015)", ref)
 		}
 		if cl.StorageClasses != "" {
 			e.oneOf(k+".storage_classes", cl.StorageClasses, storageClasses)

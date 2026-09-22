@@ -193,156 +193,55 @@ func (d *FileDir) Reload() (bool, error) {
 	return true, nil
 }
 
+// Sync implements Store: a reload.
+func (d *FileDir) Sync(context.Context) error {
+	_, err := d.Reload()
+	return err
+}
+
 // Create implements Directory.
 func (d *FileDir) Create(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
-	k := Key(tenant, bucket)
-	return d.mutate(ctx, actor, "create", k, func(f *File) error {
-		if _, ok := f.Placements[k]; ok {
-			return ErrExists
-		}
-		if _, ok := f.Tenants[tenant]; !ok {
-			return fmt.Errorf("%w: tenant %q is not in the directory", ErrNotFound, tenant)
-		}
-		f.Placements[k] = Placement{
-			State: StateActive, Primary: cluster, Names: map[string]string{cluster: backend},
-			Created: d.now().UTC().Truncate(time.Millisecond),
-		}
-		return nil
-	})
+	return d.mutate(ctx, actor, "create", Key(tenant, bucket), func(f *File) error { return f.Create(tenant, bucket, cluster, backend, d.now()) })
 }
 
 // Delete implements Directory.
 func (d *FileDir) Delete(ctx context.Context, tenant, bucket, actor string) error {
-	k := Key(tenant, bucket)
-	return d.mutate(ctx, actor, "delete", k, func(f *File) error {
-		p, ok := f.Placements[k]
-		if !ok {
-			return ErrNotFound
-		}
-		if p.State != StateActive {
-			return fmt.Errorf("%w: %s is %s; only an ACTIVE placement can be deleted", ErrConflict, k, p.State)
-		}
-		delete(f.Placements, k)
-		return nil
-	})
+	return d.mutate(ctx, actor, "delete", Key(tenant, bucket), func(f *File) error { return f.Delete(tenant, bucket) })
 }
 
-// SetTenantDefault repoints a tenant's default cluster: the cluster its next CreateBucket lands on.
-// It is not part of the Directory seam — the proxy never changes it — but an operator needs it when
-// a cluster is being retired, or every new bucket keeps landing on the machine being switched off.
+// SetTenantDefault implements Store.
 func (d *FileDir) SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error {
-	return d.mutate(ctx, actor, "set-default", tenant, func(f *File) error {
-		t, ok := f.Tenants[tenant]
-		if !ok {
-			return fmt.Errorf("%w: tenant %q is not in the directory", ErrNotFound, tenant)
-		}
-		if _, ok := f.Clusters[cluster]; !ok {
-			return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, cluster)
-		}
-		if t.DefaultCluster == cluster {
-			return fmt.Errorf("%w: %s already defaults to %s", ErrConflict, tenant, cluster)
-		}
-		t.DefaultCluster = cluster
-		f.Tenants[tenant] = t
-		return nil
-	})
+	return d.mutate(ctx, actor, "set-default", tenant, func(f *File) error { return f.SetTenantDefault(tenant, cluster) })
 }
 
-// SetState implements Directory.
+// SetState implements Store.
 func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error {
-	k := Key(tenant, bucket)
-	return d.mutate(ctx, actor, "set-state", k, func(f *File) error {
-		p, ok := f.Placements[k]
-		if !ok {
-			return ErrNotFound
-		}
-		if p.State != from {
-			return fmt.Errorf("%w: %s is %s on disk, expected %s", ErrConflict, k, p.State, from)
-		}
-		np, err := Apply(p, t)
-		if err != nil {
-			return err
-		}
-		f.Placements[k] = np
-		return nil
-	})
+	return d.mutate(ctx, actor, "set-state", Key(tenant, bucket), func(f *File) error { return f.SetState(tenant, bucket, from, t) })
 }
 
-// PutCluster adds a cluster, or replaces its definition. The proxy's Prepare hook builds it (and
-// resolves its secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused.
+// PutCluster implements Store. The proxy's Prepare hook builds the cluster (and resolves its
+// secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused. The
+// directory file carries only refs: a secret is refused.
 func (d *FileDir) PutCluster(ctx context.Context, name string, c config.Cluster, secret, actor string) error {
 	if secret != "" {
 		return ErrSecretInline
 	}
-	return d.mutate(ctx, actor, "cluster-put", clusterKey(name), func(f *File) error {
-		if f.Clusters == nil {
-			f.Clusters = map[string]config.Cluster{}
-		}
-		f.Clusters[name] = c
-		config.ApplyClusterDefaults(f.Clusters)
-		return nil
-	})
+	return d.mutate(ctx, actor, "cluster-put", clusterKey(name), func(f *File) error { f.PutCluster(name, c); return nil })
 }
 
-// RemoveCluster deletes a cluster no tenant or placement references.
+// RemoveCluster implements Store.
 func (d *FileDir) RemoveCluster(ctx context.Context, name, actor string) error {
-	return d.mutate(ctx, actor, "cluster-remove", clusterKey(name), func(f *File) error {
-		if _, ok := f.Clusters[name]; !ok {
-			return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
-		}
-		if refs := References(f, name); len(refs) > 0 {
-			return fmt.Errorf("%w: cluster %q is still referenced by %s", ErrInUse, name, strings.Join(refs, ", "))
-		}
-		delete(f.Clusters, name)
-		return nil
-	})
+	return d.mutate(ctx, actor, "cluster-remove", clusterKey(name), func(f *File) error { return f.RemoveCluster(name) })
 }
 
-// Adopt writes an ACTIVE placement for a bucket that already exists on cluster under backend,
-// creating the tenant (defaulting to cluster) if it is not in the directory yet (docs/DESIGN.md §11).
+// Adopt implements Store.
 func (d *FileDir) Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
-	k := Key(tenant, bucket)
-	return d.mutate(ctx, actor, "adopt", k, func(f *File) error {
-		if _, ok := f.Placements[k]; ok {
-			return ErrExists
-		}
-		if f.Tenants == nil {
-			f.Tenants = map[string]Tenant{}
-		}
-		if _, ok := f.Tenants[tenant]; !ok {
-			f.Tenants[tenant] = Tenant{DefaultCluster: cluster}
-		}
-		f.Placements[k] = Placement{
-			State: StateActive, Primary: cluster, Names: map[string]string{cluster: backend},
-			Created: d.now().UTC().Truncate(time.Millisecond),
-		}
-		return nil
-	})
+	return d.mutate(ctx, actor, "adopt", Key(tenant, bucket), func(f *File) error { return f.Adopt(tenant, bucket, cluster, backend, d.now()) })
 }
 
-// SetTarget records the cluster and backend bucket an ACTIVE placement will move to (shunt expand).
+// SetTarget implements Store.
 func (d *FileDir) SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
-	k := Key(tenant, bucket)
-	return d.mutate(ctx, actor, "set-target", k, func(f *File) error {
-		p, ok := f.Placements[k]
-		if !ok {
-			return ErrNotFound
-		}
-		if p.State != StateActive {
-			return fmt.Errorf("%w: %s is %s; expand prepares an ACTIVE placement", ErrConflict, k, p.State)
-		}
-		if p.Target != "" && p.Target != cluster {
-			return fmt.Errorf("%w: %s is already expanded to %s", ErrConflict, k, p.Target)
-		}
-		np := p.clone()
-		np.Target = cluster
-		if np.Names == nil {
-			np.Names = map[string]string{}
-		}
-		np.Names[cluster] = backend
-		f.Placements[k] = np
-		return nil
-	})
+	return d.mutate(ctx, actor, "set-target", Key(tenant, bucket), func(f *File) error { return f.SetTarget(tenant, bucket, cluster, backend) })
 }
 
 func clusterKey(name string) string { return "clusters/" + name }

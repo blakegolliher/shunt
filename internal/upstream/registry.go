@@ -40,9 +40,19 @@ func (r *Registry) Load() *Set { return r.cur.Load() }
 // Build makes a cluster from its definition exactly as Apply would, secret resolved in this process,
 // without making it live. The caller closes it.
 func (r *Registry) Build(name string, def config.Cluster) (*Cluster, error) {
+	return r.BuildWith(name, def, "")
+}
+
+// BuildWith is Build with the secret given rather than resolved: `cluster add` checking a secret
+// the operator just typed, before any store holds it.
+func (r *Registry) BuildWith(name string, def config.Cluster, secret string) (*Cluster, error) {
 	cl, err := New(name, def, r.opts)
 	if err != nil {
 		return nil, fmt.Errorf("cluster %s: %w", name, err)
+	}
+	if secret != "" {
+		cl.Creds.Secret = secret
+		return cl, nil
 	}
 	if r.resolve != nil {
 		secret, rerr := r.resolve(def.Credentials.SecretRef)

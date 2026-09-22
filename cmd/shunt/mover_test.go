@@ -84,20 +84,20 @@ func TestMoverRefusesATargetWithoutConditionalPut(t *testing.T) {
 	}{{"migrating", directory.StateMigrating, 0}, {"ramping at ratio 1", directory.StateRamping, 1}} {
 		dir := moverFixture(t, state.state, state.ratio, &no)
 		for _, sel := range [][2]string{{"acme/data", ""}, {"", "minio"}} {
-			_, err := selectPlacements(dir, sel[0], sel[1], false)
+			_, err := selectPlacements(dir, nil, sel[0], sel[1], false)
 			if err == nil {
 				t.Fatalf("%s, -bucket %q -from %q: a target without conditional PUT was accepted", state.name, sel[0], sel[1])
 			}
 			if want := migrate.RefuseLostWriteWindow("acme/data", "garage").Error(); err.Error() != want {
 				t.Errorf("%s: refusal differs from migrate start's:\n got %s\nwant %s", state.name, err, want)
 			}
-			jobs, err := selectPlacements(dir, sel[0], sel[1], true)
+			jobs, err := selectPlacements(dir, nil, sel[0], sel[1], true)
 			if err != nil || len(jobs) != 1 || jobs[0].conditional {
 				t.Errorf("%s: with -accept-lost-write-window: %v, %+v", state.name, err, jobs)
 			}
 		}
 		dir = moverFixture(t, state.state, state.ratio, &yes)
-		if jobs, err := selectPlacements(dir, "acme/data", "", false); err != nil || len(jobs) != 1 || !jobs[0].conditional {
+		if jobs, err := selectPlacements(dir, nil, "acme/data", "", false); err != nil || len(jobs) != 1 || !jobs[0].conditional {
 			t.Errorf("%s: a conditional target needs no flag: %v, %+v", state.name, err, jobs)
 		}
 	}

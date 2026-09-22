@@ -24,6 +24,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/listener"
+	"github.com/blakegolliher/shunt/internal/member"
 	"github.com/blakegolliher/shunt/internal/proxy"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -122,10 +123,21 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	}
 	var dir *directory.FileDir
 	var ctl *control.Server
-	if cfg.Control.Member() {
-		return errors.New("fleet member mode (control.endpoints) is not built yet: this commit is the seams; internal/member lands next")
-	}
-	if cfg.Auth.Mode == "resign" {
+	var mem *member.Client
+	switch {
+	case cfg.Control.Member():
+		// A fleet member (ADR-0015): the directory, the client keys and the cluster secrets come
+		// from shunt-control, and nothing on this host is shared with another.
+		m, registry, err := startMember(ctx, cfg, metrics, log)
+		if err != nil {
+			return err
+		}
+		defer registry.Close()
+		mem = m
+		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir, hcfg.Stale = proxy.ModeResign, m.Keys(), registry, m, m.Stale
+		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
+		publishRouteState(metrics, m.Snapshot())
+	case cfg.Auth.Mode == "resign":
 		store, err := auth.Load(cfg.Auth.CredentialsFile)
 		if err != nil {
 			return err
@@ -196,7 +208,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		if !hcfg.Rewrite {
 			log.Warn("kill_switches.xml_rewrite_disable is set: responses carry backend bucket names, cluster endpoints, and backend uploadIds to clients (ADR-0006)")
 		}
-	} else {
+	default:
 		cc := cfg.Clusters[cfg.Proxy.Cluster]
 		cl, err := upstream.New(cfg.Proxy.Cluster, cc, upstream.Options{})
 		if err != nil {
@@ -222,6 +234,12 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	adm := admin.New(metrics.Registry, slow)
 	if ctl != nil {
 		adm.Mount("/v1/", ctl.Handler())
+	}
+	if mem != nil {
+		adm.Mount("/-/fleet", mem)
+		mctx, stop := context.WithCancel(ctx)
+		defer stop()
+		go mem.Run(mctx)
 	}
 	admSrv := adm.Listen(cfg.Admin.Address)
 
@@ -291,6 +309,73 @@ func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
 				"placement", key, "ratio", p.Ramp.Ratio, "hold_ratio", p.Ramp.Hold.Ratio, "hold_prefixes", p.Ramp.Hold.Prefixes)
 		}
 	}
+}
+
+// startMember builds a fleet member's directory client and its cluster registry, loads the cached
+// directory, and registers with the control plane before the proxy serves anything (ADR-0016).
+func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, error) {
+	mcfg := member.Config{Endpoints: cfg.Control.Endpoints, ProxyID: cfg.Control.ProxyID, CacheDir: cfg.Control.CacheDir,
+		Interval: cfg.Control.HeartbeatInterval, LeaseTTL: cfg.Control.LeaseTTL}
+	if ref := cfg.Control.TokenRef; ref != "" {
+		tok, err := config.ResolveSecret(ref)
+		if err != nil {
+			return nil, nil, fmt.Errorf("control.token_ref: %w", err)
+		}
+		mcfg.Token = tok
+	}
+	if mcfg.ProxyID == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return nil, nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
+		}
+		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
+		mcfg.ProxyID = defaultProxyID(host, port)
+	}
+	if !config.ValidProxyID(mcfg.ProxyID) {
+		return nil, nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", mcfg.ProxyID)
+	}
+	m := member.New(mcfg, log)
+	m.Metrics = metrics
+	registry := upstream.NewRegistry(upstream.Options{}, m.Resolve)
+	rewrite := !cfg.KillSwitches.XMLRewriteDisable
+	m.Prepare = func(f *directory.File) error {
+		before := registry.Load()
+		added, removed, err := registry.Apply(f.Clusters)
+		if err != nil {
+			return err
+		}
+		for _, name := range added {
+			cl, _ := registry.Load().Get(name)
+			event := "cluster added"
+			if _, existed := before.Get(name); existed {
+				event = "cluster updated"
+			}
+			logCluster(log, event, cl, f.Clusters[name], rewrite)
+		}
+		for _, name := range removed {
+			log.Info("cluster removed", "cluster", name)
+		}
+		return nil
+	}
+	m.OnInstall = func(s *directory.Snapshot) {
+		publishRouteState(metrics, s)
+		warnUnknownRampHashes(log, s)
+	}
+	metrics.FleetStale.Set(1) // until the first heartbeat is answered
+	if err := m.Load(); err != nil {
+		return nil, nil, err
+	}
+	log.Info("fleet member", "proxy", mcfg.ProxyID, "control", cfg.Control.Endpoints, "heartbeat", mcfg.Interval.String(), "lease_ttl", mcfg.LeaseTTL.String(),
+		"cache_dir", cfg.Control.CacheDir, "control_channel", "PLAINTEXT http (control.plaintext: true; secrets and client keys cross the network in the clear)")
+	// Join before serving: a proxy that serves first could route writes to a bucket whose first
+	// step the control plane takes without waiting for it (ADR-0016).
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.Register(rctx); err != nil {
+		log.Warn("fleet member could not register with the control plane before serving: starting stale (writes on moving buckets are refused until it can)",
+			"proxy", mcfg.ProxyID, "err", err.Error())
+	}
+	return m, registry, nil
 }
 
 // defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',

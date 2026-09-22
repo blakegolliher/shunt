@@ -62,7 +62,11 @@ The open questions, as answered:
 - **Tags are not carried** across a cross-cluster copy (`x-amz-tagging-directive`), written down in
   ADR-0014 rather than left to be discovered.
 
-## Item 3 — version fence across proxies (done, ADR-0016)
+## Item 3 — version fence across proxies (done, ADR-0016; on etcd since P3c-1)
+
+*P3c-1 moved the fleet from a proxy's memory and a shared directory file onto `shunt-control`
+(ADR-0015; ADR-0016 amendment). The semantics below are unchanged; "control node" now means a
+`shunt-control` node, and members share nothing but the network.*
 
 One proxy is the fleet's **control node**; the others are **members** (`control.endpoint`) that
 heartbeat to it with the directory version they have installed. A ramp step, `migrate start` or
