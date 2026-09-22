@@ -423,6 +423,38 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
+// maxTxnOps is etcd's default --max-txn-ops.
+const maxTxnOps = 128
+
+// Changes implements directory.Store: the audit records at or before version before, newest
+// first, read as point gets in batches (the keys are decimal, not zero-padded, so no range walks
+// them in order). Records past changeRetention are absent.
+func (s *Store) Changes(ctx context.Context, before int64, limit int) ([]directory.Change, error) {
+	if before == 0 {
+		before = s.Version()
+	}
+	var out []directory.Change
+	for v := before; v > 0 && len(out) < limit; {
+		var ops []clientv3.Op
+		for ; v > 0 && len(ops) < maxTxnOps && len(out)+len(ops) < limit; v-- {
+			ops = append(ops, clientv3.OpGet(kChanges+strconv.FormatInt(v, 10)))
+		}
+		resp, err := s.cli.Txn(ctx).Then(ops...).Commit()
+		if err != nil {
+			return nil, fmt.Errorf("%w: reading the change log: %w", control.ErrUnavailable, err)
+		}
+		for _, r := range resp.Responses {
+			for _, kv := range r.GetResponseRange().Kvs {
+				var c directory.Change
+				if json.Unmarshal(kv.Value, &c) == nil {
+					out = append(out, c)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // mutate applies fn to a copy of the current state and commits the difference as one transaction,
 // compare-and-swapped on the directory version. Any control node may write: a conflict means
 // another node wrote first, and the change is re-applied to the newer version. On success it

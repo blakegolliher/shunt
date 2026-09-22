@@ -65,7 +65,10 @@ With one proxy, nothing: every command answers as in the README. With members:
 - **Each step waits for every proxy.** `ramp`, `migrate start` and `cutover` answer once every live
   member has installed the change, and say `in effect on every live proxy`. One that has not
   within `--wait` (default 30s) is named (`PENDING: not yet installed on proxy-c`), and the next
-  step on that bucket is refused until it has.
+  step on that bucket is refused until it has. Each step runs as an operation record on the
+  control plane (`POST /v1/operations`, ADR-0017): the CLI polls it every 250 ms and prints the
+  outcome, so a step outlives a dropped connection, and a `--wait` the CLI gives up on prints the
+  record's id to follow with `GET /v1/operations/<id>` on any control node.
 - **The keys a step moves pause their writes for a moment.** Two proxies must never send the same
   key to different clusters, so a step that moves writes is written twice: first as a hold, where
   writes to the keys it moves answer `503` with `Retry-After: 1` (every SDK and aws-cli retries),

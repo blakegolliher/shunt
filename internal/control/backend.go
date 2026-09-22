@@ -157,7 +157,13 @@ func (b backend) versioning(ctx context.Context, bucket string) (string, error) 
 
 // listPage returns one ListObjectsV2 page of decoded keys and the next continuation token ("" at
 // the end).
-func (b backend) listPage(ctx context.Context, bucket, token string) (keys []string, next string, err error) {
+// listEntry is one object of a listing page: its key and size.
+type listEntry struct {
+	key  string
+	size int64
+}
+
+func (b backend) listPage(ctx context.Context, bucket, token string) (entries []listEntry, next string, err error) {
 	q := url.Values{"list-type": {"2"}, "encoding-type": {"url"}}
 	if token != "" {
 		q.Set("continuation-token", token)
@@ -175,22 +181,29 @@ func (b backend) listPage(ctx context.Context, bucket, token string) (keys []str
 	}
 	for _, o := range page.Contents {
 		if o.Key != nil {
-			keys = append(keys, s3.DecodeListingKey(*o.Key))
+			e := listEntry{key: s3.DecodeListingKey(*o.Key)}
+			if o.Size != nil {
+				e.size = *o.Size
+			}
+			entries = append(entries, e)
 		}
 	}
 	if page.IsTruncated != nil && *page.IsTruncated && page.NextContinuationToken != nil {
 		next = *page.NextContinuationToken
 	}
-	return keys, next, nil
+	return entries, next, nil
 }
 
-// lister walks a bucket's keys in listing order, one page in memory at a time.
+// lister walks a bucket's keys in listing order, one page in memory at a time, counting what it
+// has passed.
 type lister struct {
-	b      backend
-	bucket string
-	page   []string
-	next   string
-	done   bool
+	b       backend
+	bucket  string
+	page    []listEntry
+	next    string
+	done    bool
+	objects int
+	bytes   int64
 }
 
 func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
@@ -198,53 +211,55 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 		if l.done {
 			return "", false, nil
 		}
-		keys, next, err := l.b.listPage(ctx, l.bucket, l.next)
+		entries, next, err := l.b.listPage(ctx, l.bucket, l.next)
 		if err != nil {
 			return "", false, err
 		}
-		l.page, l.next, l.done = keys, next, next == ""
+		l.page, l.next, l.done = entries, next, next == ""
 	}
-	k := l.page[0]
+	e := l.page[0]
 	l.page = l.page[1:]
-	return k, true, nil
+	l.objects++
+	l.bytes += e.size
+	return e.key, true, nil
 }
 
 // missingOn returns up to limit keys that source holds and primary does not, walking both
 // listings in step: memory is two pages, whatever the bucket size. A key the listings disagree on
 // is confirmed with HEADs before it counts (stillMissing), so a client delete landing between the
-// two listings' pages is not reported.
-func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int) ([]string, error) {
+// two listings' pages is not reported. It also returns how many objects and bytes the source
+// listing held, as far as it was walked.
+func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int) (missing []string, objects int, size int64, err error) {
 	src := &lister{b: source, bucket: sourceBucket}
 	dst := &lister{b: primary, bucket: primaryBucket}
-	var missing []string
 	d, dok, err := dst.nextKey(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	for {
 		s, sok, err := src.nextKey(ctx)
 		if err != nil {
-			return nil, err
+			return nil, src.objects, src.bytes, err
 		}
 		if !sok {
-			return missing, nil
+			return missing, src.objects, src.bytes, nil
 		}
 		for dok && d < s {
 			if d, dok, err = dst.nextKey(ctx); err != nil {
-				return nil, err
+				return nil, src.objects, src.bytes, err
 			}
 		}
 		if !dok || d != s {
 			confirmed, err := stillMissing(ctx, source, sourceBucket, primary, primaryBucket, s)
 			if err != nil {
-				return nil, err
+				return nil, src.objects, src.bytes, err
 			}
 			if !confirmed {
 				continue
 			}
 			missing = append(missing, s)
 			if len(missing) >= limit {
-				return missing, nil
+				return missing, src.objects, src.bytes, nil
 			}
 		}
 	}
@@ -281,8 +296,9 @@ func (b backend) objectExists(ctx context.Context, bucket, key string) (bool, er
 var errNotEmpty = errors.New("bucket is not empty")
 
 // empty aborts every in-progress multipart upload and deletes every object in bucket, then
-// confirms the listing is empty. It returns the counts.
-func (b backend) empty(ctx context.Context, bucket string) (objects, uploads int, err error) {
+// confirms the listing is empty. It returns the counts, and reports objects deleted so far to
+// progress, when given.
+func (b backend) empty(ctx context.Context, bucket string, progress func(deleted int)) (objects, uploads int, err error) {
 	for {
 		r, err := b.do(ctx, http.MethodGet, bucket, "", url.Values{"uploads": {""}}, nil, nil)
 		if err != nil {
@@ -320,22 +336,25 @@ func (b backend) empty(ctx context.Context, bucket string) (objects, uploads int
 	// Deleting while paging with continuation tokens can skip keys, so every round lists from the
 	// start until a listing comes back empty.
 	for {
-		keys, _, err := b.listPage(ctx, bucket, "")
+		entries, _, err := b.listPage(ctx, bucket, "")
 		if err != nil {
 			return objects, uploads, err
 		}
-		if len(keys) == 0 {
+		if len(entries) == 0 {
 			return objects, uploads, nil
 		}
-		for _, k := range keys {
-			dr, err := b.do(ctx, http.MethodDelete, bucket, k, nil, nil, nil)
+		for _, e := range entries {
+			dr, err := b.do(ctx, http.MethodDelete, bucket, e.key, nil, nil, nil)
 			if err != nil {
 				return objects, uploads, err
 			}
 			if dr.status >= 300 && dr.status != http.StatusNotFound {
-				return objects, uploads, fmt.Errorf("%s: deleting %s: HTTP %d %s: %w", b.cl.Name, k, dr.status, dr.code, errNotEmpty)
+				return objects, uploads, fmt.Errorf("%s: deleting %s: HTTP %d %s: %w", b.cl.Name, e.key, dr.status, dr.code, errNotEmpty)
 			}
 			objects++
+			if progress != nil {
+				progress(objects)
+			}
 		}
 	}
 }

@@ -33,9 +33,20 @@ filesystem:
   The fence of ADR-0016 runs on leased etcd keys. TLS for the control channel is deferred and the
   channel says `plaintext` for it. `bin/shunt` links no etcd (`make build` proves it). Docs:
   docs/fleet.md, docs/how-to/run-shunt-control.md, docs/runbooks/, docs/explanation/why-no-objects-table.md.
+- **UI-0 done (2026-09-22, ADR-0017 proposed):** the control API is browser-ready. Every
+  long-running action (ramp, migrate start, cutover, purge-source, finish, cluster remove) runs
+  under an operation record (`POST /v1/operations`, `GET /v1/operations/{id}`; the routes answer
+  as before plus `operation`, and the CLI's `--wait` polls the record); `GET /v1/events` streams
+  directory, fence and fleet changes with replay by `Last-Event-ID`; read models with no secret
+  in them (`/v1/clusters/{name}/view`, `/v1/placements/{t}/{b}/view`, `/v1/audit` over the change
+  records both backends already wrote); `purge-source` and `cluster remove` have a dry run and a
+  confirmation token; `GET /v1/control` carries `last_compaction` and a join line; the route table
+  is `docs/reference/control-routes.json`, generated from code. Operations run on the server's
+  context, so a client that disconnects mid-step does not stop it.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
-  left of the fleet-scale form: movers as workers, fleet decisions, the web UI, and the P3c-2
-  deferrals (deltas, object-storage bootstrap and audit export, TLS, the browser-client API).
+  left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
+  prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
+  and audit export, TLS, the browser-client API).
 
 **Guards on this branch.** `make readme-demo` runs the README's hand-run demo, steps 1 to 14,
 unattended; `make walkthrough` the operator walkthrough; `make fleet` three control nodes and two

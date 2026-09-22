@@ -9,6 +9,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -56,37 +57,38 @@ type Server struct {
 	// Now defaults to time.Now; Sleep to a context-aware wait. Tests replace both.
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Ops holds the operation records (ADR-0017). nil: in memory, for a lab.
+	Ops Operations
+	// Node names this control node in the records it owns; "lab" when empty.
+	Node string
+	// Events, if set, is the stream GET /v1/events serves.
+	Events *Events
+	// ConfirmKey keys the confirmation tokens dry runs issue; every control node shares one.
+	// Empty: a random key for this process, so a lab's tokens die with it.
+	ConfirmKey []byte
+	// Ctx is the server's lifetime: operations run on it, never on a request's. nil: Background.
+	Ctx context.Context
 
-	mu       sync.Mutex
-	progress map[string]Progress // placement key → the mover's last report (in memory only)
-	steps    sync.Map            // placement key → *sync.Mutex: one fenced step per bucket at a time
+	mu          sync.Mutex
+	progress    map[string]Progress // placement key → the mover's last report (in memory only)
+	prevFleet   []Member            // the fleet as of the last PublishFleet, for fleet events
+	fleetSeeded bool
+	steps       sync.Map // placement key → *sync.Mutex: one fenced step per bucket at a time
+	opsOnce     sync.Once
+	defaultOps  *MemOperations
+	confirmOnce sync.Once
 }
 
-// Handler returns the /v1/ routes, one handler per operation.
+// Handler returns the /v1/ routes, one handler per operation, from the route table (routes.go).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", s.status)
-	mux.HandleFunc("GET /v1/directory", s.directoryHandler)
-	mux.HandleFunc("GET /v1/placements/{tenant}/{bucket}", s.placement)
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/create", s.logged("create", s.createPlacement))
-	mux.HandleFunc("DELETE /v1/placements/{tenant}/{bucket}", s.logged("delete", s.deletePlacement))
-	mux.HandleFunc("POST /v1/clusters", s.logged("cluster add", s.putCluster))
-	mux.HandleFunc("DELETE /v1/clusters/{name}", s.logged("cluster remove", s.removeCluster))
-	mux.HandleFunc("POST /v1/tenants/{tenant}/default-cluster", s.logged("tenant set-default", s.setTenantDefault))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/adopt", s.logged("adopt", s.adopt))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/expand", s.logged("expand", s.expand))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/ramp", s.logged("ramp", s.ramp))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/migrate", s.logged("migrate start", s.migrateStart))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/mover-progress", s.logged("mover report", s.moverProgress))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/cutover", s.logged("cutover", s.cutover))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/purge-source", s.logged("purge-source", s.purgeSource))
-	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/finish", s.logged("migrate finish", s.finish))
-	mux.HandleFunc("GET /v1/tenants/{tenant}/step-out", s.stepOut)
-	mux.HandleFunc("POST /v1/tenants/{tenant}/client-keys", s.logged("client key import", s.importKey))
-	mux.HandleFunc("DELETE /v1/tenants/{tenant}/client-keys/{access_key}", s.logged("client key remove", s.removeKey))
-	mux.HandleFunc("POST /v1/fleet/{id}/heartbeat", s.heartbeat)
-	mux.HandleFunc("GET /v1/fleet", s.fleetList)
-	mux.HandleFunc("DELETE /v1/fleet/{id}", s.logged("proxy forget", s.forgetProxy))
+	for _, rt := range s.routes() {
+		h := rt.h
+		if rt.log != "" {
+			h = s.logged(rt.log, h)
+		}
+		mux.HandleFunc(rt.Method+" "+rt.Pattern, h)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
@@ -150,6 +152,11 @@ func actor(r *http.Request) string {
 	return "api:" + host
 }
 
+// pathKey is the placement key a /v1/placements/{tenant}/{bucket} route names.
+func pathKey(r *http.Request) string {
+	return directory.Key(r.PathValue("tenant"), r.PathValue("bucket"))
+}
+
 // Error is the body of every non-2xx answer.
 type Error struct {
 	Code    string `json:"code"`
@@ -167,6 +174,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, Error{Code: code, Message: msg})
 }
+
+// badRequest is a malformed body or argument; it answers 400.
+type badRequest struct{ msg string }
+
+func (b *badRequest) Error() string { return b.msg }
+
+func bad(format string, a ...any) error { return &badRequest{msg: fmt.Sprintf(format, a...)} }
 
 // refusal is an operator action the rules forbid right now; it answers 409 with its reason.
 type refusal struct{ msg string }
@@ -191,33 +205,53 @@ func (m *missing) Is(target error) bool { return target == directory.ErrNotFound
 
 func notFound(format string, a ...any) error { return &missing{msg: fmt.Sprintf(format, a...)} }
 
-// fail maps an error to its HTTP answer.
-func fail(w http.ResponseWriter, err error) {
+// errorOf maps an error to its HTTP status and body.
+func errorOf(err error) (int, Error) {
 	var (
+		br  *badRequest
 		ref *refusal
 		te  *directory.TransitionError
 		ce  *config.Error
 	)
 	switch {
+	case errors.As(err, &br):
+		return http.StatusBadRequest, Error{Code: "bad_request", Message: err.Error()}
 	case errors.As(err, &ref), errors.Is(err, directory.ErrInUse), errors.As(err, &te):
-		writeError(w, http.StatusConflict, "refused", err.Error())
+		return http.StatusConflict, Error{Code: "refused", Message: err.Error()}
 	case errors.Is(err, directory.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return http.StatusNotFound, Error{Code: "not_found", Message: err.Error()}
 	case errors.Is(err, directory.ErrExists), errors.Is(err, directory.ErrConflict):
-		writeError(w, http.StatusConflict, "conflict", err.Error())
+		return http.StatusConflict, Error{Code: "conflict", Message: err.Error()}
 	case errors.As(err, &ce):
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
+		return http.StatusBadRequest, Error{Code: "invalid", Message: err.Error()}
 	case errors.Is(err, directory.ErrReadOnly), errors.Is(err, directory.ErrLockTimeout), errors.Is(err, ErrUnavailable):
-		writeError(w, http.StatusServiceUnavailable, "unavailable", err.Error())
+		return http.StatusServiceUnavailable, Error{Code: "unavailable", Message: err.Error()}
 	default:
-		writeError(w, http.StatusBadGateway, "backend", err.Error())
+		return http.StatusBadGateway, Error{Code: "backend", Message: err.Error()}
 	}
+}
+
+// fail maps an error to its HTTP answer.
+func fail(w http.ResponseWriter, err error) {
+	status, e := errorOf(err)
+	writeJSON(w, status, e)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields() // a cluster's inline "secret" is an unknown field, and refused
 	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "request body: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// decodeOptional is decode for a route whose body may be empty: v is then left as it is.
+func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "bad_request", "request body: "+err.Error())
 		return false
 	}
@@ -270,13 +304,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	f := snap.File()
 	out := Status{Version: f.Version, Clusters: []ClusterStatus{}, Placements: []PlacementStatus{}}
 	for _, name := range sortedKeys(f.Clusters) {
-		c := f.Clusters[name]
-		out.Clusters = append(out.Clusters, ClusterStatus{
-			Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: endpoints(c),
-			AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
-			ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false),
-			References: directory.References(f, name),
-		})
+		out.Clusters = append(out.Clusters, clusterStatus(f, name, f.Clusters[name]))
 	}
 	want := r.URL.Query().Get("bucket")
 	if want != "" {
@@ -394,14 +422,23 @@ func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (string, directory.Placement, *directory.File, bool) {
-	key := directory.Key(r.PathValue("tenant"), r.PathValue("bucket"))
-	f := s.Dir.Snapshot().File()
-	p, ok := f.Placements[key]
-	if !ok {
-		fail(w, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key))
+	key := pathKey(r)
+	p, f, err := s.placementOf(key)
+	if err != nil {
+		fail(w, err)
 		return key, p, f, false
 	}
 	return key, p, f, true
+}
+
+// placementOf reads a placement from the current snapshot.
+func (s *Server) placementOf(key string) (directory.Placement, *directory.File, error) {
+	f := s.Dir.Snapshot().File()
+	p, ok := f.Placements[key]
+	if !ok {
+		return p, f, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
+	}
+	return p, f, nil
 }
 
 // ClusterRequest adds or replaces a cluster.
@@ -498,14 +535,97 @@ func isDirectoryError(err error) bool {
 	return false
 }
 
+// RemoveRequest is DELETE /v1/clusters/{name}'s body: the confirmation token its dry run issued.
+type RemoveRequest struct {
+	Token string `json:"token,omitempty"`
+}
+
+// RemoveResult is what cluster remove did.
+type RemoveResult struct {
+	Removed   string `json:"removed"`
+	Operation string `json:"operation,omitempty"`
+}
+
+// RemoveDryRun is DELETE /v1/clusters/{name}?dry_run=1: what removing the cluster would do, and
+// the token the real call must present (ADR-0017).
+type RemoveDryRun struct {
+	Allowed     bool      `json:"allowed"`
+	Reason      string    `json:"reason,omitempty"` // the refusal the real call would give
+	Name        string    `json:"name"`
+	References  []string  `json:"references"`
+	SecretFiles int       `json:"secret_files"` // secret files this shunt stored for it, removed with it
+	Token       string    `json:"token,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at,omitzero"`
+}
+
 func (s *Server) removeCluster(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := s.Dir.RemoveCluster(r.Context(), name, actor(r)); err != nil {
-		fail(w, err)
+	if r.URL.Query().Get("dry_run") != "" {
+		res, err := s.removeDryRun(name)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
 		return
 	}
+	var req RemoveRequest
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	s.serveOperation(w, r, OperationRequest{Kind: OpClusterRemove, Cluster: name}, req)
+}
+
+// removeBinding is what a cluster remove token is bound to: the definition and what references it.
+func removeBinding(f *directory.File, name string) [32]byte {
+	return digestOf(f.Clusters[name], directory.References(f, name))
+}
+
+// removeChecks is every refusal cluster remove gives before the token is looked at.
+func removeChecks(f *directory.File, name string) ([]string, error) {
+	if _, ok := f.Clusters[name]; !ok {
+		return nil, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, name)
+	}
+	refs := directory.References(f, name)
+	if len(refs) > 0 {
+		return refs, fmt.Errorf("%w: cluster %q is still referenced by %s", directory.ErrInUse, name, strings.Join(refs, ", "))
+	}
+	return nil, nil
+}
+
+func (s *Server) removeDryRun(name string) (RemoveDryRun, error) {
+	f := s.Dir.Snapshot().File()
+	res := RemoveDryRun{Name: name, References: []string{}, SecretFiles: len(s.secretFiles(name))}
+	refs, err := removeChecks(f, name)
+	if refs != nil {
+		res.References = refs
+	}
+	switch {
+	case errors.Is(err, directory.ErrNotFound):
+		return res, err
+	case err != nil:
+		res.Reason = err.Error()
+		return res, nil
+	}
+	res.Allowed = true
+	res.Token, res.ExpiresAt = s.confirmToken("cluster remove", removeBinding(f, name))
+	return res, nil
+}
+
+func (s *Server) runRemoveCluster(tr *tracker, name string, req RemoveRequest) (RemoveResult, error) {
+	tr.phase(PhaseStep)
+	f := s.Dir.Snapshot().File()
+	if _, err := removeChecks(f, name); err != nil {
+		return RemoveResult{}, err
+	}
+	if err := s.checkToken(req.Token, "cluster remove", removeBinding(f, name)); err != nil {
+		return RemoveResult{}, err
+	}
+	if err := s.Dir.RemoveCluster(tr.ctx, name, tr.actor); err != nil {
+		return RemoveResult{}, err
+	}
 	s.dropSecrets(name, "")
-	writeJSON(w, http.StatusOK, map[string]string{"removed": name})
+	return RemoveResult{Removed: name, Operation: tr.id()}, nil
 }
 
 // TenantDefaultRequest repoints the cluster a tenant's new buckets land on.
@@ -524,7 +644,7 @@ func (s *Server) setTenantDefault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := s.Dir.Snapshot().Version()
-	s.info(r, "tenant default changed", "tenant", tenant, "default_cluster", req.Cluster, "version", v)
+	s.info(actor(r), "tenant default changed", "tenant", tenant, "default_cluster", req.Cluster, "version", v)
 	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "default_cluster": req.Cluster, "version": v})
 }
 
@@ -642,19 +762,29 @@ func (s *Server) storeSecret(name, secret string) (string, error) {
 	return path, f.Close()
 }
 
-// dropSecrets removes the secret files shunt stored for a cluster, except keep.
-func (s *Server) dropSecrets(name, keep string) {
+// secretFiles lists the secret files shunt stored for a cluster.
+func (s *Server) secretFiles(name string) []string {
 	if s.SecretsDir == "" {
-		return
+		return nil
 	}
 	entries, err := os.ReadDir(s.SecretsDir)
 	if err != nil {
-		return
+		return nil
 	}
 	own := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `-[0-9a-f]{8}$`)
+	var paths []string
 	for _, e := range entries {
-		path := filepath.Join(s.SecretsDir, e.Name())
-		if own.MatchString(e.Name()) && path != keep {
+		if own.MatchString(e.Name()) {
+			paths = append(paths, filepath.Join(s.SecretsDir, e.Name()))
+		}
+	}
+	return paths
+}
+
+// dropSecrets removes the secret files shunt stored for a cluster, except keep.
+func (s *Server) dropSecrets(name, keep string) {
+	for _, path := range s.secretFiles(name) {
+		if path != keep {
 			_ = os.Remove(path) //nolint:errcheck // best effort
 		}
 	}
@@ -717,9 +847,9 @@ func (s *Server) logged(op string, h http.HandlerFunc) http.HandlerFunc {
 }
 
 // info writes one success line for an operation, with who asked.
-func (s *Server) info(r *http.Request, event string, attrs ...any) {
+func (s *Server) info(actor, event string, attrs ...any) {
 	if s.Log != nil {
-		s.Log.Info(event, append(attrs, "actor", actor(r))...)
+		s.Log.Info(event, append(attrs, "actor", actor)...)
 	}
 }
 

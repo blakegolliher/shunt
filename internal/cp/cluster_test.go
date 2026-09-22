@@ -15,13 +15,13 @@ import (
 // testCluster starts n embedded members on free loopback ports, the first alone and the rest
 // joining it, and stops them all when the test ends.
 type testCluster struct {
-	t     *testing.T
+	t     testing.TB
 	nodes []*Node
 	dirs  []string
 	ports []int
 }
 
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -31,7 +31,7 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func startCluster(t *testing.T, n int) *testCluster {
+func startCluster(t testing.TB, n int) *testCluster {
 	t.Helper()
 	tc := &testCluster{t: t}
 	base := t.TempDir()

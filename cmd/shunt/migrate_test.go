@@ -150,13 +150,33 @@ func TestOperatorVerbsWalkTheMove(t *testing.T) {
 	if out := rg.must(t, "cutover", "acme/data01", "--window", "10ms"); !strings.Contains(out, "MIGRATING -> CUTOVER") {
 		t.Fatalf("cutover: %s", out)
 	}
-	if out := rg.must(t, "purge-source", "acme/data01"); !strings.Contains(out, "deleted 2 objects and aborted 0 uploads from vast01/data01") {
+	// The dry run counts and changes nothing (ADR-0017); the purge presents its token.
+	if out := rg.must(t, "purge-source", "acme/data01", "--dry-run"); !strings.Contains(out, "acme/data01: would delete 2 objects (6 B) and abort 0 in-flight uploads from vast01/data01") {
+		t.Fatalf("purge-source --dry-run: %s", out)
+	}
+	if _, err := rg.vast01.HeadObject("data01", "a"); err != nil {
+		t.Fatalf("the dry run deleted from the source: %v", err)
+	}
+	var plan control.PurgeDryRun
+	if err := json.Unmarshal([]byte(rg.must(t, "purge-source", "acme/data01", "--dry-run", "--json")), &plan); err != nil || !plan.Allowed || plan.Token == "" || plan.Objects != 2 {
+		t.Fatalf("purge-source --dry-run --json: %v %+v", err, plan)
+	}
+	if out := rg.must(t, "purge-source", "acme/data01"); !strings.Contains(out, "would delete 2 objects") || !strings.Contains(out, "deleted 2 objects and aborted 0 uploads from vast01/data01") {
 		t.Fatalf("purge-source: %s", out)
+	}
+	if out, err := rg.cli(t, "cluster", "remove", "vast01", "--dry-run"); err == nil || !strings.Contains(out, "refused: ") || !strings.Contains(out, "tenants.acme.default_cluster") {
+		t.Fatalf("dry run of removing the tenant's default: %v %s", err, out)
 	}
 	if out, err := rg.cli(t, "cluster", "remove", "vast01"); err == nil || !strings.Contains(out, "refused: ") || !strings.Contains(out, "tenants.acme.default_cluster") {
 		t.Fatalf("removing the tenant's default: %v %s", err, out)
 	}
 	rg.must(t, "tenant", "set-default", "acme", "vast02")
+	if out := rg.must(t, "cluster", "remove", "vast01", "--dry-run"); !strings.Contains(out, "would remove cluster vast01") {
+		t.Fatalf("cluster remove --dry-run: %s", out)
+	}
+	if d := readDir(t, rg.dirPath); !strings.Contains(d, "vast01") {
+		t.Fatalf("the dry run removed vast01:\n%s", d)
+	}
 	if out := rg.must(t, "cluster", "remove", "vast01"); !strings.Contains(out, "cluster vast01 removed") {
 		t.Fatalf("cluster remove: %s", out)
 	}

@@ -42,6 +42,11 @@ linters:
       disabled-checks:
         # hugeParam flags every pass-by-value config struct in tests; benchmarks cover the real cost.
         - hugeParam
+      settings:
+        rangeValCopy:
+          # control.Member is 136 bytes since host and version joined it (ADR-0017); the loops
+          # over the fleet copy one per proxy, bounded by proxies, not by requests.
+          sizeThreshold: 160
     gosec:
       excludes:
         # G304: check-config opens the file path the operator passed on the command line; that is its job.

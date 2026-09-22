@@ -165,6 +165,12 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 // Client is the in-process etcd client.
 func (n *Node) Client() *clientv3.Client { return n.cli }
 
+// Compaction is the member's automatic compaction: its mode and retention (§12.7).
+func (n *Node) Compaction() (mode, retention string) {
+	c := n.e.Config()
+	return c.AutoCompactionMode, c.AutoCompactionRetention
+}
+
 // Name is the member's name.
 func (n *Node) Name() string { return n.cfg.Name }
 

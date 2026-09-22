@@ -123,6 +123,7 @@ type rig struct {
 	dir    *directory.FileDir
 	vast01 *fakeCluster
 	vast02 *fakeCluster
+	events *Events
 	slept  []time.Duration
 	log    *syncLog
 }
@@ -166,13 +167,18 @@ func newRig(t *testing.T) *rig {
 		_, _, err := reg.Apply(f.Clusters)
 		return err
 	}
-	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), log: &syncLog{}}
+	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), events: NewEvents(8), log: &syncLog{}}
+	// The event stream is wired as the lab proxy wires it: the directory's install hook, seeded
+	// with the current snapshot, and the operation store's change hook.
+	dir.OnInstall = rg.events.Directory
+	rg.events.Directory(dir.Snapshot())
 	rg.ctl = &Server{Dir: dir, Clusters: reg, Metrics: telemetry.NewMetrics(), SecretsDir: filepath.Join(t.TempDir(), "secrets"), Log: slog.New(telemetry.NewConsoleHandler(rg.log, telemetry.ConsoleOptions{})),
 		Now: func() time.Time { return time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC) },
 		Sleep: func(_ context.Context, d time.Duration) error {
 			rg.slept = append(rg.slept, d)
 			return nil
-		}}
+		},
+		Events: rg.events, Ops: &MemOperations{OnChange: rg.events.Fence}}
 	rg.api = httptest.NewServer(rg.ctl.Handler())
 	t.Cleanup(rg.api.Close)
 	return rg
@@ -309,12 +315,22 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 		t.Fatalf("cutover: %+v", tr)
 	}
 
-	// dir/b never reached vast02: the diff refuses the purge and names it.
-	rg.refused("POST", "/v1/placements/acme/data01/purge-source", nil, "dir/b")
+	// dir/b never reached vast02: the dry run says the purge would be refused and names it, and
+	// issues no token; the real call needs one (ADR-0017).
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if dry.Allowed || !strings.Contains(dry.Reason, "dir/b") || dry.Token != "" || dry.Objects != 2 || len(dry.Missing) != 1 {
+		t.Fatalf("dry run with a missing key: %+v", dry)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/purge-source", nil, "needs the confirmation token")
 	rg.vast02.put(t, "data01-001", "dir/b", "two")
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Token == "" || dry.Objects != 2 || dry.Bytes != 6 || dry.Bucket != "data01" || dry.Source != "vast01" || len(dry.Missing) != 0 {
+		t.Fatalf("dry run: %+v", dry)
+	}
 	var pg PurgeResult
-	rg.must("POST", "/v1/placements/acme/data01/purge-source", nil, &pg)
-	if pg.ObjectsDeleted != 2 || pg.Bucket != "data01" || pg.Source != "vast01" {
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if pg.ObjectsDeleted != 2 || pg.Bucket != "data01" || pg.Source != "vast01" || pg.Operation == "" {
 		t.Fatalf("purge: %+v", pg)
 	}
 	if ok, _ := rg.vast01.be.BucketExists("data01"); ok {
@@ -325,10 +341,21 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 		t.Fatalf("placement after purge: %+v", p)
 	}
 
-	// vast01 is still the tenant's default: refused until repointed, then removed.
+	// vast01 is still the tenant's default: refused until repointed, then removed with the token
+	// its dry run issues.
 	rg.refused("DELETE", "/v1/clusters/vast01", nil, "tenants.acme.default_cluster")
 	rg.must("POST", "/v1/tenants/acme/default-cluster", TenantDefaultRequest{Cluster: "vast02"}, nil)
-	rg.must("DELETE", "/v1/clusters/vast01", nil, nil)
+	var rd RemoveDryRun
+	rg.must("DELETE", "/v1/clusters/vast01?dry_run=1", nil, &rd)
+	if !rd.Allowed || rd.Token == "" || len(rd.References) != 0 {
+		t.Fatalf("remove dry run: %+v", rd)
+	}
+	rg.refused("DELETE", "/v1/clusters/vast01", nil, "needs the confirmation token")
+	var rm RemoveResult
+	rg.must("DELETE", "/v1/clusters/vast01", RemoveRequest{Token: rd.Token}, &rm)
+	if rm.Removed != "vast01" || rm.Operation == "" {
+		t.Fatalf("remove: %+v", rm)
+	}
 	if _, ok := rg.ctl.Clusters.Load().Get("vast01"); ok {
 		t.Error("vast01 is still live in the proxy")
 	}
@@ -534,7 +561,12 @@ func TestClusterAddStoresTheSecret(t *testing.T) {
 		t.Fatalf("after replacing the secret: %v, ref %s", files, out.SecretRef)
 	}
 	rg.answers("POST", "/v1/clusters", ClusterRequest{Name: "../etc", Cluster: def, Secret: "x"}, http.StatusBadRequest, "bad_request")
-	rg.must("DELETE", "/v1/clusters/vast01", nil, nil)
+	var rd RemoveDryRun
+	rg.must("DELETE", "/v1/clusters/vast01?dry_run=1", nil, &rd)
+	if !rd.Allowed || rd.SecretFiles != 1 {
+		t.Fatalf("remove dry run: %+v", rd)
+	}
+	rg.must("DELETE", "/v1/clusters/vast01", RemoveRequest{Token: rd.Token}, nil)
 	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 0 {
 		t.Fatalf("removing the cluster left its secret: %v", files)
 	}
@@ -701,7 +733,7 @@ func TestPurgeDiffIgnoresConcurrentDeletes(t *testing.T) {
 		}
 		dst.onList = nil
 	}
-	missing, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20)
+	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20)
 	if err != nil {
 		t.Fatal(err)
 	}

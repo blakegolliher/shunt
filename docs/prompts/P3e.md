@@ -1,3 +1,5 @@
+> **Superseded by `docs/prompts/webui.md` (ADR-0017, branch `distributed`, 2026-09-22).** Item 1 (htmx, no Node) is replaced by the Vite + React stack decided there; items 2 to 5 are carried into its prompts UI-2 to UI-4. OIDC identity (the P3c amendment) stays deferred and is not in webui.md.
+
 Phase 3e: web UI. Plan mode. Read docs/design/distributed.md §12.6 and docs/reference/control-api.md.
 
 Build:

@@ -255,7 +255,7 @@ func (s *Server) importKey(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	s.info(r, "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
+	s.info(actor(r), "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -314,6 +314,6 @@ func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	left := len(s.Keys.Tenant(tenant))
-	s.info(r, "client key removed", "tenant", tenant, "access_key", accessKey, "keys_left", left)
+	s.info(actor(r), "client key removed", "tenant", tenant, "access_key", accessKey, "keys_left", left)
 	writeJSON(w, http.StatusOK, ClientKeyResult{AccessKey: accessKey, Tenant: tenant, Left: left})
 }

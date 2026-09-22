@@ -39,6 +39,10 @@ type Config struct {
 	LeaseTTL  time.Duration
 	// LongPoll is how long a directory poll waits for a newer version before returning empty.
 	LongPoll time.Duration
+	// Host and Version are reported in every heartbeat, for the fleet view: where this proxy
+	// runs and which build it is.
+	Host    string
+	Version string
 }
 
 // Client is a member proxy's directory, credential store and heartbeat. It implements
@@ -391,7 +395,7 @@ func (c *Client) Run(ctx context.Context) {
 func (c *Client) beat(ctx context.Context) error {
 	sent := c.Now()
 	snap := c.Snapshot()
-	hb := control.Heartbeat{Started: c.started, Seq: c.seq.Add(1), Applied: snap.Version()}
+	hb := control.Heartbeat{Started: c.started, Seq: c.seq.Add(1), Applied: snap.Version(), Host: c.cfg.Host, Version: c.cfg.Version}
 	f := snap.File()
 	for key := range f.Placements {
 		if f.Placements[key].State == directory.StateActive {

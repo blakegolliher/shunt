@@ -183,10 +183,13 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			return applyErr
 		}
 		dir.Prepare = applyClusters
+		events := control.NewEvents(0)
 		dir.OnInstall = func(s *directory.Snapshot) {
 			publishRouteState(metrics, s)
 			warnUnknownRampHashes(log, s)
+			events.Directory(s)
 		}
+		events.Directory(dir.Snapshot()) // the baseline: the first write is the first event
 		warnUnknownRampHashes(log, dir.Snapshot())
 		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, registry, dir
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = rewrite, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
@@ -194,7 +197,8 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
 		}
 		publishRouteState(metrics, dir.Snapshot())
-		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{}}
+		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{},
+			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Ctx: ctx}
 		warnHeldSteps(log, dir.Snapshot())
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
@@ -315,7 +319,10 @@ func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
 // directory, and registers with the control plane before the proxy serves anything (ADR-0016).
 func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, error) {
 	mcfg := member.Config{Endpoints: cfg.Control.Endpoints, ProxyID: cfg.Control.ProxyID, CacheDir: cfg.Control.CacheDir,
-		Interval: cfg.Control.HeartbeatInterval, LeaseTTL: cfg.Control.LeaseTTL}
+		Interval: cfg.Control.HeartbeatInterval, LeaseTTL: cfg.Control.LeaseTTL, Version: version}
+	if host, err := os.Hostname(); err == nil {
+		mcfg.Host = host
+	}
 	if ref := cfg.Control.TokenRef; ref != "" {
 		tok, err := config.ResolveSecret(ref)
 		if err != nil {

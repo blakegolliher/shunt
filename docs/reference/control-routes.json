@@ -1,0 +1,277 @@
+[
+  {
+    "method": "GET",
+    "pattern": "/v1/status",
+    "verbs": [
+      "status"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/directory",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/events",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/audit",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/fleet",
+    "verbs": [
+      "proxy list"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/operations",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/operations/{id}",
+    "verbs": [
+      "ramp",
+      "migrate start",
+      "cutover",
+      "purge-source",
+      "migrate finish",
+      "cluster remove"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/clusters/{name}/view",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/placements/{tenant}/{bucket}",
+    "verbs": [
+      "migrate run"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/placements/{tenant}/{bucket}/view",
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/tenants/{tenant}/step-out",
+    "verbs": [
+      "step-out"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations",
+    "verbs": [
+      "ramp",
+      "migrate start",
+      "cutover",
+      "purge-source",
+      "migrate finish",
+      "cluster remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/create",
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/placements/{tenant}/{bucket}",
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/clusters",
+    "verbs": [
+      "cluster add"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/clusters/{name}",
+    "verbs": [
+      "cluster remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/tenants/{tenant}/default-cluster",
+    "verbs": [
+      "tenant set-default"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/adopt",
+    "verbs": [
+      "adopt"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/expand",
+    "verbs": [
+      "expand"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/ramp",
+    "verbs": [
+      "ramp"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/migrate",
+    "verbs": [
+      "migrate start"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/mover-progress",
+    "verbs": [
+      "migrate run"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/cutover",
+    "verbs": [
+      "cutover"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/purge-source",
+    "verbs": [
+      "purge-source"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/finish",
+    "verbs": [
+      "migrate finish"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/tenants/{tenant}/client-keys",
+    "verbs": [
+      "adopt",
+      "client add"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/tenants/{tenant}/client-keys/{access_key}",
+    "verbs": [
+      "client remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/fleet/{id}/heartbeat",
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/fleet/{id}",
+    "verbs": [
+      "proxy forget"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/control",
+    "verbs": [
+      "status",
+      "member list"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/control/{$}",
+    "verbs": [
+      "status",
+      "member list"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/control/status",
+    "verbs": [
+      "status",
+      "member list"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/control/members",
+    "verbs": [
+      "join"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/control/members/{name}",
+    "verbs": [
+      "member remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/control/snapshot",
+    "verbs": [
+      "snapshot save"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/control/defrag",
+    "verbs": [
+      "defrag"
+    ],
+    "mutation": true
+  }
+]

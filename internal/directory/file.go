@@ -418,6 +418,59 @@ func classifyWrite(err error) error {
 	return fmt.Errorf("directory: write: %w", err)
 }
 
+// maxChangeLogRead bounds how much of the change log Changes reads: the file is a lab's, and
+// its tail is what an operator looks at.
+const maxChangeLogRead = 8 << 20
+
+// Changes implements Store: the tail of the change log, newest first.
+func (d *FileDir) Changes(_ context.Context, before int64, limit int) ([]Change, error) {
+	if before == 0 {
+		before = d.Snapshot().Version()
+	}
+	fh, err := os.Open(d.ChangeLogPath())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer fh.Close() //nolint:errcheck // read only
+	st, err := fh.Stat()
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	if st.Size() > maxChangeLogRead {
+		// The tail only: skip to the first whole line after the cut.
+		if _, err = fh.Seek(st.Size()-maxChangeLogRead, io.SeekStart); err != nil {
+			return nil, err
+		}
+		if data, err = io.ReadAll(fh); err != nil {
+			return nil, err
+		}
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		}
+	} else if data, err = io.ReadAll(fh); err != nil {
+		return nil, err
+	}
+	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+	var out []Change
+	for i := len(lines) - 1; i >= 0 && len(out) < limit; i-- {
+		if len(lines[i]) == 0 {
+			continue
+		}
+		var c Change
+		if err := json.Unmarshal(lines[i], &c); err != nil {
+			continue // a torn line at the cut, or a hand edit: skipped
+		}
+		if c.Version <= before {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func (d *FileDir) appendChange(c Change) error {
 	line, err := json.Marshal(c)
 	if err != nil {

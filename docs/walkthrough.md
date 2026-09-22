@@ -332,6 +332,7 @@ rm -rf readback && as_client s3 cp --recursive --quiet s3://data01/seed/ readbac
 Expected:
 
 ```
+data01: would delete 100 objects (1.6 MiB) and abort 0 in-flight uploads from vast01/data01, then forget the source
 data01: listing diff empty; deleted 100 objects and aborted 0 uploads from vast01/data01, deleted the bucket; ACTIVE on its primary (directory version 11)
 shunt: refused: directory: cluster is still in use: cluster "vast01" is still referenced by the default cluster for new buckets
 New buckets now land on vast02 (directory version 12)

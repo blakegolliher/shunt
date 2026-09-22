@@ -29,7 +29,11 @@ The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--
 | 502 | `backend` | a cluster call failed (HEAD, create, canary, listing, delete) |
 | 503 | `unavailable` | the directory is read-only or its lock timed out |
 
-- Every mutation goes through the directory write path (lock, re-read, version bump, rename) and appends one record to `<directory>.changes.jsonl` with actor `api:<peer address>`.
+- `202` (`accepted`) is not an error: `POST /v1/operations` wrote an operation record and the action runs; poll the record ([Operations](#operations)).
+- `purge-source` and `DELETE /v1/clusters/{name}` take a `token` their dry run issued (ADR-0017); without one they are refused.
+- CORS is not enabled: the web UI is served from the control port itself, same-origin, and every other client is the CLI.
+- The route table is `docs/reference/control-routes.json`, generated from the code by a test, so a route cannot exist in one and not the other.
+- Every mutation goes through the directory write path (lock, re-read, version bump, rename) and appends one record to `<directory>.changes.jsonl` with actor `api:<peer address>`. `GET /v1/audit` reads those records back.
 - Every mutation is logged by `shunt serve`, with its actor: one INFO line on success (`bucket adopted`, `target recorded`, `ramp`, `migrate start`, `mover pass`, `cutover window started`, `cutover`, `source purged`, `migrate finish`, `tenant default changed`, plus `cluster added|updated|removed`), and one WARN line for any refusal or failure (`<operation> refused` or `<operation> failed`, with the code and reason). An operator watching serve's log sees every change, whichever host ran the command.
 - `{tenant}/{bucket}` is the client's view: the tenant of the access key and the bucket name the client uses. A client key with no tenant belongs to tenant `default`; the CLI takes a bare bucket name for it and never shows it (ADR-0010).
 
@@ -85,9 +89,18 @@ It then signs one `ListBuckets` to the cluster with that access key and secret, 
 
 A plain `AccessDenied` passes, since a key may be allowed its buckets without being allowed `ListBuckets`. Every refusal is also logged by `shunt serve` as `cluster add refused`.
 
-### `DELETE /v1/clusters/{name}`
+### `DELETE /v1/clusters/{name}[?dry_run=1]`
 
-Removes a cluster. Refused while any placement (primary, source, target, a `names` entry) or any tenant's `default_cluster` references it; the message lists each reference.
+Removes a cluster, and its stored secret files with it. Refused while any placement (primary, source, target, a `names` entry) or any tenant's `default_cluster` references it; the message lists each reference.
+
+With `?dry_run=1` nothing is removed; the answer says what would happen and carries the token the real call needs (ADR-0017):
+
+```json
+{"allowed": true, "name": "vast01", "references": [], "secret_files": 1,
+ "token": "1758542400.k2…", "expires_at": "2026-09-22T12:10:00Z"}
+```
+
+`allowed: false` carries the refusal the real call would give as `reason`, with the `references`, and no token. The real call takes the token in an optional body, `{"token": "…"}`, and refuses in this order: the references first, then a missing, malformed, expired or mismatched token (see [`purge-source`](#post-v1placementstenantbucketpurge-source) for the messages). The token is bound to the cluster's definition and its reference set, and lasts 10 minutes. The call runs under an operation record and answers `{"removed": "vast01", "operation": "…"}`. `shunt cluster remove` runs the dry run, prints it, and proceeds with the token; `--dry-run` stops after the summary.
 
 ### `POST /v1/tenants/{tenant}/default-cluster`
 
@@ -147,14 +160,29 @@ The call blocks for the window. It records `{"at", "window", "fallback_reads"}` 
 
 ### `POST /v1/placements/{tenant}/{bucket}/purge-source`
 
+`{"dry_run": false, "token": "…", "wait": "30s"}`; the body may be empty.
+
 Deletes the source bucket, then returns the placement to `ACTIVE` on its primary. Refused unless all of these hold:
 - the placement is `CUTOVER`, and every live member has installed the current directory version (a proxy that has not seen the cutover still reads the source on a miss);
 - it carries `cutover` evidence;
 - a full listing of both buckets finds no source key that the primary lacks, each candidate confirmed by a HEAD that finds it absent on the primary and then present on the source. The refusal names the first 20 keys it finds.
 
-Once allowed, it aborts the source's in-progress multipart uploads, deletes every object and then the bucket, and applies `CUTOVER → ACTIVE`, which drops the source.
+Once allowed, it aborts the source's in-progress multipart uploads, deletes every object and then the bucket, and applies `CUTOVER → ACTIVE`, which drops the source. It runs under an operation record whose `progress` counts the objects deleted.
 
-Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version"}`.
+Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version", "operation"}`.
+
+**The dry run** (`dry_run: true`) makes every check above, walks the source listing once more to count it, and deletes nothing (ADR-0017):
+
+```json
+{"allowed": true, "key": "default/data01", "source": "vast01", "bucket": "data01",
+ "objects": 5213, "bytes": 1287348211, "uploads_in_flight": 0, "missing": [], "version": 14,
+ "token": "1758542400.k2…", "expires_at": "2026-09-22T12:10:00Z"}
+```
+
+- `allowed: false` carries as `reason` the refusal the real call would give, with whatever was gathered before it (`missing` when the listing diff was not empty), and no token.
+- `objects`, `bytes` and `uploads_in_flight` are information, not what the token is bound to: in `CUTOVER` deletes still reach the source, so the counts move under client traffic. The token is bound to the placement and the source cluster's definition, and lasts 10 minutes.
+
+The real call refuses in this order: the state and the evidence (`… is ACTIVE; purge-source runs on a placement in CUTOVER`); then a missing token (`purge-source needs the confirmation token from its dry run; the token is valid for 10m0s`); then the fence and the listing diff; then a token that is wrong: `the confirmation token is malformed; run the dry run again`, `the confirmation token has expired; run the dry run again`, or `the confirmation token does not match the current state: something changed since the dry run; run it again`. `shunt purge-source` runs the dry run, prints it, and proceeds with the token; `--dry-run` stops after the summary.
 
 ### `POST /v1/tenants/{tenant}/client-keys`
 
@@ -185,10 +213,120 @@ It answers `{"tenant", "cluster", "scheme", "endpoints", "ready", "problems", "n
 ```json
 {"key": "default/data01", "from": "RAMPING", "to": "MIGRATING", "version": 8, "primary": "vast02", "source": "vast01",
  "ratio": 1, "created_bucket": "", "warning": "", "cutover": null,
- "held": true, "proxies": 2, "waiting_on": [], "silent": ["proxy-c"]}
+ "held": true, "proxies": 2, "waiting_on": [], "silent": ["proxy-c"],
+ "operation": "1758542400123-a1b2c3"}
 ```
 
-The last four are only present with fleet members (ADR-0016): `held`, the step was written as a hold first; `proxies`, live members that have the change; `waiting_on`, live members that have not installed it yet within `wait` (the change is written, but pending); `silent`, members past their lease that were not waited for.
+`held`, `proxies`, `waiting_on` and `silent` are only present with fleet members (ADR-0016): `held`, the step was written as a hold first; `proxies`, live members that have the change; `waiting_on`, live members that have not installed it yet within `wait` (the change is written, but pending); `silent`, members past their lease that were not waited for. `operation` is the record the change ran under ([Operations](#operations)).
+
+## Operations
+
+Every long-running action (a ramp step, `migrate`, `cutover`, `purge-source`, `finish`, and `DELETE /v1/clusters/{name}`) runs under an operation record (ADR-0017): which phase it is in, which proxies it is waiting on, how it ended. The action's own route writes the record, runs, and answers as it always has plus `operation`; `POST /v1/operations` writes the record and answers at once, for a browser that polls or follows [Events](#events). The CLI's `--wait` polls the record. A record is per operation, never per object.
+
+- An operation runs on the control node's lifetime, not the request's: a client that leaves does not stop it, and the record has its outcome.
+- `wait` in the args keeps the fence semantics of ADR-0016: a hold that does not reach every member within it is released, and the record ends `refused` with the same message the route gives.
+- A record is owned by the node that runs it. A control node that restarts marks its own `running` records `failed` with `the control node running this operation restarted before it finished; repeat the step to complete it`; a held step it left completes when the step is repeated.
+- Records are kept in etcd on a fleet (`/shunt/ops/<id>`, the last 1 000, readable from any control node) and in memory on a lab proxy.
+
+### `POST /v1/operations`
+
+`{"kind": "ramp", "placement": "default/data01", "args": {"ratio": 0.5, "wait": "30s"}}`
+
+`kind` is one of `ramp`, `migrate`, `cutover`, `purge-source`, `finish` (a placement, as `tenant/bucket`) or `cluster-remove` (a `cluster`). `args` is the body the action's own route takes; unknown fields are refused, and a `purge-source` dry run is not an operation (call its route). A missing placement or cluster is 404. Answers `202` with the record:
+
+```json
+{"id": "1758542400123-a1b2c3", "kind": "ramp", "placement": "default/data01", "actor": "api:127.0.0.1", "node": "c1",
+ "created": "2026-09-22T12:00:00Z", "updated": "2026-09-22T12:00:00Z",
+ "status": "running", "phase": "queued", "args": {"ratio": 0.5, "wait": "30s"}}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `running`, then `succeeded`, `failed` (the error's `code` is what the route would have answered) or `refused` |
+| `phase` | where it is: `queued` (waiting for the bucket's step lock), `precondition` (waiting for every proxy to have the current version), `hold` (the hold is written; waiting for every proxy to have it), `step` (the step is being written), `settle` (the step is written; waiting for every live proxy to have it), `window` (cutover's quiet window), `diff` (purge-source's listing diff), `purge` (deleting the source), `done` |
+| `waiting_on` | the proxies the current phase waits for, by id, as they change |
+| `silent` | members past their lease, not waited for |
+| `progress` | `{"done", "total", "unit"}` for a phase with a length: cutover's window in seconds, purge-source's objects |
+| `version` | the directory version the step wrote, once it has |
+| `args` | the request as given |
+| `result` | the answer the route gives, once `succeeded`: a transition result, a purge result, or `{"removed"}` |
+| `error` | `{"code", "message"}`, once `failed` or `refused`; the message is the one the route gives |
+
+### `GET /v1/operations/{id}`
+
+The record; 404 `not_found` for an id this control plane does not have (a lab proxy's records die with it).
+
+### `GET /v1/operations[?placement=t/b][&cluster=name][&limit=50]`
+
+`{"operations": [...]}`, newest first, filtered by placement or cluster when given; `limit` defaults to 50 and is capped at 500.
+
+## Events
+
+### `GET /v1/events`
+
+Server-sent events from this control node (ADR-0017): `Content-Type: text/event-stream`, one `id: <epoch>:<seq>`, `event: <type>`, `data: <json>` block per event, and a `: keepalive` comment every 15 s while nothing happens. A change made by the CLI is on the stream within one heartbeat.
+
+| `event` | `data` |
+|---|---|
+| `directory` | `{"version", "kind": "placement" \| "cluster" \| "tenant", "key", "op": "put" \| "delete", "record"}`, one per record that changed at that version (a cluster record carries `secret_ref`, never a secret), then `{"version", "kind": "version"}` once every record of the version has been sent |
+| `fence` | `{"operation", "kind", "placement" \| "cluster", "status", "phase", "waiting_on", "silent", "version"}`, every time an operation record changes, from any control node |
+| `fleet` | `{"id", "event": "joined" \| "left" \| "silent" \| "live" \| "applied", "applied", "version"}`, from the fleet table read once a second |
+| `telemetry` | reserved: a merged 10 s window is ready (UI-1) |
+| `reset` | `{"reason"}`: the id the client resumed from is not in this node's ring; reload the read models, then follow the stream |
+
+- Ids are `<epoch>:<seq>`, the epoch being this node's start, so an id from another node or an earlier run is recognized as foreign. Each node keeps its last 4 096 events. Resuming with `Last-Event-ID` (the header, or `?last_event_id=` for a client that cannot set one) replays what was missed when the id is in the ring, and sends `reset` first when it is not.
+- The bearer token is the only authentication, so a browser reads the stream with `fetch` and the `Authorization` header, not `EventSource`, which cannot send headers; a token never goes in a URL.
+- On `shunt-control` the route answers 503 `unavailable` until the node has loaded the directory (waiting for quorum); a client treats it as retry. At most 64 streams per node; the 65th is 503.
+
+## Views
+
+Read models for a browser: what one screen shows, in one answer, with no secret in it (ADR-0017). `GET /v1/placements/{tenant}/{bucket}` keeps its secrets for the mover; these routes strip them.
+
+### `GET /v1/clusters/{name}/view`
+
+The cluster as `GET /v1/status` lists it, plus:
+
+```json
+{"name": "vast02", "type": "vast", "scheme": "http", "region": "us-east-1", "endpoints": ["10.0.0.2:80"],
+ "access_key": "AKIA…", "secret_ref": "control:vast02", "conditional_write": true, "conditional_delete": false,
+ "references": ["placements.default/data01"],
+ "capabilities": {"conditional_write": {"value": true, "known": true}, "conditional_delete": {"value": false, "known": false}},
+ "probe": {"reachable": true, "latency_ms": 3.2, "checked_at": "2026-09-22T12:00:00Z"}}
+```
+
+- `capabilities`: `known` is true when the definition states the capability (set by the operator, or measured by `expand`); `known: false` is the assumed default, which the UI marks as such.
+- `probe`: one signed `ListBuckets` made for this answer, with a 2 s timeout; `error` says why it is not `reachable`.
+
+### `GET /v1/placements/{tenant}/{bucket}/view`
+
+The placement as `GET /v1/status` reports it (state, sides, names, ratio, prefixes, hold, counters, cutover evidence, mover), plus:
+
+```json
+{"key": "default/data01", "state": "RAMPING", "primary": "vast02", "source": "vast01", "names": {"vast01": "data01", "vast02": "data01-001"},
+ "ratio": 0.5, "ramp_writes": {"primary": 4456, "source": 4353}, "fallback_reads": 37, "dual_deletes": {},
+ "fence": {"version": 12, "held": false, "proxies": 2, "waiting_on": [], "silent": []},
+ "source_uploads_in_flight": 0, "operations": ["1758542400123-a1b2c3"],
+ "clusters": {"vast01": {"name": "vast01", "…": "…"}, "vast02": {"name": "vast02", "…": "…"}}}
+```
+
+- `fence`: the fleet read once for this answer; `waiting_on` are live members that have not installed `version`, `silent` members past their lease, `held` a step written as a hold and not yet completed (ADR-0016).
+- `source_uploads_in_flight`: multipart uploads in progress on the source bucket, which a cutover would cut off; `null` without a source, or when the source could not be asked (then `source_uploads_error` says why).
+- `operations`: the running operation records on this placement.
+- `clusters`: the definitions of the clusters the placement names, as `GET /v1/status` lists them, without secrets.
+- `mover` is the last report this node received, held in memory; per-range progress and cursors come with movers as workers (P3d).
+
+### `GET /v1/audit[?limit=50][&before=<version>]`
+
+`{"changes": [...]}`: the change records, newest first, the last `limit` (default 50, at most 500) at or before directory version `before` (default: the current version; the oldest record's `version` minus one is the next page).
+
+```json
+{"changes": [
+  {"ts": "2026-09-22T12:00:01Z", "actor": "api:127.0.0.1", "op": "set-state", "key": "default/data01", "version": 12,
+   "before": {"state": "ACTIVE", "…": "…"}, "after": {"state": "RAMPING", "…": "…"}}
+]}
+```
+
+`op` is `create`, `delete`, `set-state`, `set-default`, `adopt`, `set-target`, `cluster-put`, `cluster-remove`, or on a fleet `key-add` and `key-remove`; `before` and `after` are the placement, or `cluster_before` and `cluster_after` the cluster definition (with `secret_ref`, never a secret). A fleet keeps the last 10 000 versions in etcd; a lab proxy reads the tail of `<directory>.changes.jsonl`. The actor is `api:<peer address>` until OIDC lands.
 
 ## The fleet
 
@@ -209,11 +347,11 @@ A member's S3 `CreateBucket` and `DeleteBucket`, forwarded: `{"cluster", "name",
 
 ### `POST /v1/fleet/{id}/heartbeat`
 
-Sent by a member every `control.heartbeat_interval`: `{"started", "seq", "applied", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only. The first one from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"version", "lease_ttl"}`; a member whose version is behind fetches the directory at once.
+Sent by a member every `control.heartbeat_interval`: `{"started", "seq", "applied", "host", "version", "fallback_reads": {"<tenant>/<bucket>": n}}`, with counters for buckets that are not `ACTIVE` only; `host` is the member's host name and `version` its build. The first one from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"version", "lease_ttl"}`; a member whose version is behind fetches the directory at once. Unknown fields are refused, so control nodes are upgraded before proxies: an old node refuses a new proxy's `host` and `version`.
 
 ### `GET /v1/fleet`
 
-`{"version", "members": [{"id", "live", "applied", "seq", "started", "seen", "since_seen", "fallback_reads"}]}`. `live`: the lease has not expired. `shunt proxy list`.
+`{"version", "members": [{"id", "live", "applied", "seq", "started", "seen", "since_seen", "host", "version", "fallback_reads"}]}`. `live`: the lease has not expired; a member that is not live is what the web UI shows as stale. `shunt proxy list`.
 
 ### `DELETE /v1/fleet/{id}`
 
@@ -225,7 +363,8 @@ Served by `shunt-control` only, under the same token, for its own lifecycle; the
 
 | Route | Verb | Does |
 |---|---|---|
-| `GET /v1/control/status` | `status`, `member list` | `{"node", "version", "cluster": {"members": [{"name", "id", "peer_urls", "leader", "started"}], "quorum", "started", "has_quorum", "revision", "db_bytes", "db_in_use_bytes", "quota_bytes", "leader"}, "fleet": [...], "directory": <version>}` |
+| `GET /v1/control/status` | `status`, `member list` | `{"node", "version", "cluster": {"members": [{"name", "id", "peer_urls", "leader", "started"}], "quorum", "started", "has_quorum", "revision", "db_bytes", "db_in_use_bytes", "quota_bytes", "leader"}, "fleet": [...], "directory": <version>, "directory_loaded", "last_compaction", "compaction": {"mode", "retention"}, "join"}`. `last_compaction` is when etcd last compacted, `null` until it has since this node started; `compaction` is the schedule it runs on; `join` is the `shunt-control join` line a new node runs, built from this node's flags, with the new node's name, host and data directory left to fill in |
+| `GET /v1/control`, `GET /v1/control/` | the web UI | The same answer as `GET /v1/control/status` |
 | `POST /v1/control/members` | `join` | `{"name", "peer_url"}` adds a member and answers `{"initial_cluster", "encryption_key"}`: what the new node starts with. The key crosses the channel here |
 | `DELETE /v1/control/members/{name}` | `member remove` | Removes a member; the only member is refused |
 | `GET /v1/control/snapshot` | `snapshot save` | Streams a point-in-time snapshot of the store (secrets sealed) |

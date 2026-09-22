@@ -194,9 +194,17 @@ KEYS=6; mkdir -p last
   done ) &
 WRITER_PID=$!
 sleep 3
+# GET /v1/events (ADR-0017) must show the step as it happens: the record's fence and the directory change.
+TOKEN=$(cat "$WORK/secrets/control.token")
+curl -sN --max-time 4 -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/events" > "$WORK/events.log" 2>&1 &
+EVENTS_PID=$!
 accepted ramp fleet-a --ratio 0.25
 grep -q 'paused their writes until every proxy had it' <<<"$OUT" || fail "the first ramp step was not held"
 grep -q 'in effect on every live proxy (this one and 2 member' <<<"$OUT" || fail "ramp does not say it reached both members"
+wait "$EVENTS_PID" 2>/dev/null || true
+grep -q 'event: directory' "$WORK/events.log" || fail "GET /v1/events published no directory event for the ramp step"
+grep -q 'event: fence' "$WORK/events.log" || fail "GET /v1/events published no fence event for the ramp step"
+note "GET /v1/events carried the step: $(grep -c '^event: ' "$WORK/events.log") events during the ramp"
 sleep 3
 SHUNT_API=http://$C2_API accepted ramp fleet-a --ratio 0.6
 grep -q 'paused their writes' <<<"$OUT" || fail "the second step was not held"
@@ -285,5 +293,13 @@ grep -q 'in effect on every live proxy' <<<"$OUT" || fail "cutover did not reach
 accepted purge-source fleet-a
 [ "$(via "$A_LISTEN" s3 cp --quiet s3://fleet-a/seed/1 -)" = "seed 1" ] || fail "seed/1 is gone after the move"
 "$CONTROL" status | sed 's/^/     /'
+# Every step ran as an operation record (ADR-0017), readable from any control node.
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations?placement=default/fleet-a" \
+  | jq -e '[.operations[] | select(.status == "succeeded") | .kind] as $k
+           | ($k | index("ramp")) != null and ($k | index("cutover")) != null and ($k | index("purge-source")) != null' >/dev/null \
+  || fail "the operation records for fleet-a do not show ramp, cutover and purge-source succeeded"
+note "operation records: ramp, cutover and purge-source on fleet-a all succeeded"
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C2_API/v1/control" | jq -e '.join | test("shunt-control join --name")' >/dev/null \
+  || fail "GET /v1/control carries no join line for a new node"
 
 say "FLEET GREEN: three control nodes, two proxies sharing nothing, the fence, quorum loss and a cache restart all behave as ADR-0015 and ADR-0016 say"

@@ -201,7 +201,12 @@ source only ever loses keys. Then either:
   candidate is confirmed with a HEAD on both sides, so clients deleting meanwhile do not trip it). It then
   aborts the source's in-progress multipart uploads, deletes every object and the bucket, and returns
   the placement to `ACTIVE` without a source. The refusal names the first 20 missing keys: run the
-  mover again, or find out why they are missing, before retrying.
+  mover again, or find out why they are missing, before retrying. The command runs the API's dry
+  run first and prints what would go (`would delete 100 objects (1.6 MiB) and abort 0 in-flight
+  uploads from vast01/data01`); `--dry-run` stops there. The dry run issues a confirmation token,
+  valid for ten minutes and bound to the placement and the source cluster's definition, which the
+  purge presents: if either changed in between, the purge is refused and the dry run must be run
+  again (ADR-0017).
 - `shunt migrate finish data`: returns to `ACTIVE` and leaves the source bucket untouched and
   unreferenced, for you to keep or delete yourself.
 

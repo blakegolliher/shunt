@@ -1,0 +1,67 @@
+package control
+
+import "net/http"
+
+// Route is one entry of the control API's route table: the mux is built from it, and
+// docs/reference/control-routes.json is generated from it for the web UI's parity test
+// (ADR-0017). Verbs names the CLI verbs that reach the route; none means a member proxy's or a
+// read model's route.
+type Route struct {
+	Method   string   `json:"method"`
+	Pattern  string   `json:"pattern"`
+	Verbs    []string `json:"verbs,omitempty"`
+	Mutation bool     `json:"mutation"`
+
+	log string // the operation name serve's log shows a refusal under; "" for reads
+	h   http.HandlerFunc
+}
+
+func (s *Server) routes() []Route {
+	read := func(pattern string, h http.HandlerFunc, verbs ...string) Route {
+		return Route{Method: "GET", Pattern: pattern, Verbs: verbs, h: h}
+	}
+	mut := func(method, pattern, log string, h http.HandlerFunc, verbs ...string) Route {
+		return Route{Method: method, Pattern: pattern, Verbs: verbs, Mutation: true, log: log, h: h}
+	}
+	return []Route{
+		read("/v1/status", s.status, "status"),
+		read("/v1/directory", s.directoryHandler),
+		read("/v1/events", s.events),
+		read("/v1/audit", s.audit),
+		read("/v1/fleet", s.fleetList, "proxy list"),
+		read("/v1/operations", s.listOperations),
+		read("/v1/operations/{id}", s.getOperation, "ramp", "migrate start", "cutover", "purge-source", "migrate finish", "cluster remove"),
+		read("/v1/clusters/{name}/view", s.clusterView),
+		read("/v1/placements/{tenant}/{bucket}", s.placement, "migrate run"),
+		read("/v1/placements/{tenant}/{bucket}/view", s.placementView),
+		read("/v1/tenants/{tenant}/step-out", s.stepOut, "step-out"),
+		mut("POST", "/v1/operations", "operation", s.startOperation, "ramp", "migrate start", "cutover", "purge-source", "migrate finish", "cluster remove"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/create", "create", s.createPlacement),
+		mut("DELETE", "/v1/placements/{tenant}/{bucket}", "delete", s.deletePlacement),
+		mut("POST", "/v1/clusters", "cluster add", s.putCluster, "cluster add"),
+		mut("DELETE", "/v1/clusters/{name}", "cluster remove", s.removeCluster, "cluster remove"),
+		mut("POST", "/v1/tenants/{tenant}/default-cluster", "tenant set-default", s.setTenantDefault, "tenant set-default"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/adopt", "adopt", s.adopt, "adopt"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/expand", "expand", s.expand, "expand"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/ramp", "ramp", s.ramp, "ramp"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/migrate", "migrate start", s.migrateStart, "migrate start"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/mover-progress", "mover report", s.moverProgress, "migrate run"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/cutover", "cutover", s.cutover, "cutover"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/purge-source", "purge-source", s.purgeSource, "purge-source"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/finish", "migrate finish", s.finish, "migrate finish"),
+		mut("POST", "/v1/tenants/{tenant}/client-keys", "client key import", s.importKey, "adopt", "client add"),
+		mut("DELETE", "/v1/tenants/{tenant}/client-keys/{access_key}", "client key remove", s.removeKey, "client remove"),
+		mut("POST", "/v1/fleet/{id}/heartbeat", "", s.heartbeat),
+		mut("DELETE", "/v1/fleet/{id}", "proxy forget", s.forgetProxy, "proxy forget"),
+	}
+}
+
+// Routes is the route table without its handlers.
+func Routes() []Route {
+	rs := (&Server{}).routes()
+	out := make([]Route, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, Route{Method: r.Method, Pattern: r.Pattern, Verbs: r.Verbs, Mutation: r.Mutation})
+	}
+	return out
+}

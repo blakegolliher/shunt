@@ -19,7 +19,7 @@ cutover relies on.
 | 5 | Capability profiles measured vs assumed | partial: `expand` measures and reports `measured`, but provenance is not stored, `cluster add` does not probe, and nothing refuses an assumed profile |
 | — | Secrets never on argv | **already true**: prompt or stdin, `--secret-ref env:/file:`, `--keys <file>` |
 | — | `shunt-data` at an explicit path, absolute path logged | partial: `--state-dir` defaults to a relative `shunt-data`; the path is absolutized and logged |
-| — | `purge-source` dry run | not started; only the mover has `--dry-run` |
+| — | `purge-source` dry run | **done** in UI-0 (ADR-0017): `dry_run: true` answers the counts, the first missing keys and a confirmation token the real call must present; `shunt purge-source --dry-run` |
 | — | README and walkthrough | updated per item as each lands |
 
 **ADR numbering:** 0010–0012 are taken (operator ergonomics, stepping out, importing client keys).
@@ -136,8 +136,10 @@ profile should probably carry the probe's date and shunt should say when it is o
 
 - **`shunt-data` explicit:** require `--state-dir` rather than defaulting to a relative path, and log
   the absolute path at startup (it is already absolutized internally).
-- **`purge-source` dry run:** print what would be deleted (counts and the first keys) and require a
-  second call, or `--yes`, to delete. The listing diff it already computes is most of the work.
+- **`purge-source` dry run:** done in UI-0 (ADR-0017): the dry run answers what would be deleted
+  (counts and the first keys) and a confirmation token bound to the placement and the source
+  cluster; the real call must present it. `shunt purge-source` runs the dry run and proceeds with
+  the token, `--dry-run` stops after the summary.
 - **README and walkthrough** are updated with each item that changes a command.
 
 ## Acceptance

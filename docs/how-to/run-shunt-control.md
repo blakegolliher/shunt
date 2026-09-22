@@ -100,6 +100,10 @@ node's database file in place when `status` shows it far larger than what is in 
 that node briefly, so one node at a time. The audit trail keeps the last 10,000 directory
 versions in the store (`/shunt/v1/changes/`); export to object storage is deferred.
 
+Upgrade the control nodes before the proxies. A proxy's heartbeat is decoded with unknown fields
+refused, and a newer proxy reports fields (`host`, `version`, ADR-0017) an older control node
+does not know, so it would be refused until the node is upgraded.
+
 ## Metrics
 
 Every node serves `/-/metrics` on its API listener: `shunt_fleet_members{state="live"|"silent"}`,

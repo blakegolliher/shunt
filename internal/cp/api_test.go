@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"flag"
+	"os"
+	"path/filepath"
 
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
@@ -57,11 +62,22 @@ func fakeS3(t *testing.T) *httptest.Server {
 
 // node is one control node's API over the shared etcd cluster.
 type node struct {
-	t     *testing.T
-	api   *httptest.Server
-	ctl   *control.Server
-	store *Store
-	fleet *Fleet
+	t      *testing.T
+	api    *httptest.Server
+	ctl    *control.Server
+	store  *Store
+	fleet  *Fleet
+	ops    *Operations
+	events *control.Events
+	hookMu sync.Mutex
+	hook   func(control.Operation) // a test's own OnChange, beside the events
+}
+
+// onChange sets a test's hook on the node's operation records, safely beside the running watch.
+func (n *node) onChange(fn func(control.Operation)) {
+	n.hookMu.Lock()
+	n.hook = fn
+	n.hookMu.Unlock()
 }
 
 func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.Duration) *node {
@@ -74,19 +90,38 @@ func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.D
 	registry := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, store.Resolve)
 	t.Cleanup(registry.Close)
 	store.Prepare = func(f *directory.File) error { _, _, err := registry.Apply(f.Clusters); return err }
+	events := control.NewEvents(256)
+	store.OnInstall = events.Directory
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := store.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Close)
+	n := &node{t: t, store: store, events: events}
+	ops := NewOperations(tc.nodes[i].Client())
+	ops.OnChange = func(op control.Operation) {
+		events.Fence(op)
+		n.hookMu.Lock()
+		hook := n.hook
+		n.hookMu.Unlock()
+		if hook != nil {
+			hook(op)
+		}
+	}
+	if err := ops.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ops.Close)
 	fleet := NewFleet(tc.nodes[i].Client(), leaseTTL)
 	fleet.DropMargin = 500 * time.Millisecond
 	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: telemetry.NewMetrics(), Log: slog.New(slog.DiscardHandler),
-		Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, FencePoll: 20 * time.Millisecond}
+		Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, FencePoll: 20 * time.Millisecond,
+		Ops: ops, Node: fmt.Sprintf("c%d", i+1), Events: events, ConfirmKey: c.Derive("confirm")}
 	api := httptest.NewServer(ctl.Handler())
 	t.Cleanup(api.Close)
-	return &node{t: t, api: api, ctl: ctl, store: store, fleet: fleet}
+	n.api, n.ctl, n.fleet, n.ops = api, ctl, fleet, ops
+	return n
 }
 
 func (n *node) call(method, path string, body, out any) (int, string) {
@@ -310,5 +345,174 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	}
 	if int64(len(changes.Kvs)) != a.store.Version() {
 		t.Errorf("%d change records for version %d", len(changes.Kvs), a.store.Version())
+	}
+}
+
+// An operation started on one node is followed from another: its record, its fence events, and
+// its outcome (ADR-0017). Then the records a node leaves running when it stops, and the audit
+// trail read back through the store.
+func TestOperationsAcrossNodes(t *testing.T) {
+	tc := startCluster(t, 2)
+	key := make([]byte, 32)
+	key[5] = 9
+	a, b := startNode(t, tc, 0, key, time.Second), startNode(t, tc, 1, key, time.Second)
+	src, dst := fakeS3(t), fakeS3(t)
+	def := func(srv *httptest.Server, name string) config.Cluster {
+		cw := true
+		return config.Cluster{Type: "minio", Scheme: "http", Region: "us-east-1", Endpoints: []string{strings.TrimPrefix(srv.URL, "http://")},
+			Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:" + name}, Capabilities: config.Capabilities{ConditionalWrite: &cw}}
+	}
+	a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast01", Cluster: def(src, "vast01"), Secret: "s1"}, nil)
+	a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast02", Cluster: def(dst, "vast02"), Secret: "s2"}, nil)
+	a.must("POST", "/v1/placements/acme/data01/adopt", control.AdoptRequest{Cluster: "vast01"}, nil)
+	a.must("POST", "/v1/placements/acme/data01/expand", control.ExpandRequest{To: "vast02", Create: true}, nil)
+	p2 := startMember(t, a, "p2", 50*time.Millisecond)
+
+	// A step through its own route runs under a record that the other node reads at once.
+	var tr control.TransitionResult
+	a.must("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 0.5}, &tr)
+	if tr.Operation == "" || !tr.Held {
+		t.Fatalf("ramp through its route: %+v", tr)
+	}
+	var rec control.Operation
+	b.must("GET", "/v1/operations/"+tr.Operation, nil, &rec)
+	if rec.Status != control.StatusSucceeded || rec.Kind != control.OpRamp || rec.Node != "c1" || rec.Version != tr.Version {
+		t.Fatalf("the record on node b: %+v", rec)
+	}
+
+	// p2 stops installing: an operation started on a waits on it, which b sees on the record and
+	// as fence events.
+	_, fence, _, ok, cancel := b.events.Subscribe("")
+	if !ok {
+		t.Fatal("subscribe on b")
+	}
+	defer cancel()
+	var (
+		trailMu sync.Mutex
+		trail   []string
+	)
+	a.onChange(func(op control.Operation) {
+		trailMu.Lock()
+		trail = append(trail, fmt.Sprintf("%s phase=%s status=%s waiting=%v updated=%s", op.ID, op.Phase, op.Status, op.WaitingOn, op.Updated.Format("05.000")))
+		trailMu.Unlock()
+	})
+	p2.follow.Store(false)
+	var started control.Operation
+	if code, raw := a.call("POST", "/v1/operations", control.OperationRequest{Kind: control.OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":0.8,"wait":"8s"}`)}, &started); code != http.StatusAccepted {
+		t.Fatalf("POST /v1/operations: %d %s", code, raw)
+	}
+	if started.ID == "" || started.Status != control.StatusRunning {
+		t.Fatalf("started: %+v", started)
+	}
+	waitFor(t, 5*time.Second, "node b did not see the hold waiting on p2", func() bool {
+		var op control.Operation
+		if code, _ := b.call("GET", "/v1/operations/"+started.ID, nil, &op); code != http.StatusOK {
+			return false
+		}
+		return op.Status == control.StatusRunning && op.Phase == control.PhaseHold && len(op.WaitingOn) == 1 && op.WaitingOn[0] == "p2"
+	})
+	deadline := time.After(5 * time.Second)
+	sawHold := false
+	for !sawHold {
+		select {
+		case ev := <-fence:
+			var fe control.FenceEvent
+			if ev.Type == "fence" && json.Unmarshal(ev.Data, &fe) == nil && fe.Operation == started.ID && fe.Phase == control.PhaseHold && len(fe.WaitingOn) == 1 {
+				sawHold = true
+			}
+		case <-deadline:
+			t.Fatal("node b published no fence event for the operation node a runs")
+		}
+	}
+	p2.follow.Store(true)
+	var done control.Operation
+	waitFor(t, 8*time.Second, "the operation did not succeed once p2 caught up", func() bool {
+		done = control.Operation{} // a fresh decode each poll: omitted fields would otherwise keep an earlier poll's values
+		if code, _ := a.call("GET", "/v1/operations/"+started.ID, nil, &done); code != http.StatusOK {
+			return false
+		}
+		return done.Status == control.StatusSucceeded
+	})
+	var res control.TransitionResult
+	if err := json.Unmarshal(done.Result, &res); err != nil || !res.Held || res.Ratio != 0.8 || done.Version == 0 || done.Version != res.Version || len(done.WaitingOn) != 0 {
+		trailMu.Lock()
+		defer trailMu.Unlock()
+		t.Fatalf("the finished record: %+v result %+v (%v)\nrecord trail on a:\n%s", done, res, err, strings.Join(trail, "\n"))
+	}
+	var list control.OperationList
+	b.must("GET", "/v1/operations?placement=acme/data01", nil, &list)
+	if len(list.Operations) != 2 || list.Operations[0].ID != started.ID {
+		t.Fatalf("listing on b: %+v", list.Operations)
+	}
+
+	// A record a node was running when it stopped is closed as failed when the node is back.
+	orphan := &control.Operation{ID: "0000000000001-abcdef", Kind: control.OpRamp, Placement: "acme/data01", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseHold}
+	if err := a.ops.Put(context.Background(), orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ctl.FailOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var failed control.Operation
+	a.must("GET", "/v1/operations/"+orphan.ID, nil, &failed)
+	if failed.Status != control.StatusFailed || failed.Error == nil || failed.Error.Code != "unavailable" {
+		t.Fatalf("the orphan: %+v", failed)
+	}
+
+	// The audit trail, newest first, from either node.
+	sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer scancel()
+	if err := b.store.WaitVersion(sctx, a.store.Version()); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := b.store.Changes(context.Background(), 0, 3)
+	if err != nil || len(changes) != 3 || changes[0].Version != a.store.Version() || changes[1].Version != changes[0].Version-1 || changes[0].Actor == "" {
+		t.Fatalf("changes: %+v %v", changes, err)
+	}
+	var page control.AuditPage
+	a.must("GET", "/v1/audit?limit=2", nil, &page)
+	if len(page.Changes) != 2 || page.Changes[0].Version != a.store.Version() {
+		t.Fatalf("audit page: %+v", page.Changes)
+	}
+	older, err := b.store.Changes(context.Background(), changes[2].Version, 2)
+	if err != nil || len(older) != 2 || older[0].Version != changes[2].Version {
+		t.Fatalf("paging the changes: %+v %v", older, err)
+	}
+}
+
+var updateRoutes = flag.Bool("update", false, "rewrite docs/reference/control-routes.json from the route tables")
+
+// The route table the web UI's parity test reads is the code's (ADR-0017): control.Routes and
+// this package's, kept equal to docs/reference/control-routes.json.
+func TestRouteTable(t *testing.T) {
+	path := filepath.Join("..", "..", "docs", "reference", "control-routes.json")
+	routes := append(control.Routes(), Routes()...)
+	want, err := json.MarshalIndent(routes, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+	if *updateRoutes {
+		if err := os.WriteFile(path, want, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("%v; run go test ./internal/cp -run TestRouteTable -update", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s does not match the route tables; run go test ./internal/cp -run TestRouteTable -update and commit it", path)
+	}
+	seen := map[string]bool{}
+	for _, r := range routes {
+		k := r.Method + " " + r.Pattern
+		if seen[k] {
+			t.Errorf("route %s is listed twice", k)
+		}
+		seen[k] = true
+		if (r.Method == "POST" || r.Method == "DELETE") != r.Mutation {
+			t.Errorf("route %s: mutation %v does not match its method", k, r.Mutation)
+		}
 	}
 }

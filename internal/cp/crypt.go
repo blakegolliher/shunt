@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -47,6 +48,16 @@ func NewCipher(key []byte) (*Cipher, error) {
 
 // Key returns the raw key, for handing to a joining node.
 func (c *Cipher) Key() []byte { return append([]byte(nil), c.key...) }
+
+// Derive returns a key for another purpose from the data-encryption key: sha256(key ‖ purpose).
+// The confirmation tokens of dry runs are keyed this way (ADR-0017), so every control node
+// verifies a token any node issued.
+func (c *Cipher) Derive(purpose string) []byte {
+	h := sha256.New()
+	h.Write(c.key)
+	h.Write([]byte(purpose))
+	return h.Sum(nil)
+}
 
 // Encrypt returns "v1:" + base64(nonce ‖ ciphertext).
 func (c *Cipher) Encrypt(plaintext string) (string, error) {

@@ -224,7 +224,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 
 ## 3. Non-goals for v1
 
-Object-level location index; migrating versioned buckets; erasure/replication across clusters; write-back caching with local disk; HTTP/2; SigV4A; S3 Select; legacy Glacier vault API; being the data mover; being the L4 balancer; kernel or NIC crypto offload; a web UI.
+Object-level location index; migrating versioned buckets; erasure/replication across clusters; write-back caching with local disk; HTTP/2; SigV4A; S3 Select; legacy Glacier vault API; being the data mover; being the L4 balancer; kernel or NIC crypto offload; a web UI (ADR-0017, branch `distributed`; a non-goal through POC-5).
 
 ## 4. Repo layout
 

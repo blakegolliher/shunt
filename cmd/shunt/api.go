@@ -98,6 +98,53 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
+// operate starts an operation record for one action and polls it until it ends (ADR-0017). The
+// server runs the action on its own context, so a --wait longer than a listener's timeout is
+// fine, and an operator who loses the connection can still read the outcome from the record.
+func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, out any) error {
+	var op control.Operation
+	if err := c.call(ctx, http.MethodPost, "/v1/operations", req, &op); err != nil {
+		return err
+	}
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for op.Status == control.StatusRunning {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("operation %s is still running (phase %s); follow it with GET %s/v1/operations/%s", op.ID, op.Phase, c.base, op.ID)
+		case <-tick.C:
+		}
+		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &op); err != nil {
+			return err
+		}
+	}
+	msg := "operation " + op.ID + " " + op.Status
+	if op.Error != nil {
+		msg = op.Error.Message
+	}
+	switch op.Status {
+	case control.StatusSucceeded:
+		if out != nil && len(op.Result) > 0 {
+			return json.Unmarshal(op.Result, out)
+		}
+		return nil
+	case control.StatusRefused:
+		if !strings.HasPrefix(msg, "refused") {
+			return fmt.Errorf("refused: %s", shownText(msg))
+		}
+	}
+	return fmt.Errorf("%s", shownText(msg))
+}
+
+// argsOf is an operation's args: the request body the action's own route takes.
+func argsOf(v any) json.RawMessage {
+	if v == nil {
+		return nil
+	}
+	raw, _ := json.Marshal(v) //nolint:errcheck // request structs marshal
+	return raw
+}
+
 // printJSON writes v as indented JSON.
 func printJSON(cmd *cobra.Command, v any) error {
 	enc := json.NewEncoder(cmd.OutOrStdout())

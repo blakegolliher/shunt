@@ -37,6 +37,9 @@ type Heartbeat struct {
 	// FallbackReads is shunt_migration_fallback_reads_total for each bucket that is not ACTIVE in
 	// the member's snapshot: bounded by migrations in flight, never by buckets.
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
+	// Host and Version say where the member runs and which build it is, for the fleet view.
+	Host    string `json:"host,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 // HeartbeatAnswer tells a member the current version and its lease.
@@ -57,6 +60,8 @@ type Member struct {
 	Seen          time.Time          `json:"seen,omitzero"`        // when its last heartbeat arrived
 	SinceSeen     time.Duration      `json:"since_seen,omitempty"` // how long ago, by the control plane's clock
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
+	Host          string             `json:"host,omitempty"`
+	Version       string             `json:"version,omitempty"` // the member's build
 }
 
 // Fleet is the fleet table. Two implementations: the control plane's, on leased etcd keys
@@ -122,10 +127,14 @@ func (s *Server) members(ctx context.Context) ([]Member, error) {
 }
 
 // PublishFleet refreshes shunt_fleet_members from the table, so a member that falls silent shows
-// up without anyone asking (ADR-0016).
+// up without anyone asking (ADR-0016), and publishes what changed as fleet events.
 func (s *Server) PublishFleet(ctx context.Context) error {
-	_, err := s.members(ctx)
-	return err
+	ms, err := s.members(ctx)
+	if err != nil {
+		return err
+	}
+	s.fleetEvents(ms)
+	return nil
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +174,7 @@ func (s *Server) forgetProxy(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	s.info(r, "proxy forgotten", "proxy", id)
+	s.info(actor(r), "proxy forgotten", "proxy", id)
 	writeJSON(w, http.StatusOK, map[string]string{"forgotten": id})
 }
 
@@ -173,11 +182,12 @@ func (s *Server) forgetProxy(w http.ResponseWriter, r *http.Request) {
 // runs out, and returns the ids it is still waiting on. strict waits for every member, live or
 // not: a round that takes a bucket out of ACTIVE, where a silent member may still be writing every
 // key to the source. Otherwise only live members count: a member that fell silent after the
-// bucket left ACTIVE stops routing its writes when its lease lapses.
-func (s *Server) fenceRound(ctx context.Context, v int64, strict bool, wait time.Duration) ([]string, error) {
+// bucket left ACTIVE stops routing its writes when its lease lapses. The ids it waits on are
+// reported on the operation's record as they change.
+func (s *Server) fenceRound(tr *tracker, v int64, strict bool, wait time.Duration) ([]string, error) {
 	start := s.now()
 	for {
-		ms, err := s.members(ctx)
+		ms, err := s.members(tr.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -187,6 +197,7 @@ func (s *Server) fenceRound(ctx context.Context, v int64, strict bool, wait time
 				waiting = append(waiting, m.ID)
 			}
 		}
+		tr.waiting(waiting)
 		if len(waiting) == 0 {
 			if s.Metrics != nil && len(ms) > 0 {
 				s.Metrics.FenceWait.Observe(s.now().Sub(start).Seconds())
@@ -196,7 +207,7 @@ func (s *Server) fenceRound(ctx context.Context, v int64, strict bool, wait time
 		if s.now().Sub(start) >= wait {
 			return waiting, nil
 		}
-		if err := s.sleep(ctx, s.fencePoll()); err != nil {
+		if err := s.sleep(tr.ctx, s.fencePoll()); err != nil {
 			return waiting, err
 		}
 	}
@@ -328,8 +339,9 @@ func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	wait, ok := parseWait(w, q.Get("wait"))
-	if !ok {
+	wait, err := parseWait(q.Get("wait"))
+	if err != nil {
+		fail(w, err)
 		return
 	}
 	if q.Get("wait") == "" {

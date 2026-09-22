@@ -187,6 +187,15 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	store := cp.New(node.Client(), cipher, log)
 	registry := upstream.NewRegistry(upstream.Options{}, store.Resolve)
 	defer registry.Close()
+	// Every installed version and every operation record change is published on GET /v1/events
+	// (ADR-0017); the store's first install is the stream's baseline.
+	events := control.NewEvents(0)
+	store.OnInstall = events.Directory
+	ops := cp.NewOperations(node.Client())
+	ops.OnChange = events.Fence
+	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
+	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, Token: token,
+		Ops: ops, Node: o.name, Events: events, Ctx: ctx, ConfirmKey: cipher.Derive("confirm")}
 	store.Prepare = func(f *directory.File) error {
 		added, removed, aerr := registry.Apply(f.Clusters)
 		if aerr != nil {
@@ -201,17 +210,36 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		return nil
 	}
 	// The store loads once there is quorum; until then /v1/ answers 503 and status says so. A
-	// node restarting alone after an outage must serve its API for the operator to see that.
+	// node restarting alone after an outage must serve its API for the operator to see that. The
+	// operation records follow the directory, and the records this node was running when it last
+	// stopped are closed as failed.
 	go func() {
+		loaded := false
 		for ctx.Err() == nil {
 			sctx, scancel := context.WithTimeout(ctx, 15*time.Second)
-			err := store.Start(sctx)
+			var err error
+			if !loaded {
+				if err = store.Start(sctx); err == nil {
+					loaded = true
+					log.Info("directory loaded", "version", store.Version())
+				}
+			}
+			if loaded {
+				if err = ops.Start(sctx); err == nil {
+					if ferr := ctl.FailOrphans(sctx); ferr != nil {
+						log.Warn("operation records left running by the last stop could not all be closed", "err", ferr.Error())
+					}
+				}
+			}
 			scancel()
 			if err == nil {
-				log.Info("directory loaded", "version", store.Version())
 				return
 			}
-			log.Warn("directory not loaded yet (waiting for quorum?)", "err", err.Error())
+			if !loaded {
+				log.Warn("directory not loaded yet (waiting for quorum?)", "err", err.Error())
+			} else {
+				log.Warn("operation records not loaded yet", "err", err.Error())
+			}
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
@@ -219,13 +247,11 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		}
 	}()
 	defer store.Close()
-	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
-	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, Token: token}
-	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version}
+	defer ops.Close()
+	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o)}
 
 	adm := admin.New(metrics.Registry, telemetry.NewSlowRing(1, time.Hour))
-	adm.Mount("/v1/control/", ctl.Authorize(api.Handler()))
-	adm.Mount("/v1/", gate(store, ctl.Handler()))
+	mountControl(adm, ctl, api, store)
 	srv := adm.Listen(o.api)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
@@ -251,6 +277,36 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 			}
 		}
 	}
+}
+
+// mountControl serves the control plane's own routes and the control API on the admin mux. The
+// bare /v1/control is mounted on its own: a subtree pattern alone would redirect it to a path the
+// inner mux does not serve.
+func mountControl(adm *admin.Server, ctl *control.Server, api *cp.API, store *cp.Store) {
+	own := ctl.Authorize(api.Handler())
+	adm.Mount("/v1/control", own)
+	adm.Mount("/v1/control/", own)
+	adm.Mount("/v1/", gate(store, ctl.Handler()))
+}
+
+// joinLine is the command a new control node runs to join this one, as GET /v1/control shows it:
+// this node's own flags filled in, the parts only the operator knows in angle brackets.
+func joinLine(o *nodeOptions) string {
+	_, port, err := net.SplitHostPort(o.api)
+	if err != nil {
+		port = "9901"
+	}
+	parts := []string{"shunt-control join --name <name> --data-dir <data-dir> --peer-url http://<host>:2380 --api <host>:" + port}
+	if o.tokenRef != "" {
+		parts = append(parts, "--token-ref "+o.tokenRef)
+	}
+	if o.plaintext {
+		parts = append(parts, "--plaintext")
+	}
+	if o.leaseTTL != 10*time.Second && o.leaseTTL > 0 {
+		parts = append(parts, "--lease-ttl "+o.leaseTTL.String())
+	}
+	return strings.Join(append(parts, "--existing http://"+o.api), " ")
 }
 
 // gate answers 503 until the store has loaded the directory.

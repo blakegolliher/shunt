@@ -221,6 +221,9 @@ type Store interface {
 	PutCluster(ctx context.Context, name string, c config.Cluster, secret, actor string) error
 	// RemoveCluster drops a cluster nothing references.
 	RemoveCluster(ctx context.Context, name, actor string) error
+	// Changes returns the last limit change records at or before version before, newest first;
+	// before 0 means the current version. Records past the store's retention are gone.
+	Changes(ctx context.Context, before int64, limit int) ([]Change, error)
 }
 
 // Errors returned by Directory implementations.

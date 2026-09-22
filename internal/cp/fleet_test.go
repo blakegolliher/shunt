@@ -11,7 +11,7 @@ import (
 )
 
 // waitFor polls until cond holds or the deadline passes.
-func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
+func waitFor(t testing.TB, d time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for !cond() {

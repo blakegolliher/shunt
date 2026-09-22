@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 )
@@ -29,7 +31,8 @@ type JoinAnswer struct {
 	EncryptionKey  []byte `json:"encryption_key"`
 }
 
-// StatusAnswer is `shunt-control status`: the etcd cluster and the fleet in one answer.
+// StatusAnswer is `shunt-control status` and GET /v1/control: the etcd cluster and the fleet in
+// one answer, with what a new node needs to join (ADR-0017).
 type StatusAnswer struct {
 	Node    string           `json:"node"`
 	Version string           `json:"version"` // shunt-control's build
@@ -41,26 +44,82 @@ type StatusAnswer struct {
 	// node waits for quorum to load it.
 	Directory       int64 `json:"directory"`
 	DirectoryLoaded bool  `json:"directory_loaded"`
+	// LastCompaction is when etcd last compacted its history, from its own gauge; null until a
+	// compaction has run since this node started.
+	LastCompaction *time.Time `json:"last_compaction"`
+	Compaction     Compaction `json:"compaction"`
+	// Join is the command a new control node runs to join this one, with the parts only the
+	// operator knows in angle brackets.
+	Join string `json:"join"`
 }
 
-// API is the handler for /v1/control/.
+// Compaction is etcd's automatic compaction as this node runs it.
+type Compaction struct {
+	Mode      string `json:"mode"`
+	Retention string `json:"retention"`
+}
+
+// API is the handler for /v1/control.
 type API struct {
 	Node    *Node
 	Store   *Store
 	Fleet   *Fleet
 	Cipher  *Cipher
 	Version string
+	// Join is the join command line shunt-control renders from its own flags.
+	Join string
 }
 
 // Handler returns the routes. Authentication is the control API's, applied by the caller.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/control", a.status)
+	mux.HandleFunc("GET /v1/control/{$}", a.status)
 	mux.HandleFunc("GET /v1/control/status", a.status)
 	mux.HandleFunc("POST /v1/control/members", a.join)
 	mux.HandleFunc("DELETE /v1/control/members/{name}", a.removeMember)
 	mux.HandleFunc("GET /v1/control/snapshot", a.snapshot)
 	mux.HandleFunc("POST /v1/control/defrag", a.defrag)
 	return mux
+}
+
+// Routes is the control plane's own route table, for docs/reference/control-routes.json: the
+// `shunt-control` verbs that reach each route.
+func Routes() []control.Route {
+	status := []string{"status", "member list"}
+	return []control.Route{
+		{Method: "GET", Pattern: "/v1/control", Verbs: status},
+		{Method: "GET", Pattern: "/v1/control/{$}", Verbs: status},
+		{Method: "GET", Pattern: "/v1/control/status", Verbs: status},
+		{Method: "POST", Pattern: "/v1/control/members", Verbs: []string{"join"}, Mutation: true},
+		{Method: "DELETE", Pattern: "/v1/control/members/{name}", Verbs: []string{"member remove"}, Mutation: true},
+		{Method: "GET", Pattern: "/v1/control/snapshot", Verbs: []string{"snapshot save"}},
+		{Method: "POST", Pattern: "/v1/control/defrag", Verbs: []string{"defrag"}, Mutation: true},
+	}
+}
+
+// compactionGauge is etcd's own record of its last compaction: unix seconds, 0 since start.
+const compactionGauge = "etcd_debugging_mvcc_db_compaction_last"
+
+// lastCompaction reads when etcd last compacted, from the gauge it registers on the default
+// Prometheus registry; nil until a compaction has run since this process started.
+func lastCompaction() *time.Time {
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		return nil
+	}
+	for _, f := range families {
+		if f.GetName() != compactionGauge {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if v := m.GetGauge().GetValue(); v > 0 {
+				t := time.Unix(int64(v), 0).UTC()
+				return &t
+			}
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -83,7 +142,9 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 		return
 	}
-	ans := StatusAnswer{Node: a.Node.Name(), Version: a.Version, Cluster: cs, Fleet: []control.Member{}, Directory: a.Store.Version(), DirectoryLoaded: a.Store.Ready()}
+	ans := StatusAnswer{Node: a.Node.Name(), Version: a.Version, Cluster: cs, Fleet: []control.Member{}, Directory: a.Store.Version(), DirectoryLoaded: a.Store.Ready(),
+		LastCompaction: lastCompaction(), Join: a.Join}
+	ans.Compaction.Mode, ans.Compaction.Retention = a.Node.Compaction()
 	fctx, fcancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer fcancel()
 	if fleet, err := a.Fleet.Members(fctx); err != nil {

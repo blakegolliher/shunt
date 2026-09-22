@@ -160,28 +160,51 @@ func checkSecret(s string) (string, error) {
 }
 
 func newClusterRemove() *cobra.Command {
-	var o apiOptions
+	var (
+		o      apiOptions
+		dryRun bool
+	)
 	cmd := &cobra.Command{
 		Use:   "remove <name>",
 		Short: "Remove a cluster nothing references any more",
-		Args:  cobra.ExactArgs(1),
+		Long: "Refused while any placement or tenant default still names the cluster. The dry run the API answers\n" +
+			"first says what would happen and issues the confirmation token the removal presents (ADR-0017);\n" +
+			"--dry-run stops there.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
 			api, err := o.client()
 			if err != nil {
 				return err
 			}
-			var out map[string]string
-			if callErr := api.call(cmd.Context(), "DELETE", "/v1/clusters/"+url.PathEscape(args[0]), nil, &out); callErr != nil {
+			var plan control.RemoveDryRun
+			if callErr := api.call(cmd.Context(), "DELETE", "/v1/clusters/"+url.PathEscape(name)+"?dry_run=1", nil, &plan); callErr != nil {
 				return callErr
+			}
+			if !plan.Allowed {
+				return fmt.Errorf("refused: %s", shownText(plan.Reason))
+			}
+			if dryRun {
+				if o.json {
+					return printJSON(cmd, plan)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "would remove cluster %s: nothing references it, and %d stored secret file(s) go with it\n", name, plan.SecretFiles)
+				return err
+			}
+			var out control.RemoveResult
+			req := control.OperationRequest{Kind: control.OpClusterRemove, Cluster: name, Args: argsOf(control.RemoveRequest{Token: plan.Token})}
+			if opErr := api.operate(cmd.Context(), req, &out); opErr != nil {
+				return opErr
 			}
 			if o.json {
 				return printJSON(cmd, out)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s removed; shunt no longer holds a connection to it\n", args[0])
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s removed; shunt no longer holds a connection to it\n", name)
 			return err
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "say what would be removed and stop")
 	return cmd
 }
 
@@ -376,7 +399,7 @@ func newRamp() *cobra.Command {
 			}
 			req.Wait = wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, "/ramp", req, time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpRamp, req, time.Minute+3*wait)
 			})
 		},
 	}
@@ -418,7 +441,7 @@ func newMigrateStart() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req.Wait = wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, "/migrate", req, time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpMigrate, req, time.Minute+3*wait)
 			})
 		},
 	}
@@ -454,7 +477,7 @@ func newCutover() *cobra.Command {
 				if !o.json {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: waiting %s for fallback reads to stay flat\n", key, window)
 				}
-				return transition(cmd, api, o, key, "/cutover", control.CutoverRequest{Window: window.String(), Wait: wait.String()}, window+2*time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpCutover, control.CutoverRequest{Window: window.String(), Wait: wait.String()}, window+2*time.Minute+3*wait)
 			})
 		},
 	}
@@ -466,16 +489,26 @@ func newCutover() *cobra.Command {
 }
 
 func newPurgeSource() *cobra.Command {
-	var o apiOptions
+	var (
+		o      apiOptions
+		dryRun bool
+		wait   time.Duration
+	)
 	cmd := &cobra.Command{
 		Use:   "purge-source <bucket>",
 		Short: "Delete the source bucket of a cut-over placement and forget the source",
 		Long: "Refused unless the placement is in CUTOVER with the evidence shunt cutover recorded, and unless the\n" +
-			"source holds no key the primary lacks. Then every in-progress upload on the source is aborted,\n" +
-			"every object deleted, the bucket deleted, and the placement returns to ACTIVE on its primary.",
+			"source holds no key the primary lacks. The dry run the API answers first counts what would go and\n" +
+			"issues the confirmation token the purge presents (ADR-0017); --dry-run stops there. Then every\n" +
+			"in-progress upload on the source is aborted, every object deleted, the bucket deleted, and the\n" +
+			"placement returns to ACTIVE on its primary.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := placementPath(args[0])
+			if err != nil {
+				return err
+			}
+			key, err := placementKey(args[0])
 			if err != nil {
 				return err
 			}
@@ -483,19 +516,40 @@ func newPurgeSource() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var out control.PurgeResult
-			if callErr := api.call(cmd.Context(), "POST", path+"/purge-source", nil, &out); callErr != nil {
+			var plan control.PurgeDryRun
+			if callErr := api.call(cmd.Context(), "POST", path+"/purge-source", control.PurgeRequest{DryRun: true, Wait: wait.String()}, &plan); callErr != nil {
 				return callErr
 			}
-			if o.json {
-				return printJSON(cmd, out)
+			if !plan.Allowed {
+				return fmt.Errorf("refused: %s", shownText(plan.Reason))
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
-				shown(out.Key), out.ObjectsDeleted, out.UploadsAborted, out.Source, out.Bucket, out.Version)
+			out := cmd.OutOrStdout()
+			switch {
+			case o.json && dryRun:
+				return printJSON(cmd, plan)
+			case !o.json:
+				_, _ = fmt.Fprintf(out, "%s: would delete %d objects (%s) and abort %d in-flight uploads from %s/%s, then forget the source\n",
+					shown(plan.Key), plan.Objects, humanBytes(plan.Bytes), plan.UploadsInFlight, plan.Source, plan.Bucket)
+			}
+			if dryRun {
+				return nil
+			}
+			var res control.PurgeResult
+			req := control.OperationRequest{Kind: control.OpPurge, Placement: key, Args: argsOf(control.PurgeRequest{Token: plan.Token, Wait: wait.String()})}
+			if opErr := api.operate(cmd.Context(), req, &res); opErr != nil {
+				return opErr
+			}
+			if o.json {
+				return printJSON(cmd, res)
+			}
+			_, err = fmt.Fprintf(out, "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
+				shown(res.Key), res.ObjectsDeleted, res.UploadsAborted, res.Source, res.Bucket, res.Version)
 			return err
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "count what would be deleted and stop")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the cutover")
 	return cmd
 }
 
@@ -510,7 +564,7 @@ func newMigrateFinish() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			err := forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, "/finish", nil, time.Minute)
+				return transition(cmd, api, o, key, control.OpFinish, nil, time.Minute)
 			})
 			if err == nil && from != "" && !o.json {
 				return reportLeftovers(cmd, o, from)
@@ -612,16 +666,16 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 	return tw.Flush()
 }
 
-// transition posts one state change and prints what it did.
-func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, op string, body any, timeout time.Duration) error {
-	path, err := placementPath(key)
+// transition runs one state change as an operation record, polls it, and prints what it did.
+func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, kind string, args any, timeout time.Duration) error {
+	placement, err := placementKey(key)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := waitContext(cmd, timeout)
 	defer cancel()
 	var res control.TransitionResult
-	if err := api.call(ctx, "POST", path+op, body, &res); err != nil {
+	if err := api.operate(ctx, control.OperationRequest{Kind: kind, Placement: placement, Args: argsOf(args)}, &res); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 	if o.json {
