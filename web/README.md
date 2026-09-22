@@ -19,6 +19,8 @@ inventory with their rationale:
   own records instead.
 - `GET /v1/clusters/{name}/view` and `GET /v1/placements/{tenant}/{bucket}/view` — secret-free
   composites of state that CLI commands render through their task-specific output.
+- `GET /v1/placements/{tenant}/{bucket}/mover-ledger` — a bounded browser tail of the local
+  append-only mover ledger; the CLI writes that ledger but has no tail verb.
 
 Member heartbeat routes are not browser routes. Later UI phases add their read models and operator
 actions to the inventory as those screens begin to call them.

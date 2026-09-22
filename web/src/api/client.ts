@@ -56,6 +56,9 @@ export interface ClusterStatus {
   secret_ref: string
   conditional_write: boolean
   conditional_delete: boolean
+  conditional_write_known?: boolean
+  conditional_delete_known?: boolean
+  capability_profile?: 'measured' | 'assumed'
   references?: string[]
   read_only: boolean
   reject_writes: boolean
@@ -70,6 +73,19 @@ export interface PlacementStatus {
   names: Record<string, string>
   read_only: boolean
   reject_writes: boolean
+  ratio?: number
+  prefixes?: string[]
+  ramp_writes?: Record<string, number>
+  fallback_reads?: number
+  dual_deletes?: Record<string, number>
+  cutover?: { at: string; window: number; fallback_reads: number }
+  mover?: MoverProgress
+  migration_window?: {
+    start: string
+    end: string
+    writes: Record<string, number>
+    reads: Record<string, number>
+  }
 }
 
 export interface DirectoryStatus {
@@ -97,6 +113,32 @@ export interface PlacementView extends PlacementStatus {
   fence: FenceStatus
   operations: string[]
   clusters: Record<string, ClusterStatus>
+  source_uploads_in_flight: number | null
+  source_uploads_error?: string
+}
+
+export interface MoverRange {
+  name: string
+  cursor?: string
+  done: number
+  total?: number
+  complete: boolean
+}
+
+export interface MoverProgress {
+  source: string
+  primary: string
+  pass: number
+  copied: number
+  skipped: number
+  vanished: number
+  failed: number
+  bytes: number
+  last_key?: string
+  done: boolean
+  converged: boolean
+  updated_at: string
+  ranges?: MoverRange[]
 }
 
 export interface Operation {
@@ -108,11 +150,41 @@ export interface Operation {
   status: 'running' | 'succeeded' | 'failed' | 'refused'
   phase?: string
   waiting_on?: string[]
+  silent?: string[]
+  progress?: { done: number; total: number; unit: string }
+  version?: number
   result?: unknown
   error?: { code: string; message: string }
 }
 
 export interface RemoveDryRun { allowed: boolean; reason?: string; name: string; references: string[]; secret_files: number; token?: string; expires_at?: string }
+export interface PurgeDryRun {
+  allowed: boolean
+  reason?: string
+  key: string
+  source?: string
+  bucket?: string
+  objects: number
+  bytes: number
+  uploads_in_flight: number
+  missing: string[]
+  version: number
+  token?: string
+  expires_at?: string
+}
+
+export interface LedgerEntry {
+  at: string
+  key: string
+  size: number
+  src_etag: string
+  dst_etag?: string
+  parts?: number
+  mode: string
+  result: string
+  detail?: string
+  took?: string
+}
 
 export interface TelemetryPoint { start: string; end: string; p50_us: number; p90_us: number; p99_us: number; p999_us: number; max_us: number; count: number }
 
@@ -171,6 +243,10 @@ export const setClusterReadOnly = (token: string, name: string, readOnly: boolea
 export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/read-only`, token, json({ read_only: readOnly, reject }))
 export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
 export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
+export const startOperation = (token: string, kind: string, placement: string, args?: unknown) => request<Operation>(`${apiRoot}/operations`, token, json({ kind, placement, args }))
+export const getOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}`, token)
+export const purgeSourceDryRun = (token: string, tenant: string, bucket: string) => request<PurgeDryRun>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/purge-source`, token, json({ dry_run: true, wait: '30s' }))
+export const getMoverLedger = (token: string, tenant: string, bucket: string) => request<{ entries: LedgerEntry[] }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/mover-ledger?limit=20`, token)
 
 export function parseSSEFrame(frame: string): StreamEvent | null {
   let id = ''

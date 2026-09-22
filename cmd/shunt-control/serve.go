@@ -196,8 +196,12 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	ops.OnChange = events.Fence
 	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
 	telemetryStore := telemetry.NewStore(o.leaseTTL)
+	moverDir := filepath.Join(o.dataDir, "mover")
+	worker := control.MoverWorker{Snapshot: func() *directory.File { return store.Snapshot().File() }, Secrets: store.ClusterSecrets,
+		CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
 	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, Token: token,
-		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm")}
+		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"),
+		Mover: worker.Run, MoverLedger: worker.Ledger}
 	store.Prepare = func(f *directory.File) error {
 		added, removed, aerr := registry.Apply(f.Clusters)
 		if aerr != nil {

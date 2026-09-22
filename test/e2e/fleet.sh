@@ -330,9 +330,20 @@ accepted ramp fleet-b --ratio 1.0
 grep -q 'silent, not waited for: proxy-b' <<<"$OUT" || fail "a step with a silent member did not name it"
 kill -CONT "${PID[b]}"; member_ok proxy-b || fail "B did not catch up after being silent"
 
-say "6. Mover, cutover and purge through the control plane, with the mover signing with secrets it holds"
-accepted migrate run fleet-a --until-converged --cursor-dir "$WORK" --ledger-dir "$WORK"
-grep -q 'converged' <<<"$OUT" || fail "the mover did not converge"
+say "6. Browser mover operation, cutover and purge through the control plane, with the mover signing with secrets it holds"
+mover=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"kind":"mover","placement":"default/fleet-a","args":{"until_converged":true,"max_passes":10}}' \
+  "http://$C1_API/v1/operations") || fail "the browser mover operation was not accepted"
+mover_id=$(jq -r '.id' <<<"$mover")
+for _ in $(seq 1 600); do
+  mover=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations/$mover_id") || fail "the mover operation disappeared"
+  [ "$(jq -r '.status' <<<"$mover")" = running ] || break
+  sleep 0.1
+done
+jq -e '.status == "succeeded" and .result.converged == true' <<<"$mover" >/dev/null || { printf '%s\n' "$mover"; fail "the browser mover did not converge"; }
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/placements/default/fleet-a/mover-ledger?limit=20" \
+  | jq -e '.entries | length > 0' >/dev/null || fail "the browser mover ledger has no entries"
+note "browser mover operation $mover_id converged and exposed its bounded ledger tail"
 accepted cutover fleet-a --window 5s
 grep -q 'in effect on every live proxy' <<<"$OUT" || fail "cutover did not reach the fleet"
 accepted purge-source fleet-a
@@ -341,9 +352,9 @@ accepted purge-source fleet-a
 # Every step ran as an operation record (ADR-0017), readable from any control node.
 curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations?placement=default/fleet-a" \
   | jq -e '[.operations[] | select(.status == "succeeded") | .kind] as $k
-           | ($k | index("ramp")) != null and ($k | index("cutover")) != null and ($k | index("purge-source")) != null' >/dev/null \
-  || fail "the operation records for fleet-a do not show ramp, cutover and purge-source succeeded"
-note "operation records: ramp, cutover and purge-source on fleet-a all succeeded"
+           | ($k | index("ramp")) != null and ($k | index("mover")) != null and ($k | index("cutover")) != null and ($k | index("purge-source")) != null' >/dev/null \
+  || fail "the operation records for fleet-a do not show ramp, mover, cutover and purge-source succeeded"
+note "operation records: ramp, mover, cutover and purge-source on fleet-a all succeeded"
 curl -sf -H "Authorization: Bearer $TOKEN" "http://$C2_API/v1/control" | jq -e '.join | test("shunt-control join --name")' >/dev/null \
   || fail "GET /v1/control carries no join line for a new node"
 

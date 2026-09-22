@@ -345,6 +345,20 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 				defer resp.Body.Close() //nolint:errcheck // relayed or aborted below
 			}
 		}
+		if h.Telemetry != nil && p.route.Fallback {
+			outcome := ""
+			switch {
+			case resp.StatusCode == http.StatusNotFound:
+				outcome = "miss"
+			case resp.StatusCode < http.StatusBadRequest && p.placement != nil && o.cluster == p.placement.Source:
+				outcome = "fallback_source"
+			case resp.StatusCode < http.StatusBadRequest:
+				outcome = "target_hit"
+			}
+			if outcome != "" {
+				h.Telemetry.ObserveMigration(time.Now(), p.bucketKey, "reads", outcome)
+			}
+		}
 	}
 
 	copyHeaders(w.Header(), resp.Header)

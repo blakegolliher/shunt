@@ -181,6 +181,14 @@ A fenced change (see [The fleet](#the-fleet)); held when the ramp is below 1. En
 
 Sent by `shunt migrate run` every 1,000 objects and at the end of each pass. Refused if `source` and `primary` do not match the placement. Only counts and the cursor key are stored, in memory.
 
+### `GET /v1/placements/{tenant}/{bucket}/mover-ledger[?limit=20]`
+
+Returns `{"entries": [...]}` from the append-only JSONL ledger on the control node that ran the
+browser mover. `limit` is 1 through 500. Entries carry the object key, size, source and destination
+ETags, part count, guard mode, outcome and duration. The ledger is local evidence, never directory
+or etcd state; another control node may therefore have no tail. The UI treats that as unavailable
+and can repeat the guarded mover there after failover.
+
 ### `POST /v1/placements/{tenant}/{bucket}/cutover`
 
 `{"window": "60s", "wait": "30s"}`
@@ -254,7 +262,7 @@ It answers `{"tenant", "cluster", "scheme", "endpoints", "ready", "problems", "n
 
 ## Operations
 
-Every long-running action (a ramp step, `migrate`, `cutover`, `purge-source`, `finish`, and `DELETE /v1/clusters/{name}`) runs under an operation record (ADR-0017): which phase it is in, which proxies it is waiting on, how it ended. The action's own route writes the record, runs, and answers as it always has plus `operation`; `POST /v1/operations` writes the record and answers at once, for a browser that polls or follows [Events](#events). The CLI's `--wait` polls the record. A record is per operation, never per object.
+Every long-running action (a ramp step, `migrate`, the browser `mover`, `cutover`, `purge-source`, `finish`, and `DELETE /v1/clusters/{name}`) runs under an operation record (ADR-0017): which phase it is in, which proxies it is waiting on, how it ended. The action's own route writes the record, runs, and answers as it always has plus `operation`; `POST /v1/operations` writes the record and answers at once, for a browser that polls or follows [Events](#events). The CLI's `--wait` polls the record. A record is per operation, never per object.
 
 - An operation runs on the control node's lifetime, not the request's: a client that leaves does not stop it, and the record has its outcome.
 - `wait` in the args keeps the fence semantics of ADR-0016: a hold that does not reach every member within it is released, and the record ends `refused` with the same message the route gives.
@@ -265,7 +273,7 @@ Every long-running action (a ramp step, `migrate`, `cutover`, `purge-source`, `f
 
 `{"kind": "ramp", "placement": "default/data01", "args": {"ratio": 0.5, "wait": "30s"}}`
 
-`kind` is one of `ramp`, `migrate`, `cutover`, `purge-source`, `finish`, `placement-read-only`
+`kind` is one of `ramp`, `migrate`, `mover`, `cutover`, `purge-source`, `finish`, `placement-read-only`
 (a placement, as `tenant/bucket`) or `cluster-remove`, `cluster-read-only` (a `cluster`). `args` is
 the body the action's own route takes; unknown fields are refused, and a `purge-source` dry run is
 not an operation (call its route). A missing placement or cluster is 404. Answers `202` with the
@@ -284,10 +292,10 @@ cluster or client secret; their secret-free response is recorded as `result`.
 | Field | Meaning |
 |---|---|
 | `status` | `running`, then `succeeded`, `failed` (the error's `code` is what the route would have answered) or `refused` |
-| `phase` | where it is: `queued` (waiting for the bucket's step lock), `precondition` (waiting for every proxy to have the current version), `hold` (the hold is written; waiting for every proxy to have it), `step` (the step is being written), `settle` (the step is written; waiting for every live proxy to have it), `window` (cutover's quiet window), `diff` (purge-source's listing diff), `purge` (deleting the source), `done` |
+| `phase` | where it is: `queued` (waiting for the bucket's step lock), `precondition` (waiting for every proxy to have the current version), `hold` (the hold is written; waiting for every proxy to have it), `step` (the step is being written), `settle` (the step is written; waiting for every live proxy to have it), `mover` (copying guarded objects and reporting passes), `window` (cutover's quiet window), `diff` (purge-source's listing diff), `purge` (deleting the source), `done` |
 | `waiting_on` | the proxies the current phase waits for, by id, as they change |
 | `silent` | members past their lease, not waited for |
-| `progress` | `{"done", "total", "unit"}` for a phase with a length: cutover's window in seconds, purge-source's objects |
+| `progress` | `{"done", "total", "unit", "ranges"?}` for a phase with a length: mover objects and cursors, cutover's window in seconds, purge-source's objects |
 | `version` | the directory version the step wrote, once it has |
 | `args` | the request as given |
 | `result` | the answer the route gives, once `succeeded`: a transition result, a purge result, or `{"removed"}` |
@@ -376,6 +384,7 @@ The placement as `GET /v1/status` reports it (state, sides, names, ratio, prefix
  "ratio": 0.5, "ramp_writes": {"primary": 4456, "source": 4353}, "fallback_reads": 37, "dual_deletes": {},
  "fence": {"version": 12, "held": false, "proxies": 2, "waiting_on": [], "silent": []},
  "source_uploads_in_flight": 0, "operations": ["1758542400123-a1b2c3"],
+ "migration_window": {"start":"2026-09-22T12:00:00Z","end":"2026-09-22T12:00:10Z","writes":{"source":51,"primary":49},"reads":{"target_hit":70,"fallback_source":3,"miss":1}},
  "clusters": {"vast01": {"name": "vast01", "…": "…"}, "vast02": {"name": "vast02", "…": "…"}}}
 ```
 
@@ -383,7 +392,13 @@ The placement as `GET /v1/status` reports it (state, sides, names, ratio, prefix
 - `source_uploads_in_flight`: multipart uploads in progress on the source bucket, which a cutover would cut off; `null` without a source, or when the source could not be asked (then `source_uploads_error` says why).
 - `operations`: the running operation records on this placement.
 - `clusters`: the definitions of the clusters the placement names, as `GET /v1/status` lists them, without secrets.
-- `mover` is the last report this node received, held in memory; per-range progress and cursors come with movers as workers (P3d).
+- `migration_window` is the latest completed fleet 10-second window for this placement: exact ramp
+  write outcomes (`source`, `primary`) and migrating read outcomes (`target_hit`, `fallback_source`,
+  `miss`). It is absent before a matching window closes. These bounded counters ride the same
+  heartbeat and merge deadline as latency telemetry.
+- `mover` is the last report this node received, held in memory. `ranges` currently contains one
+  ordered `all keys` range with its cursor and completed object count; a later split worker can add
+  ranges without changing the read model.
 
 ### `GET /v1/audit[?limit=50][&before=<version>]`
 

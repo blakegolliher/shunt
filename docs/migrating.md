@@ -87,10 +87,13 @@ The mover copies what the source still holds to the new primary. It is safe to r
 `MIGRATING`, or in `RAMPING` at ratio 1: anywhere else some writes are still going to the source, and
 a copied key could go stale. It refuses to start otherwise.
 
-It runs in the `shunt migrate run` process, not in `shunt serve`. It asks the control API for the
-placement and the cluster definitions, then resolves their `secret_ref`s itself, so the host running
-it needs the same `env:` or `file:` secrets as the proxy. It reports each pass to the API, which is
-what `shunt status` shows and what `cutover` checks.
+The copy engine never runs on the proxy request path. `shunt migrate run` runs it in the CLI process,
+after asking the control API for the placement and cluster definitions and resolving their
+`secret_ref`s locally. The web UI starts the same engine as an operation on the control node; that
+node resolves the sealed cluster secrets it already owns and keeps its cursor and ledger under its
+data directory. In either form every pass is reported to the API, which is what `shunt status`, the
+migration screen, and `cutover` check. A control-node restart fails its running operation; repeat the
+mover safely, since its guards, cursor, and append-only ledger make the work resumable.
 
 ```sh
 shunt migrate run data --until-converged                   # passes until one copies nothing (max --max-passes 10)
@@ -125,8 +128,8 @@ What it guarantees, and how (ADR-0004):
   bucket.
 
 `cutover` requires the mover's last pass to have copied nothing: that is what `--until-converged`
-repeats for. The report is held in the proxy's memory, so after a proxy restart, run the mover again
-before cutting over.
+repeats for. The report is held by the control API process serving the operation, so after that
+process restarts, run the mover again before cutting over.
 
 ### Into a cluster without conditional writes, the mover can lose a client write
 

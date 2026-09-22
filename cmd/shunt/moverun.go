@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -13,12 +12,15 @@ import (
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/mover"
 )
 
 // moverPaths are where a mover run keeps its cursor and ledger, and where it uploads the ledger.
 type moverPaths struct {
 	cursorDir, ledgerDir, ledgerBucket string
 }
+
+func humanBytes(n int64) string { return mover.HumanBytes(n) }
 
 func newMigrateRun() *cobra.Command {
 	var (
@@ -72,14 +74,7 @@ func newMigrateRun() *cobra.Command {
 					return err
 				}
 			}
-			jobs, err := selectPlacements(dir, secrets, one, from, accept)
-			if err != nil {
-				return err
-			}
-			if len(jobs) == 0 {
-				return errors.New("nothing to move: no MIGRATING placement, or RAMPING at ratio 1, matched")
-			}
-			return runMover(cmd, api, jobs, paths, dryRun, untilConverged, maxPasses)
+			return runMover(cmd, api, dir, secrets, one, from, paths, dryRun, untilConverged, maxPasses, accept)
 		},
 	}
 	addAPIFlags(cmd, &o)
@@ -114,79 +109,23 @@ func movingOff(ctx context.Context, api *apiClient, cluster string) ([]string, e
 
 // runMover runs passes over every job, reporting progress to the control API. It fails if an
 // object failed or changed ETag, or if --until-converged ran out of passes.
-func runMover(cmd *cobra.Command, api *apiClient, jobs []job, paths moverPaths, dryRun, untilConverged bool, maxPasses int) error {
-	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
-	for _, dir := range []string{paths.cursorDir, paths.ledgerDir} {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return err
+func runMover(cmd *cobra.Command, api *apiClient, dir *directory.File, secrets map[string]string, one, from string,
+	paths moverPaths, dryRun, untilConverged bool, maxPasses int, accept bool,
+) error {
+	_, err := mover.Run(cmd.Context(), dir, secrets, mover.Options{
+		Key: one, From: from, AcceptLostWriteWindow: accept, DryRun: dryRun,
+		UntilConverged: untilConverged, MaxPasses: maxPasses,
+		Paths:  mover.Paths{CursorDir: paths.cursorDir, LedgerDir: paths.ledgerDir, LedgerBucket: paths.ledgerBucket},
+		Out:    cmd.OutOrStdout(),
+		ErrOut: cmd.ErrOrStderr(),
+	}, func(p mover.Progress) {
+		progress := control.Progress{Source: p.Source, Primary: p.Primary, Pass: p.Pass, Copied: p.Copied,
+			Skipped: p.Skipped, Vanished: p.Vanished, Failed: p.Failed, Bytes: p.Bytes,
+			LastKey: p.LastKey, Done: p.Done, Converged: p.Converged}
+		path, _ := placementPath(p.Key)
+		if callErr := api.call(context.WithoutCancel(cmd.Context()), "POST", path+"/mover-progress", progress, nil); callErr != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "   progress report to the control API failed: %v\n", callErr)
 		}
-	}
-	if !untilConverged || dryRun {
-		maxPasses = 1
-	}
-	total := stats{}
-	unconverged := 0
-	for i := range jobs {
-		j := jobs[i]
-		key := j.tenant + "/" + j.client
-		_, _ = fmt.Fprintf(out, "== %s: %s/%s → %s/%s (%s guard, %s withdrawal)\n", shown(key),
-			j.src.name, j.src.bucket, j.dst.name, j.dst.bucket, guardName(j.conditional), withdrawName(j.condDelete))
-		if !j.conditional {
-			_, _ = fmt.Fprintf(out, "   WARNING (accepted with --%s): %s\n", migrate.AcceptLostWriteWindowFlag, migrate.LostWriteWindow(key, j.dst.name))
-		}
-		if err := checkSide(cmd.Context(), "source", j.src); err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
-		if err := checkSide(cmd.Context(), "target", j.dst); err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
-		converged := false
-		for pass := 1; pass <= maxPasses; pass++ {
-			if maxPasses > 1 {
-				_, _ = fmt.Fprintf(out, "   pass %d\n", pass)
-			}
-			report := func(s stats, lastKey string, done bool) {
-				p := control.Progress{Source: j.src.name, Primary: j.dst.name, Pass: pass, Copied: s.copied, Skipped: s.skipped,
-					Vanished: s.vanished, Failed: s.failed + s.drifted, Bytes: s.bytes, LastKey: lastKey, Done: done,
-					Converged: done && s.copied == 0 && s.failed == 0 && s.drifted == 0}
-				path, _ := placementPath(key)
-				if err := api.call(context.WithoutCancel(cmd.Context()), "POST", path+"/mover-progress", p, nil); err != nil {
-					_, _ = fmt.Fprintf(errOut, "   progress report to the control API failed: %v\n", err)
-				}
-			}
-			s, err := move(cmd.Context(), j, paths, dryRun, out, errOut, report)
-			total.copied += s.copied
-			total.skipped += s.skipped
-			total.vanished += s.vanished
-			total.failed += s.failed
-			total.drifted += s.drifted
-			total.bytes += s.bytes
-			if err != nil {
-				_, _ = fmt.Fprintf(errOut, "mover: %s: %v\n", key, err)
-				total.failed++
-				break
-			}
-			if s.copied == 0 && s.failed == 0 && s.drifted == 0 {
-				converged = true
-				break
-			}
-		}
-		if untilConverged && !dryRun && !converged {
-			unconverged++
-		}
-		if untilConverged && converged {
-			_, _ = fmt.Fprintf(out, "   converged: the last pass copied nothing\n")
-		}
-	}
-	_, _ = fmt.Fprintf(out, "\nmover: %d copied, %d already on the target, %d vanished mid-copy, %d failed, %s moved\n",
-		total.copied, total.skipped, total.vanished, total.failed, humanBytes(total.bytes))
-	switch {
-	case total.drifted > 0:
-		return fmt.Errorf("%d objects changed ETag across the move", total.drifted)
-	case total.failed > 0:
-		return fmt.Errorf("%d objects failed to copy", total.failed)
-	case unconverged > 0:
-		return fmt.Errorf("%d placements did not converge within %d passes", unconverged, maxPasses)
-	}
-	return nil
+	})
+	return err
 }

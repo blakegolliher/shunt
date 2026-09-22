@@ -8,10 +8,14 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
+	moveengine "github.com/blakegolliher/shunt/internal/mover"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 // The browser-facing surface of UI-0 (ADR-0017): operation records, dry runs and their tokens,
@@ -112,6 +116,131 @@ func TestOperationRecords(t *testing.T) {
 	rg.answers("POST", "/v1/operations", OperationRequest{Kind: OpRamp, Placement: "data01", Args: json.RawMessage(`{"ratio": 1}`)}, http.StatusBadRequest, "bad_request")
 	rg.answers("POST", "/v1/operations", OperationRequest{Kind: OpPurge, Placement: "acme/data01", Args: json.RawMessage(`{"dry_run": true}`)}, http.StatusBadRequest, "bad_request")
 	rg.answers("GET", "/v1/operations/nope", nil, http.StatusNotFound, "not_found")
+}
+
+func TestBrowserMoverOperationAndLedger(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
+	rg.ctl.Mover = func(_ context.Context, key string, req MoverRequest, report func(Progress)) (MoverResult, error) {
+		if key != "acme/data01" || !req.UntilConverged || req.MaxPasses != 3 {
+			t.Fatalf("mover request: key=%q req=%+v", key, req)
+		}
+		report(Progress{Source: "vast01", Primary: "vast02", Pass: 1, Copied: 2, Bytes: 6,
+			Done: true, Ranges: []MoverRange{{Name: "all keys", Done: 2, Total: 2, Complete: true}}})
+		report(Progress{Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true,
+			Ranges: []MoverRange{{Name: "all keys", Done: 2, Total: 2, Complete: true}}})
+		return MoverResult{Key: key, Passes: 2, Copied: 2, Skipped: 2, Bytes: 6, Converged: true}, nil
+	}
+	rg.ctl.MoverLedger = func(key string, limit int) ([]moveengine.LedgerEntry, error) {
+		if key != "acme/data01" || limit != 7 {
+			t.Fatalf("ledger request: key=%q limit=%d", key, limit)
+		}
+		return []moveengine.LedgerEntry{{Key: "a", Size: 3, Mode: "conditional", Result: "copied"}}, nil
+	}
+
+	args, _ := json.Marshal(MoverRequest{UntilConverged: true, MaxPasses: 3})
+	var op Operation
+	if code, raw := rg.call("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01", Args: args}, &op); code != http.StatusAccepted {
+		t.Fatalf("start mover: HTTP %d %s", code, raw)
+	}
+	done := rg.await(op.ID)
+	var result MoverResult
+	if done.Status != StatusSucceeded || done.Kind != OpMover || json.Unmarshal(done.Result, &result) != nil || !result.Converged || result.Copied != 2 {
+		t.Fatalf("mover operation: %+v result=%+v", done, result)
+	}
+	if done.Progress == nil || done.Progress.Done != 2 || done.Progress.Total != 2 || done.Progress.Unit != "objects" {
+		t.Fatalf("mover operation progress: %+v", done.Progress)
+	}
+	var view PlacementView
+	rg.must("GET", "/v1/placements/acme/data01/view", nil, &view)
+	if view.Mover == nil || !view.Mover.Converged || len(view.Mover.Ranges) != 1 || !view.Mover.Ranges[0].Complete {
+		t.Fatalf("placement mover: %+v", view.Mover)
+	}
+	var ledger struct {
+		Entries []moveengine.LedgerEntry `json:"entries"`
+	}
+	rg.must("GET", "/v1/placements/acme/data01/mover-ledger?limit=7", nil, &ledger)
+	if len(ledger.Entries) != 1 || ledger.Entries[0].Key != "a" {
+		t.Fatalf("ledger: %+v", ledger.Entries)
+	}
+	rg.answers("GET", "/v1/placements/acme/data01/mover-ledger?limit=501", nil, http.StatusBadRequest, "bad_request")
+}
+
+func TestBrowserMoverRefusals(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	var calls atomic.Int32
+	rg.ctl.Mover = func(context.Context, string, MoverRequest, func(Progress)) (MoverResult, error) {
+		calls.Add(1)
+		return MoverResult{Key: "acme/data01", Passes: 1}, nil
+	}
+	rg.refused("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01"}, "mover runs on a MIGRATING placement")
+	if calls.Load() != 0 {
+		t.Fatal("refused mover ran")
+	}
+
+	// The browser gets the same ADR-0004 lost-write-window refusal as the CLI and can explicitly
+	// accept it. Updating the target capability after expand models a corrected probe profile.
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(false)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{AcceptLostWriteWindow: true}, nil)
+	code, raw := rg.call("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01"}, nil)
+	var refusal Error
+	_ = json.Unmarshal([]byte(raw), &refusal)
+	want := migrate.RefuseLostWriteWindow("acme/data01", "vast02").Error()
+	if code != http.StatusConflict || refusal.Code != "refused" || refusal.Message != want {
+		t.Fatalf("lost-write refusal:\n got HTTP %d %s\nwant HTTP 409 %s", code, raw, want)
+	}
+	args, _ := json.Marshal(MoverRequest{AcceptLostWriteWindow: true})
+	var op Operation
+	if code, raw := rg.call("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01", Args: args}, &op); code != http.StatusAccepted {
+		t.Fatalf("accepted mover: HTTP %d %s", code, raw)
+	}
+	if done := rg.await(op.ID); done.Status != StatusSucceeded {
+		t.Fatalf("accepted mover: %+v", done)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("accepted mover calls = %d, want 1", calls.Load())
+	}
+
+	assumed := newRig(t)
+	assumed.prepare()
+	assumed.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
+	definition := assumed.vast02.definition(true)
+	definition.Capabilities.ConditionalWrite = nil
+	definition.Capabilities.ConditionalDelete = nil
+	assumed.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: definition}, nil)
+	assumed.ctl.Mover = rg.ctl.Mover
+	assumed.refused("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01"}, "has an assumed conditional-write profile")
+	accepted, _ := json.Marshal(MoverRequest{AcceptLostWriteWindow: true})
+	if code, raw := assumed.call("POST", "/v1/operations", OperationRequest{Kind: OpMover, Placement: "acme/data01", Args: accepted}, &op); code != http.StatusAccepted {
+		t.Fatalf("accepted assumed profile: HTTP %d %s", code, raw)
+	}
+	if done := assumed.await(op.ID); done.Status != StatusSucceeded {
+		t.Fatalf("accepted assumed-profile mover: %+v", done)
+	}
+}
+
+func TestPlacementViewUsesFleetMigrationWindow(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	store := telemetry.NewStore(10 * time.Second)
+	rg.ctl.Telemetry = store
+	start := time.Date(2026, 9, 16, 11, 59, 50, 0, time.UTC)
+	_, err := store.Ingest([]telemetry.MemberWindow{{ID: "proxy-a", Live: true, Telemetry: &telemetry.Window{
+		Start: start, End: start.Add(telemetry.WindowDuration),
+		Migrations: []telemetry.MigrationCounter{{Bucket: "acme/data01", Writes: map[string]int64{"source": 49, "primary": 51},
+			Reads: map[string]int64{"target_hit": 88, "fallback_source": 11, "miss": 1}}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view PlacementView
+	rg.must("GET", "/v1/placements/acme/data01/view", nil, &view)
+	window := view.MigrationWindow
+	if window == nil || !window.Start.Equal(start) || window.Writes["primary"] != 51 || window.Reads["fallback_source"] != 11 {
+		t.Fatalf("migration window: %+v", window)
+	}
 }
 
 func TestUI3ProbeAndReadOnlyOperations(t *testing.T) {
@@ -565,7 +694,7 @@ func TestRouteTableIsUnique(t *testing.T) {
 			t.Errorf("route %s: mutation %v", k, r.Mutation)
 		}
 	}
-	if len(seen) != 35 {
+	if len(seen) != 36 {
 		t.Errorf("%d routes; update this count with the route table", len(seen))
 	}
 }

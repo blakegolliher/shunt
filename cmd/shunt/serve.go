@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -201,8 +202,12 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		publishRouteState(metrics, dir.Snapshot())
 		telemetryStore := telemetry.NewStore(10 * time.Second)
 		telemetryStore.SetLocal("lab", windows)
+		moverDir := filepath.Join(filepath.Dir(cfg.Directory.File), "mover")
+		worker := control.MoverWorker{Snapshot: func() *directory.File { return dir.Snapshot().File() },
+			CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
 		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{},
-			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx}
+			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx,
+			Mover: worker.Run, MoverLedger: worker.Ledger}
 		warnHeldSteps(log, dir.Snapshot())
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {

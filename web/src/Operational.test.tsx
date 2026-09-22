@@ -98,5 +98,5 @@ test('adopts a bucket, shows the generated expand name, and hands off to Migrati
   expect(screen.getByText('data-001')).toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
   await waitFor(() => expect(screen.getByRole('heading', { name: 'Migrations', level: 1 })).toBeInTheDocument())
-  expect(screen.getByText(/acme\/data is ready/)).toBeInTheDocument()
+  expect(await screen.findByRole('heading', { name: 'source → target' })).toBeInTheDocument()
 })

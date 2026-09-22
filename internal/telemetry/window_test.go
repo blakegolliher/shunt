@@ -65,6 +65,41 @@ func TestCollectorRotatesLazilyAndResends(t *testing.T) {
 	}
 }
 
+func TestMigrationSignalsUseAndMergeCompletedWindows(t *testing.T) {
+	window := func(writesSource, writesPrimary, hits, fallback, misses int) *Window {
+		c := NewCollector()
+		for outcome, count := range map[string]int{"source": writesSource, "primary": writesPrimary} {
+			for range count {
+				c.ObserveMigration(windowBase.Add(time.Second), "acme/data", "writes", outcome)
+			}
+		}
+		for outcome, count := range map[string]int{"target_hit": hits, "fallback_source": fallback, "miss": misses} {
+			for range count {
+				c.ObserveMigration(windowBase.Add(time.Second), "acme/data", "reads", outcome)
+			}
+		}
+		return c.Completed(windowBase.Add(WindowDuration))
+	}
+	a, b := window(4, 6, 7, 2, 1), window(5, 5, 8, 1, 0)
+	if a == nil || len(a.Sketches) != 0 || len(a.Migrations) != 1 {
+		t.Fatalf("signal-only window: %#v", a)
+	}
+	merged, err := mergeWindows(map[string]*Window{"a": a, "b": b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fleet *MigrationCounter
+	for _, scope := range merged {
+		if scope.Scope == "fleet" && len(scope.Migrations) == 1 {
+			fleet = &scope.Migrations[0]
+		}
+	}
+	if fleet == nil || fleet.Writes["source"] != 9 || fleet.Writes["primary"] != 11 ||
+		fleet.Reads["target_hit"] != 15 || fleet.Reads["fallback_source"] != 3 || fleet.Reads["miss"] != 1 {
+		t.Fatalf("merged migration signals: %#v", fleet)
+	}
+}
+
 func TestMergedSketchEqualsUnionProperty(t *testing.T) {
 	rnd := rand.New(rand.NewSource(931337)) //nolint:gosec // deterministic property data
 	for trial := 0; trial < 100; trial++ {

@@ -72,6 +72,17 @@ filesystem:
   the first four demo actions and outcome/refusal toasts. Build, UI, lint, Go test and race gates
   are green; a fresh `make fleet` proved preflight, operation and audit records, read-only across
   two proxies, telemetry within 5.70%, quorum loss, cache restart, migration, cutover and purge.
+- **UI-4 done (2026-09-22; browser acceptance is manual by operator choice):** the migration
+  screen now carries the complete ramp → mover → cutover → purge/forget flow with an always-visible
+  fence, presets and prefix rules, completed-window write/read outcome bars, stale-member warning,
+  mover range/count/convergence/ledger views, exact API refusals, the ADR-0004 lost-write
+  acceptance, multipart count, purge dry run and unused-source removal. The browser mover invokes
+  the same guarded engine as the CLI as a control-node operation; no object state enters etcd.
+  `make ui`, UI lint and all 16 UI unit/accessibility tests are green; build, Go lint/test/race,
+  walkthrough (66,403 verifier operations, 0 errors), README demo and fleet are green. Fleet ran
+  the browser mover operation against Garage → MinIO, saw it converge, read its ledger, and then
+  cut over and purged. At the operator's request no Playwright dependency or automated browser run
+  is committed; the full visual workflow is the next manual acceptance pass.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

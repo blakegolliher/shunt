@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -93,12 +94,22 @@ type WindowCounter struct {
 	Errors   map[string]int64 `json:"errors,omitempty"`
 }
 
+// MigrationCounter is one placement's exact routing outcomes in a completed window. It is kept
+// separate from the general request dimensions because bucket is intentionally not a global
+// telemetry label; only placements currently moving call ObserveMigration.
+type MigrationCounter struct {
+	Bucket string           `json:"bucket"`
+	Writes map[string]int64 `json:"writes,omitempty"` // source | primary
+	Reads  map[string]int64 `json:"reads,omitempty"`  // target_hit | fallback_source | miss
+}
+
 // Window is the last completed telemetry window carried by a proxy heartbeat.
 type Window struct {
-	Start    time.Time       `json:"start"`
-	End      time.Time       `json:"end"`
-	Sketches []Sketch        `json:"sketches"`
-	Counters []WindowCounter `json:"counters"`
+	Start      time.Time          `json:"start"`
+	End        time.Time          `json:"end"`
+	Sketches   []Sketch           `json:"sketches"`
+	Counters   []WindowCounter    `json:"counters"`
+	Migrations []MigrationCounter `json:"migrations,omitempty"`
 }
 
 type sketchKey struct {
@@ -114,11 +125,12 @@ type counterKey struct {
 // Collector owns only the current raw sketches and one encoded completed window. Histograms are
 // allocated lazily on the first observation of a tuple.
 type Collector struct {
-	mu       sync.Mutex
-	start    time.Time
-	sketches map[sketchKey]*hdrhistogram.Histogram
-	counters map[counterKey]*WindowCounter
-	last     *Window
+	mu         sync.Mutex
+	start      time.Time
+	sketches   map[sketchKey]*hdrhistogram.Histogram
+	counters   map[counterKey]*WindowCounter
+	migrations map[string]*MigrationCounter
+	last       *Window
 }
 
 // NewCollector returns an empty window collector.
@@ -137,7 +149,7 @@ func (c *Collector) rotateLocked(now time.Time) {
 	if !start.After(c.start) {
 		return
 	}
-	if len(c.sketches) > 0 {
+	if len(c.sketches) > 0 || len(c.migrations) > 0 {
 		w := &Window{Start: c.start, End: c.start.Add(WindowDuration)}
 		keys := make([]sketchKey, 0, len(c.sketches))
 		for k := range c.sketches {
@@ -173,9 +185,15 @@ func (c *Collector) rotateLocked(now time.Time) {
 			v.Errors = cloneErrors(v.Errors)
 			w.Counters = append(w.Counters, v)
 		}
+		for _, bucket := range slices.Sorted(maps.Keys(c.migrations)) {
+			v := *c.migrations[bucket]
+			v.Writes = maps.Clone(v.Writes)
+			v.Reads = maps.Clone(v.Reads)
+			w.Migrations = append(w.Migrations, v)
+		}
 		c.last = w
 	}
-	c.start, c.sketches, c.counters = start, nil, nil
+	c.start, c.sketches, c.counters, c.migrations = start, nil, nil, nil
 }
 
 func cloneErrors(in map[string]int64) map[string]int64 {
@@ -260,6 +278,36 @@ func (c *Collector) Observe(o Observation) {
 	}
 }
 
+// ObserveMigration records one bounded migration-routing signal in the current telemetry window.
+func (c *Collector) ObserveMigration(at time.Time, bucket, series, outcome string) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rotateLocked(at)
+	if c.migrations == nil {
+		c.migrations = map[string]*MigrationCounter{}
+	}
+	v := c.migrations[bucket]
+	if v == nil {
+		v = &MigrationCounter{Bucket: bucket}
+		c.migrations[bucket] = v
+	}
+	switch series {
+	case "writes":
+		if v.Writes == nil {
+			v.Writes = map[string]int64{}
+		}
+		v.Writes[outcome]++
+	case "reads":
+		if v.Reads == nil {
+			v.Reads = map[string]int64{}
+		}
+		v.Reads[outcome]++
+	}
+}
+
 // Completed rotates on the clock and returns the same immutable last non-empty completed window
 // until another non-empty window closes.
 func (c *Collector) Completed(now time.Time) *Window {
@@ -286,11 +334,12 @@ type Summary struct {
 
 // ScopeWindow is one control-node summary window for a fleet, cluster, or proxy scope.
 type ScopeWindow struct {
-	Scope    string          `json:"scope"`
-	Start    time.Time       `json:"start"`
-	End      time.Time       `json:"end"`
-	Series   []Summary       `json:"series"`
-	Counters []WindowCounter `json:"counters"`
+	Scope      string             `json:"scope"`
+	Start      time.Time          `json:"start"`
+	End        time.Time          `json:"end"`
+	Series     []Summary          `json:"series"`
+	Counters   []WindowCounter    `json:"counters"`
+	Migrations []MigrationCounter `json:"migrations,omitempty"`
 }
 
 // MemberWindow is the part of a control.Member the telemetry store needs.
@@ -348,7 +397,7 @@ func (s *Store) Ingest(members []MemberWindow) ([]time.Time, error) {
 		if m.Live {
 			live[m.ID] = true
 		}
-		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 {
+		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 && len(m.Telemetry.Migrations) == 0 {
 			continue
 		}
 		start := m.Telemetry.Start.UnixNano()
@@ -435,6 +484,20 @@ func addCounter(dst map[OpClass]*WindowCounter, src WindowCounter) {
 	}
 }
 
+func addMigration(dst map[string]*MigrationCounter, src MigrationCounter) {
+	d := dst[src.Bucket]
+	if d == nil {
+		d = &MigrationCounter{Bucket: src.Bucket, Writes: map[string]int64{}, Reads: map[string]int64{}}
+		dst[src.Bucket] = d
+	}
+	for k, v := range src.Writes {
+		d.Writes[k] += v
+	}
+	for k, v := range src.Reads {
+		d.Reads[k] += v
+	}
+}
+
 func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 	if len(windows) == 0 {
 		return nil, nil
@@ -442,9 +505,10 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 	type rawScope struct {
 		h map[summaryKey]*hdrhistogram.Histogram
 		c map[OpClass]*WindowCounter
+		m map[string]*MigrationCounter
 	}
 	newRaw := func() *rawScope {
-		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}}
+		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}, m: map[string]*MigrationCounter{}}
 	}
 	raw := map[string]*rawScope{}
 	get := func(scope string) *rawScope {
@@ -508,6 +572,12 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 			c.Errors = cloneErrors(c.Errors)
 			sw.Counters = append(sw.Counters, c)
 		}
+		for _, bucket := range slices.Sorted(maps.Keys(r.m)) {
+			m := *r.m[bucket]
+			m.Writes = maps.Clone(m.Writes)
+			m.Reads = maps.Clone(m.Reads)
+			sw.Migrations = append(sw.Migrations, m)
+		}
 		return sw
 	}
 	// A proxy scope is reduced and released one proxy at a time. Keeping one raw histogram per
@@ -539,6 +609,10 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 			if count.Cluster != "" && count.Cluster != "none" {
 				addCounter(get("cluster:"+count.Cluster).c, count)
 			}
+		}
+		for _, migration := range w.Migrations {
+			addMigration(get("fleet").m, migration)
+			addMigration(proxyRaw.m, migration)
 		}
 		out = append(out, finalize("proxy:"+proxy, proxyRaw))
 	}

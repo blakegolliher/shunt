@@ -45,11 +45,17 @@ func capability(v *bool, def bool) Capability {
 }
 
 func clusterStatus(f *directory.File, name string, c config.Cluster) ClusterStatus {
+	profile := "assumed"
+	if c.Capabilities.ConditionalWrite != nil && c.Capabilities.ConditionalDelete != nil {
+		profile = "measured"
+	}
 	return ClusterStatus{
 		Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: endpoints(c),
 		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
 		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false),
-		References: directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
+		ConditionalWriteKnown: c.Capabilities.ConditionalWrite != nil, ConditionalDeleteKnown: c.Capabilities.ConditionalDelete != nil,
+		CapabilityProfile: profile,
+		References:        directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
 	}
 }
 
@@ -115,6 +121,10 @@ type PlacementView struct {
 }
 
 func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
+	if err := s.flushLocalTelemetry(); err != nil {
+		fail(w, err)
+		return
+	}
 	key, p, f, ok := s.lookup(w, r)
 	if !ok {
 		return

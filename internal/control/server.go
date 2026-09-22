@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -70,6 +71,11 @@ type Server struct {
 	// ConfirmKey keys the confirmation tokens dry runs issue; every control node shares one.
 	// Empty: a random key for this process, so a lab's tokens die with it.
 	ConfirmKey []byte
+	// Mover runs the copy engine for a browser-started mover operation. It is installed at the
+	// process edge and never runs in a proxy request handler.
+	Mover MoverRunner
+	// MoverLedger reads a bounded tail of the mover's append-only local ledger.
+	MoverLedger MoverLedgerReader
 	// Ctx is the server's lifetime: operations run on it, never on a request's. nil: Background.
 	Ctx context.Context
 
@@ -268,38 +274,50 @@ func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
 
 // ClusterStatus is one cluster as status reports it: the secret_ref, never a secret.
 type ClusterStatus struct {
-	Name              string   `json:"name"`
-	Type              string   `json:"type"`
-	Scheme            string   `json:"scheme"`
-	Region            string   `json:"region"`
-	Endpoints         []string `json:"endpoints"`
-	AccessKey         string   `json:"access_key"`
-	SecretRef         string   `json:"secret_ref"`
-	ConditionalWrite  bool     `json:"conditional_write"`
-	ConditionalDelete bool     `json:"conditional_delete"`
-	References        []string `json:"references,omitempty"`
-	ReadOnly          bool     `json:"read_only"`
-	RejectWrites      bool     `json:"reject_writes"`
+	Name                   string   `json:"name"`
+	Type                   string   `json:"type"`
+	Scheme                 string   `json:"scheme"`
+	Region                 string   `json:"region"`
+	Endpoints              []string `json:"endpoints"`
+	AccessKey              string   `json:"access_key"`
+	SecretRef              string   `json:"secret_ref"`
+	ConditionalWrite       bool     `json:"conditional_write"`
+	ConditionalDelete      bool     `json:"conditional_delete"`
+	ConditionalWriteKnown  bool     `json:"conditional_write_known"`
+	ConditionalDeleteKnown bool     `json:"conditional_delete_known"`
+	CapabilityProfile      string   `json:"capability_profile"`
+	References             []string `json:"references,omitempty"`
+	ReadOnly               bool     `json:"read_only"`
+	RejectWrites           bool     `json:"reject_writes"`
 }
 
 // PlacementStatus is one placement with the migration signals an operator watches.
 type PlacementStatus struct {
-	Key           string                     `json:"key"`
-	State         string                     `json:"state"`
-	Primary       string                     `json:"primary"`
-	Source        string                     `json:"source,omitempty"`
-	Target        string                     `json:"target,omitempty"`
-	Names         map[string]string          `json:"names"`
-	Ratio         float64                    `json:"ratio,omitempty"`
-	Prefixes      []string                   `json:"prefixes,omitempty"`
-	Hold          *directory.RampHold        `json:"hold,omitempty"` // a ramp step written but not yet on every proxy (ADR-0016)
-	Writes        map[string]float64         `json:"ramp_writes"`    // side → shunt_ramp_writes_total on this proxy
-	FallbackReads float64                    `json:"fallback_reads"`
-	DualDeletes   map[string]float64         `json:"dual_deletes"`
-	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
-	Mover         *Progress                  `json:"mover,omitempty"`
-	ReadOnly      bool                       `json:"read_only"`
-	RejectWrites  bool                       `json:"reject_writes"`
+	Key             string                     `json:"key"`
+	State           string                     `json:"state"`
+	Primary         string                     `json:"primary"`
+	Source          string                     `json:"source,omitempty"`
+	Target          string                     `json:"target,omitempty"`
+	Names           map[string]string          `json:"names"`
+	Ratio           float64                    `json:"ratio,omitempty"`
+	Prefixes        []string                   `json:"prefixes,omitempty"`
+	Hold            *directory.RampHold        `json:"hold,omitempty"` // a ramp step written but not yet on every proxy (ADR-0016)
+	Writes          map[string]float64         `json:"ramp_writes"`    // side → shunt_ramp_writes_total on this proxy
+	FallbackReads   float64                    `json:"fallback_reads"`
+	DualDeletes     map[string]float64         `json:"dual_deletes"`
+	MigrationWindow *MigrationWindow           `json:"migration_window,omitempty"`
+	Cutover         *directory.CutoverEvidence `json:"cutover,omitempty"`
+	Mover           *Progress                  `json:"mover,omitempty"`
+	ReadOnly        bool                       `json:"read_only"`
+	RejectWrites    bool                       `json:"reject_writes"`
+}
+
+// MigrationWindow is the fleet's last completed 10-second routing signal for one placement.
+type MigrationWindow struct {
+	Start  time.Time        `json:"start"`
+	End    time.Time        `json:"end"`
+	Writes map[string]int64 `json:"writes"`
+	Reads  map[string]int64 `json:"reads"`
 }
 
 // Status is the answer to GET /v1/status.
@@ -312,6 +330,10 @@ type Status struct {
 // status lists every cluster, and every placement that is moving or expanded (all of them with
 // ?all=1), or the one ?bucket=t/b names.
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	if err := s.flushLocalTelemetry(); err != nil {
+		fail(w, err)
+		return
+	}
 	snap := s.Dir.Snapshot()
 	f := snap.File()
 	out := Status{Version: f.Version, Clusters: []ClusterStatus{}, Placements: []PlacementStatus{}}
@@ -354,6 +376,19 @@ func (s *Server) placementStatus(key string, p directory.Placement) PlacementSta
 		ps.Writes = counters(s.Metrics.RampWrites, key, "side")
 		ps.FallbackReads = counters(s.Metrics.FallbackReads, key, "")[""]
 		ps.DualDeletes = counters(s.Metrics.DualDelete, key, "outcome")
+	}
+	if s.Telemetry != nil {
+		for _, window := range s.Telemetry.Latest() {
+			if window.Scope != "fleet" {
+				continue
+			}
+			for _, signal := range window.Migrations {
+				if signal.Bucket == key {
+					ps.MigrationWindow = &MigrationWindow{Start: window.Start, End: window.End,
+						Writes: maps.Clone(signal.Writes), Reads: maps.Clone(signal.Reads)}
+				}
+			}
+		}
 	}
 	s.mu.Lock()
 	if pr, ok := s.progress[key]; ok {

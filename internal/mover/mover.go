@@ -1,6 +1,7 @@
-// The mover (docs/DESIGN.md §2.5, ADR-0004, ADR-0009): `shunt migrate run` copies a bucket's objects
-// from a moving placement's source cluster to its primary, in the operator's process, never in the
-// proxy's (docs/DESIGN.md decision 8). It keeps the obligations the test/mover fixture proved in POC-4:
+// Package mover copies a moving placement's objects from its source cluster to its primary for
+// `shunt migrate run` and control-node browser operations. It never runs on the proxy request path
+// (docs/DESIGN.md §2.5, ADR-0004, ADR-0009). It keeps the obligations the test/mover fixture proved
+// in POC-4:
 //
 //   - it refuses to run unless the placement is MIGRATING, or RAMPING at ratio 1, so it never
 //     copies a key whose writes still go to the source;
@@ -12,7 +13,7 @@
 //     ETag and a Last-Modified no later than the PUT (ADR-0004 race 1);
 //   - it reproduces the source's multipart part layout, so ETags survive;
 //   - it keeps a resumable cursor, appends a JSONL ledger, and reports each pass to the control API.
-package main
+package mover
 
 import (
 	"bytes"
@@ -66,8 +67,8 @@ type job struct {
 	condDelete  bool // the target honors If-Match on DELETE
 }
 
-// ledgerLine is one row of the run's record, in the order the mover wrote them.
-type ledgerLine struct {
+// LedgerEntry is one row of a run's append-only record, in the order the mover wrote it.
+type LedgerEntry struct {
 	At       time.Time `json:"at"`
 	Bucket   string    `json:"bucket"`
 	Key      string    `json:"key"`
@@ -191,12 +192,12 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 }
 
 // move copies one placement's objects, resuming from its cursor.
-func move(ctx context.Context, j job, paths moverPaths, dryRun bool, out, errOut io.Writer, report func(s stats, lastKey string, done bool)) (stats, error) {
+func move(ctx context.Context, j job, paths Paths, dryRun bool, out, errOut io.Writer, report func(s stats, lastKey string, done bool)) (stats, error) {
 	var s stats
 	safe := strings.ReplaceAll(j.tenant+"-"+j.client, "/", "-")
-	cursorPath := filepath.Join(paths.cursorDir, "mover-"+safe+".cursor")
-	ledgerPath := filepath.Join(paths.ledgerDir, "mover-"+safe+".ledger.jsonl")
-	ledgerBucket := paths.ledgerBucket
+	cursorPath := filepath.Join(paths.CursorDir, "mover-"+safe+".cursor")
+	ledgerPath := filepath.Join(paths.LedgerDir, "mover-"+safe+".ledger.jsonl")
+	ledgerBucket := paths.LedgerBucket
 	after := readCursor(cursorPath)
 	if after != "" {
 		_, _ = fmt.Fprintf(out, "   resuming after %q\n", after)
@@ -259,7 +260,7 @@ func move(ctx context.Context, j job, paths moverPaths, dryRun bool, out, errOut
 	if report != nil && !dryRun {
 		report(s, "", true)
 	}
-	_, _ = fmt.Fprintf(out, "   %d copied, %d already there, %d vanished, %d failed, %s\n", s.copied, s.skipped, s.vanished, s.failed, humanBytes(s.bytes))
+	_, _ = fmt.Fprintf(out, "   %d copied, %d already there, %d vanished, %d failed, %s\n", s.copied, s.skipped, s.vanished, s.failed, HumanBytes(s.bytes))
 	if ledgerBucket != "" && !dryRun {
 		if err := uploadLedger(ctx, j, ledgerBucket, ledgerPath, out); err != nil {
 			_, _ = fmt.Fprintf(errOut, "   ledger upload: %v\n", err)
@@ -269,9 +270,9 @@ func move(ctx context.Context, j job, paths moverPaths, dryRun bool, out, errOut
 }
 
 // copyOne copies a single object under the guard the target's capability profile allows.
-func copyOne(ctx context.Context, j job, key string) ledgerLine {
+func copyOne(ctx context.Context, j job, key string) LedgerEntry {
 	started := time.Now()
-	line := ledgerLine{Key: key, Mode: guardName(j.conditional)}
+	line := LedgerEntry{Key: key, Mode: guardName(j.conditional)}
 	defer func() { line.Duration = time.Since(started).Round(time.Millisecond).String() }()
 
 	head, err := j.src.cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &j.src.bucket, Key: &key})
@@ -620,7 +621,8 @@ func isPreconditionFailed(err error) bool {
 	return errors.As(err, &api) && (api.ErrorCode() == "PreconditionFailed" || api.ErrorCode() == "412")
 }
 
-func humanBytes(n int64) string {
+// HumanBytes formats a mover byte count for operator output.
+func HumanBytes(n int64) string {
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))

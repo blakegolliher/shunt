@@ -28,6 +28,7 @@ import (
 const (
 	OpRamp              = "ramp"
 	OpMigrate           = "migrate"
+	OpMover             = "mover"
 	OpCutover           = "cutover"
 	OpPurge             = "purge-source"
 	OpFinish            = "finish"
@@ -58,6 +59,7 @@ const (
 	PhaseWindow       = "window"       // cutover: the quiet window
 	PhaseDiff         = "diff"         // purge-source: the listing diff
 	PhasePurge        = "purge"        // purge-source: deleting the source
+	PhaseMover        = "mover"        // copying source objects and reporting pass progress
 	PhaseDone         = "done"
 )
 
@@ -530,6 +532,22 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 			return nil, nil, err
 		}
 		return start(Operation{Kind: OpMigrate, Placement: key}, a, func(tr *tracker) (any, error) { return s.runMigrate(tr, key, a) })
+	case OpMover:
+		var a MoverRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if a.MaxPasses < 0 || a.MaxPasses > maxMoverPasses {
+			return nil, nil, bad("max_passes %d: want 1 through %d", a.MaxPasses, maxMoverPasses)
+		}
+		key, err := s.placementKey(req.Placement)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := s.checkMover(key, a); err != nil {
+			return nil, nil, err
+		}
+		return start(Operation{Kind: OpMover, Placement: key}, a, func(tr *tracker) (any, error) { return s.runMover(tr, key, a) })
 	case OpCutover:
 		var a CutoverRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -611,7 +629,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 			return s.runPlacementReadOnly(tr, key, a)
 		})
 	}
-	return nil, nil, bad("kind %q: want one of ramp, migrate, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only", req.Kind)
+	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only", req.Kind)
 }
 
 // serveOperation runs an action for its own route and answers with its outcome, as the route did

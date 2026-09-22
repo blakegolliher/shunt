@@ -3,6 +3,7 @@ import { Card } from './components/Card'
 import { Buckets } from './screens/Buckets'
 import { Clusters } from './screens/Clusters'
 import { ControlPlane } from './screens/ControlPlane'
+import { Migrations } from './screens/Migrations'
 import { useStore } from './store'
 
 const pages = ['Control plane', 'Clusters', 'Buckets', 'Migrations', 'Telemetry', 'Audit'] as const
@@ -33,7 +34,8 @@ export function App() {
   const screen = page === 'Control plane' ? <ControlPlane />
     : page === 'Clusters' ? <Clusters />
       : page === 'Buckets' ? <Buckets onMigrate={(key) => { setMigration(key); setPage('Migrations') }} />
-        : <Card title={page}><p className="text-muted">{page === 'Migrations' && migration ? `${migration} is ready for its migration workflow. UI-4 builds the fenced ramp, mover, cutover, and purge controls here.` : `This screen arrives in the next UI phase.`}</p></Card>
+        : page === 'Migrations' ? <Migrations selected={migration} onSelect={setMigration} />
+          : <Card title={page}><p className="text-muted">This screen arrives in the next UI phase.</p></Card>
   return <div className="min-h-screen bg-ink-950 lg:grid lg:grid-cols-[240px_1fr]">
     <aside className="border-b border-ink-700 bg-ink-900 p-5 lg:min-h-screen lg:border-b-0 lg:border-r">
       <div className="mb-8"><p className="text-xl font-semibold tracking-tight">shunt</p><p className="eyebrow mt-1">control surface</p></div>

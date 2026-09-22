@@ -1,9 +1,12 @@
-package main
+package mover
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +53,35 @@ func BenchmarkOwnCopy(b *testing.B) {
 	at := time.Now()
 	for b.Loop() {
 		_ = ownCopy(`"a"`, `"a"`, at, at)
+	}
+}
+
+func TestLedgerTailIsBoundedAndOrdered(t *testing.T) {
+	paths := Paths{LedgerDir: t.TempDir()}
+	path := LedgerPath(paths, "acme/data")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	for _, key := range []string{"a", "b", "c", "d"} {
+		if err := enc.Encode(LedgerEntry{Key: key, Result: "copied"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := LedgerTail(paths, "acme/data", 2)
+	if err != nil || len(entries) != 2 || entries[0].Key != "c" || entries[1].Key != "d" {
+		t.Fatalf("tail: %+v, %v", entries, err)
+	}
+	if filepath.Base(path) != "mover-acme-data.ledger.jsonl" {
+		t.Fatalf("ledger path: %s", path)
+	}
+	missing, err := LedgerTail(paths, "acme/missing", 20)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("missing ledger: %+v, %v", missing, err)
 	}
 }
 

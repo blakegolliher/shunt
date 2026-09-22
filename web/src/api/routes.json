@@ -45,5 +45,10 @@
     "method":"GET",
     "pattern":"/v1/placements/{tenant}/{bucket}/view",
     "readOnlyException":"This secret-free browser read model combines status, fence and operation data that CLI commands render separately."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/placements/{tenant}/{bucket}/mover-ledger",
+    "readOnlyException":"The migration screen shows a bounded tail of the mover's append-only object ledger; the CLI writes the ledger but has no tail command."
   }
 ]

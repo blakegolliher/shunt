@@ -78,6 +78,11 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/placements/{tenant}/{bucket}/mover-ledger",
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/tenants/{tenant}/step-out",
     "verbs": [
       "step-out"

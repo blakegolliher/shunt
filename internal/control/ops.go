@@ -641,18 +641,19 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 // Progress is a mover's report on one placement, held in memory by this proxy for status and for
 // cutover's convergence check. It is counts and a cursor key, never a per-object record.
 type Progress struct {
-	Source    string    `json:"source"`
-	Primary   string    `json:"primary"`
-	Pass      int       `json:"pass"`
-	Copied    int       `json:"copied"`
-	Skipped   int       `json:"skipped"`
-	Vanished  int       `json:"vanished"`
-	Failed    int       `json:"failed"`
-	Bytes     int64     `json:"bytes"`
-	LastKey   string    `json:"last_key,omitempty"`
-	Done      bool      `json:"done"`      // the pass reached the end of the source listing
-	Converged bool      `json:"converged"` // a completed pass copied nothing and failed nothing
-	UpdatedAt time.Time `json:"updated_at"`
+	Source    string       `json:"source"`
+	Primary   string       `json:"primary"`
+	Pass      int          `json:"pass"`
+	Copied    int          `json:"copied"`
+	Skipped   int          `json:"skipped"`
+	Vanished  int          `json:"vanished"`
+	Failed    int          `json:"failed"`
+	Bytes     int64        `json:"bytes"`
+	LastKey   string       `json:"last_key,omitempty"`
+	Done      bool         `json:"done"`      // the pass reached the end of the source listing
+	Converged bool         `json:"converged"` // a completed pass copied nothing and failed nothing
+	UpdatedAt time.Time    `json:"updated_at"`
+	Ranges    []MoverRange `json:"ranges,omitempty"`
 }
 
 func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
@@ -670,12 +671,7 @@ func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Converged = req.Converged && req.Done && req.Copied == 0 && req.Failed == 0
 	req.UpdatedAt = s.now().UTC()
-	s.mu.Lock()
-	if s.progress == nil {
-		s.progress = map[string]Progress{}
-	}
-	s.progress[key] = req
-	s.mu.Unlock()
+	s.setMoverProgress(key, req)
 	if req.Done {
 		s.info(actor(r), "mover pass", "placement", key, "pass", req.Pass, "copied", req.Copied, "already_there", req.Skipped, "vanished", req.Vanished,
 			"failed", req.Failed, "bytes", req.Bytes, "converged", req.Converged)

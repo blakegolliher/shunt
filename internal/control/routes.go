@@ -38,6 +38,7 @@ func (s *Server) routes() []Route {
 		read("/v1/clusters/{name}/view", s.clusterView),
 		read("/v1/placements/{tenant}/{bucket}", s.placement, "migrate run"),
 		read("/v1/placements/{tenant}/{bucket}/view", s.placementView),
+		read("/v1/placements/{tenant}/{bucket}/mover-ledger", s.moverLedger),
 		read("/v1/tenants/{tenant}/step-out", s.stepOut, "step-out"),
 		mut("POST", "/v1/operations", "operation", s.startOperation, "ramp", "migrate start", "cutover", "purge-source", "migrate finish", "cluster remove"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/create", "create", s.createPlacement),

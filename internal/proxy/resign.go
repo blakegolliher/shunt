@@ -157,7 +157,11 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	backend := p.Names[cl.Name]
 	o.cluster, o.clusterType, o.backend = cl.Name, cl.Type, backend
 	if p.State == directory.StateRamping && class == migrate.ClassWrite {
-		h.Metrics.RampWrites.WithLabelValues(directory.Key(o.tenant, info.Bucket), route.Cluster.String()).Inc()
+		bucketKey := directory.Key(o.tenant, info.Bucket)
+		h.Metrics.RampWrites.WithLabelValues(bucketKey, route.Cluster.String()).Inc()
+		if h.Telemetry != nil {
+			h.Telemetry.ObserveMigration(time.Now(), bucketKey, "writes", route.Cluster.String())
+		}
 	}
 
 	// A conditional write while the bucket's objects are split across two clusters is judged
