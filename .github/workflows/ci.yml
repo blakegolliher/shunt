@@ -17,6 +17,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: browser application
+        run: make ui ui-lint ui-test
       - name: make all
         run: make all
       - name: go mod tidy is clean

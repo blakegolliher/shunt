@@ -22,6 +22,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
+	shuntweb "github.com/blakegolliher/shunt/web"
 )
 
 // nodeOptions are the flags init and join share: what one control node is.
@@ -288,6 +289,7 @@ func mountControl(adm *admin.Server, ctl *control.Server, api *cp.API, store *cp
 	adm.Mount("/v1/control", own)
 	adm.Mount("/v1/control/", own)
 	adm.Mount("/v1/", gate(store, ctl.Handler()))
+	adm.Mount("/", shuntweb.Handler())
 }
 
 // joinLine is the command a new control node runs to join this one, as GET /v1/control shows it:

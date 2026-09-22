@@ -51,6 +51,18 @@ filesystem:
   (1,025,921 bytes below the 1 MiB heartbeat cap); the fleet-scale read cost is documented. `make
   fleet` saw both proxies and both clusters and matched the verifier's client p99 within 6.51%
   (26,559 us versus 24,831 us, under the 10% gate); build, lint, test and race are green.
+- **UI-2 done (2026-09-22):** `web/` is the pinned Vite, React, TypeScript, Tailwind and Recharts
+  application in ADR-0017's dark ember/ink theme. `shunt-control` embeds it at `/` with SPA
+  fallback; a committed stub keeps a Node-free Go build working, while CI runs `make ui` first.
+  The shell keeps its bearer token in `sessionStorage`, follows authenticated SSE with replay,
+  shows the control node, quorum and live/stale proxies, and includes the shared cards, stats,
+  state/fence, confirmation, copy and sparkline components. The Go parity test checks the UI's
+  reviewed API inventory against the generated route table, with every read-only no-CLI route
+  named and justified rather than silently exempted. `make ui && make build`, UI lint, 10 browser
+  tests (including theme contrast and a two-live-proxy shell), Go test and Go lint are green.
+  `make fleet` is green on the embedded build, and a live same-origin smoke served the real bundle
+  beside a healthy control API; production npm notices cover 44 packages and the generator rejects
+  copyleft licenses.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

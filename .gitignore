@@ -10,3 +10,7 @@
 /s3diff
 /s3bench
 /test/property/runs/
+/web/node_modules/
+/web/coverage/
+/web/dist/*
+!/web/dist/index.html

@@ -1,0 +1,41 @@
+[
+  {"method":"GET","pattern":"/v1/status"},
+  {"method":"GET","pattern":"/v1/control"},
+  {"method":"GET","pattern":"/v1/fleet"},
+  {
+    "method":"GET",
+    "pattern":"/v1/events",
+    "readOnlyException":"The authenticated SSE stream has no CLI verb; it carries changes to read models the CLI can fetch."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/telemetry/series",
+    "readOnlyException":"The telemetry dashboard reads emitted time-series points; the CLI reports a verifier comparison but has no general chart-data verb."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/telemetry/latest",
+    "readOnlyException":"The shell and telemetry dashboard need the newest per-scope windows; verify reaches this API internally but it has no standalone CLI verb."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/audit",
+    "readOnlyException":"The audit tail is a browser read model over records the mutating CLI verbs already create."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/operations",
+    "readOnlyException":"The browser lists operation records; CLI verbs expose and poll their own record rather than offering a general list verb."
+  },
+  {"method":"GET","pattern":"/v1/operations/{id}"},
+  {
+    "method":"GET",
+    "pattern":"/v1/clusters/{name}/view",
+    "readOnlyException":"This secret-free browser read model corresponds to cluster data spread across status and cluster CLI output."
+  },
+  {
+    "method":"GET",
+    "pattern":"/v1/placements/{tenant}/{bucket}/view",
+    "readOnlyException":"This secret-free browser read model combines status, fence and operation data that CLI commands render separately."
+  }
+]

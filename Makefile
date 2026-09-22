@@ -8,10 +8,13 @@ MODULE        := github.com/blakegolliher/shunt
 BIN           := $(CURDIR)/bin
 GO            ?= go
 GOFLAGS       ?=
-PKGS          := ./...
+# npm packages occasionally ship Go source; they are build inputs for web, not repository packages.
+PKGS           = $(filter-out ./web/node_modules/%,$(patsubst $(CURDIR)/%,./%,$(shell $(GO) list -f '{{.Dir}}' ./...)))
 FUZZ_TIME     ?= 30s
 BENCH_TIME    ?= 1s
 BENCH_COUNT   ?= 6
+NPM           ?= npm
+WEB           := $(CURDIR)/web
 
 # Current releases as of 2026-09-14 (Go 1.27.1 on the dev box; both need Go >= 1.26).
 GOLANGCI_LINT_VERSION ?= v2.13.2
@@ -37,7 +40,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare licenses vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough s3diff s3diff-mixed bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -94,8 +97,26 @@ bench: ## run all benchmarks, write test/bench/new.txt
 bench-compare: bench ## compare test/bench/new.txt against test/bench/baseline.txt with benchstat
 	$(GO) run $(BENCHSTAT) test/bench/baseline.txt test/bench/new.txt
 
-licenses: $(GO_LICENSES) ## regenerate the linked-module half of THIRD_PARTY_NOTICES (G4)
+licenses: $(GO_LICENSES) web-licenses ## regenerate Go and web production dependency notices (G4)
 	GO_LICENSES=$(GO_LICENSES) GO=$(GO) scripts/third-party-notices.sh
+
+$(WEB)/node_modules/.package-lock.json: $(WEB)/package.json $(WEB)/package-lock.json
+	cd $(WEB) && $(NPM) ci
+
+ui: $(WEB)/node_modules/.package-lock.json ## build the embedded browser application and its production notices
+	cd $(WEB) && $(NPM) run build
+
+ui-dev: $(WEB)/node_modules/.package-lock.json ## Vite dev server; SHUNT_CONTROL_URL selects the /v1 proxy target
+	cd $(WEB) && $(NPM) run dev
+
+ui-lint: $(WEB)/node_modules/.package-lock.json ## lint the browser application
+	cd $(WEB) && $(NPM) run lint
+
+ui-test: $(WEB)/node_modules/.package-lock.json ## browser unit, accessibility and API parity tests
+	cd $(WEB) && $(NPM) test
+
+web-licenses: $(WEB)/node_modules/.package-lock.json
+	cd $(WEB) && $(NPM) run licenses
 
 vuln: $(GOVULNCHECK) ## govulncheck over every package (G4)
 	$(GOVULNCHECK) ./...

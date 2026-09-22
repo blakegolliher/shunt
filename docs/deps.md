@@ -19,6 +19,14 @@ One line per dependency saying why the stdlib wasn't enough (CLAUDE.md). Tool bi
 | `github.com/johannesboyne/gofakes3` | v1.2.0 | MIT | **Test-only** (imported from `_test.go` files). In-process fake S3 so unit tests need no Docker. Pulls aws-sdk-go-v2, afero, bbolt into the test build only; `go build ./cmd/shunt` does not link them. |
 | `github.com/HdrHistogram/hdrhistogram-go` | v1.2.0 | MIT | Mergeable, compressible latency sketches with bounded relative error for 10-second proxy telemetry windows; the stdlib has neither a quantile sketch nor a wire format that can be merged without averaging percentiles. |
 
+## Web production dependencies (build-time Node, embedded output)
+
+| Dependency | Version | License | Why the platform was not enough |
+|---|---:|---|---|
+| `react` | 19.3.0 | MIT | Declarative component rendering and predictable state updates for the live operator application; browser DOM APIs alone do not provide a component model. |
+| `react-dom` | 19.3.0 | MIT | The maintained React renderer for the browser DOM, including accessible event and lifecycle integration. |
+| `recharts` | 3.10.1 | MIT | Accessible, responsive SVG time-series charts for emitted telemetry; the browser has drawing primitives but no chart scales, layout, or interaction model. |
+
 ## Tool binaries (Makefile, ./bin)
 
 | Tool | Version | License | Why |
