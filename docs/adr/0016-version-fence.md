@@ -38,6 +38,8 @@ A step that starts in ACTIVE is held as `RAMPING` with a ratio of 0 and the step
 
 **Cost:** writes to the keys a step moves get two fence rounds of 503s, about 2 s with a 1 s heartbeat. Keys outside the step, and all reads, are never refused. With one proxy nothing is held. A single process only ever moves forward through versions, so a write that starts after another has finished always sees a rule at least as new, and a split write cannot happen.
 
+**Held steps survive an interrupted call.** If the control node stops between writing a hold and completing or releasing it, the hold stays in the directory and its keys keep answering 503. Repeating the step completes it: the call fences the existing hold, then writes the step, instead of refusing because a hold is "already in progress". A different step is refused, naming the step to repeat. The control node warns at startup for every held bucket, and `status` shows `held→<ratio>`. Completing is a compare-and-swap on the hold, checked inside the directory's write lock (`Transition.Complete`). Fenced steps on one bucket are also serialized on the control node. Without both, a call whose hold another call had just released could complete it anyway and move writes that no proxy held.
+
 ### Leaving ACTIVE
 
 A stale member refuses writes only on buckets it knows are moving. A member cut off before a bucket's first step still sees that bucket as ACTIVE and keeps writing every key to the source, and nothing on that proxy can tell it otherwise. So **a fence round that takes a bucket out of ACTIVE waits for every member, live or not**. The round is the precondition plus V1 of the hold. A member that does not answer blocks it, by name, until it comes back or until `shunt proxy forget <id>` removes it. Every later round waits only for live members, because a member that falls silent after V1 already holds a non-ACTIVE snapshot and stops itself when its lease runs out.
@@ -58,6 +60,13 @@ A stale member refuses writes only on buckets it knows are moving. A member cut 
   - metrics `shunt_fleet_members`, `shunt_fleet_stale`, `shunt_fleet_fence_wait_seconds`, `shunt_migration_refused_writes_total`.
 
   `proxy` is a new top-level verb, added to the subcommand list in §2.10 and CLAUDE.md by this ADR.
+- **Hardening from review (2026-09-21):**
+  - An unreadable `fleet.yaml` fails closed with 503. It never reads as an empty fleet, which would silently turn the fence off.
+  - The member's lease is measured on the monotonic clock, so a wall clock stepped backwards cannot extend it.
+  - A member registers with one synchronous heartbeat before it serves anything, so a bucket's first step never runs without waiting for a proxy that has just started. One gap remains: a brand-new member that cannot reach the control node at startup starts stale and unregistered. A restarted member is unaffected, since its id is already a member.
+  - The default proxy id is sanitized and shortened to fit 64 characters, and an invalid one fails startup rather than every heartbeat.
+  - A stale proxy also reads a moving bucket target-first when it is a copy's source.
+  - `shunt_fleet_members` is refreshed on every directory poll, so a silent member can be alerted on.
 - **A dead member costs an operator one command,** and only at a bucket's first step. Once a migration is under way, a dead member is dropped when its lease ends.
 - **A control-node restart** forgets liveness but not membership, so the first fenced change after a restart waits one heartbeat for members to check back in.
 - **The fleet table is per proxy, not per object** (CLAUDE.md). It is bounded by proxies, and each heartbeat is bounded by migrations in flight.

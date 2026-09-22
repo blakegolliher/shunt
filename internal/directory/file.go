@@ -459,6 +459,11 @@ func (d *FileDir) lock(ctx context.Context) (func(), error) {
 	}
 }
 
+// WriteAtomic replaces path with data the way the directory file is written, for other files
+// the control plane keeps beside it (the fleet membership, ADR-0016). An existing file keeps its
+// mode; a new one is 0644.
+func WriteAtomic(path string, data []byte) error { return writeAtomic(path, data) }
+
 // writeAtomic replaces path with data: temp file in the same directory, fsync, rename, fsync the
 // directory. Readers see the old file or the new one, never a partial write.
 func writeAtomic(path string, data []byte) error {

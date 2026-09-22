@@ -187,6 +187,8 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 				return err
 			}
 			hcfg.Stale = member.Stale
+		} else {
+			warnHeldSteps(log, dir.Snapshot())
 		}
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
@@ -231,6 +233,12 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		adm.Mount("/-/fleet", member)
 		mctx, stop := context.WithCancel(ctx)
 		defer stop()
+		// Join before serving: a proxy that serves first could route writes to a bucket whose first
+		// step the control node takes without waiting for it (ADR-0016).
+		if rerr := member.Register(mctx); rerr != nil {
+			log.Warn("fleet member could not register with its control node before serving: starting stale (writes on moving buckets are refused until it can)",
+				"proxy", member.ID, "control", member.Endpoint, "err", rerr.Error())
+		}
 		go member.Run(mctx)
 		log.Info("fleet member", "proxy", member.ID, "control", member.Endpoint, "heartbeat", member.Interval.String(), "lease_ttl", member.LeaseTTL.String())
 	}
@@ -256,6 +264,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		tick = t.C
 	}
 
+	fleetErr := ""
 wait:
 	for {
 		select {
@@ -272,6 +281,9 @@ wait:
 			break wait
 		case <-tick:
 			reloadDirectory(dir, log, "poll")
+			if ctl != nil && member == nil {
+				fleetErr = publishFleet(ctl, log, fleetErr)
+			}
 		case <-hup:
 			reloadDirectory(dir, log, "SIGHUP")
 		}
@@ -289,6 +301,32 @@ wait:
 	_ = admSrv.Shutdown(dctx)
 	log.Info("stopped")
 	return nil
+}
+
+// warnHeldSteps names every bucket with a held ramp step at startup: a control node that stopped
+// between a hold and its completion leaves the held keys answering 503 until the step is repeated
+// (ADR-0016).
+func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
+	f := snap.File()
+	for _, key := range slices.Sorted(maps.Keys(f.Placements)) {
+		if p := f.Placements[key]; p.Held() {
+			log.Warn("a ramp step was left held by an interrupted call: writes to the keys it moves answer 503 until it is repeated",
+				"placement", key, "ratio", p.Ramp.Ratio, "hold_ratio", p.Ramp.Hold.Ratio, "hold_prefixes", p.Ramp.Hold.Prefixes)
+		}
+	}
+}
+
+// publishFleet refreshes the control node's fleet gauges, logging an unreadable membership file
+// once per distinct error rather than every poll. It returns the error now in force.
+func publishFleet(ctl *control.Server, log *slog.Logger, last string) string {
+	msg := ""
+	if err := ctl.PublishFleet(); err != nil {
+		msg = err.Error()
+	}
+	if msg != "" && msg != last {
+		log.Error("fleet membership unreadable: fenced changes are refused until it is fixed (ADR-0016)", "err", msg)
+	}
+	return msg
 }
 
 // newMembership builds this proxy's side of the fleet (ADR-0016). The id defaults to the host name
@@ -309,10 +347,37 @@ func newMembership(cfg *config.Config, dir *directory.FileDir, metrics *telemetr
 			return nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
 		}
 		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
-		m.ID = strings.NewReplacer(" ", "-", "/", "-").Replace(host) + "-" + port
+		m.ID = defaultProxyID(host, port)
+	}
+	if !config.ValidProxyID(m.ID) {
+		// Refused here, not by every heartbeat: a member whose id the control node rejects is stale
+		// for as long as it runs.
+		return nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", m.ID)
 	}
 	metrics.FleetStale.Set(1) // until the first heartbeat is answered
 	return m, nil
+}
+
+// defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',
+// and the host shortened to its first label if the whole would not fit in 64: a Kubernetes pod
+// name can alone be 63 characters.
+func defaultProxyID(host, port string) string {
+	clean := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+				return r
+			}
+			return '-'
+		}, s)
+	}
+	host = strings.TrimLeft(clean(host), "._-")
+	if len(host)+1+len(port) > 64 {
+		host, _, _ = strings.Cut(host, ".")
+	}
+	if n := 64 - 1 - len(port); len(host) > n {
+		host = host[:n]
+	}
+	return host + "-" + port
 }
 
 func isLoopbackHost(host string) bool {

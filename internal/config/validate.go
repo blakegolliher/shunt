@@ -167,6 +167,10 @@ func (c *Config) validateDirectory(e *errs) {
 
 var proxyIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+// ValidProxyID reports whether id can name a fleet member (control.proxy_id, ADR-0016): 1-64
+// letters, digits, '.', '_' or '-', starting with a letter or digit.
+func ValidProxyID(id string) bool { return proxyIDPattern.MatchString(id) }
+
 func (c *Config) validateControl(e *errs) {
 	ct := c.Control
 	if ct.Endpoint != "" {
@@ -186,7 +190,7 @@ func (c *Config) validateControl(e *errs) {
 			e.add("control.token_ref", "only used with control.endpoint")
 		}
 	}
-	if ct.ProxyID != "" && !proxyIDPattern.MatchString(ct.ProxyID) {
+	if ct.ProxyID != "" && !ValidProxyID(ct.ProxyID) {
 		e.add("control.proxy_id", "want 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit; got %q", ct.ProxyID)
 	}
 	if ct.HeartbeatInterval <= 0 {

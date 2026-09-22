@@ -15,6 +15,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/s3/xmlrw"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -31,6 +32,22 @@ func (h *Handler) answer(w http.ResponseWriter, r *http.Request, o *outcome, cod
 	o.status = e.Status
 	o.err = "shunt: " + string(code)
 	writeErrorMessage(w, code, e.Status, msg, r.URL.Path, o.rid)
+}
+
+// staleFor reports whether this proxy has lost its lease and p is moving (ADR-0016).
+func (h *Handler) staleFor(p *directory.Placement) bool {
+	return p.State != directory.StateActive && h.Stale != nil && h.Stale()
+}
+
+// staleRead widens a read a stale proxy would send to the source only. The proxy may have missed
+// ramp steps, and another proxy may already have written the key to the target: target first,
+// then source, is right whatever step it missed, since a stale proxy writes nothing to a moving
+// bucket and the target only ever holds the newer copy.
+func staleRead(stale bool, class migrate.OpClass, route migrate.Route) migrate.Route {
+	if stale && class == migrate.ClassRead && route.Cluster == migrate.Source && !route.Fallback {
+		return migrate.Route{Cluster: migrate.Primary, Fallback: true}
+	}
+	return route
 }
 
 // refuseWrite answers a write shunt will not route yet with 503 and Retry-After, which every SDK

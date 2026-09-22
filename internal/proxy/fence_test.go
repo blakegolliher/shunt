@@ -82,6 +82,15 @@ func TestStaleProxyRefusesWritesOnMovingBuckets(t *testing.T) {
 	if r := m.acme(t, "GET", "/data/stay/k", nil); r.StatusCode != http.StatusOK || string(r.body) != "x" {
 		t.Errorf("a stale proxy falls back to the source: %d %q", r.StatusCode, r.body)
 	}
+	// The same holds when the moving bucket is a copy's source and the destination is ACTIVE: the
+	// copy must carry the target's newer object, not the source's older one.
+	cp := m.send(t, "PUT", "/pics/copied", "", nil, acmeAK, acmeSK, map[string]string{"X-Amz-Copy-Source": "/data/stay/k3"})
+	if cp.StatusCode != http.StatusOK {
+		t.Fatalf("stale proxy copy from a moving bucket into an ACTIVE one: %d %s", cp.StatusCode, cp.body)
+	}
+	if b, ok := m.garage.object("acme-7777-pics", "copied"); !ok || string(b) != "newer, on the target" {
+		t.Errorf("a stale proxy's copy read the source only: %q %v", b, ok)
+	}
 	stale = false
 	if r := m.acme(t, "PUT", "/data/stay/k", []byte("y")); r.StatusCode != http.StatusOK {
 		t.Errorf("write after the lease is back: %d %s", r.StatusCode, r.body)

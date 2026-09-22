@@ -22,6 +22,10 @@ type Transition struct {
 	// Release undoes a hold that did not reach every proxy: the step is dropped, and a placement held
 	// from ACTIVE goes back to ACTIVE with its target recorded, as it was before the step.
 	Release bool
+	// Complete writes the step a hold was for, and only if the placement is still held when the
+	// write happens: a hold released concurrently must not be completed, or the step would move
+	// writes that no proxy held.
+	Complete bool
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -72,7 +76,10 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		return fail("only a step to RAMPING or MIGRATING is held")
 	}
 	if p.Ramp != nil && p.Ramp.Hold != nil && t.Hold {
-		return fail("a held step is already in progress; it completes or is released first")
+		return fail("a held step is already in progress; repeat that step to complete it first")
+	}
+	if t.Complete && !p.Held() {
+		return fail("the held step was released or completed meanwhile; nothing is held to complete")
 	}
 	if !legal[[2]string{p.State, t.To}] {
 		next := next(p.State)
@@ -150,17 +157,17 @@ func Apply(p Placement, t Transition) (Placement, error) {
 			// Completing a held step: it may move only the keys that were held, never more.
 			for _, pre := range r.Prefixes {
 				if !slices.Contains(old.Prefixes, pre) && !slices.Contains(h.Prefixes, pre) {
-					return fail("prefix %q was not part of the held step; a held step completes as it was held, or is released", pre)
+					return fail("prefix %q was not part of the held step; repeat the held step to complete it first", pre)
 				}
 			}
 			if r.Ratio > h.Ratio && r.Ratio > old.Ratio {
-				return fail("ratio %v is beyond the held step's %v; a held step completes as it was held, or is released", r.Ratio, h.Ratio)
+				return fail("ratio %v is beyond the held step's %v; repeat the held step to complete it first", r.Ratio, h.Ratio)
 			}
 		}
 		np.Ramp = &r
 	case t.To == StateMigrating:
 		if p.Held() && p.Ramp.Hold.Ratio < 1 && !t.Hold {
-			return fail("a held ramp step is in progress; it completes or is released before MIGRATING")
+			return fail("a held ramp step is in progress; repeat that ramp step to complete it before MIGRATING")
 		}
 		np.Ramp = nil
 	case t.To == StateCutover:
@@ -204,4 +211,4 @@ func release(p Placement) (Placement, error) {
 }
 
 // Held reports whether p has a ramp step written but not yet in force.
-func (p *Placement) Held() bool { return p.Ramp != nil && p.Ramp.Hold != nil }
+func (p Placement) Held() bool { return p.Ramp != nil && p.Ramp.Hold != nil }

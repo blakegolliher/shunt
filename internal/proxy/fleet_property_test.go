@@ -151,8 +151,8 @@ func (fr *fleetRun) client(t *testing.T, w, n, keys int, seed uint64, stop <-cha
 	}
 }
 
-// retry sends a write until it is not refused with 503, trying either proxy: a held key or a
-// stale proxy answers 503, and a client retries.
+// retry sends a write to p until it is not refused with 503: a held key or a stale proxy answers
+// 503, and a client retries.
 func (fr *fleetRun) retry(t *testing.T, p fleetProxy, stop <-chan struct{}, send func(fleetProxy) int) int {
 	for {
 		code := send(p)
@@ -362,7 +362,7 @@ func TestFleetStepsKeepTheClientsView(t *testing.T) {
 	p, _ := fr.m.dir.Snapshot().Lookup("acme", "data")
 	t.Logf("%d client operations, %d writes retried after a 503; %d of %d steps held; ended %s", fr.ops.Load(), fr.retried.Load(), held, len(fleetSteps), p.State)
 	if p.State != directory.StateMigrating {
-		t.Errorf("the run ended in %s before every step was taken; lengthen SHUNT_PROPERTY_DURATION", p.State)
+		t.Errorf("the run ended in %s before every step was taken", p.State)
 	}
 	if held < len(fleetSteps)-2 {
 		t.Errorf("only %d steps were held: B was a member for all but one of them", held)

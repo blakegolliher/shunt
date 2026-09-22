@@ -101,13 +101,8 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.ServiceUnavailable, "This bucket's migration ramp cannot be routed by this proxy version. Try again later.")
 		return nil, false
 	}
-	stale := p.State != directory.StateActive && h.Stale != nil && h.Stale()
-	if stale && class == migrate.ClassRead && route.Cluster == migrate.Source && !route.Fallback {
-		// A stale proxy may have missed ramp steps: another proxy can have written this key to the
-		// target already. Target first, then source, is right whatever the step: this proxy
-		// writes nothing to a moving bucket, and the target only ever holds the newer copy.
-		route = migrate.Route{Cluster: migrate.Primary, Fallback: true}
-	}
+	stale := h.staleFor(p)
+	route = staleRead(stale, class, route)
 	switch {
 	case route.Held:
 		h.refuseWrite(w, r, o, info.Bucket, "hold", "This key is moving to another cluster and its writes pause until every proxy has the change. Retry shortly.")

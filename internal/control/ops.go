@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -92,9 +93,21 @@ func (s *Server) precondition(r *http.Request, strict bool, wait time.Duration) 
 // writes to the new primary is held until every proxy has the hold when the fleet has members; and
 // the answer says which members have not installed the step yet. A hold that does not reach every
 // member is released, so the step either happens everywhere or nowhere.
-func (s *Server) fencedStep(r *http.Request, key string, p directory.Placement, f *directory.File, t directory.Transition, create, acceptLoss bool, wait time.Duration) (TransitionResult, error) {
-	leaving := p.State == directory.StateActive
-	if err := s.precondition(r, leaving, wait); err != nil {
+func (s *Server) fencedStep(r *http.Request, key string, t directory.Transition, create, acceptLoss bool, wait time.Duration) (TransitionResult, error) {
+	// One fenced step per bucket at a time: two operators stepping the same bucket would otherwise
+	// fence, release and complete each other's holds. The placement is read under the lock, so a
+	// step starts from what the previous one left.
+	unlock := s.lockStep(key)
+	defer unlock()
+	f := s.Dir.Snapshot().File()
+	p, ok := f.Placements[key]
+	if !ok {
+		return TransitionResult{}, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
+	}
+	// A step out of ACTIVE waits for every member, live or not. A hold taken from ACTIVE and not yet
+	// completed (nothing in force, only the hold) is still that step.
+	fromActive := p.State == directory.StateActive || (p.Held() && p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0)
+	if err := s.precondition(r, fromActive, wait); err != nil {
 		return TransitionResult{}, err
 	}
 	moves := t.To == directory.StateRamping ||
@@ -102,7 +115,7 @@ func (s *Server) fencedStep(r *http.Request, key string, p directory.Placement, 
 	hold := false
 	if moves {
 		var err error
-		if hold, err = s.counted(leaving); err != nil {
+		if hold, err = s.counted(fromActive); err != nil {
 			return TransitionResult{}, err
 		}
 	}
@@ -115,28 +128,49 @@ func (s *Server) fencedStep(r *http.Request, key string, p directory.Placement, 
 		return res, nil
 	}
 
-	// Anything that would refuse the completed step refuses before the hold is written.
-	if np, err := directory.Apply(p, withDefaultName(key, p, t)); err != nil {
-		return TransitionResult{}, err
-	} else if np.State == directory.StateMigrating && !f.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
-		return TransitionResult{}, lostWriteWindow(key, np.Primary)
-	}
 	tenant, bucket, _ := directory.SplitKey(key)
-	th := t
-	th.Hold = true
-	held, err := s.transition(r, key, p, f, th, create, acceptLoss)
-	if err != nil {
-		return held, err
+	complete := t // the step as written once every member holds it: never with a target
+	complete.Target, complete.Name, complete.Complete = "", "", true
+	var heldAt int64
+	var created string
+	if p.Held() {
+		// A hold left by an interrupted call, such as a control-node restart between the hold and
+		// its completion. Its keys answer 503 until it completes, so repeating the step resumes it
+		// rather than being refused as "already held".
+		if t.Target != "" && t.Target != p.Primary {
+			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, p.Primary)
+		}
+		if _, err := directory.Apply(p, complete); err != nil {
+			return TransitionResult{}, refuse("%s has a held step to %s left by an interrupted call; repeat it to complete it (%v)", key, holdText(p.Ramp.Hold), err)
+		}
+		heldAt = s.Dir.Snapshot().Version()
+		s.info(r, "resuming a held step", "placement", key, "version", heldAt, "hold", holdText(p.Ramp.Hold))
+	} else {
+		// Anything that would refuse the completed step refuses before the hold is written.
+		np, err := directory.Apply(p, withDefaultName(key, p, t))
+		if err != nil {
+			return TransitionResult{}, err
+		}
+		if np.State == directory.StateMigrating && !f.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+			return TransitionResult{}, lostWriteWindow(key, np.Primary)
+		}
+		th := t
+		th.Hold = true
+		held, err := s.transition(r, key, p, f, th, create, acceptLoss)
+		if err != nil {
+			return held, err
+		}
+		heldAt, created = held.Version, held.CreatedBucket
+		s.info(r, "ramp step held", "placement", key, "version", heldAt, "to", t.To, "ratio", t.Ratio, "prefixes", t.Prefixes)
 	}
-	s.info(r, "ramp step held", "placement", key, "version", held.Version, "to", t.To, "ratio", t.Ratio, "prefixes", t.Prefixes)
 	release := func(why string) error {
 		if rerr := s.Dir.SetState(context.WithoutCancel(r.Context()), tenant, bucket, directory.StateRamping, directory.Transition{Release: true}, actor(r)); rerr != nil {
-			return fmt.Errorf("%s, and releasing the hold failed: %w; release it with the same command once the fleet is back", why, rerr)
+			return fmt.Errorf("%s, and releasing the hold failed: %w; repeat the step once the fleet is back to complete it", why, rerr)
 		}
 		s.info(r, "held step released", "placement", key, "reason", why)
 		return refuse("%s; the held step was released and nothing changed", why)
 	}
-	waiting, err := s.fenceRound(r.Context(), held.Version, leaving, wait)
+	waiting, err := s.fenceRound(r.Context(), heldAt, fromActive, wait)
 	switch {
 	case err != nil:
 		return TransitionResult{}, release("waiting for the fleet was interrupted: " + err.Error())
@@ -148,16 +182,33 @@ func (s *Server) fencedStep(r *http.Request, key string, p directory.Placement, 
 	if !ok || !p2.Held() {
 		return TransitionResult{}, fmt.Errorf("%w: %s changed while its step was held", directory.ErrConflict, key)
 	}
-	t2 := t
-	t2.Target, t2.Name = "", ""
-	res, err := s.transition(r, key, p2, f2, t2, false, acceptLoss)
+	res, err := s.transition(r, key, p2, f2, complete, false, acceptLoss)
 	if err != nil {
 		return res, release("completing the held step failed: " + err.Error())
 	}
-	res.From, res.Held = p.State, true
-	res.CreatedBucket = held.CreatedBucket
+	res.From, res.Held, res.CreatedBucket = p.State, true, created
 	s.settle(r, &res, res.Version, wait)
 	return res, nil
+}
+
+// lockStep serializes fenced steps on one placement key and returns the unlock.
+func (s *Server) lockStep(key string) func() {
+	v, _ := s.steps.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// holdText describes a held step for an operator.
+func holdText(h *directory.RampHold) string {
+	switch {
+	case h.Ratio >= 1:
+		return "every key (ratio 1)"
+	case len(h.Prefixes) == 0:
+		return fmt.Sprintf("ratio %v", h.Ratio)
+	default:
+		return fmt.Sprintf("ratio %v, prefixes %s", h.Ratio, strings.Join(h.Prefixes, " "))
+	}
 }
 
 // withDefaultName fills the backend name a first step gets when neither expand nor the request
@@ -175,10 +226,8 @@ func withDefaultName(key string, p directory.Placement, t directory.Transition) 
 // conditional PUT was accepted explicitly.
 func (s *Server) transition(r *http.Request, key string, p directory.Placement, f *directory.File, t directory.Transition, create, acceptLoss bool) (TransitionResult, error) {
 	tenant, bucket, _ := directory.SplitKey(key)
-	switch {
-	case p.State == directory.StateActive && p.Target == "" && t.Target != "" && t.Name == "":
-		t.Name = directory.BackendName(tenant, bucket, 0)
-	case p.State != directory.StateActive && t.Target != "":
+	t = withDefaultName(key, p, t)
+	if p.State != directory.StateActive && t.Target != "" {
 		// Repeating the target on a later step is how an operator types it; only a change is refused.
 		if t.Target != p.Primary {
 			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, p.Primary)
@@ -519,11 +568,11 @@ func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	key, p, f, ok := s.lookup(w, r)
+	key, _, _, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
-	res, err := s.fencedStep(r, key, p, f, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes}, req.Create, false, wait)
+	res, err := s.fencedStep(r, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes}, req.Create, false, wait)
 	if err != nil {
 		fail(w, err)
 		return
@@ -550,11 +599,11 @@ func (s *Server) migrateStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	key, p, f, ok := s.lookup(w, r)
+	key, _, _, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
-	res, err := s.fencedStep(r, key, p, f, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(r, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		fail(w, err)
 		return

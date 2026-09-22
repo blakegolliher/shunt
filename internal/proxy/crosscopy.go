@@ -102,6 +102,7 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 	if rerr != nil {
 		return "", nil, s3.ServiceUnavailable, "The source bucket's migration ramp cannot be routed by this proxy version."
 	}
+	route = staleRead(h.staleFor(sp), migrate.ClassRead, route)
 	readFrom := sp.Primary
 	if route.Cluster == migrate.Source {
 		readFrom = sp.Source

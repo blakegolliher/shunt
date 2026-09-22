@@ -586,6 +586,10 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 		if p.Ratio > 0 {
 			ratio = strconv.FormatFloat(p.Ratio, 'f', 2, 64)
 		}
+		if p.Hold != nil {
+			// A step written but not on every proxy yet: its keys' writes answer 503 (ADR-0016).
+			ratio += " held→" + strconv.FormatFloat(p.Hold.Ratio, 'f', 2, 64)
+		}
 		source := "-"
 		if p.Source != "" {
 			source = p.Source + "/" + p.Names[p.Source]

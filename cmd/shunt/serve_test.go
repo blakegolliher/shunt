@@ -228,3 +228,21 @@ func (l *lockedBuffer) String() string {
 	defer l.mu.Unlock()
 	return l.b.String()
 }
+
+// The default proxy id always passes the control node's check: a member whose id it rejects would
+// be stale for as long as it runs.
+func TestDefaultProxyIDIsValid(t *testing.T) {
+	for _, c := range []struct{ host, port, want string }{
+		{"proxy1", "9900", "proxy1-9900"},
+		{"proxy1.dc1.example.com", "9900", "proxy1.dc1.example.com-9900"},
+		{"my host/with:odd*chars", "9900", "my-host-with-odd-chars-9900"},
+		{strings.Repeat("a", 63), "9900", strings.Repeat("a", 59) + "-9900"},                                 // a maximal pod name
+		{strings.Repeat("b", 40) + "." + strings.Repeat("c", 40), "9900", strings.Repeat("b", 40) + "-9900"}, // first label only
+		{"_leading.dot", "9900", "leading.dot-9900"},
+	} {
+		got := defaultProxyID(c.host, c.port)
+		if got != c.want || !config.ValidProxyID(got) {
+			t.Errorf("defaultProxyID(%q, %q) = %q (valid %v), want %q", c.host, c.port, got, config.ValidProxyID(got), c.want)
+		}
+	}
+}

@@ -836,9 +836,14 @@ func TestHeldSteps(t *testing.T) {
 	if _, err := Apply(h, Transition{To: StateMigrating}); err == nil {
 		t.Error("MIGRATING over a held ramp step accepted")
 	}
-	done, err := Apply(h, Transition{To: StateRamping, Ratio: 0.5})
+	done, err := Apply(h, Transition{To: StateRamping, Ratio: 0.5, Complete: true})
 	if err != nil || done.Ramp.Ratio != 0.5 || done.Ramp.Hold != nil || done.Held() {
 		t.Fatalf("completing the hold: %+v %v", done.Ramp, err)
+	}
+	// Completing is a compare-and-swap on the hold: once it is released (or completed) by another
+	// call, completing again must fail rather than move writes no proxy held.
+	if _, err := Apply(done, Transition{To: StateRamping, Ratio: 0.8, Complete: true}); err == nil {
+		t.Error("completing a step with nothing held accepted")
 	}
 	valid("completed hold", done)
 

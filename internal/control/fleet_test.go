@@ -257,7 +257,6 @@ func TestFirstStepWaitsForSilentMembers(t *testing.T) {
 
 	// Membership survives a control-node restart: a fresh server reads it back.
 	fresh := &Server{Dir: rg.dir, FleetFile: rg.ctl.FleetFile, Now: rg.ctl.Now}
-	fresh.fleet.path = rg.ctl.FleetFile
 	ms, err := fresh.members()
 	if err != nil || len(ms) != 1 || ms[0].ID != "p2" || ms[0].Live {
 		t.Fatalf("membership after a restart: %+v %v", ms, err)
@@ -329,4 +328,44 @@ func TestMemberRefusesMutations(t *testing.T) {
 		t.Fatalf("member ramp: %d %s", code, raw)
 	}
 	rg.must("GET", "/v1/status", nil, nil)
+}
+
+// A hold left behind by an interrupted call (the control node restarted between the hold and its
+// completion) must not strand the bucket: repeating the step completes it, and a different step
+// is refused naming the one to repeat.
+func TestLeftoverHoldIsCompletedByRepeatingTheStep(t *testing.T) {
+	rg := newRig(t)
+	fs := newFleetSim(rg)
+	expanded(t, rg)
+	fs.modes["p2"] = "follow"
+	fs.tick()
+	// The hold is written, as by a control node that then died.
+	if err := rg.dir.SetState(context.Background(), "acme", "data01", directory.StateActive, directory.Transition{To: directory.StateRamping, Ratio: 0.5, Hold: true}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	fs.tick()
+	rg.refused("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.8}, "repeat it")
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5}, &tr)
+	p := placement(t, rg)
+	if p.Held() || p.State != directory.StateRamping || p.Ramp.Ratio != 0.5 || !tr.Held {
+		t.Fatalf("after repeating the held step: %+v %+v (%+v)", p, p.Ramp, tr)
+	}
+}
+
+// An unreadable membership file fails closed: a fenced step is refused, never run as if the fleet
+// were empty.
+func TestUnreadableFleetFileFailsClosed(t *testing.T) {
+	rg := newRig(t)
+	newFleetSim(rg)
+	expanded(t, rg)
+	if err := os.WriteFile(rg.ctl.FleetFile, []byte("members: {not: [a list"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second call must fail too: the first error must not be forgotten
+		rg.answers("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5}, http.StatusServiceUnavailable, "unavailable")
+	}
+	if p := placement(t, rg); p.State != directory.StateActive {
+		t.Fatalf("a step ran with the fleet unknown: %+v", p)
+	}
 }

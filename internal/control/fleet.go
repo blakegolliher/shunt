@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"slices"
@@ -19,6 +20,7 @@ import (
 
 	"go.yaml.in/yaml/v4"
 
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 )
@@ -59,8 +61,9 @@ type Member struct {
 	Live          bool               `json:"live"`
 	Applied       int64              `json:"applied"`
 	Started       time.Time          `json:"started,omitzero"`
-	Seen          time.Time          `json:"seen,omitzero"` // when its last heartbeat arrived; zero since this control node started
-	Beats         int64              `json:"-"`             // heartbeats received since this control node started
+	Seen          time.Time          `json:"seen,omitzero"`        // when its last heartbeat arrived; zero since this control node started
+	SinceSeen     time.Duration      `json:"since_seen,omitempty"` // how long ago, by the control node's clock
+	Beats         int64              `json:"-"`                    // heartbeats received since this control node started
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
 }
 
@@ -71,12 +74,11 @@ type Fleet struct {
 	Members  []Member      `json:"members"`
 }
 
-// fleet is the control node's table. Membership (ids) is persisted to path so it survives a
-// restart; liveness is memory only.
+// fleet is the control node's table. Membership (ids) is persisted to Server.FleetFile so it
+// survives a restart; liveness is memory only.
 type fleet struct {
 	mu      sync.Mutex
 	loaded  bool
-	path    string
 	members map[string]*Member
 }
 
@@ -84,65 +86,59 @@ type fleetFile struct {
 	Members []string `yaml:"members"`
 }
 
-// load reads the membership file once. A missing file is an empty fleet.
-func (f *fleet) load() error {
+// errFleet is a membership file that cannot be read or written. It fails closed: without the
+// membership, no fenced change can know whom to wait for, so it answers 503 rather than run as if
+// the fleet were empty.
+type errFleet struct{ err error }
+
+func (e *errFleet) Error() string { return "fleet membership: " + e.err.Error() }
+func (e *errFleet) Unwrap() error { return e.err }
+
+// load reads the membership file the first time it succeeds; until then every call tries again
+// and fails. A missing file is an empty fleet.
+func (f *fleet) load(path string) error {
 	if f.loaded {
 		return nil
 	}
-	f.members = map[string]*Member{}
-	f.loaded = true
-	if f.path == "" {
-		return nil
+	members := map[string]*Member{}
+	if path != "" {
+		data, err := os.ReadFile(path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return &errFleet{err}
+		default:
+			var ff fleetFile
+			if err := yaml.Unmarshal(data, &ff); err != nil {
+				return &errFleet{fmt.Errorf("%s: %w", path, err)}
+			}
+			for _, id := range ff.Members {
+				if !config.ValidProxyID(id) {
+					return &errFleet{fmt.Errorf("%s: proxy id %q is not valid", path, id)}
+				}
+				members[id] = &Member{ID: id}
+			}
+		}
 	}
-	data, err := os.ReadFile(f.path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("fleet membership %s: %w", f.path, err)
-	}
-	var ff fleetFile
-	if err := yaml.Unmarshal(data, &ff); err != nil {
-		return fmt.Errorf("fleet membership %s: %w", f.path, err)
-	}
-	for _, id := range ff.Members {
-		f.members[id] = &Member{ID: id}
-	}
+	f.members, f.loaded = members, true
 	return nil
 }
 
-// save writes the membership file: temp file, fsync, rename.
-func (f *fleet) save() error {
-	if f.path == "" {
+// save writes the membership file durably (directory.WriteAtomic).
+func (f *fleet) save(path string) error {
+	if path == "" {
 		return nil
 	}
-	ids := make([]string, 0, len(f.members))
-	for id := range f.members {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
+	ids := slices.Sorted(maps.Keys(f.members))
 	data, err := yaml.Dump(fleetFile{Members: ids})
 	if err != nil {
-		return err
+		return &errFleet{err}
 	}
 	data = append([]byte("# shunt fleet membership (ADR-0016): proxy ids only. Written by the control node.\n"), data...)
-	tmp := f.path + ".tmp"
-	fh, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
+	if err := directory.WriteAtomic(path, data); err != nil {
+		return &errFleet{err}
 	}
-	if _, err := fh.Write(data); err != nil {
-		_ = fh.Close()
-		return err
-	}
-	if err := fh.Sync(); err != nil {
-		_ = fh.Close()
-		return err
-	}
-	if err := fh.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, f.path)
+	return nil
 }
 
 // liveAt reports whether a member's last heartbeat is recent enough to count it live at now.
@@ -165,7 +161,7 @@ func (s *Server) leaseTTL() time.Duration {
 func (s *Server) members() ([]Member, error) {
 	s.fleet.mu.Lock()
 	defer s.fleet.mu.Unlock()
-	if err := s.fleet.load(); err != nil {
+	if err := s.fleet.load(s.FleetFile); err != nil {
 		return nil, err
 	}
 	now := s.now()
@@ -173,10 +169,24 @@ func (s *Server) members() ([]Member, error) {
 	for _, m := range s.fleet.members {
 		c := *m
 		c.Live = s.liveAt(m, now)
+		if !m.Seen.IsZero() {
+			c.SinceSeen = now.Sub(m.Seen)
+		}
 		out = append(out, c)
 	}
 	slices.SortFunc(out, func(a, b Member) int { return strings.Compare(a.ID, b.ID) })
 	return out, nil
+}
+
+// PublishFleet refreshes shunt_fleet_members from the table. serve calls it on every directory
+// poll, so a member that falls silent shows up without anyone asking (ADR-0016).
+func (s *Server) PublishFleet() error {
+	ms, err := s.members()
+	if err != nil {
+		return err
+	}
+	s.publishFleet(ms)
+	return nil
 }
 
 // publishFleet sets shunt_fleet_members.
@@ -196,7 +206,7 @@ func (s *Server) publishFleet(ms []Member) {
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !validProxyID(id) {
+	if !config.ValidProxyID(id) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("proxy id %q: want 1-64 letters, digits, '.', '_' or '-'", id))
 		return
 	}
@@ -205,7 +215,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.fleet.mu.Lock()
-	if err := s.fleet.load(); err != nil {
+	if err := s.fleet.load(s.FleetFile); err != nil {
 		s.fleet.mu.Unlock()
 		fail(w, err)
 		return
@@ -214,10 +224,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if !known {
 		m = &Member{ID: id}
 		s.fleet.members[id] = m
-		if err := s.fleet.save(); err != nil {
+		if err := s.fleet.save(s.FleetFile); err != nil {
 			delete(s.fleet.members, id)
 			s.fleet.mu.Unlock()
-			writeError(w, http.StatusServiceUnavailable, "unavailable", "recording fleet membership: "+err.Error())
+			fail(w, err)
 			return
 		}
 	}
@@ -246,7 +256,7 @@ func (s *Server) forgetProxy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.fleet.mu.Lock()
 	defer s.fleet.mu.Unlock()
-	if err := s.fleet.load(); err != nil {
+	if err := s.fleet.load(s.FleetFile); err != nil {
 		fail(w, err)
 		return
 	}
@@ -260,26 +270,13 @@ func (s *Server) forgetProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(s.fleet.members, id)
-	if err := s.fleet.save(); err != nil {
+	if err := s.fleet.save(s.FleetFile); err != nil {
 		s.fleet.members[id] = m
-		writeError(w, http.StatusServiceUnavailable, "unavailable", "recording fleet membership: "+err.Error())
+		fail(w, err)
 		return
 	}
 	s.info(r, "proxy forgotten", "proxy", id)
 	writeJSON(w, http.StatusOK, map[string]string{"forgotten": id})
-}
-
-func validProxyID(id string) bool {
-	if id == "" || len(id) > 64 {
-		return false
-	}
-	for i, c := range id {
-		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || (i > 0 && (c == '.' || c == '_' || c == '-'))
-		if !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // fenceRound waits until every member it must wait for has installed version v, or until wait
@@ -351,7 +348,7 @@ func (s *Server) fleetFallbackReads(key string) (total float64, beats map[string
 	}
 	s.fleet.mu.Lock()
 	defer s.fleet.mu.Unlock()
-	if err := s.fleet.load(); err != nil {
+	if err := s.fleet.load(s.FleetFile); err != nil {
 		return 0, nil, err
 	}
 	beats = map[string]int64{}
@@ -413,7 +410,10 @@ type Membership struct {
 	Now      func() time.Time
 
 	started time.Time
-	lastAck atomic.Int64 // unix nanos of the send time of the last acknowledged heartbeat; 0: none yet
+	// lastAck is the send time of the last acknowledged heartbeat; nil: none yet. A time.Time from
+	// time.Now carries a monotonic reading, so the lease is measured by elapsed time, and a wall
+	// clock stepped backwards cannot extend it (a Unix timestamp would lose that reading).
+	lastAck atomic.Pointer[time.Time]
 	stale   atomic.Bool
 }
 
@@ -429,16 +429,27 @@ func (m *Membership) now() time.Time {
 // bucket it sees as ACTIVE has started to move.
 func (m *Membership) Stale() bool {
 	ack := m.lastAck.Load()
-	return ack == 0 || m.now().Sub(time.Unix(0, ack)) > m.LeaseTTL
+	return ack == nil || m.now().Sub(*ack) > m.LeaseTTL
 }
 
-// Run sends heartbeats until ctx ends.
-func (m *Membership) Run(ctx context.Context) {
+// Register sends the first heartbeat, before this proxy serves anything, so the control node
+// counts it as a member from its first request: a bucket's first step then waits for it. An error
+// means the control node could not be reached or this proxy could not install its version; the
+// proxy may still start, stale, and Run keeps trying.
+func (m *Membership) Register(ctx context.Context) error {
 	m.started = m.now().UTC().Truncate(time.Second)
+	return m.beat(ctx)
+}
+
+// Run sends heartbeats until ctx ends. Register, when called first, sent the first one.
+func (m *Membership) Run(ctx context.Context) {
+	if m.started.IsZero() {
+		m.started = m.now().UTC().Truncate(time.Second)
+	}
 	t := time.NewTicker(m.Interval)
 	defer t.Stop()
 	for {
-		m.beat(ctx)
+		_ = m.beat(ctx) //nolint:errcheck // beat logs lease changes itself; the next tick retries
 		select {
 		case <-ctx.Done():
 			return
@@ -448,7 +459,7 @@ func (m *Membership) Run(ctx context.Context) {
 }
 
 // beat sends one heartbeat and records whether the lease holds.
-func (m *Membership) beat(ctx context.Context) {
+func (m *Membership) beat(ctx context.Context) error {
 	sent := m.now()
 	ans, err := m.send(ctx)
 	if err == nil {
@@ -462,7 +473,7 @@ func (m *Membership) beat(ctx context.Context) {
 		// back from silence may have missed steps that went ahead without it; until it has
 		// installed them it stays stale, or it would write a moved key to the source.
 		if v := m.Dir.Snapshot().Version(); v >= ans.Version {
-			m.lastAck.Store(sent.UnixNano())
+			m.lastAck.Store(&sent)
 		} else {
 			err = fmt.Errorf("directory version %d is behind the control node's %d", v, ans.Version)
 		}
@@ -483,6 +494,7 @@ func (m *Membership) beat(ctx context.Context) {
 		}
 		m.Metrics.FleetStale.Set(v)
 	}
+	return err
 }
 
 func errString(err error) string {
@@ -558,8 +570,8 @@ type MemberStatus struct {
 // ServeHTTP answers /-/fleet on a member's admin listener.
 func (m *Membership) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	st := MemberStatus{ID: m.ID, ControlNode: m.Endpoint, Stale: m.Stale(), Applied: m.Dir.Snapshot().Version()}
-	if ack := m.lastAck.Load(); ack != 0 {
-		st.LastAck = m.now().Sub(time.Unix(0, ack)).Round(time.Millisecond).String()
+	if ack := m.lastAck.Load(); ack != nil {
+		st.LastAck = m.now().Sub(*ack).Round(time.Millisecond).String()
 	}
 	writeJSON(w, http.StatusOK, st)
 }

@@ -70,6 +70,7 @@ type Server struct {
 	mu       sync.Mutex
 	progress map[string]Progress // placement key → the mover's last report (in memory only)
 	fleet    fleet
+	steps    sync.Map // placement key → *sync.Mutex: one fenced step per bucket at a time
 }
 
 // Handler returns the /v1/ routes, one handler per operation.
@@ -94,7 +95,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/fleet/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("GET /v1/fleet", s.fleetList)
 	mux.HandleFunc("DELETE /v1/fleet/{id}", s.logged("proxy forget", s.forgetProxy))
-	s.fleet.path = s.FleetFile
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "the control API needs Authorization: Bearer <admin.control_token_ref>, or a loopback peer when no token is configured")
@@ -201,7 +201,7 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.As(err, &ce):
 		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-	case errors.Is(err, directory.ErrReadOnly), errors.Is(err, directory.ErrLockTimeout):
+	case errors.Is(err, directory.ErrReadOnly), errors.Is(err, directory.ErrLockTimeout), errors.As(err, new(*errFleet)):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 	default:
 		writeError(w, http.StatusBadGateway, "backend", err.Error())
@@ -242,7 +242,8 @@ type PlacementStatus struct {
 	Names         map[string]string          `json:"names"`
 	Ratio         float64                    `json:"ratio,omitempty"`
 	Prefixes      []string                   `json:"prefixes,omitempty"`
-	Writes        map[string]float64         `json:"ramp_writes"` // side → shunt_ramp_writes_total on this proxy
+	Hold          *directory.RampHold        `json:"hold,omitempty"` // a ramp step written but not yet on every proxy (ADR-0016)
+	Writes        map[string]float64         `json:"ramp_writes"`    // side → shunt_ramp_writes_total on this proxy
 	FallbackReads float64                    `json:"fallback_reads"`
 	DualDeletes   map[string]float64         `json:"dual_deletes"`
 	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
@@ -300,7 +301,7 @@ func (s *Server) placementStatus(key string, p directory.Placement) PlacementSta
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.Primary, Source: p.Source, Target: p.Target, Names: p.Names,
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Ramp != nil {
-		ps.Ratio, ps.Prefixes = p.Ramp.Ratio, p.Ramp.Prefixes
+		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
 	}
 	if s.Metrics != nil {
 		ps.Writes = counters(s.Metrics.RampWrites, key, "side")
