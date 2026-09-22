@@ -32,7 +32,75 @@ import (
 
 func newCluster() *cobra.Command {
 	cmd := &cobra.Command{Use: "cluster", Short: "Add or remove a backend cluster while shunt serves"}
-	cmd.AddCommand(newClusterAdd(), newClusterRemove())
+	cmd.AddCommand(newClusterAdd(), newClusterRemove(), newClusterReadOnly())
+	return cmd
+}
+
+func newClusterReadOnly() *cobra.Command {
+	var o apiOptions
+	var off, reject bool
+	var wait time.Duration
+	cmd := &cobra.Command{
+		Use:   "readonly <name>",
+		Short: "Fence a backend read-only for maintenance, or make it writable again",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.ReadOnlyResult
+			req := control.OperationRequest{Kind: control.OpClusterReadOnly, Cluster: args[0], Args: argsOf(control.ReadOnlyRequest{ReadOnly: !off, Reject: reject, Wait: wait.String()})}
+			if opErr := api.operate(cmd.Context(), req, &out); opErr != nil {
+				return opErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s: read-only %t (directory version %d)\n", args[0], out.ReadOnly, out.Version)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&off, "off", false, "make the cluster writable again")
+	cmd.Flags().BoolVar(&reject, "reject", false, "fail writes fast with 403 instead of retryable 503")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy at each fence")
+	return cmd
+}
+
+func newBucketReadOnly() *cobra.Command {
+	var o apiOptions
+	var off, reject bool
+	var wait time.Duration
+	cmd := &cobra.Command{
+		Use:   "readonly <bucket>",
+		Short: "Fence one bucket read-only, or make it writable again",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			key := args[0]
+			if !strings.Contains(key, "/") {
+				key = directory.Key(directory.DefaultTenant, key)
+			}
+			var out control.ReadOnlyResult
+			req := control.OperationRequest{Kind: control.OpPlacementReadOnly, Placement: key, Args: argsOf(control.ReadOnlyRequest{ReadOnly: !off, Reject: reject, Wait: wait.String()})}
+			if opErr := api.operate(cmd.Context(), req, &out); opErr != nil {
+				return opErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: read-only %t (directory version %d)\n", shown(key), out.ReadOnly, out.Version)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&off, "off", false, "make the bucket writable again")
+	cmd.Flags().BoolVar(&reject, "reject", false, "fail writes fast with 403 instead of retryable 503")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy at each fence")
 	return cmd
 }
 

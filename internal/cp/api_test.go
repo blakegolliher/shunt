@@ -441,7 +441,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	}
 	var list control.OperationList
 	b.must("GET", "/v1/operations?placement=acme/data01", nil, &list)
-	if len(list.Operations) != 2 || list.Operations[0].ID != started.ID {
+	if len(list.Operations) < 2 || list.Operations[0].ID != started.ID {
 		t.Fatalf("listing on b: %+v", list.Operations)
 	}
 

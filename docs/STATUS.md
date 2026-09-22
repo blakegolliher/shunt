@@ -63,6 +63,15 @@ filesystem:
   `make fleet` is green on the embedded build, and a live same-origin smoke served the real bundle
   beside a healthy control API; production npm notices cover 44 packages and the generator rejects
   copyleft licenses.
+- **UI-3 done (2026-09-22):** the operational UI now has control-plane membership, leader/quorum,
+  database quota and fleet views; cluster preflight/add/detail/remove/read-only flows; and bucket
+  adopt/create/detail/expand/read-only flows, with exact join guidance and Migrations handoff.
+  Successful short mutations now create operation records too, bearer-authenticated audit rows use
+  a stable non-secret `token:<fingerprint>` actor, and read-only is a fleet-fenced directory flag
+  enforced by every proxy (retryable 503 by default, optional 403). Thirteen browser tests drive
+  the first four demo actions and outcome/refusal toasts. Build, UI, lint, Go test and race gates
+  are green; a fresh `make fleet` proved preflight, operation and audit records, read-only across
+  two proxies, telemetry within 5.70%, quorum loss, cache restart, migration, cutover and purge.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

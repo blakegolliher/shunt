@@ -125,6 +125,10 @@ type Cluster struct {
 	StorageClass   string       `yaml:"storage_class,omitempty" json:"storage_class,omitempty"`     // emulated cold clusters only
 	Access         string       `yaml:"access,omitempty" json:"access,omitempty"`                   // instant | restore-required
 	Capabilities   Capabilities `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	// ReadOnly is a fleet-fenced maintenance switch. RejectWrites changes the response from the
+	// retryable default (503 + Retry-After) to a fail-fast 403.
+	ReadOnly     bool `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+	RejectWrites bool `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
 }
 
 // Capabilities is the hand-written capability profile of a cluster, filled from `shunt probe`

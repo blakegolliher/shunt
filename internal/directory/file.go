@@ -219,6 +219,20 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 	return d.mutate(ctx, actor, "set-state", Key(tenant, bucket), func(f *File) error { return f.SetState(tenant, bucket, from, t) })
 }
 
+// SetPlacementReadOnly implements Store.
+func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+	return d.mutate(ctx, actor, "placement-read-only", Key(tenant, bucket), func(f *File) error {
+		return f.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+	})
+}
+
+// SetClusterReadOnly implements Store.
+func (d *FileDir) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+	return d.mutate(ctx, actor, "cluster-read-only", clusterKey(name), func(f *File) error {
+		return f.SetClusterReadOnly(name, readOnly, reject)
+	})
+}
+
 // PutCluster implements Store. The proxy's Prepare hook builds the cluster (and resolves its
 // secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused. The
 // directory file carries only refs: a secret is refused.

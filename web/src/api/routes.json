@@ -28,6 +28,14 @@
     "readOnlyException":"The browser lists operation records; CLI verbs expose and poll their own record rather than offering a general list verb."
   },
   {"method":"GET","pattern":"/v1/operations/{id}"},
+  {"method":"POST","pattern":"/v1/clusters/probe"},
+  {"method":"POST","pattern":"/v1/clusters"},
+  {"method":"DELETE","pattern":"/v1/clusters/{name}"},
+  {"method":"POST","pattern":"/v1/clusters/{name}/read-only"},
+  {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/adopt"},
+  {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/create-backend"},
+  {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/expand"},
+  {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/read-only"},
   {
     "method":"GET",
     "pattern":"/v1/clusters/{name}/view",

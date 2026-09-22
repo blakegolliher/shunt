@@ -60,7 +60,7 @@ func TestUIRouteParityWithControlAPIAndCLI(t *testing.T) {
 	// A literal fetch added to the client cannot bypass the reviewed inventory above.
 	literal := regexp.MustCompile(`['\"](/v1/[A-Za-z0-9_/{}/.-]+)['\"]`)
 	err := filepath.WalkDir("src", func(name string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || (!strings.HasSuffix(name, ".ts") && !strings.HasSuffix(name, ".tsx")) {
+		if err != nil || entry.IsDir() || strings.Contains(name, ".test.") || (!strings.HasSuffix(name, ".ts") && !strings.HasSuffix(name, ".tsx")) {
 			return err
 		}
 		b, readErr := os.ReadFile(name)

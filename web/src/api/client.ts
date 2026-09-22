@@ -46,6 +46,76 @@ export interface FleetStatus {
   members: ProxyMember[]
 }
 
+export interface ClusterStatus {
+  name: string
+  type: string
+  scheme: string
+  region: string
+  endpoints: string[]
+  access_key: string
+  secret_ref: string
+  conditional_write: boolean
+  conditional_delete: boolean
+  references?: string[]
+  read_only: boolean
+  reject_writes: boolean
+}
+
+export interface PlacementStatus {
+  key: string
+  state: string
+  primary: string
+  source?: string
+  target?: string
+  names: Record<string, string>
+  read_only: boolean
+  reject_writes: boolean
+}
+
+export interface DirectoryStatus {
+  version: number
+  clusters: ClusterStatus[]
+  placements: PlacementStatus[]
+}
+
+export interface Capability { value: boolean; known: boolean }
+
+export interface ClusterView extends ClusterStatus {
+  capabilities: { conditional_write: Capability; conditional_delete: Capability }
+  probe: { reachable: boolean; latency_ms: number; error?: string; checked_at: string }
+}
+
+export interface ClusterProbeResult {
+  cluster: ClusterStatus
+  reachable: boolean
+  profile: 'measured' | 'assumed'
+  capabilities: { conditional_write: Capability; conditional_delete: Capability }
+}
+
+export interface FenceStatus { version: number; held: boolean; proxies: number; waiting_on: string[]; silent: string[] }
+export interface PlacementView extends PlacementStatus {
+  fence: FenceStatus
+  operations: string[]
+  clusters: Record<string, ClusterStatus>
+}
+
+export interface Operation {
+  id: string
+  kind: string
+  placement?: string
+  cluster?: string
+  actor: string
+  status: 'running' | 'succeeded' | 'failed' | 'refused'
+  phase?: string
+  waiting_on?: string[]
+  result?: unknown
+  error?: { code: string; message: string }
+}
+
+export interface RemoveDryRun { allowed: boolean; reason?: string; name: string; references: string[]; secret_files: number; token?: string; expires_at?: string }
+
+export interface TelemetryPoint { start: string; end: string; p50_us: number; p90_us: number; p99_us: number; p999_us: number; max_us: number; count: number }
+
 export interface StreamEvent {
   id: string
   type: string
@@ -78,6 +148,29 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
 
 export const getControl = (token: string) => request<ControlStatus>('/v1/control', token)
 export const getFleet = (token: string) => request<FleetStatus>('/v1/fleet', token)
+export const getStatus = (token: string) => request<DirectoryStatus>('/v1/status?all=1', token)
+export const getClusterView = (token: string, name: string) => request<ClusterView>(`/v1/clusters/${encodeURIComponent(name)}/view`, token)
+export const getPlacementView = (token: string, tenant: string, bucket: string) => request<PlacementView>(`/v1/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/view`, token)
+export const getTelemetrySeries = (token: string, query: URLSearchParams) => request<{ points: TelemetryPoint[] }>(`/v1/telemetry/series?${query}`, token)
+
+const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+const apiRoot = '/v1'
+
+export interface ClusterInput {
+  name: string
+  cluster: { type?: string; scheme: string; region?: string; endpoints: string[]; credentials: { access_key: string; secret_ref?: string } }
+  secret?: string
+}
+
+export const probeCluster = (token: string, input: ClusterInput) => request<ClusterProbeResult>(`${apiRoot}/clusters/probe`, token, json(input))
+export const addCluster = (token: string, input: ClusterInput) => request<ClusterStatus>(`${apiRoot}/clusters`, token, json(input))
+export const adoptBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name?: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/adopt`, token, json(body))
+export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
+export const expandBucket = (token: string, tenant: string, bucket: string, to: string) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, create: true }))
+export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}/read-only`, token, json({ read_only: readOnly, reject }))
+export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/read-only`, token, json({ read_only: readOnly, reject }))
+export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
+export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
 
 export function parseSSEFrame(frame: string): StreamEvent | null {
   let id = ''

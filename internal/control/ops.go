@@ -415,6 +415,10 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		fail(w, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, req.To))
 		return
 	}
+	if target.ReadOnly {
+		fail(w, refuse("cluster %s is read-only for maintenance", req.To))
+		return
+	}
 	if req.Name == "" {
 		req.Name = nextName(f, req.To, p.Names[p.Primary])
 	}
@@ -1037,6 +1041,47 @@ func (s *Server) createPlacement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
+}
+
+// createBackendPlacement is the browser's Create action: unlike the member-only /create route it
+// creates the S3 bucket as well as recording the placement.
+func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) {
+	var req CreateRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	if req.Name == "" {
+		req.Name = bucket
+	}
+	if !s3.ValidBucketName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("%q is not a valid bucket name", req.Name))
+		return
+	}
+	if c, ok := s.Dir.Snapshot().Cluster(req.Cluster); ok && c.ReadOnly {
+		fail(w, refuse("cluster %s is read-only for maintenance", req.Cluster))
+		return
+	}
+	b, err := s.backendFor(req.Cluster)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	if err := b.createBucket(ctx, req.Name); err != nil {
+		fail(w, err)
+		return
+	}
+	if err := s.Dir.Adopt(r.Context(), tenant, bucket, req.Cluster, req.Name, actor(r)); err != nil {
+		_, _ = b.do(context.WithoutCancel(ctx), http.MethodDelete, req.Name, "", nil, nil, nil)
+		fail(w, err)
+		return
+	}
+	key := directory.Key(tenant, bucket)
+	p, _ := s.Dir.Snapshot().Lookup(tenant, bucket)
+	s.info(actor(r), "bucket created", "placement", key, "cluster", req.Cluster, "bucket", req.Name, "version", s.Dir.Snapshot().Version())
+	writeJSON(w, http.StatusOK, s.placementStatus(key, *p))
 }
 
 func (s *Server) deletePlacement(w http.ResponseWriter, r *http.Request) {

@@ -167,7 +167,7 @@ func newRig(t *testing.T) *rig {
 		_, _, err := reg.Apply(f.Clusters)
 		return err
 	}
-	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), events: NewEvents(8), log: &syncLog{}}
+	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), events: NewEvents(16), log: &syncLog{}}
 	// The event stream is wired as the lab proxy wires it: the directory's install hook, seeded
 	// with the current snapshot, and the operation store's change hook.
 	dir.OnInstall = rg.events.Directory

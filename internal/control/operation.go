@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -25,12 +26,18 @@ import (
 
 // Kinds of operation.
 const (
-	OpRamp          = "ramp"
-	OpMigrate       = "migrate"
-	OpCutover       = "cutover"
-	OpPurge         = "purge-source"
-	OpFinish        = "finish"
-	OpClusterRemove = "cluster-remove"
+	OpRamp              = "ramp"
+	OpMigrate           = "migrate"
+	OpCutover           = "cutover"
+	OpPurge             = "purge-source"
+	OpFinish            = "finish"
+	OpClusterRemove     = "cluster-remove"
+	OpClusterReadOnly   = "cluster-read-only"
+	OpPlacementReadOnly = "placement-read-only"
+	OpClusterAdd        = "cluster-add"
+	OpAdopt             = "adopt"
+	OpCreate            = "create"
+	OpExpand            = "expand"
 )
 
 // Statuses of an operation.
@@ -309,6 +316,86 @@ func (tr *tracker) finish(res any, err error) {
 	}
 }
 
+// finishHTTP closes a record around an existing synchronous route. These short UI actions keep
+// their established handlers while still producing the same operation/SSE history as fenced
+// actions. Their request bodies are deliberately not recorded because cluster add may carry a
+// typed secret and adopt may carry client secrets.
+func (tr *tracker) finishHTTP(status int, body []byte) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.op.Phase = PhaseDone
+	if status >= 200 && status < 300 {
+		tr.op.Status = StatusSucceeded
+		if json.Valid(body) {
+			tr.op.Result = bytes.TrimSpace(slices.Clone(body))
+			var v struct {
+				Version int64  `json:"version"`
+				Name    string `json:"name"`
+				Key     string `json:"key"`
+			}
+			_ = json.Unmarshal(body, &v) //nolint:errcheck // a result without a version is fine
+			tr.op.Version = v.Version
+			if tr.op.Cluster == "" && tr.op.Kind == OpClusterAdd {
+				tr.op.Cluster = v.Name
+			}
+			if tr.op.Placement == "" {
+				tr.op.Placement = v.Key
+			}
+		}
+	} else {
+		var e Error
+		if json.Unmarshal(body, &e) != nil || e.Code == "" {
+			e = Error{Code: "failed", Message: http.StatusText(status)}
+		}
+		tr.op.Error = &e
+		tr.op.Status = StatusFailed
+		if e.Code == "refused" {
+			tr.op.Status = StatusRefused
+		}
+	}
+	tr.put()
+}
+
+type operationWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *operationWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *operationWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.body.Write(p)
+	return w.ResponseWriter.Write(p)
+}
+
+// recorded wraps a short mutation with an operation record without changing its HTTP contract.
+func (s *Server) recorded(kind string, scope func(*http.Request) (placement, cluster string), h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		placement, cluster := scope(r)
+		tr, err := s.begin(actor(r), Operation{Kind: kind, Placement: placement, Cluster: cluster}, nil, false)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		ow := &operationWriter{ResponseWriter: w}
+		h(ow, r)
+		status := ow.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		tr.finishHTTP(status, ow.body.Bytes())
+	}
+}
+
 // begin writes a new running record and returns its tracker.
 func (s *Server) begin(actor string, op Operation, args any, async bool) (*tracker, error) {
 	now := s.now().UTC()
@@ -494,8 +581,37 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 			return nil, nil, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, name)
 		}
 		return start(Operation{Kind: OpClusterRemove, Cluster: name}, a, func(tr *tracker) (any, error) { return s.runRemoveCluster(tr, name, a) })
+	case OpClusterReadOnly:
+		var a ReadOnlyRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if _, err := parseWait(a.Wait); err != nil {
+			return nil, nil, err
+		}
+		if _, ok := s.Dir.Snapshot().File().Clusters[req.Cluster]; !ok {
+			return nil, nil, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, req.Cluster)
+		}
+		return start(Operation{Kind: OpClusterReadOnly, Cluster: req.Cluster}, a, func(tr *tracker) (any, error) {
+			return s.runClusterReadOnly(tr, req.Cluster, a)
+		})
+	case OpPlacementReadOnly:
+		var a ReadOnlyRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if _, err := parseWait(a.Wait); err != nil {
+			return nil, nil, err
+		}
+		key, err := s.placementKey(req.Placement)
+		if err != nil {
+			return nil, nil, err
+		}
+		return start(Operation{Kind: OpPlacementReadOnly, Placement: key}, a, func(tr *tracker) (any, error) {
+			return s.runPlacementReadOnly(tr, key, a)
+		})
 	}
-	return nil, nil, bad("kind %q: want one of ramp, migrate, cutover, purge-source, finish, cluster-remove", req.Kind)
+	return nil, nil, bad("kind %q: want one of ramp, migrate, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only", req.Kind)
 }
 
 // serveOperation runs an action for its own route and answers with its outcome, as the route did

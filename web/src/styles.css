@@ -14,7 +14,7 @@
     @apply m-0 min-w-[320px] bg-ink-950 text-paper antialiased;
   }
 
-  button, a, input {
+  button, a, input, select, textarea {
     @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember-300 focus-visible:ring-offset-2 focus-visible:ring-offset-ink-950;
   }
 }

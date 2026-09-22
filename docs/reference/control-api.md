@@ -50,11 +50,13 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
     {"name": "vast02", "type": "vast", "scheme": "http", "region": "us-east-1", "endpoints": ["10.0.0.2:80"],
      "access_key": "AKIA…", "secret_ref": "file:/etc/shunt/vast02.secret",
      "conditional_write": true, "conditional_delete": false,
+     "read_only": false, "reject_writes": false,
      "references": ["placements.default/data01"]}
   ],
   "placements": [
     {"key": "default/data01", "state": "RAMPING", "primary": "vast02", "source": "vast01",
      "names": {"vast01": "data01", "vast02": "data01-001"}, "ratio": 0.5,
+     "read_only": false, "reject_writes": false,
      "ramp_writes": {"primary": 4456, "source": 4353}, "fallback_reads": 37, "dual_deletes": {"both": 812},
      "mover": {"source": "vast01", "primary": "vast02", "pass": 2, "copied": 0, "skipped": 5210, "vanished": 3,
                "failed": 0, "bytes": 0, "done": true, "converged": true, "updated_at": "2026-09-16T20:31:02Z"},
@@ -89,6 +91,15 @@ It then signs one `ListBuckets` to the cluster with that access key and secret, 
 
 A plain `AccessDenied` passes, since a key may be allowed its buckets without being allowed `ListBuckets`. Every refusal is also logged by `shunt serve` as `cluster add refused`.
 
+### `POST /v1/clusters/probe`
+
+Takes the same body as cluster add, but does not store the secret or change the directory. It
+validates the definition, builds the client, signs the credential probe, and answers the effective
+cluster plus `reachable`, `profile`, and capability values with a `known` bit. `profile` is
+`measured` only when both migration capabilities were supplied; otherwise it is `assumed`, and
+`expand` measures them against a real target bucket. The web UI requires an unchanged successful
+probe before enabling Save.
+
 ### `DELETE /v1/clusters/{name}[?dry_run=1]`
 
 Removes a cluster, and its stored secret files with it. Refused while any placement (primary, source, target, a `names` entry) or any tenant's `default_cluster` references it; the message lists each reference.
@@ -101,6 +112,14 @@ With `?dry_run=1` nothing is removed; the answer says what would happen and carr
 ```
 
 `allowed: false` carries the refusal the real call would give as `reason`, with the `references`, and no token. The real call takes the token in an optional body, `{"token": "…"}`, and refuses in this order: the references first, then a missing, malformed, expired or mismatched token (see [`purge-source`](#post-v1placementstenantbucketpurge-source) for the messages). The token is bound to the cluster's definition and its reference set, and lasts 10 minutes. The call runs under an operation record and answers `{"removed": "vast01", "operation": "…"}`. `shunt cluster remove` runs the dry run, prints it, and proceeds with the token; `--dry-run` stops after the summary.
+
+### `POST /v1/clusters/{name}/read-only`
+
+`{"read_only": true, "reject": false, "wait": "30s"}` changes the backend maintenance switch
+under an operation record. It fences on every registered proxy before and after the directory
+write. A write routed to this cluster answers retryable 503 with `Retry-After: 1`; `reject: true`
+selects fail-fast 403. Setting `read_only: false` also clears reject mode. The answer carries
+`version`, `operation`, live `proxies`, and any `waiting_on` or `silent` proxy ids.
 
 ### `POST /v1/tenants/{tenant}/default-cluster`
 
@@ -117,6 +136,14 @@ Refused if:
 - it has ever been versioned;
 - the placement already exists (`conflict`).
 
+### `POST /v1/placements/{tenant}/{bucket}/create-backend`
+
+The browser's Create action. `{"cluster": "vast01", "name": "data01"}` creates the backend S3
+bucket, then records it as an `ACTIVE` placement (creating the tenant when needed). `name` defaults
+to the client bucket name. If the directory write fails, the newly created backend bucket is
+removed. The member-only `/create` route remains the first half of a proxy's signed S3
+CreateBucket flow and does not duplicate the backend request.
+
 ### `POST /v1/placements/{tenant}/{bucket}/expand`
 
 `{"to": "vast02", "name": "data01-001", "create": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
@@ -129,6 +156,12 @@ Prepares the target while the placement stays `ACTIVE`, in this order:
 5. Records `target` and its name on the placement.
 
 Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_write", "conditional_delete", "measured", "version"}`. Later `ramp` and `migrate` calls use the recorded target.
+
+### `POST /v1/placements/{tenant}/{bucket}/read-only`
+
+The same body and operation result as cluster read-only, scoped to one placement. The flag is
+independent of migration state and is applied through a strict fleet fence. Reads continue. Writes
+and deletes answer 503 plus `Retry-After: 1` by default, or 403 with `reject: true`.
 
 ### `POST /v1/placements/{tenant}/{bucket}/ramp`
 
@@ -232,7 +265,15 @@ Every long-running action (a ramp step, `migrate`, `cutover`, `purge-source`, `f
 
 `{"kind": "ramp", "placement": "default/data01", "args": {"ratio": 0.5, "wait": "30s"}}`
 
-`kind` is one of `ramp`, `migrate`, `cutover`, `purge-source`, `finish` (a placement, as `tenant/bucket`) or `cluster-remove` (a `cluster`). `args` is the body the action's own route takes; unknown fields are refused, and a `purge-source` dry run is not an operation (call its route). A missing placement or cluster is 404. Answers `202` with the record:
+`kind` is one of `ramp`, `migrate`, `cutover`, `purge-source`, `finish`, `placement-read-only`
+(a placement, as `tenant/bucket`) or `cluster-remove`, `cluster-read-only` (a `cluster`). `args` is
+the body the action's own route takes; unknown fields are refused, and a `purge-source` dry run is
+not an operation (call its route). A missing placement or cluster is 404. Answers `202` with the
+record:
+
+The short UI mutations `cluster-add`, `adopt`, `create`, and `expand` also produce records when
+their own routes are called. Their bodies are never copied into `args`, because they can carry a
+cluster or client secret; their secret-free response is recorded as `result`.
 
 ```json
 {"id": "1758542400123-a1b2c3", "kind": "ramp", "placement": "default/data01", "actor": "api:127.0.0.1", "node": "c1",
@@ -355,13 +396,19 @@ The placement as `GET /v1/status` reports it (state, sides, names, ratio, prefix
 ]}
 ```
 
-`op` is `create`, `delete`, `set-state`, `set-default`, `adopt`, `set-target`, `cluster-put`, `cluster-remove`, or on a fleet `key-add` and `key-remove`; `before` and `after` are the placement, or `cluster_before` and `cluster_after` the cluster definition (with `secret_ref`, never a secret). A fleet keeps the last 10 000 versions in etcd; a lab proxy reads the tail of `<directory>.changes.jsonl`. The actor is `api:<peer address>` until OIDC lands.
+`op` is `create`, `delete`, `set-state`, `placement-read-only`, `set-default`, `adopt`, `set-target`,
+`cluster-put`, `cluster-read-only`, `cluster-remove`, or on a fleet `key-add` and `key-remove`;
+`before` and `after` are the placement, or `cluster_before` and `cluster_after` the cluster
+definition (with `secret_ref`, never a secret). A fleet keeps the last 10 000 versions in etcd; a
+lab proxy reads the tail of `<directory>.changes.jsonl`. An authenticated request's actor is a
+stable, non-secret `token:<12-hex fingerprint>`; a loopback-only API with no token records
+`api:<peer address>`. OIDC can replace that label without changing the API.
 
 ## The fleet
 
 Several proxies serve one directory when a control plane holds it: `shunt-control`, three nodes (one for a lab) with the directory in embedded etcd (ADR-0015). Every route above is served by every control node; the CLI's `--api` may point at any of them. A proxy whose config names them in `control.endpoints` is a **member**: it takes its directory, client keys and cluster secrets from `GET /v1/directory`, forwards bucket creation, sends a heartbeat, and serves no `/v1/` of its own. A proxy without `control.endpoints` is a single-node lab with the file backend, whose in-process API serves the routes above from the file and takes no members. How to run a fleet: docs/fleet.md; the control nodes: docs/how-to/run-shunt-control.md.
 
-- **Fenced changes** (`ramp`, `migrate`, `cutover`; `finish` and `purge-source` wait too) first wait until every live member has the current version, and are refused with the ids they are waiting on if one does not within `wait`. A bucket's **first** step waits for every member, live or not, because one cut off before it would still write every key to the source; `DELETE /v1/fleet/{id}` removes a member that is gone for good (ADR-0016).
+- **Fenced changes** (`ramp`, `migrate`, `cutover`; `finish` and `purge-source` wait too) first wait until every live member has the current version, and are refused with the ids they are waiting on if one does not within `wait`. A bucket's **first** step and read-only changes wait for every member, live or not, because one cut off before them could still write; `DELETE /v1/fleet/{id}` removes a member that is gone for good (ADR-0016).
 - **The hold.** With members, a step that moves writes to the new primary is written twice: once as `ramp.hold`, where the keys it moves answer writes with `503` + `Retry-After: 1`, and again as the step itself once every member has the hold. If the hold does not reach every member within `wait`, it is released and the call is refused: nothing changed.
 - **Stale mode.** A member whose last acknowledged heartbeat is older than `control.lease_ttl` refuses writes and deletes on buckets that are not `ACTIVE` with `503` + `Retry-After: 1`, reads every key of such a bucket target-first-then-source (it may have missed a step), and serves everything else, ACTIVE buckets included. A heartbeat renews the lease only once the member has installed the version the control plane answered with. Its `/-/healthz` stays 200: a control-plane outage must not drain the fleet. `/-/fleet` on a member reports `{"id", "control_node", "stale", "last_ack", "applied"}`.
 - **Quorum loss.** With a minority of control nodes up, no route that writes answers (503 `unavailable`), heartbeats are not answered, so every member goes stale within `lease_ttl`; reads and writes on ACTIVE buckets continue on every proxy. Quorum back, everything resumes with no operator action.

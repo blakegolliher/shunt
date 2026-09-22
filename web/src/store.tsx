@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer } from 'react'
 import type { PropsWithChildren } from 'react'
-import { getControl, getFleet, streamEvents } from './api/client'
-import type { ControlStatus, FleetStatus, StreamEvent } from './api/client'
+import { getControl, getFleet, getStatus, streamEvents } from './api/client'
+import type { ControlStatus, DirectoryStatus, FleetStatus, StreamEvent } from './api/client'
 
 const tokenKey = 'shunt.control.token'
 
@@ -15,6 +15,7 @@ interface State {
   token: string
   control: ControlStatus | null
   fleet: FleetStatus | null
+  directory: DirectoryStatus | null
   loading: boolean
   error: string
   lastEvent: StreamEvent | null
@@ -24,7 +25,7 @@ interface State {
 type Action =
   | { type: 'token'; token: string }
   | { type: 'loading' }
-  | { type: 'loaded'; control: ControlStatus; fleet: FleetStatus }
+  | { type: 'loaded'; control: ControlStatus; fleet: FleetStatus; directory: DirectoryStatus }
   | { type: 'error'; message: string }
   | { type: 'event'; event: StreamEvent }
   | { type: 'toast'; toast: Toast }
@@ -34,6 +35,7 @@ const initialState = (): State => ({
   token: sessionStorage.getItem(tokenKey) ?? '',
   control: null,
   fleet: null,
+  directory: null,
   loading: false,
   error: '',
   lastEvent: null,
@@ -42,9 +44,9 @@ const initialState = (): State => ({
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
-    case 'token': return { ...state, token: action.token, control: null, fleet: null, error: '' }
+    case 'token': return { ...state, token: action.token, control: null, fleet: null, directory: null, error: '' }
     case 'loading': return { ...state, loading: true, error: '' }
-    case 'loaded': return { ...state, loading: false, error: '', control: action.control, fleet: action.fleet }
+    case 'loaded': return { ...state, loading: false, error: '', control: action.control, fleet: action.fleet, directory: action.directory }
     case 'error': return { ...state, loading: false, error: action.message }
     case 'event': return { ...state, lastEvent: action.event }
     case 'toast': return { ...state, toasts: [...state.toasts.slice(-3), action.toast] }
@@ -57,6 +59,7 @@ interface StoreValue extends State {
   clearToken: () => void
   refresh: () => Promise<void>
   dismissToast: (id: number) => void
+  notify: (message: string, tone?: Toast['tone']) => void
 }
 
 const Store = createContext<StoreValue | null>(null)
@@ -75,12 +78,17 @@ export function StoreProvider({ children }: PropsWithChildren) {
     dispatch({ type: 'token', token: '' })
   }, [])
 
+  const dismissToast = useCallback((id: number) => dispatch({ type: 'dismiss', id }), [])
+  const notify = useCallback((message: string, tone: Toast['tone'] = 'success') => {
+    dispatch({ type: 'toast', toast: { id: Date.now(), message, tone } })
+  }, [])
+
   const refresh = useCallback(async () => {
     if (!state.token) return
     dispatch({ type: 'loading' })
     try {
-      const [control, fleet] = await Promise.all([getControl(state.token), getFleet(state.token)])
-      dispatch({ type: 'loaded', control, fleet })
+      const [control, fleet, directory] = await Promise.all([getControl(state.token), getFleet(state.token), getStatus(state.token)])
+      dispatch({ type: 'loaded', control, fleet, directory })
     } catch (error) {
       dispatch({ type: 'error', message: error instanceof Error ? error.message : String(error) })
     }
@@ -122,8 +130,11 @@ export function StoreProvider({ children }: PropsWithChildren) {
     return () => { stopped = true; controller.abort() }
   }, [refresh, state.token])
 
-  const value = useMemo<StoreValue>(() => ({ ...state, setToken, clearToken, refresh, dismissToast: (id) => dispatch({ type: 'dismiss', id }) }),
-    [state, setToken, clearToken, refresh])
+  const value = useMemo<StoreValue>(() => ({ ...state, setToken, clearToken, refresh,
+    dismissToast,
+    notify,
+  }),
+    [state, setToken, clearToken, refresh, dismissToast, notify])
   return <Store.Provider value={value}>{children}</Store.Provider>
 }
 

@@ -80,6 +80,35 @@ func (f *File) SetState(tenant, bucket, from string, t Transition) error {
 	return nil
 }
 
+// SetPlacementReadOnly updates the maintenance switch without changing migration state.
+func (f *File) SetPlacementReadOnly(tenant, bucket string, readOnly, reject bool) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if p.ReadOnly == readOnly && p.RejectWrites == (readOnly && reject) {
+		return fmt.Errorf("%w: %s read-only is already %t", ErrConflict, k, readOnly)
+	}
+	p.ReadOnly, p.RejectWrites = readOnly, readOnly && reject
+	f.Placements[k] = p
+	return nil
+}
+
+// SetClusterReadOnly updates the maintenance switch on one backend.
+func (f *File) SetClusterReadOnly(name string, readOnly, reject bool) error {
+	c, ok := f.Clusters[name]
+	if !ok {
+		return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
+	}
+	if c.ReadOnly == readOnly && c.RejectWrites == (readOnly && reject) {
+		return fmt.Errorf("%w: cluster %s read-only is already %t", ErrConflict, name, readOnly)
+	}
+	c.ReadOnly, c.RejectWrites = readOnly, readOnly && reject
+	f.Clusters[name] = c
+	return nil
+}
+
 // PutCluster adds a cluster, or replaces its definition.
 func (f *File) PutCluster(name string, c config.Cluster) {
 	f.ensureMaps()

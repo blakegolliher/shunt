@@ -58,6 +58,18 @@ func (h *Handler) refuseWrite(w http.ResponseWriter, r *http.Request, o *outcome
 	h.answer(w, r, o, s3.ServiceUnavailable, msg)
 }
 
+// refuseReadOnly applies the operator-selected maintenance policy. Retryable mode is the safe
+// default for SDKs; reject mode is an explicit fail-fast 403.
+func (h *Handler) refuseReadOnly(w http.ResponseWriter, r *http.Request, o *outcome, bucket, reason, msg string, reject bool) {
+	h.Metrics.RefusedWrites.WithLabelValues(directory.Key(o.tenant, bucket), reason).Inc()
+	if reject {
+		h.answer(w, r, o, s3.AccessDenied, msg)
+		return
+	}
+	w.Header().Set("Retry-After", "1")
+	h.answer(w, r, o, s3.ServiceUnavailable, msg)
+}
+
 // listBuckets synthesizes ListBuckets from the directory: every bucket of the tenant, on every
 // cluster, and nothing else. No upstream request is made. prefix is honored; the response is one
 // final page.
@@ -119,6 +131,10 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 	t, ok := snap.Tenant(o.tenant)
 	if !ok {
 		h.answer(w, r, o, s3.AccessDenied, "The tenant has no default cluster in the bucket directory.")
+		return
+	}
+	if c, found := snap.Cluster(t.DefaultCluster); found && c.ReadOnly {
+		h.refuseReadOnly(w, r, o, bucket, "cluster-read-only", "Backend cluster "+t.DefaultCluster+" is read-only for maintenance.", c.RejectWrites)
 		return
 	}
 	cl, ok := clusters.Get(t.DefaultCluster)

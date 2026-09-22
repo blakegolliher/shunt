@@ -14,6 +14,7 @@ const fleet = { version: 12, members: [
   { id: 'proxy-a', live: true, applied: 12, seq: 3, host: 'host-a', version: 'test' },
   { id: 'proxy-b', live: true, applied: 12, seq: 4, host: 'host-b', version: 'test' },
 ] }
+const directory = { version: 12, clusters: [], placements: [] }
 
 beforeEach(() => {
   sessionStorage.setItem('shunt.control.token', 'secret')
@@ -21,6 +22,7 @@ beforeEach(() => {
     const url = String(input)
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json(fleet)
+    if (url.endsWith('/v1/status?all=1')) return Response.json(directory)
     if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
     return new Response('', { status: 404 })
   })

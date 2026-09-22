@@ -103,6 +103,14 @@
     "mutation": true
   },
   {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/create-backend",
+    "verbs": [
+      "create"
+    ],
+    "mutation": true
+  },
+  {
     "method": "DELETE",
     "pattern": "/v1/placements/{tenant}/{bucket}",
     "mutation": true
@@ -116,10 +124,26 @@
     "mutation": true
   },
   {
+    "method": "POST",
+    "pattern": "/v1/clusters/probe",
+    "verbs": [
+      "cluster add"
+    ],
+    "mutation": true
+  },
+  {
     "method": "DELETE",
     "pattern": "/v1/clusters/{name}",
     "verbs": [
       "cluster remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/clusters/{name}/read-only",
+    "verbs": [
+      "cluster readonly"
     ],
     "mutation": true
   },
@@ -144,6 +168,14 @@
     "pattern": "/v1/placements/{tenant}/{bucket}/expand",
     "verbs": [
       "expand"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/read-only",
+    "verbs": [
+      "readonly"
     ],
     "mutation": true
   },

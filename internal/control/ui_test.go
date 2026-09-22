@@ -87,7 +87,7 @@ func TestOperationRecords(t *testing.T) {
 	}
 	var list OperationList
 	rg.must("GET", "/v1/operations?placement=acme/data01", nil, &list)
-	if len(list.Operations) != 2 || list.Operations[0].ID != tr.Operation || list.Operations[1].ID != op.ID {
+	if len(list.Operations) < 2 || list.Operations[0].ID != tr.Operation || list.Operations[1].ID != op.ID {
 		t.Fatalf("list, newest first: %+v", list)
 	}
 	rg.must("GET", "/v1/operations?placement=acme/other", nil, &list)
@@ -112,6 +112,38 @@ func TestOperationRecords(t *testing.T) {
 	rg.answers("POST", "/v1/operations", OperationRequest{Kind: OpRamp, Placement: "data01", Args: json.RawMessage(`{"ratio": 1}`)}, http.StatusBadRequest, "bad_request")
 	rg.answers("POST", "/v1/operations", OperationRequest{Kind: OpPurge, Placement: "acme/data01", Args: json.RawMessage(`{"dry_run": true}`)}, http.StatusBadRequest, "bad_request")
 	rg.answers("GET", "/v1/operations/nope", nil, http.StatusNotFound, "not_found")
+}
+
+func TestUI3ProbeAndReadOnlyOperations(t *testing.T) {
+	rg := newRig(t)
+	def := rg.vast01.definition(true)
+	var probe ClusterProbeResult
+	rg.must("POST", "/v1/clusters/probe", ClusterRequest{Name: "vast01", Cluster: def}, &probe)
+	if !probe.Reachable || probe.Cluster.Name != "vast01" || probe.Profile != "assumed" {
+		t.Fatalf("probe: %+v", probe)
+	}
+	if _, ok := rg.dir.Snapshot().Cluster("vast01"); ok {
+		t.Fatal("probe mutated the directory")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def}, nil)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	var res ReadOnlyResult
+	rg.must("POST", "/v1/placements/acme/data01/read-only", ReadOnlyRequest{ReadOnly: true}, &res)
+	if !res.ReadOnly || res.Version == 0 || res.Operation == "" || rg.await(res.Operation).Status != StatusSucceeded {
+		t.Fatalf("placement read-only: %+v", res)
+	}
+	rg.must("POST", "/v1/clusters/vast01/read-only", ReadOnlyRequest{ReadOnly: true, Reject: true}, &res)
+	if !res.ReadOnly || !res.Reject || rg.await(res.Operation).Status != StatusSucceeded {
+		t.Fatalf("cluster read-only: %+v", res)
+	}
+	var page AuditPage
+	rg.must("GET", "/v1/audit?limit=2", nil, &page)
+	if len(page.Changes) != 2 || page.Changes[0].Actor != "api:127.0.0.1" || page.Changes[1].Actor != "api:127.0.0.1" {
+		t.Fatalf("read-only audit actors: %+v", page.Changes)
+	}
 }
 
 func TestMemOperations(t *testing.T) {
@@ -353,14 +385,20 @@ func TestEventsReplay(t *testing.T) {
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
 	v := rg.dir.Snapshot().Version()
 	got := live.until(eventTypeDir, versionEvent(v))
+	var dirs []Event
+	for _, event := range got {
+		if event.Type == eventTypeDir {
+			dirs = append(dirs, event)
+		}
+	}
 	var first DirectoryEvent
-	if len(got) != 2 || json.Unmarshal(got[0].Data, &first) != nil || first.Kind != "cluster" || first.Key != "vast01" || first.Op != "put" || first.Version != v {
+	if len(dirs) != 2 || json.Unmarshal(dirs[0].Data, &first) != nil || first.Kind != "cluster" || first.Key != "vast01" || first.Op != "put" || first.Version != v {
 		t.Fatalf("cluster add events: %+v", got)
 	}
-	if raw := string(got[0].Data); strings.Contains(raw, `"secret":`) {
+	if raw := string(dirs[0].Data); strings.Contains(raw, `"secret":`) {
 		t.Fatalf("a cluster event carries a secret: %s", raw)
 	}
-	last := got[1].ID
+	last := got[len(got)-1].ID
 	live.close()
 
 	// Two changes while disconnected are replayed from Last-Event-ID, contiguous, with no reset.
@@ -379,6 +417,9 @@ func TestEventsReplay(t *testing.T) {
 	}
 	kinds := make([]string, 0, len(got))
 	for _, ev := range got {
+		if ev.Type != eventTypeDir {
+			continue
+		}
 		var d DirectoryEvent
 		_ = json.Unmarshal(ev.Data, &d)
 		kinds = append(kinds, d.Kind+"/"+d.Key)
@@ -410,7 +451,10 @@ func TestEventsReplay(t *testing.T) {
 		t.Fatalf("fence event: %+v", f)
 	}
 	fenced.close()
-	old := rg.stream(last) // the ring holds 8 events; more than that have passed since
+	for i := 0; i < 17; i++ {
+		rg.events.Publish("test", map[string]int{"i": i})
+	}
+	old := rg.stream(last) // more than the 16-event test ring has passed since
 	if ev, ok := old.next(5 * time.Second); !ok || ev.Type != eventTypeReset {
 		t.Fatalf("an id older than the ring: %+v %v", ev, ok)
 	}
@@ -521,7 +565,7 @@ func TestRouteTableIsUnique(t *testing.T) {
 			t.Errorf("route %s: mutation %v", k, r.Mutation)
 		}
 	}
-	if len(seen) != 31 {
+	if len(seen) != 35 {
 		t.Errorf("%d routes; update this count with the route table", len(seen))
 	}
 }

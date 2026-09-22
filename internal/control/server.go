@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -148,6 +149,10 @@ func (s *Server) sleep(ctx context.Context, d time.Duration) error {
 }
 
 func actor(r *http.Request) string {
+	if token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && token != "" {
+		sum := sha256.Sum256([]byte(token))
+		return "token:" + hex.EncodeToString(sum[:6])
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -273,6 +278,8 @@ type ClusterStatus struct {
 	ConditionalWrite  bool     `json:"conditional_write"`
 	ConditionalDelete bool     `json:"conditional_delete"`
 	References        []string `json:"references,omitempty"`
+	ReadOnly          bool     `json:"read_only"`
+	RejectWrites      bool     `json:"reject_writes"`
 }
 
 // PlacementStatus is one placement with the migration signals an operator watches.
@@ -291,6 +298,8 @@ type PlacementStatus struct {
 	DualDeletes   map[string]float64         `json:"dual_deletes"`
 	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
 	Mover         *Progress                  `json:"mover,omitempty"`
+	ReadOnly      bool                       `json:"read_only"`
+	RejectWrites  bool                       `json:"reject_writes"`
 }
 
 // Status is the answer to GET /v1/status.
@@ -336,6 +345,7 @@ func endpoints(c config.Cluster) []string {
 
 func (s *Server) placementStatus(key string, p directory.Placement) PlacementStatus {
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.Primary, Source: p.Source, Target: p.Target, Names: p.Names,
+		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites,
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Ramp != nil {
 		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
@@ -527,6 +537,60 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
 		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
 		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)})
+}
+
+// ClusterProbeResult is the non-mutating preflight used by the add-cluster drawer. Reachability
+// and credentials are measured; a capability is measured only when the proposed definition states
+// it, otherwise its conservative runtime default is identified as assumed.
+type ClusterProbeResult struct {
+	Cluster      ClusterStatus `json:"cluster"`
+	Reachable    bool          `json:"reachable"`
+	Profile      string        `json:"profile"` // measured when both migration capabilities are known
+	Capabilities struct {
+		ConditionalWrite  Capability `json:"conditional_write"`
+		ConditionalDelete Capability `json:"conditional_delete"`
+	} `json:"capabilities"`
+}
+
+func (s *Server) probeCluster(w http.ResponseWriter, r *http.Request) {
+	var req ClusterRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Name == "" || !clusterName.MatchString(req.Name) {
+		writeError(w, http.StatusBadRequest, "bad_request", "name is required and must use lowercase letters, digits, - or _")
+		return
+	}
+	inferType := req.Cluster.Type == ""
+	if inferType {
+		req.Cluster.Type = "s3"
+	}
+	if req.Cluster.Region == "" {
+		req.Cluster.Region = regionFor(req.Cluster.Endpoints)
+	}
+	if msg, server := s.checkCredentials(r.Context(), req.Name, req.Cluster, req.Secret); msg != "" {
+		writeError(w, http.StatusConflict, "refused", msg)
+		return
+	} else if inferType {
+		req.Cluster.Type = typeFromServer(server)
+	}
+	defs := map[string]config.Cluster{req.Name: req.Cluster}
+	config.ApplyClusterDefaults(defs)
+	if err := config.ValidateClusters("clusters", defs); err != nil {
+		fail(w, err)
+		return
+	}
+	c := defs[req.Name]
+	res := ClusterProbeResult{Reachable: true, Profile: "assumed"}
+	res.Cluster = ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: endpoints(c),
+		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef, ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)}
+	res.Capabilities.ConditionalWrite = capability(c.Capabilities.ConditionalWrite, true)
+	res.Capabilities.ConditionalDelete = capability(c.Capabilities.ConditionalDelete, false)
+	if res.Capabilities.ConditionalWrite.Known && res.Capabilities.ConditionalDelete.Known {
+		res.Profile = "measured"
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func isDirectoryError(err error) bool {

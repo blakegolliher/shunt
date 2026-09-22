@@ -49,7 +49,7 @@ func clusterStatus(f *directory.File, name string, c config.Cluster) ClusterStat
 		Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: endpoints(c),
 		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
 		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false),
-		References: directory.References(f, name),
+		References: directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
 	}
 }
 

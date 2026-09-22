@@ -92,6 +92,11 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// Where this request goes (docs/DESIGN.md §2.5, ADR-0004). An uploadId, resolved below, wins:
 	// a multipart upload only exists on the cluster that issued its id.
 	class := migrate.Class(info.Op)
+	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	if p.ReadOnly && mutating {
+		h.refuseReadOnly(w, r, o, info.Bucket, "placement-read-only", "This bucket is read-only for maintenance.", p.RejectWrites)
+		return nil, false
+	}
 	route, err := migrate.Decide(p, class, info.Key)
 	if err != nil {
 		if h.Log != nil {
@@ -128,6 +133,18 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		}
 		clusterName = pcl.Name
 		route = migrate.Route{Cluster: migrate.Primary} // pinned: no fallback, no dual, no merge
+	}
+	if mutating {
+		check := []string{clusterName}
+		if route.Both {
+			check = append(check, p.Source)
+		}
+		for _, name := range check {
+			if c, found := snap.Cluster(name); found && c.ReadOnly {
+				h.refuseReadOnly(w, r, o, info.Bucket, "cluster-read-only", "Backend cluster "+name+" is read-only for maintenance.", c.RejectWrites)
+				return nil, false
+			}
+		}
 	}
 	cl, ok := clusters.Get(clusterName)
 	if !ok {

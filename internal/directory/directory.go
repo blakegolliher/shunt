@@ -72,14 +72,16 @@ type Placement struct {
 	Source  string `yaml:"source,omitempty" json:"source,omitempty"`
 	// Target is the cluster `shunt expand` prepared for the move, recorded while ACTIVE so the
 	// first ramp or migrate step needs no --to. Its backend name is in Names.
-	Target    string            `yaml:"target,omitempty" json:"target,omitempty"`
-	Cutover   *CutoverEvidence  `yaml:"cutover,omitempty" json:"cutover,omitempty"`
-	Ramp      *Ramp             `yaml:"ramp,omitempty" json:"ramp,omitempty"`
-	Names     map[string]string `yaml:"names" json:"names"` // cluster → backend bucket name
-	Cold      string            `yaml:"cold,omitempty" json:"cold,omitempty"`
-	Tier      string            `yaml:"tier,omitempty" json:"tier,omitempty"` // native | emulated
-	Lifecycle string            `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
-	Created   time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
+	Target       string            `yaml:"target,omitempty" json:"target,omitempty"`
+	Cutover      *CutoverEvidence  `yaml:"cutover,omitempty" json:"cutover,omitempty"`
+	Ramp         *Ramp             `yaml:"ramp,omitempty" json:"ramp,omitempty"`
+	Names        map[string]string `yaml:"names" json:"names"` // cluster → backend bucket name
+	Cold         string            `yaml:"cold,omitempty" json:"cold,omitempty"`
+	Tier         string            `yaml:"tier,omitempty" json:"tier,omitempty"` // native | emulated
+	Lifecycle    string            `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
+	Created      time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
+	ReadOnly     bool              `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+	RejectWrites bool              `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
 }
 
 func (p Placement) clone() Placement {
@@ -209,6 +211,10 @@ type Store interface {
 	Sync(ctx context.Context) error
 	// SetState applies a transition if the placement is still in state from.
 	SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error
+	// SetPlacementReadOnly changes a placement's fleet-fenced maintenance switch.
+	SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error
+	// SetClusterReadOnly changes a backend's fleet-fenced maintenance switch.
+	SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error
 	// Adopt takes over an existing backend bucket as an ACTIVE placement.
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.

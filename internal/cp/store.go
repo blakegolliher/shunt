@@ -624,6 +624,20 @@ func (s *Store) SetState(ctx context.Context, tenant, bucket, from string, t dir
 	return s.mutate(ctx, actor, "set-state", directory.Key(tenant, bucket), func(st *state) error { return st.file.SetState(tenant, bucket, from, t) })
 }
 
+// SetPlacementReadOnly implements directory.Store.
+func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+	return s.mutate(ctx, actor, "placement-read-only", directory.Key(tenant, bucket), func(st *state) error {
+		return st.file.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+	})
+}
+
+// SetClusterReadOnly implements directory.Store.
+func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+	return s.mutate(ctx, actor, "cluster-read-only", "clusters/"+name, func(st *state) error {
+		return st.file.SetClusterReadOnly(name, readOnly, reject)
+	})
+}
+
 // Adopt implements directory.Store.
 func (s *Store) Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
 	return s.mutate(ctx, actor, "adopt", directory.Key(tenant, bucket), func(st *state) error {

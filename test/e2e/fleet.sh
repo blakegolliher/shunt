@@ -154,6 +154,13 @@ start_control 3 join
 "$CONTROL" status > status-0.txt || fail "shunt-control status"
 sed 's/^/     /' status-0.txt
 grep -q '3 of 3 members started, 2 needed for writes, quorum' status-0.txt || fail "the cluster did not form"
+TOKEN=$(cat "$WORK/secrets/control.token")
+probe=$(jq -n --arg endpoint "127.0.0.1:3900" --arg access "$GARAGE_ACCESS_KEY" --arg secret "file:$WORK/secrets/garage.secret" \
+  '{name:"garage",cluster:{type:"s3",scheme:"http",region:"garage",endpoints:[$endpoint],credentials:{access_key:$access,secret_ref:$secret},capabilities:{conditional_write:false}}}')
+curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$probe" \
+  "http://$C1_API/v1/clusters/probe" | jq -e '.reachable == true and .cluster.name == "garage" and .profile == "assumed"' >/dev/null \
+  || fail "the non-mutating cluster preflight did not return garage's reachable assumed profile"
+note "cluster preflight reached Garage and returned its capability profile before Save"
 accepted cluster add garage --type s3 --scheme http --region garage --endpoint 127.0.0.1:3900 --access-key "$GARAGE_ACCESS_KEY" --secret-ref "file:$WORK/secrets/garage.secret" --conditional-write=false
 SHUNT_API=http://$C2_API accepted cluster add minio --type minio --scheme http --region us-east-1 --endpoint 127.0.0.1:9000 --access-key "$MINIO_ACCESS_KEY" --secret-ref "file:$WORK/secrets/minio.secret"
 # The secrets above are file: refs the control nodes resolve on this host; a secret given to
@@ -165,6 +172,15 @@ accepted adopt garage fleet-a --keys client-keys.yaml
 grep -q "client key $CLIENT_AK imported" <<<"$OUT" || fail "adopt --keys did not import the clients' key into the control plane"
 accepted adopt garage fleet-b
 for b in fleet-a fleet-b; do accepted expand $b --to minio --name $b; done
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations?limit=100" \
+  | jq -e '[.operations[] | select(.status == "succeeded") | .kind] as $k
+           | ($k | index("cluster-add")) != null and ($k | index("adopt")) != null and ($k | index("expand")) != null' >/dev/null \
+  || fail "cluster add, adopt and expand do not all have successful operation records"
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/audit?limit=100" \
+  | jq -e '[.changes[] | select(.op == "cluster-put" or .op == "cluster-remove" or .op == "adopt" or .op == "set-target")] as $c
+           | ($c | length) >= 8 and all($c[]; .actor | test("^token:[0-9a-f]{12}$"))' >/dev/null \
+  || fail "setup actions are missing from the audit tail or expose the wrong actor"
+note "cluster add, adopt and expand have operation records and token-fingerprint audit actors"
 start_proxy a
 start_proxy b
 member_ok proxy-a && member_ok proxy-b || fail "the proxies did not join the fleet"
@@ -173,6 +189,19 @@ grep -q 'proxy-a  live' <<<"$OUT" && grep -q 'proxy-b  live' <<<"$OUT" || fail "
 for p in $A_ADMIN $B_ADMIN; do curl -fsS "http://$p/-/fleet" | jq -e '.stale == false' >/dev/null || fail "a proxy reports stale"; done
 [ "$(via "$A_LISTEN" s3 cp --quiet s3://fleet-a/seed/1 -)" = "seed 1" ] || fail "proxy A cannot read with the delivered key and secret"
 [ "$(via "$B_LISTEN" s3 cp --quiet s3://fleet-a/seed/2 -)" = "seed 2" ] || fail "proxy B cannot read"
+printf 'read-only proof' | via "$A_LISTEN" s3 cp --quiet - s3://fleet-b/read-only-proof || fail "seed for the read-only check"
+accepted readonly fleet-b --wait 5s
+printf x > read-only.body
+if AWS_MAX_ATTEMPTS=1 via "$B_LISTEN" s3api put-object --bucket fleet-b --key refused --body read-only.body >/dev/null 2>read-only.err; then
+  fail "a read-only placement accepted a write"
+fi
+grep -q '503\|ServiceUnavailable' read-only.err || fail "the read-only refusal was not retryable: $(cat read-only.err)"
+[ "$(via "$B_LISTEN" s3 cp --quiet s3://fleet-b/read-only-proof -)" = "read-only proof" ] || fail "read-only mode refused a read"
+accepted readonly fleet-b --off --wait 5s
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations?placement=default/fleet-b&limit=100" \
+  | jq -e '[.operations[] | select(.kind == "placement-read-only" and .status == "succeeded")] | length == 2' >/dev/null \
+  || fail "the read-only toggle does not have two successful operation records"
+note "placement read-only fenced both proxies, refused writes with 503, allowed reads, then unfenced"
 via "$B_LISTEN" s3 mb s3://fleet-c >/dev/null || fail "CreateBucket through a member"
 accepted status fleet-c
 grep -q 'fleet-c' <<<"$OUT" || fail "a bucket created through proxy B is not in the control plane"
@@ -195,7 +224,6 @@ KEYS=6; mkdir -p last
 WRITER_PID=$!
 sleep 3
 # GET /v1/events (ADR-0017) must show the step as it happens: the record's fence and the directory change.
-TOKEN=$(cat "$WORK/secrets/control.token")
 curl -sN --max-time 4 -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/events" > "$WORK/events.log" 2>&1 &
 EVENTS_PID=$!
 accepted ramp fleet-a --ratio 0.25
