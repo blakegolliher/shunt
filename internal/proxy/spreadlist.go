@@ -124,9 +124,14 @@ func (h *Handler) spreadListing(ctx context.Context, w http.ResponseWriter, r *h
 		w.Header().Set(headerRoute, "spread "+strings.Join(routes, "+"))
 	}
 
+	// A leg lists the keys it owns; while a move is under way the keys in its range may be on either
+	// of its two legs, and the destination's copy wins, as in a migration's merge (ADR-0018 N3).
 	own := func(l *spreadLeg) {
 		l.items = slices.DeleteFunc(l.items, func(it listItem) bool {
 			if it.prefix {
+				return false
+			}
+			if m := p.Move; m != nil && (l.id == m.From || l.id == m.To) && migrate.InRangeHash(m.Range, it.name) {
 				return false
 			}
 			owner, err := migrate.OwnerOf(p, it.name)
@@ -196,8 +201,11 @@ func (h *Handler) spreadListing(ctx context.Context, w http.ResponseWriter, r *h
 			break
 		}
 		take := *least
-		for _, l := range legs { // a common prefix several legs hold is one entry
+		for _, l := range legs { // a common prefix several legs hold is one entry; a moving key, the destination's
 			if len(l.items) > 0 && l.items[0].name == take.name {
+				if p.Move != nil && l.id == p.Move.To {
+					take = l.items[0]
+				}
 				l.items = l.items[1:]
 			}
 		}

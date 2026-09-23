@@ -241,10 +241,21 @@ func OwnerOf(p *directory.Placement, key string) (string, error) {
 	return p.Owners[i].Leg, nil
 }
 
-// Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the
-// key, a plain one-cluster placement that every per-object path routes as it always has. A leg is
-// the only home of its keys at rest, so there is no fallback and nothing to merge.
+// Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the key,
+// a plain one-cluster placement that every per-object path routes as it always has; or, for a key
+// in the range a move is taking to another leg, the move's two-cluster migration (MoveView), which
+// every per-object migration path routes as it always has. At rest a leg is the only home of its
+// keys, so there is no fallback and nothing to merge.
 func Narrow(p *directory.Placement, key string) (directory.Placement, error) {
+	if m := p.Move; m != nil {
+		if p.KeyHash != directory.RampHash {
+			return directory.Placement{}, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
+		}
+		if InRangeHash(m.Range, key) {
+			// A key in the moving range: the move is the two-cluster migration it is (ADR-0018 N3).
+			return p.MoveView(), nil
+		}
+	}
 	id, err := OwnerOf(p, key)
 	if err != nil {
 		return directory.Placement{}, err

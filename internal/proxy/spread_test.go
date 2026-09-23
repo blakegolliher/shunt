@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -367,4 +368,96 @@ func FuzzSpreadToken(f *testing.F) {
 			t.Fatalf("round trip of %+v: %+v %v", tok, back, err)
 		}
 	})
+}
+
+// A plain bucket moves the lower half of its key space to a new leg through the handler (ADR-0018
+// N3): inside the range the move routes as a migration, outside it the bucket stays where it was,
+// and once the move ends the range's leftovers on the old leg are neither read nor listed.
+func TestMovePartOfABucketThroughTheProxy(t *testing.T) {
+	m := newMixedRig(t, nil)
+	lower := directory.HashRange{From: 0, To: 1<<63 - 1}
+	var in, out []string
+	for i := 0; len(in) < 6 || len(out) < 6; i++ {
+		k := fmt.Sprintf("m/%03d", i)
+		if migrate.InRangeHash(lower, k) {
+			in = append(in, k)
+		} else {
+			out = append(out, k)
+		}
+	}
+	for _, k := range append(append([]string{}, in...), out...) {
+		m.acme(t, "PUT", "/data/"+k, []byte("old-"+k))
+	}
+	m.minio.addBucket("acme-data-b")
+	m.backendNames = append(m.backendNames, "acme-data-b")
+	setState := func(from string, tr directory.Transition) {
+		t.Helper()
+		if err := m.dir.SetState(context.Background(), "acme", "data", from, tr, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setState(directory.StateActive, directory.Transition{To: directory.StateRamping, Target: "minio", Name: "acme-data-b", Range: &lower, Ratio: 1})
+
+	// Writes inside the range go to the new leg; outside it they stay on garage.
+	m.acme(t, "PUT", "/data/"+in[0], []byte("new-"+in[0]))
+	m.acme(t, "PUT", "/data/"+out[0], []byte("new-"+out[0]))
+	if b, ok := m.minio.object("acme-data-b", in[0]); !ok || string(b) != "new-"+in[0] {
+		t.Fatalf("a write in the moving range did not reach the new leg: %q %v", b, ok)
+	}
+	if b, ok := m.garage.object("acme-1111-data", out[0]); !ok || string(b) != "new-"+out[0] {
+		t.Fatalf("a write outside the range left garage: %q %v", b, ok)
+	}
+	if _, ok := m.minio.object("acme-data-b", out[0]); ok {
+		t.Fatal("a key outside the range reached the new leg")
+	}
+	// An old key in the range is still read, from garage by fallback.
+	if r := m.acme(t, "GET", "/data/"+in[1], nil); string(r.body) != "old-"+in[1] {
+		t.Fatalf("fallback read in the range: %d %q", r.StatusCode, r.body)
+	}
+	listed := func() []string {
+		r := m.acme(t, "GET", "/data?list-type=2&prefix=m/", nil)
+		if r.StatusCode != 200 {
+			t.Fatalf("listing: %d %s", r.StatusCode, r.body)
+		}
+		return listKeys(t, r.body, "Key")
+	}
+	want := append(append([]string{}, in...), out...)
+	slices.Sort(want)
+	if got := listed(); !slices.Equal(got, want) {
+		t.Fatalf("listing during the move:\n got  %v\n want %v", got, want)
+	}
+
+	setState(directory.StateRamping, directory.Transition{To: directory.StateMigrating})
+	// A delete in the range reaches both legs; outside it, garage alone.
+	m.acme(t, "DELETE", "/data/"+in[2], nil)
+	if _, ok := m.garage.object("acme-1111-data", in[2]); ok {
+		t.Fatal("a delete in the moving range missed the source leg")
+	}
+	// The mover's work, done by hand: every key of the range on the new leg.
+	for _, k := range in[1:] {
+		if b, ok := m.garage.object("acme-1111-data", k); ok {
+			if _, there := m.minio.object("acme-data-b", k); !there {
+				m.minio.put("acme-data-b", k, b)
+			}
+		}
+	}
+	setState(directory.StateMigrating, directory.Transition{To: directory.StateCutover, Cutover: &directory.CutoverEvidence{Window: time.Second}})
+	setState(directory.StateCutover, directory.Transition{To: directory.StateActive})
+	p, _ := m.dir.Snapshot().Lookup("acme", "data")
+	if !p.Spread() || p.Move != nil || len(p.Owners) != 2 || p.Owners[0].Leg != "minio" {
+		t.Fatalf("after the move: %+v", p)
+	}
+	// Garage still holds the range's old copies; they are neither read nor listed.
+	if _, ok := m.garage.object("acme-1111-data", in[1]); !ok {
+		t.Fatal("test premise: the old copy should still be on garage")
+	}
+	m.minio.put("acme-data-b", in[1], []byte("moved-"+in[1]))
+	if r := m.acme(t, "GET", "/data/"+in[1], nil); string(r.body) != "moved-"+in[1] {
+		t.Fatalf("a key of the moved range is read from its new owner only: %q", r.body)
+	}
+	want = slices.DeleteFunc(want, func(k string) bool { return k == in[2] })
+	if got := listed(); !slices.Equal(got, want) {
+		t.Fatalf("listing after the move:\n got  %v\n want %v", got, want)
+	}
+	m.noLeak(t, "moved bucket", m.acme(t, "GET", "/data/"+in[1], nil))
 }
