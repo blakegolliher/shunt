@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
 )
 
@@ -31,6 +32,7 @@ type TransitionResult struct {
 	CreatedBucket string                     `json:"created_bucket,omitempty"`
 	Warning       string                     `json:"warning,omitempty"`
 	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
+	Range         *directory.HashRange       `json:"range,omitempty"` // the moving range, for part of a bucket (ADR-0018 N3)
 	// The fleet (ADR-0016). Held: the step was written as a hold first and completed once every
 	// proxy had it. Proxies: member proxies the change had to reach, besides this one. WaitingOn:
 	// members that have not installed it yet, so it is not in effect everywhere (pending).
@@ -128,12 +130,13 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 	}
 	// A step out of ACTIVE waits for every member, live or not. A hold taken from ACTIVE and not yet
 	// completed (nothing in force, only the hold) is still that step.
-	fromActive := p.State == directory.StateActive || (p.Held() && p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0)
+	pv := moving(p)
+	fromActive := p.State == directory.StateActive || (p.Held() && pv.Ramp.Ratio == 0 && len(pv.Ramp.Prefixes) == 0)
 	if err := s.precondition(tr, fromActive, wait); err != nil {
 		return TransitionResult{}, err
 	}
 	moves := t.To == directory.StateRamping ||
-		(t.To == directory.StateMigrating && (p.State != directory.StateRamping || p.Ramp == nil || p.Ramp.Ratio < 1 || p.Held()))
+		(t.To == directory.StateMigrating && (p.State != directory.StateRamping || pv.Ramp == nil || pv.Ramp.Ratio < 1 || p.Held()))
 	hold := false
 	if moves {
 		var err error
@@ -153,29 +156,29 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 
 	tenant, bucket, _ := directory.SplitKey(key)
 	complete := t // the step as written once every member holds it: never with a target
-	complete.Target, complete.Name, complete.Complete = "", "", true
+	complete.Target, complete.Name, complete.Complete, complete.Range = "", "", true, nil
 	var heldAt int64
 	var created string
 	if p.Held() {
 		// A hold left by an interrupted call, such as a control-node restart between the hold and
 		// its completion. Its keys answer 503 until it completes, so repeating the step resumes it
 		// rather than being refused as "already held".
-		if t.Target != "" && t.Target != p.Primary {
-			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, p.Primary)
+		if t.Target != "" && t.Target != pv.Primary {
+			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, pv.Primary)
 		}
 		if _, err := directory.Apply(p, complete); err != nil {
-			return TransitionResult{}, refuse("%s has a held step to %s left by an interrupted call; repeat it to complete it (%v)", key, holdText(p.Ramp.Hold), err)
+			return TransitionResult{}, refuse("%s has a held step to %s left by an interrupted call; repeat it to complete it (%v)", key, holdText(pv.Ramp.Hold), err)
 		}
 		heldAt = s.Dir.Snapshot().Version()
-		s.info(tr.actor, "resuming a held step", "placement", key, "version", heldAt, "hold", holdText(p.Ramp.Hold))
+		s.info(tr.actor, "resuming a held step", "placement", key, "version", heldAt, "hold", holdText(pv.Ramp.Hold))
 	} else {
 		// Anything that would refuse the completed step refuses before the hold is written.
 		np, err := directory.Apply(p, withDefaultName(key, p, t))
 		if err != nil {
 			return TransitionResult{}, err
 		}
-		if np.State == directory.StateMigrating && !f.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
-			return TransitionResult{}, lostWriteWindow(key, np.Primary)
+		if nv := moving(np); np.State == directory.StateMigrating && !f.Clusters[nv.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+			return TransitionResult{}, lostWriteWindow(key, nv.Primary)
 		}
 		th := t
 		th.Hold = true
@@ -240,7 +243,7 @@ func holdText(h *directory.RampHold) string {
 // withDefaultName fills the backend name a first step gets when neither expand nor the request
 // named one, as transition does.
 func withDefaultName(key string, p directory.Placement, t directory.Transition) directory.Transition {
-	if p.State == directory.StateActive && p.Target == "" && t.Target != "" && t.Name == "" {
+	if p.State == directory.StateActive && p.Target == "" && t.Target != "" && t.Name == "" && !hasLegOn(p, t.Target) {
 		tenant, bucket, _ := directory.SplitKey(key)
 		t.Name = directory.BackendName(tenant, bucket, 0)
 	}
@@ -253,22 +256,31 @@ func withDefaultName(key string, p directory.Placement, t directory.Transition) 
 func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *directory.File, t directory.Transition, create, acceptLoss bool) (TransitionResult, error) {
 	tenant, bucket, _ := directory.SplitKey(key)
 	t = withDefaultName(key, p, t)
-	if p.State != directory.StateActive && t.Target != "" {
+	if pv := moving(p); p.State != directory.StateActive && t.Target != "" {
 		// Repeating the target on a later step is how an operator types it; only a change is refused.
-		if t.Target != p.Primary {
-			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, p.Primary)
+		if t.Target != pv.Primary {
+			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, pv.Primary)
 		}
 		t.Target, t.Name = "", ""
 	}
-	np, err := directory.Apply(p, t)
+	full, err := directory.Apply(p, t)
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res := TransitionResult{Key: key, From: p.State, To: np.State, Primary: np.Primary, Source: np.Source}
+	// What follows reasons about the two clusters of the step: the placement's own, or, for part of
+	// a bucket, the move's (ADR-0018 N3). A move that just ended is judged as it was.
+	np := moving(full)
+	if full.Move == nil && p.Move != nil {
+		np = moving(p)
+	}
+	res := TransitionResult{Key: key, From: p.State, To: full.State, Primary: np.Primary, Source: np.Source}
+	if p.Move != nil || full.Move != nil {
+		res.Range = moveRange(&p, &full)
+	}
 	if np.Ramp != nil {
 		res.Ratio = np.Ramp.Ratio
 	}
-	lossWindow := np.State == directory.StateMigrating && p.State != directory.StateMigrating &&
+	lossWindow := full.State == directory.StateMigrating && p.State != directory.StateMigrating &&
 		!f.Clusters[np.Primary].Capabilities.ConditionalWriteOr(true)
 	if lossWindow {
 		if !acceptLoss {
@@ -295,14 +307,16 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 				return TransitionResult{}, err
 			}
 			res.CreatedBucket = name
-		case p.Target == "":
-			// A first step that names its own target; one expand prepared was checked there.
+		case p.Target == "" && !hasLegOn(p, np.Primary):
+			// A first step that names its own target; one expand prepared was checked there, and a leg
+			// already in the bucket holds only keys it owns: a move's source is purged, never left
+			// holding the range (finish).
 			if err := targetEmpty(ctx, target, np.Primary, name, "expand, which can accept them (--accept-existing-objects), before the first step"); err != nil {
 				return TransitionResult{}, err
 			}
 		}
 	}
-	if np.State == directory.StateRamping || np.State == directory.StateMigrating {
+	if full.State == directory.StateRamping || full.State == directory.StateMigrating {
 		for _, side := range []struct{ role, cluster string }{{"source", np.Source}, {"primary", np.Primary}} {
 			b, err := s.backendFor(side.cluster)
 			if err != nil {
@@ -318,9 +332,49 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 	}
 	res.Version = s.Dir.Snapshot().Version()
 	if after, ok := s.Dir.Snapshot().Lookup(tenant, bucket); ok {
-		res.Cutover = after.Cutover
+		res.Cutover = moving(*after).Cutover
 	}
 	return res, nil
+}
+
+// ownsBeyond reports whether leg owns any key outside rg.
+func ownsBeyond(p directory.Placement, leg string, rg directory.HashRange) bool {
+	for _, o := range p.Owners {
+		if o.Leg == leg && (o.From < rg.From || o.To > rg.To) {
+			return true
+		}
+	}
+	return false
+}
+
+// moving is the two-cluster placement the control plane reasons about: for a bucket part of which
+// is moving between legs, the move (MoveView, ADR-0018 N3); otherwise the placement itself.
+func moving(p directory.Placement) directory.Placement {
+	if p.Move != nil {
+		return p.MoveView()
+	}
+	return p
+}
+
+// hasLegOn reports whether a spread placement has a leg on cluster already.
+func hasLegOn(p directory.Placement, cluster string) bool {
+	for _, l := range p.Legs {
+		if l.Cluster == cluster {
+			return true
+		}
+	}
+	return false
+}
+
+// moveRange is the range of the move a step started, stepped or ended.
+func moveRange(before, after *directory.Placement) *directory.HashRange {
+	for _, p := range []*directory.Placement{after, before} {
+		if p.Move != nil {
+			rg := p.Move.Range
+			return &rg
+		}
+	}
+	return nil
 }
 
 // AdoptRequest takes over an existing bucket on a cluster as an ACTIVE placement.
@@ -637,8 +691,10 @@ type RampRequest struct {
 	Prefixes []string `json:"prefixes,omitempty"`
 	To       string   `json:"to,omitempty"`   // leaving ACTIVE without expand: the target cluster
 	Name     string   `json:"name,omitempty"` // and its backend bucket
-	Create   bool     `json:"create,omitempty"`
-	Wait     string   `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
+	// Range, leaving ACTIVE, moves only the keys whose hash it holds, to the target's leg (ADR-0018 N3).
+	Range  *directory.HashRange `json:"range,omitempty"`
+	Create bool                 `json:"create,omitempty"`
+	Wait   string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
@@ -654,7 +710,7 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes}, req.Create, false, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range}, req.Create, false, wait)
 	if err != nil {
 		return res, err
 	}
@@ -665,11 +721,12 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 
 // MigrateRequest moves a placement to MIGRATING: every write to the new primary, reads falling back.
 type MigrateRequest struct {
-	To                    string `json:"to,omitempty"`
-	Name                  string `json:"name,omitempty"`
-	Create                bool   `json:"create,omitempty"`
-	AcceptLostWriteWindow bool   `json:"accept_lost_write_window,omitempty"`
-	Wait                  string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
+	To                    string               `json:"to,omitempty"`
+	Name                  string               `json:"name,omitempty"`
+	Range                 *directory.HashRange `json:"range,omitempty"` // leaving ACTIVE: move only these keys (ADR-0018 N3)
+	Create                bool                 `json:"create,omitempty"`
+	AcceptLostWriteWindow bool                 `json:"accept_lost_write_window,omitempty"`
+	Wait                  string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) migrateStart(w http.ResponseWriter, r *http.Request) {
@@ -685,7 +742,7 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		return res, err
 	}
@@ -717,10 +774,11 @@ func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	key, p, _, ok := s.lookup(w, r)
+	key, pl, _, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
+	p := moving(pl)
 	if req.Source != p.Source || req.Primary != p.Primary {
 		fail(w, refuse("%s moves %s → %s; this report is for %s → %s", key, p.Source, p.Primary, req.Source, req.Primary))
 		return
@@ -774,7 +832,7 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 	switch {
 	case !reported:
 		return TransitionResult{}, refuse("no mover has reported on %s to this proxy; run `shunt migrate run %s --until-converged` first", key, key)
-	case pr.Source != p.Source || pr.Primary != p.Primary || !pr.Converged:
+	case pr.Source != moving(p).Source || pr.Primary != moving(p).Primary || !pr.Converged:
 		return TransitionResult{}, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done)
 	}
 	// The window counts fallback reads on this proxy and on every live member (ADR-0016).
@@ -871,7 +929,7 @@ func (s *Server) purgeSource(w http.ResponseWriter, r *http.Request) {
 
 // purgeBinding is what a purge token is bound to: the placement and the source cluster's definition.
 func purgeBinding(f *directory.File, p directory.Placement) [32]byte {
-	return digestOf(p, f.Clusters[p.Source])
+	return digestOf(p, f.Clusters[moving(p).Source])
 }
 
 // purgePlan is what purge-source found out before deleting anything.
@@ -883,6 +941,10 @@ type purgePlan struct {
 	objects              int
 	bytes                int64
 	missing              []string
+	// keep, for a move of part of a bucket (ADR-0018 N3), is the moving range: only its keys are
+	// compared and deleted, and the source bucket stays unless its leg owns nothing else.
+	keep       func(string) bool
+	dropBucket bool
 }
 
 // purgeChecks runs every refusal purge-source gives before it deletes: the state, the evidence,
@@ -898,6 +960,13 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	if serr := purgeState(key, p); serr != nil {
 		return plan, serr
 	}
+	plan.dropBucket = true
+	if m := p.Move; m != nil {
+		rg := m.Range
+		plan.keep = func(k string) bool { return migrate.InRangeHash(rg, k) }
+		plan.dropBucket = !ownsBeyond(p, m.From, rg)
+	}
+	p = moving(p)
 	// A proxy that has not installed the cutover still reads the source on a miss: it must have it
 	// before the source is deleted.
 	if perr := s.precondition(tr, false, wait); perr != nil {
@@ -912,7 +981,7 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	}
 	plan.srcBucket, plan.dstBucket = p.Names[p.Source], p.Names[p.Primary]
 	tr.phase(PhaseDiff)
-	plan.missing, plan.objects, plan.bytes, err = missingOn(tr.ctx, plan.src, plan.srcBucket, dst, plan.dstBucket, 20)
+	plan.missing, plan.objects, plan.bytes, err = missingOn(tr.ctx, plan.src, plan.srcBucket, dst, plan.dstBucket, 20, plan.keep)
 	if err != nil {
 		return plan, err
 	}
@@ -924,7 +993,8 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 }
 
 // purgeState is what purge-source refuses on the placement alone.
-func purgeState(key string, p directory.Placement) error {
+func purgeState(key string, pl directory.Placement) error {
+	p := moving(pl)
 	switch {
 	case p.State != directory.StateCutover:
 		return refuse("%s is %s; purge-source runs on a placement in CUTOVER", key, p.State)
@@ -941,7 +1011,7 @@ func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDr
 	}
 	res := PurgeDryRun{Key: key, Missing: []string{}, Version: s.Dir.Snapshot().Version()}
 	plan, err := s.purgeChecks(tr, key, wait)
-	res.Source, res.Bucket, res.Objects, res.Bytes = plan.p.Source, plan.srcBucket, plan.objects, plan.bytes
+	res.Source, res.Bucket, res.Objects, res.Bytes = moving(plan.p).Source, plan.srcBucket, plan.objects, plan.bytes
 	if plan.missing != nil {
 		res.Missing = plan.missing
 	}
@@ -954,7 +1024,7 @@ func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDr
 	}
 	ctx, cancel := context.WithTimeout(tr.ctx, backendTimeout)
 	defer cancel()
-	if res.UploadsInFlight, err = s.uploadsInProgress(ctx, plan.p.Source, plan.srcBucket); err != nil {
+	if res.UploadsInFlight, err = s.uploadsInProgress(ctx, moving(plan.p).Source, plan.srcBucket); err != nil {
 		return res, err
 	}
 	res.Allowed = true
@@ -990,12 +1060,20 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	tr.phase(PhasePurge)
 	total := int64(plan.objects)
 	tr.progress(0, total, "objects")
-	objects, uploads, err := plan.src.empty(tr.ctx, plan.srcBucket, func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") })
+	progress := func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") }
+	var objects, uploads int
+	if plan.keep != nil {
+		objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.keep, progress)
+	} else {
+		objects, uploads, err = plan.src.empty(tr.ctx, plan.srcBucket, progress)
+	}
 	if err != nil {
 		return PurgeResult{}, err
 	}
-	if err := plan.src.deleteBucket(tr.ctx, plan.srcBucket); err != nil {
-		return PurgeResult{}, err
+	if plan.dropBucket {
+		if err := plan.src.deleteBucket(tr.ctx, plan.srcBucket); err != nil {
+			return PurgeResult{}, err
+		}
 	}
 	tr.phase(PhaseStep)
 	if _, err := s.transition(tr, key, p, plan.f, directory.Transition{To: directory.StateActive}, false, false); err != nil {
@@ -1003,9 +1081,10 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	}
 	s.forget(key)
 	v := s.Dir.Snapshot().Version()
-	s.info(tr.actor, "source purged", "placement", key, "cluster", p.Source, "bucket", plan.srcBucket, "objects_deleted", objects, "uploads_aborted", uploads,
-		"state", directory.StateActive, "primary", p.Primary, "version", v)
-	return PurgeResult{Key: key, Source: p.Source, Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, Version: v, Operation: tr.id()}, nil
+	pv := moving(p)
+	s.info(tr.actor, "source purged", "placement", key, "cluster", pv.Source, "bucket", plan.srcBucket, "objects_deleted", objects, "uploads_aborted", uploads,
+		"bucket_deleted", plan.dropBucket, "state", directory.StateActive, "primary", pv.Primary, "version", v)
+	return PurgeResult{Key: key, Source: pv.Source, Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, Version: v, Operation: tr.id()}, nil
 }
 
 // finish drops the source from a CUTOVER placement without touching its data.
@@ -1017,6 +1096,11 @@ func (s *Server) runFinish(tr *tracker, key string) (TransitionResult, error) {
 	p, f, err := s.placementOf(key)
 	if err != nil {
 		return TransitionResult{}, err
+	}
+	if m := p.Move; m != nil && ownsBeyond(p, m.From, m.Range) {
+		// Left in place, the range's keys would be strays on a leg that stays in the bucket: a later
+		// move into that leg would take them for the bucket's own (ADR-0018 N3).
+		return TransitionResult{}, refuse("%s: leg %s keeps other keys of the bucket, so the moved range's copies there must go: use purge-source, which deletes only that range", key, m.From)
 	}
 	tr.phase(PhaseStep)
 	res, err := s.transition(tr, key, p, f, directory.Transition{To: directory.StateActive}, false, false)

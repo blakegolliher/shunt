@@ -238,6 +238,7 @@ func (b backend) listPage(ctx context.Context, bucket, token string) (entries []
 type lister struct {
 	b       backend
 	bucket  string
+	keep    func(key string) bool // nil: every key; a move's range otherwise (ADR-0018 N3)
 	page    []listEntry
 	next    string
 	done    bool
@@ -258,6 +259,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 	}
 	e := l.page[0]
 	l.page = l.page[1:]
+	if l.keep != nil && !l.keep(e.key) {
+		return l.nextKey(ctx)
+	}
 	l.objects++
 	l.bytes += e.size
 	return e.key, true, nil
@@ -268,9 +272,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 // is confirmed with HEADs before it counts (stillMissing), so a client delete landing between the
 // two listings' pages is not reported. It also returns how many objects and bytes the source
 // listing held, as far as it was walked.
-func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int) (missing []string, objects int, size int64, err error) {
-	src := &lister{b: source, bucket: sourceBucket}
-	dst := &lister{b: primary, bucket: primaryBucket}
+func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int, keep func(string) bool) (missing []string, objects int, size int64, err error) {
+	src := &lister{b: source, bucket: sourceBucket, keep: keep}
+	dst := &lister{b: primary, bucket: primaryBucket, keep: keep}
 	d, dok, err := dst.nextKey(ctx)
 	if err != nil {
 		return nil, 0, 0, err
@@ -394,6 +398,93 @@ func (b backend) empty(ctx context.Context, bucket string, progress func(deleted
 			if progress != nil {
 				progress(objects)
 			}
+		}
+	}
+}
+
+// emptyRange deletes the keys keep holds, and aborts the multipart uploads of those keys, leaving
+// every other key: a move's source leg giving up one range and keeping the rest (ADR-0018 N3).
+// Deleting while paging can skip keys, so it walks the bucket until a whole walk deletes nothing.
+func (b backend) emptyRange(ctx context.Context, bucket string, keep func(string) bool, progress func(deleted int)) (objects, uploads int, err error) {
+	keyMarker, idMarker := "", ""
+	for {
+		q := url.Values{"uploads": {""}}
+		if keyMarker != "" {
+			q.Set("key-marker", keyMarker)
+			q.Set("upload-id-marker", idMarker)
+		}
+		r, err := b.do(ctx, http.MethodGet, bucket, "", q, nil, nil)
+		if err != nil {
+			return objects, uploads, err
+		}
+		if r.code == "NoSuchUpload" {
+			break
+		}
+		if r.status != http.StatusOK {
+			return objects, uploads, fmt.Errorf("%s: ListMultipartUploads %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+		}
+		var page struct {
+			Uploads []struct {
+				Key      string `xml:"Key"`
+				UploadID string `xml:"UploadId"`
+			} `xml:"Upload"`
+			Truncated          bool   `xml:"IsTruncated"`
+			NextKeyMarker      string `xml:"NextKeyMarker"`
+			NextUploadIDMarker string `xml:"NextUploadIdMarker"`
+		}
+		if err := xml.Unmarshal(r.body, &page); err != nil {
+			return objects, uploads, fmt.Errorf("%s: ListMultipartUploads %s: %w", b.cl.Name, bucket, err)
+		}
+		for _, u := range page.Uploads {
+			if !keep(u.Key) {
+				continue
+			}
+			ar, err := b.do(ctx, http.MethodDelete, bucket, u.Key, url.Values{"uploadId": {u.UploadID}}, nil, nil)
+			if err != nil {
+				return objects, uploads, err
+			}
+			if ar.status >= 300 && ar.status != http.StatusNotFound {
+				return objects, uploads, fmt.Errorf("%s: aborting upload of %s: HTTP %d %s", b.cl.Name, u.Key, ar.status, ar.code)
+			}
+			uploads++
+		}
+		if !page.Truncated || page.NextKeyMarker == "" {
+			break
+		}
+		keyMarker, idMarker = page.NextKeyMarker, page.NextUploadIDMarker
+	}
+	for {
+		deleted := 0
+		token := ""
+		for {
+			entries, next, err := b.listPage(ctx, bucket, token)
+			if err != nil {
+				return objects, uploads, err
+			}
+			for _, e := range entries {
+				if !keep(e.key) {
+					continue
+				}
+				dr, err := b.do(ctx, http.MethodDelete, bucket, e.key, nil, nil, nil)
+				if err != nil {
+					return objects, uploads, err
+				}
+				if dr.status >= 300 && dr.status != http.StatusNotFound {
+					return objects, uploads, fmt.Errorf("%s: deleting %s: HTTP %d %s: %w", b.cl.Name, e.key, dr.status, dr.code, errNotEmpty)
+				}
+				objects++
+				deleted++
+				if progress != nil {
+					progress(objects)
+				}
+			}
+			if next == "" {
+				break
+			}
+			token = next
+		}
+		if deleted == 0 {
+			return objects, uploads, nil
 		}
 	}
 }

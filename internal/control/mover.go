@@ -118,10 +118,11 @@ func (s *Server) moverLedger(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) checkMover(key string, req MoverRequest) error {
-	p, f, err := s.placementOf(key)
+	pl, f, err := s.placementOf(key)
 	if err != nil {
 		return err
 	}
+	p := moving(pl)
 	if p.State != directory.StateMigrating && !(p.State == directory.StateRamping && p.Ramp != nil && p.Ramp.Ratio >= 1) {
 		return refuse("%s is %s: the mover runs on a MIGRATING placement, or a RAMPING one at ratio 1", key, p.State)
 	}

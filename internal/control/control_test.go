@@ -24,6 +24,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
@@ -779,7 +780,7 @@ func TestPurgeDiffIgnoresConcurrentDeletes(t *testing.T) {
 		}
 		dst.onList = nil
 	}
-	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20)
+	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1136,6 +1137,95 @@ func TestCreateSpreadBucket(t *testing.T) {
 	rg.must("GET", "/v1/status?all=1", nil, &st)
 	if len(st.Placements) != 1 || len(st.Placements[0].Legs) != 2 {
 		t.Fatalf("status: %+v", st.Placements)
+	}
+}
+
+// Half of a plain bucket moves to another cluster through the API (ADR-0018 N3): ramp, migrate,
+// the mover's reports, cutover and purge all act on the move; purge compares and deletes only the
+// moving range and leaves the source bucket, which keeps the other half; finish is refused while the
+// source keeps keys. Moving the other half and purging it deletes the source bucket, and the
+// bucket settles back to one cluster.
+func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	lower := directory.HashRange{From: 0, To: 1<<63 - 1}
+	upper := directory.HashRange{From: 1 << 63, To: directory.FullRange.To}
+	var in, out []string
+	for i := 0; len(in) < 4 || len(out) < 4; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		if migrate.InRangeHash(lower, k) {
+			in = append(in, k)
+		} else {
+			out = append(out, k)
+		}
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 1, To: "vast02", Name: "data01-b", Create: true, Range: &lower}, &tr)
+	if tr.To != directory.StateRamping || tr.Primary != "vast02" || tr.Source != "vast01" || tr.Range == nil || *tr.Range != lower {
+		t.Fatalf("first step of the move: %+v", tr)
+	}
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, &tr)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+
+	// The mover copied the range except one key: purge names it, and counts the range alone.
+	for _, k := range in[1:] {
+		rg.vast02.put(t, "data01-b", k, "v")
+	}
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if dry.Allowed || len(dry.Missing) != 1 || dry.Missing[0] != in[0] || dry.Objects != len(in) {
+		t.Fatalf("dry run with one key of the range missing: %+v", dry)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/finish", nil, "keeps other keys of the bucket")
+	rg.vast02.put(t, "data01-b", in[0], "v")
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Objects != len(in) || dry.Source != "vast01" {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if pg.ObjectsDeleted != len(in) {
+		t.Fatalf("purge deleted %d objects, the range has %d", pg.ObjectsDeleted, len(in))
+	}
+	for _, k := range in {
+		if rg.vast01.has("data01", k) {
+			t.Fatalf("%s of the moved range is still on the source", k)
+		}
+	}
+	for _, k := range out {
+		if !rg.vast01.has("data01", k) {
+			t.Fatalf("%s is outside the range and was purged", k)
+		}
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if !p.Spread() || p.State != directory.StateActive || len(p.Owners) != 2 || p.Owners[0].Leg != "vast02" {
+		t.Fatalf("after the first move: %+v", p)
+	}
+
+	// The other half: the source leg owns nothing afterwards, so purge deletes its bucket.
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{To: "vast02", Range: &upper}, &tr)
+	for _, k := range out {
+		rg.vast02.put(t, "data01-b", k, "v")
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok {
+		t.Fatal("the source leg owns nothing, but its bucket was kept")
+	}
+	p, _ = rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.Spread() || p.Primary != "vast02" || p.Names["vast02"] != "data01-b" || len(p.Names) != 1 {
+		t.Fatalf("after moving every key: %+v", p)
 	}
 }
 
