@@ -242,7 +242,8 @@ readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cl
 fleet: build ## P3c: three shunt-control nodes and two proxies sharing nothing: the fence, quorum loss, a cache restart (ADR-0015, ADR-0016); needs make e2e-up
 	$(E2E_DIR)/fleet.sh $(FLEET_ARGS)
 
-demo-ui: e2e-up ## build and leave a three-control/two-proxy UI demo fleet running
+demo-ui: e2e-up ## build and leave a three-control/two-proxy UI demo fleet running, on the two MinIOs
+	cd $(E2E_DIR) && $(COMPOSE) stop garage   # the demo does not use it; make e2e-up starts it again
 	$(MAKE) ui
 	$(MAKE) build
 	$(E2E_DIR)/demo-ui.sh

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Persistent local fleet for the browser demo. Unlike fleet.sh this is a fixture, not a test: it
-# leaves three control nodes and two proxies running until --down.
+# leaves three control nodes and two proxies running until --down. The backends are the two e2e
+# MinIOs (minio-a on :9000, minio-b on :9100): Garage invents version ids that MinIO rejects once a
+# bucket moves off it (docs/reference/backend-compat.md), which a client such as warp then sees.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -61,7 +63,7 @@ if [ "${1:-}" = --verify-watcher ]; then
   for _ in $(seq 1 3600); do
     if curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/placements/default/ui-demo/view" >/dev/null; then
       while :; do
-        "$SHUNT" verify --endpoint "http://$A_LISTEN" --bucket ui-demo --access-key "$GARAGE_ACCESS_KEY" \
+        "$SHUNT" verify --endpoint "http://$A_LISTEN" --bucket ui-demo --access-key "$MINIO_ACCESS_KEY" \
           --secret-ref "file:$WORK/secrets/client.secret" --workers 24 --keys 200 --duration 60s --interval 0 \
           --cleanup --json-out "$WORK/verify.json" &
         child=$!
@@ -79,6 +81,7 @@ fi
 SHUNT=$ROOT/bin/shunt; CONTROL=$ROOT/bin/shunt-control
 [ -x "$SHUNT" ] && [ -x "$CONTROL" ] || { echo "run make ui and make build first" >&2; exit 1; }
 [ -f "$ROOT/test/e2e/data/garage.env" ] || { echo "run make e2e-up first" >&2; exit 1; }
+grep -q MINIO2_ENDPOINT "$ROOT/test/e2e/data/garage.env" || { echo "the e2e backends predate minio2: run make e2e-up again" >&2; exit 1; }
 command -v aws >/dev/null && command -v jq >/dev/null || { echo "demo-ui needs aws-cli and jq" >&2; exit 1; }
 # shellcheck disable=SC1091
 . "$ROOT/test/e2e/data/garage.env"
@@ -98,15 +101,13 @@ chmod 700 "$WORK" "$WORK/secrets"
 umask 077
 TOKEN=demo-ui-token-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 printf '%s' "$TOKEN" > "$WORK/secrets/control.token"
-printf '%s' "$GARAGE_SECRET" > "$WORK/secrets/client.secret"
+printf '%s' "$MINIO_SECRET" > "$WORK/secrets/client.secret"
 cat > "$WORK/demo.env" <<EOF
 SHUNT_UI_URL=http://$C1_API/
 SHUNT_PROXY_URL=http://$A_LISTEN
 SHUNT_CONTROL_TOKEN=$TOKEN
-GARAGE_ENDPOINT=127.0.0.1:3900
-GARAGE_ACCESS_KEY=$GARAGE_ACCESS_KEY
-GARAGE_SECRET=$GARAGE_SECRET
-MINIO_ENDPOINT=127.0.0.1:9000
+MINIO_A_ENDPOINT=127.0.0.1:9000
+MINIO_B_ENDPOINT=$MINIO2_ENDPOINT
 MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
 MINIO_SECRET=$MINIO_SECRET
 EOF
@@ -115,14 +116,14 @@ umask 022
 export AWS_CONFIG_FILE=$WORK/aws.config AWS_SHARED_CREDENTIALS_FILE=/dev/null
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 printf '[default]\ns3 =\n  addressing_style = path\n' > "$AWS_CONFIG_FILE"
-on_garage() { AWS_ACCESS_KEY_ID=$GARAGE_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$GARAGE_SECRET aws --endpoint-url http://127.0.0.1:3900 --region garage "$@"; }
-on_minio() { AWS_ACCESS_KEY_ID=$MINIO_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$MINIO_SECRET aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 "$@"; }
-for side in on_garage on_minio; do
+on_minio_a() { AWS_ACCESS_KEY_ID=$MINIO_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$MINIO_SECRET aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 "$@"; }
+on_minio_b() { AWS_ACCESS_KEY_ID=$MINIO_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$MINIO_SECRET aws --endpoint-url "http://$MINIO2_ENDPOINT" --region us-east-1 "$@"; }
+for side in on_minio_a on_minio_b; do
   if $side s3api head-bucket --bucket ui-demo >/dev/null 2>&1; then $side s3 rb s3://ui-demo --force >/dev/null; fi
   if $side s3api head-bucket --bucket ui-demo-001 >/dev/null 2>&1; then $side s3 rb s3://ui-demo-001 --force >/dev/null; fi
 done
-on_garage s3api create-bucket --bucket ui-demo >/dev/null
-for i in $(seq 1 40); do printf 'shunt UI seed %03d\n' "$i" | on_garage s3 cp --quiet - "s3://ui-demo/seed/object-$i.txt"; done
+on_minio_a s3api create-bucket --bucket ui-demo >/dev/null
+for i in $(seq 1 40); do printf 'shunt UI seed %03d\n' "$i" | on_minio_a s3 cp --quiet - "s3://ui-demo/seed/object-$i.txt"; done
 
 for p in a b; do
   listen=$A_LISTEN; admin=$A_ADMIN; [ "$p" = b ] && { listen=$B_LISTEN; admin=$B_ADMIN; }
@@ -201,14 +202,12 @@ Shunt UI demo fleet is ready.
   S3 proxy:       http://$UI_HOST:${A_LISTEN##*:} (and :${B_LISTEN##*:})
   source bucket:  ui-demo (40 seeded objects)
 
-  Garage cluster: name garage, endpoint 127.0.0.1:3900, region garage
-    access key:   $GARAGE_ACCESS_KEY
-    secret:       $GARAGE_SECRET
-  MinIO cluster:  name minio, endpoint 127.0.0.1:9000, region us-east-1
-    access key:   $MINIO_ACCESS_KEY
-    secret:       $MINIO_SECRET
+  MinIO cluster A: name minio-a, endpoint 127.0.0.1:9000, region us-east-1 (ui-demo is here)
+  MinIO cluster B: name minio-b, endpoint $MINIO2_ENDPOINT, region us-east-1
+    access key:    $MINIO_ACCESS_KEY (the same on both)
+    secret:        $MINIO_SECRET
 
-The verifier starts when default/ui-demo is adopted with the Garage client key.
+The verifier starts when default/ui-demo is adopted with the MinIO client key.
 Logs and the mode-0600 environment file are in $WORK.
 Follow docs/demo-ui.md. Stop everything with: make demo-ui-down
 EOF

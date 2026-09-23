@@ -1,7 +1,7 @@
-# Browser demo: move `ui-demo` from Garage to MinIO
+# Browser demo: move `ui-demo` from one MinIO cluster to another
 
 This is the manual acceptance script for the web UI. It starts the same shape as the fleet test:
-three control nodes, two proxies, Garage, MinIO, and a checked client workload. The browser performs
+three control nodes, two proxies, two MinIO clusters (`minio-a` and `minio-b`), and a checked client workload. The browser performs
 the eight demo actions; the terminal is only used to start, observe, and stop the fixture.
 
 ## Start
@@ -14,10 +14,10 @@ make demo-ui
 ```
 
 The command brings up the backend containers, builds the web assets before the binaries, seeds 40
-objects in Garage's `ui-demo` bucket, starts three control nodes and two proxies, and prints:
+objects in `minio-a`'s `ui-demo` bucket, starts three control nodes and two proxies, and prints:
 
 - the UI URL and bearer token;
-- the Garage and MinIO endpoints, regions, access keys, and secrets to paste into the UI;
+- both MinIO endpoints, their region, and the access key and secret to paste into the UI;
 - the proxy endpoint and log directory.
 
 It returns with the fixture running. If the host is remote, forward the control port from your
@@ -41,20 +41,23 @@ in the clear. Control peers and admin listeners stay on loopback.
 Open `http://127.0.0.1:9951/` and paste the printed token. The token and credentials are also in
 `test/e2e/data/demo-ui/demo.env`, mode 0600.
 
+Garage is stopped for the demo: it invents version ids on unversioned buckets, and MinIO rejects
+them once a bucket has moved off Garage, so a client that echoes them (warp does) sees errors
+(docs/reference/backend-compat.md). `make e2e-up` starts it again for the other e2e targets.
+
 ## Walk the UI
 
 1. **Control plane.** Notice three healthy members, a two-member majority, two live proxies, and
    matching applied directory revisions. Open **Add node** to see that the UI gives an exact join
    command rather than pretending it can log in to another host.
-2. **Clusters → Add cluster.** Add `garage` with scheme `http`, endpoint `127.0.0.1:3900`, region
-   `garage`, and the printed Garage key and secret. Run the probe, inspect the assumed capability
-   warning, then save. Add `minio` the same way with endpoint `127.0.0.1:9000`, region
-   `us-east-1`, and its printed credentials.
+2. **Clusters → Add cluster.** Add `minio-a` with scheme `http`, endpoint `127.0.0.1:9000`, region
+   `us-east-1`, and the printed key and secret. Run the probe, inspect the assumed capability
+   warning, then save. Add `minio-b` the same way with endpoint `127.0.0.1:9100`.
 3. **Buckets → Adopt or create → Adopt existing.** Tenant is `default`, client and backend bucket
-   are both `ui-demo`, cluster is `garage`. Under **Optional client key import**, paste the same
-   Garage access key and secret. This is the credential the verifier and a real brownfield client
+   are both `ui-demo`, cluster is `minio-a`. Under **Optional client key import**, paste the same
+   MinIO access key and secret. This is the credential the verifier and a real brownfield client
    already use. Saving the placement starts the continuous verifier automatically.
-4. Select `ui-demo`, choose **Expand**, select `minio`, and click **Create target and continue to
+4. On `ui-demo`'s row, click **Expand**, select `minio-b`, and click **Create target and continue to
    Migrations**. Notice the generated `ui-demo-001` name and the now-measured target capability
    profile.
 5. **Migrations → Ramp traffic.** Choose **50%**, apply, and watch the fence move from its held phase
@@ -68,8 +71,8 @@ Open `http://127.0.0.1:9951/` and paste the printed token. The token and credent
    starting. The fence stays visible while the quiet window and fleet settle complete; the state
    becomes `CUTOVER` only after both checks pass.
 8. **Purge or forget.** Click **Dry-run purge** and read the bucket name, object/byte count, uploads,
-   and confirmation-token expiry before confirming. After the placement is `ACTIVE` on MinIO,
-   click **Make minio tenant default**, then **Remove garage** and confirm its dry run.
+   and confirmation-token expiry before confirming. After the placement is `ACTIVE` on `minio-b`,
+   click **Make minio-b tenant default**, then **Remove minio-a** and confirm its dry run.
 
 At each state change, **Audit** should show the token-fingerprint actor. **Telemetry** should show
 fleet, both cluster, and both proxy scopes. Select the two clusters in the comparison panel and
@@ -90,7 +93,7 @@ after the split has produced completed windows and save it as `docs/telemetry-da
 is the intentionally manual UI-5 visual artifact.
 
 The refusal paths are safe to demonstrate too: try shrinking a ramp, opening purge before cutover,
-starting the mover before ratio 100%, or removing Garage before changing the tenant default. The UI
+starting the mover before ratio 100%, or removing `minio-a` before changing the tenant default. The UI
 must show the API's refusal text verbatim.
 
 ## Stop
