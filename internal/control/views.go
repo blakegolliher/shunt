@@ -131,9 +131,9 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 	}
 	view := PlacementView{PlacementStatus: s.placementStatus(key, p), Operations: []string{}, Clusters: map[string]ClusterStatus{}}
 	view.Fence = s.fenceStatus(r.Context(), p)
-	if p.Source != "" {
+	if pv := moving(p); pv.Source != "" {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		n, err := s.uploadsInProgress(ctx, p.Source, p.Names[p.Source])
+		n, err := s.uploadsInProgress(ctx, pv.Source, pv.Names[pv.Source])
 		cancel()
 		if err != nil {
 			view.SourceUploadsError = err.Error()

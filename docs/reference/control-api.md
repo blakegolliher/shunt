@@ -65,7 +65,7 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
 }
 ```
 
-A bucket spread over legs (ADR-0018 N2) has empty `primary` and `names` and a `legs` list instead: `{"id", "cluster", "bucket", "share"}` per leg in key-space order, `share` being its fraction of the key hash space.
+A bucket spread over legs (ADR-0018 N2) has empty `primary` and `names` and a `legs` list instead: `{"id", "cluster", "bucket", "share", "ranges"}` per leg in key-space order, `share` being its fraction of the key hash space and `ranges` the hash ranges it owns (a new leg of a move owns none yet). While part of it moves (N3), `primary` and `source` are the move's two clusters and `move` says which part.
 
 `client_keys` counts the tenant's client keys whose bucket allowlist admits the bucket. At 0, shunt refuses every request for the bucket until a key is imported; the field is absent when this shunt holds no client keys at all.
 
@@ -185,6 +185,8 @@ and deletes answer 503 plus `Retry-After: 1` by default, or 403 with `reject: tr
 `{"ratio": 0.5, "prefixes": ["runs/2026-09/"], "to": "", "name": "", "create": false, "wait": "30s"}`
 
 A fenced change (see [The fleet](#the-fleet)). Enters or raises `RAMPING`. A key's writes go to the new primary when its hash is below `ratio` or it starts with one of the `prefixes`. The ratio and prefix set only grow (ADR-0004 race 5). Entering `RAMPING` records the hash as `ramp.hash` (`fnv1a-fmix64-v1`). Raising a ramp whose recorded hash this build does not implement is refused, because it would re-split keys. `to`, `name` and `create` are only needed when `expand` has not recorded a target. Returns a transition result (below).
+
+**Moving part of a bucket (ADR-0018 N3).** A first step (from `ACTIVE`, here or on `migrate`) with `"range": {"from": "0000000000000000", "to": "7fffffffffffffff"}` moves only the keys whose hash falls in the range, from the leg that owns all of them to `to`: the leg already on that cluster, or a new leg named `name` there (a plain bucket's primary becomes its first leg). The ratio is then a share of the range. Every later step, `migrate`, the mover, `cutover` and `purge-source` act on that move, and status reports its two clusters as `source` and `primary` with a `move` entry (`from`, `to`, `range`, `share`). `purge-source` compares and deletes only the range's keys, and deletes the source bucket only if its leg owns nothing else; `finish` is refused while the source leg keeps other keys, since the range's copies there would be strays. When the move ends the destination owns the range, and a bucket one leg owns again returns to its plain form. One move at a time per bucket; one leg per cluster (N3b).
 
 ### `POST /v1/placements/{tenant}/{bucket}/migrate`
 

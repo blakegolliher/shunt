@@ -74,7 +74,8 @@ export interface PlacementStatus {
   read_only: boolean
   reject_writes: boolean
   client_keys?: number // keys that can reach the bucket; absent when this shunt holds no keys
-  legs?: { id: string; cluster: string; bucket: string; share: number }[] // a bucket spread over legs; primary and names are empty then
+  legs?: { id: string; cluster: string; bucket: string; share: number; ranges: { from: string; to: string }[] }[] // a bucket spread over legs; primary and names are empty then
+  move?: { from: string; to: string; range: { from: string; to: string }; share: number } // part of a spread bucket moving; primary and source are its clusters then
   ratio?: number
   prefixes?: string[]
   ramp_writes?: Record<string, number>

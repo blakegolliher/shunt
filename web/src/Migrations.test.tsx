@@ -114,3 +114,30 @@ test('the ramp slider keeps its setting across live reloads', async () => {
   expect(screen.getByText(/Traffic ratio: 100% to target/)).toHaveTextContent('(applied 100%)')
   expect(screen.getByRole('button', { name: 'Apply ramp' })).toBeDisabled()
 })
+
+// The first step of an expanded bucket can move part of it: a leading share of the key space
+// (ADR-0018 N3); during a move the screen says which part moves.
+test('starts a move of part of the bucket and shows which part moves', async () => {
+  const view = expandedView()
+  let args: unknown
+  migrationMock(view, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      args = (JSON.parse(String(init.body)) as { args: unknown }).args
+      return Response.json({ id: 'op-ramp', kind: 'ramp', placement: view.key, actor: 'token:123', status: 'succeeded', phase: 'done', version: 5 })
+    }
+  })
+  await openMigrations()
+  fireEvent.click(screen.getByLabelText('Part of the bucket'))
+  fireEvent.change(screen.getByLabelText('Share of keys to move'), { target: { value: '0.25' } })
+  fireEvent.click(screen.getByRole('button', { name: '50%' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Apply ramp' }))
+  await waitFor(() => expect(args).toEqual({ ratio: 0.5, prefixes: [], wait: '30s', range: { from: '0000000000000000', to: '3fffffffffffffff' } }))
+  vi.restoreAllMocks()
+
+  const moving: PlacementView = { ...expandedView(), state: 'RAMPING', primary: 'target', source: 'source', target: undefined, ratio: 0.5,
+    move: { from: 'source', to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, share: 0.25 } }
+  migrationMock(moving)
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Migrations' }))
+  expect(await screen.findByText(/of the bucket's keys, leg source → leg target/)).toHaveTextContent('Moving 25% of the bucket')
+})

@@ -313,6 +313,9 @@ type PlacementStatus struct {
 	// Legs are the backend buckets of a bucket spread over legs (ADR-0018 N2), in key-space order;
 	// Primary and Names are empty then.
 	Legs []LegStatus `json:"legs,omitempty"`
+	// Move is the part of a spread bucket moving between legs; Primary and Source are its two
+	// clusters then (ADR-0018 N3).
+	Move *MoveStatus `json:"move,omitempty"`
 	// ClientKeys counts the tenant's client keys whose bucket allowlist admits this bucket: 0 means
 	// no request through shunt can reach it yet. Absent when this shunt holds no client keys.
 	ClientKeys *int `json:"client_keys,omitempty"`
@@ -320,10 +323,20 @@ type PlacementStatus struct {
 
 // LegStatus is one leg of a spread bucket: where it is, and the share of the key space it owns.
 type LegStatus struct {
-	ID      string  `json:"id"`
-	Cluster string  `json:"cluster"`
-	Bucket  string  `json:"bucket"`
-	Share   float64 `json:"share"` // fraction of the key hash space, 0..1
+	ID      string                `json:"id"`
+	Cluster string                `json:"cluster"`
+	Bucket  string                `json:"bucket"`
+	Share   float64               `json:"share"`  // fraction of the key hash space, 0..1
+	Ranges  []directory.HashRange `json:"ranges"` // the hash ranges it owns, in order
+}
+
+// MoveStatus is a move of part of a bucket: its legs, its range, and that range's share of the
+// key space.
+type MoveStatus struct {
+	From  string              `json:"from"`
+	To    string              `json:"to"`
+	Range directory.HashRange `json:"range"`
+	Share float64             `json:"share"`
 }
 
 // legStatuses lists a spread placement's legs in the order their ranges run.
@@ -332,13 +345,21 @@ func legStatuses(p directory.Placement) []LegStatus {
 	seen := map[string]int{}
 	for _, o := range p.Owners {
 		share := (float64(o.To) - float64(o.From) + 1) / (1 << 64)
+		rg := directory.HashRange{From: o.From, To: o.To}
 		if i, ok := seen[o.Leg]; ok {
 			out[i].Share += share
+			out[i].Ranges = append(out[i].Ranges, rg)
 			continue
 		}
 		l := p.Legs[o.Leg]
 		seen[o.Leg] = len(out)
-		out = append(out, LegStatus{ID: o.Leg, Cluster: l.Cluster, Bucket: l.Bucket, Share: share})
+		out = append(out, LegStatus{ID: o.Leg, Cluster: l.Cluster, Bucket: l.Bucket, Share: share, Ranges: []directory.HashRange{rg}})
+	}
+	for _, id := range sortedKeys(p.Legs) { // a leg owning nothing yet: a move's new destination
+		if _, ok := seen[id]; !ok {
+			l := p.Legs[id]
+			out = append(out, LegStatus{ID: id, Cluster: l.Cluster, Bucket: l.Bucket, Ranges: []directory.HashRange{}})
+		}
 	}
 	return out
 }
@@ -407,15 +428,21 @@ func endpoints(c config.Cluster) []string {
 	return c.Endpoints
 }
 
-func (s *Server) placementStatus(key string, p directory.Placement) PlacementStatus {
+func (s *Server) placementStatus(key string, pl directory.Placement) PlacementStatus {
+	// A bucket part of which is moving reads as the move's two clusters, so everything that shows a
+	// migration shows the move as one; Legs and Move say which part (ADR-0018 N3).
+	p := moving(pl)
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.Primary, Source: p.Source, Target: p.Target, Names: p.Names,
 		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites,
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Ramp != nil {
 		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
 	}
-	if p.Spread() {
-		ps.Legs = legStatuses(p)
+	if pl.Spread() {
+		ps.Legs = legStatuses(pl)
+	}
+	if m := pl.Move; m != nil {
+		ps.Move = &MoveStatus{From: m.From, To: m.To, Range: m.Range, Share: (float64(m.Range.To) - float64(m.Range.From) + 1) / (1 << 64)}
 	}
 	if s.Keys != nil {
 		tenant, bucket, _ := directory.SplitKey(key)

@@ -227,7 +227,7 @@ test('creates a bucket spread across clusters and shows its legs', async () => {
     if (url.endsWith('/placements/acme/wide/create-backend') && init?.method === 'POST') {
       sent = JSON.parse(String(init.body))
       const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
-        legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5 }, { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5 }] }
+        legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }] }, { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5, ranges: [{ from: '8000000000000000', to: 'ffffffffffffffff' }] }] }
       directory.placements = [placement]
       directory.version++
       return Response.json(placement)
@@ -251,4 +251,27 @@ test('creates a bucket spread across clusters and shows its legs', async () => {
   expect(screen.queryByRole('button', { name: 'Expand acme/wide' })).not.toBeInTheDocument()
   fireEvent.click(screen.getByText('spread: source + target'))
   expect(await screen.findAllByText('wide · 50% of keys', { exact: false })).toHaveLength(2)
+})
+
+test('moves part of a spread bucket leg to another cluster', async () => {
+  const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+    legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }] },
+      { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5, ranges: [{ from: '8000000000000000', to: 'ffffffffffffffff' }] }] }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let started: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      started = JSON.parse(String(init.body))
+      return Response.json({ id: 'op-1', kind: 'ramp', placement: 'acme/wide', actor: 'token:x', status: 'running', phase: 'queued' })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Move keys of acme/wide' }))
+  fireEvent.change(screen.getByLabelText("Share of the leg's keys"), { target: { value: '0.5' } })
+  expect(screen.getByText('Into its leg\'s bucket', { exact: false })).toHaveTextContent('wide')
+  fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
+  await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
+    args: { to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, ratio: 0.01, create: true, wait: '30s' } }))
 })

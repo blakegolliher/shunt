@@ -1,8 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23); N1 and N2 built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1 and N2 are built
-(below); N3 and N4 are not.
+Status: proposed (2026-09-23); N1, N2 and N3a built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2 and N3a are
+built (below); N3b, N3c and N4 are not.
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -161,6 +161,33 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   a common prefix they disagree (Garage and VAST in opposite ways), so the merge's rule of dropping
   anything at or before its last name is what keeps a listing exact (docs/reference/backend-compat.md,
   ADR-0019).
+
+## N3a as built (2026-09-23): moving part of a bucket between clusters
+
+- **A move is the two-cluster migration of its range.** `Placement.MoveView` is the move as a v1
+  migration: its state, the source leg as source, the destination leg as primary, the ramp limited
+  to the range (`ramp.range`, the ratio a share of the range). `Apply` applies a move's steps to that
+  view and writes the result back, so every rule of a migration holds for it without a second copy:
+  the ramp only grows, holds complete or release, MIGRATING and CUTOVER in order. The proxy narrows
+  a key in the moving range to the view (`migrate.Narrow`), and the control plane reasons about the
+  view in every step, the mover, cutover and purge (`moving(p)`).
+- **A first step with `range`** starts a move: from a plain bucket, whose primary becomes the leg
+  owning every key, or from a spread one; the range lies inside what one leg owns; the destination
+  is the leg on the target cluster or a new one. This is how a plain bucket becomes spread.
+- **When a move ends** the destination owns the range (`reassign`), a source leg left owning nothing
+  is dropped, and a bucket one leg owns again settles back to its plain form.
+- **Purge is limited to the range** and keeps the source bucket while its leg owns other keys.
+  **Finish is refused** then: left in place, the range's copies would be strays on a leg that stays,
+  and a later move into that leg would take them for the bucket's own. So no leg ever holds keys it
+  does not own, and a move into an existing leg needs no empty check.
+- **Proof:** the fleet property test and its negative control run the move of half a bucket too:
+  six runs each, 0 violations in 54,855 client operations with the fence, a violation in every run
+  without it. Proxy tests route a move of half a bucket through the handler (the in-range writes
+  stay on the source with the narrowing removed); a control test runs ramp through purge on half a
+  bucket and then the other half, and fails with purge's range filter removed.
+- **UI:** the first step of an expanded bucket can move a share of its key space; a spread bucket
+  has **Move keys** (a share of one leg's range to another cluster); the Migrations screen shows a
+  move as the migration it is, with which part moves.
 
 ## Open questions
 

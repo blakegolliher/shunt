@@ -1171,6 +1171,13 @@ func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
 	if tr.To != directory.StateRamping || tr.Primary != "vast02" || tr.Source != "vast01" || tr.Range == nil || *tr.Range != lower {
 		t.Fatalf("first step of the move: %+v", tr)
 	}
+	// Status shows the move as a migration between its two clusters, and which part moves.
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if ps := st.Placements[0]; ps.Source != "vast01" || ps.Primary != "vast02" || ps.Ratio != 1 || ps.Move == nil ||
+		ps.Move.Share < 0.499 || ps.Move.Share > 0.501 || len(ps.Legs) != 2 || ps.Legs[1].Share != 0 {
+		t.Fatalf("status during the move: %+v move %+v legs %+v", ps, ps.Move, ps.Legs)
+	}
 	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, &tr)
 	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
 	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }

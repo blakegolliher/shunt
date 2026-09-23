@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { fullRange, leadingShare } from '../hashRange'
 import {
   getMoverLedger,
   getOperation,
@@ -73,6 +74,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
   const [operation, setOperation] = useState<Operation | null>(null)
   const [ratio, setRatio] = useState(0.5)
   const [prefixes, setPrefixes] = useState('')
+  const [moveShare, setMoveShare] = useState(1) // the first step: every key (1), or a leading share of the key space
   const [acceptLoss, setAcceptLoss] = useState(false)
   const [cutoverWindow, setCutoverWindow] = useState('5s')
   const [purge, setPurge] = useState<PurgeDryRun | null>(null)
@@ -180,7 +182,8 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
   const mover = detail.mover
   const progress = operation?.progress
 
-  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s' })
+  const firstStep = detail.state === 'ACTIVE' && !detail.legs?.length
+  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s', ...(firstStep && moveShare < 1 ? { range: leadingShare(fullRange, moveShare) } : {}) })
   const dryRunPurge = async () => {
     const [tenant, bucket] = splitKey(key)
     setBusy(true)
@@ -205,6 +208,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
 
     <Card eyebrow="Migration" title={`${source || 'source'} → ${target || 'target'}`} action={<StateBadge state={detail.state} />}>
       <label className="mb-4 block text-sm text-muted">Bucket<select value={key} onChange={(event) => onSelect(event.target.value)} className={inputClass}>{candidates.map((item) => <option key={item.key} value={item.key}>{item.key}</option>)}</select></label>
+      {detail.move && <p className="mb-3 rounded-lg bg-ink-950 p-3 text-sm">Moving <span className="font-semibold text-ember-300">{Math.round(detail.move.share * 1000) / 10}%</span> of the bucket's keys, leg {detail.move.from} → leg {detail.move.to}; the rest of the bucket stays where it is.</p>}
       <FenceStatus held={detail.fence.held || operation?.phase === 'hold'} version={operation?.version ?? detail.fence.version} waitingOn={opWaiting} phase={operation?.status === 'running' ? operation.phase : undefined} />
       {operation && <div className="mt-3 rounded-lg bg-ink-950 p-3 text-xs"><span className="font-mono text-ember-300">{operation.id}</span><span className="ml-2 text-muted">{operation.kind} · {operation.status} · {operation.phase ?? 'done'}</span>{operation.error && <p className="mt-2 text-red-200">{operation.error.message}</p>}</div>}
     </Card>
@@ -214,6 +218,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
         <div>
           <div className="flex flex-wrap gap-2">{[0.01, 0.25, 0.5, 1].map((preset) => <button key={preset} type="button" disabled={preset < currentRatio} onClick={() => setRatio(preset)} className={`rounded-full border px-3 py-1.5 text-xs font-semibold disabled:opacity-30 ${ratio === preset ? 'border-ember-400 bg-ember-600 text-white' : 'border-ink-700 text-muted'}`}>{preset * 100}%</button>)}</div>
           <label className="mt-4 block text-sm font-medium">Traffic ratio: {Math.round(ratio * 100)}% to target <span className="text-muted">(applied {Math.round(currentRatio * 100)}%)</span><input aria-label="Traffic ratio" type="range" min={Math.max(0.01, currentRatio)} max="1" step="0.01" value={ratio} onChange={(event) => setRatio(Number(event.target.value))} className="mt-3 w-full accent-ember-500" /></label>
+          {firstStep && <fieldset className="mt-4 rounded-lg border border-ink-700 p-3"><legend className="px-2 text-sm font-medium">Keys to move</legend><div className="flex flex-wrap items-center gap-4 text-sm"><label className="flex items-center gap-2"><input type="radio" checked={moveShare >= 1} onChange={() => setMoveShare(1)} />All keys</label><label className="flex items-center gap-2"><input type="radio" checked={moveShare < 1} onChange={() => setMoveShare(0.5)} />Part of the bucket</label></div>{moveShare < 1 && <label className="mt-3 block text-sm">{Math.round(moveShare * 100)}% of the key space, chosen by key hash; the rest stays on {source}<input aria-label="Share of keys to move" type="range" min="0.01" max="0.99" step="0.01" value={moveShare} onChange={(event) => setMoveShare(Number(event.target.value))} className="mt-2 w-full accent-ember-500" /></label>}</fieldset>}
           <label className="mt-4 block text-sm font-medium">Prefix rules <span className="text-muted">(one per line)</span><textarea value={prefixes} onChange={(event) => setPrefixes(event.target.value)} rows={3} className={inputClass} placeholder="runs/2026-09/" /></label>
           <button type="button" disabled={busy || ratio < currentRatio || !target || operation?.status === 'running' || (detail.state !== 'ACTIVE' && detail.state !== 'RAMPING')} onClick={() => void applyRamp()} className="mt-4 rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Apply ramp</button>
           {detail.state === 'RAMPING' && currentRatio >= 1 && <button type="button" disabled={busy || operation?.status === 'running'} onClick={() => void run('migrate', { accept_lost_write_window: acceptLoss, wait: '30s' })} className="ml-3 mt-4 rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Enter MIGRATING</button>}

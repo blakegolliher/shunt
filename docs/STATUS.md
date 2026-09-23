@@ -142,6 +142,13 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   Listed directly, the legs held 204 and 209 keys with none on both; through either proxy, paged by
   1000 or 37, v2 or v1, the listing was exactly their 413; the delimited listing gave each of 4
   prefixes once; GetBucketVersioning answered `NotImplemented`.
+- **N3a done (2026-09-23): moving part of a bucket between clusters.** A first ramp or migrate step
+  with a `range` moves only those keys to another leg (a plain bucket becomes spread this way); the
+  move runs through ramp, migrate, the mover, cutover and purge as a migration of its range, and
+  ends with the destination owning it. Purge deletes only the range; finish is refused while the
+  source leg keeps other keys. Gate: fleet property test on a half-bucket move, 6 runs, 0 violations
+  in 54,855 operations, negative control failing every run; proxy and control tests with negative
+  controls; race suite, lint, 29 UI tests. Next: N3b (two legs on one cluster), N3c (consolidation).
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
