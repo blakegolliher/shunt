@@ -157,18 +157,18 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
 - **Upload ids keep their cluster prefix.** With one leg per cluster the prefix names the leg, so the
   leg-prefixed ids planned for N2 wait for N3, which allows two legs on one cluster.
 - **Step-out** reports a spread bucket as a blocker: its keys have to be in one leg first (N3).
-- **Backend check first:** `start-after` resumes exactly after a key on Garage and MinIO, and after a
-  common prefix only with U+10FFFF appended (docs/reference/backend-compat.md). VAST is still to
-  measure.
+- **Backend check first:** `start-after` resumes exactly after a key on Garage, MinIO and VAST. After
+  a common prefix they disagree (Garage and VAST in opposite ways), so the merge's rule of dropping
+  anything at or before its last name is what keeps a listing exact (docs/reference/backend-compat.md,
+  ADR-0019).
 
 ## Open questions
 
 - **Prefix rules.** Today a ramp may go by prefix (`runs/2026-09/`). Ownership here is by hash only.
   Either ownership rules become an ordered list of prefix-or-range → leg (more expressive, harder to
   validate as a partition), or prefix rules survive only inside a move's ramp.
-- **`start-after` across backends.** VAST, MinIO, Garage and AWS must honor `start-after` (and
-  `marker`) exactly as a lexicographic resume point on the decoded name; it goes into
-  docs/reference/backend-compat.md before N2.
+- **`start-after` across backends.** Measured on Garage, MinIO and VAST (2026-09-23,
+  docs/reference/backend-compat.md); AWS is not measured.
 - **The listing target** that would justify raising the cap: a p99 for a 1 000-key page at N legs,
   measured on the lab clusters.
 - **Rebalancing policy.** This ADR provides the mechanism (split, move). Whether shunt ever

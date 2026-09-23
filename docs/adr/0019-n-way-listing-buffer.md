@@ -28,9 +28,12 @@ for any body buffering.
   listed. A common prefix several legs report is one entry.
 - **The token does not grow with the legs:** `{last, prefix, done}` (base64 JSON). Every leg resumes
   with `start-after=last`, and after a common prefix with U+10FFFF appended, because Garage lists a
-  common prefix again after `start-after=<prefix>` and MinIO does not
-  (docs/reference/backend-compat.md). The merge drops anything at or before `last` whatever a backend
-  answers. ListObjects v1 resumes from `marker` the same way.
+  common prefix again after `start-after=<prefix>` and MinIO does not. VAST does the reverse: it
+  skips the prefix after `start-after=<prefix>` and lists it again after the suffix
+  (docs/reference/backend-compat.md). No one value is exact on all three, so the merge drops anything
+  at or before `last` whatever a backend answers; the backends only ever repeat, never skip. Without
+  that rule a delimited listing on VAST pages forever. ListObjects v1 resumes from `marker` the same
+  way.
 - **A leg whose bucket is missing fails the listing** (a 5xx), because an answer without it would
   be silently incomplete.
 

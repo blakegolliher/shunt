@@ -57,7 +57,10 @@ type fakeS3 struct {
 	redirect bool
 	listPad  int  // extra <Contents> entries in listings
 	escapes  bool // percent-encodes "/" in listing keys, as Garage 2.3.0 does
-	cutList  int  // > 0: listings promise a large Content-Length, send this many bytes, and die
+	// vastAfter resumes a delimited listing as VAST 5.5 does (docs/reference/backend-compat.md):
+	// start-after=<prefix> skips the prefix, and <prefix>+U+10FFFF lists it again.
+	vastAfter bool
+	cutList   int // > 0: listings promise a large Content-Length, send this many bytes, and die
 
 	ignoreINM     bool                 // accepts If-None-Match: * and overwrites anyway, as Garage 2.3.0 does
 	ignoreIfMatch bool                 // deletes whatever If-Match says, as a backend without conditional deletes does
@@ -362,6 +365,14 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// which the merge in internal/proxy/merge.go depends on.
 		prefix, delim := q.Get("prefix"), q.Get("delimiter")
 		after := q.Get("start-after")
+		if f.vastAfter && delim != "" {
+			switch {
+			case strings.HasSuffix(after, "\U0010FFFF"):
+				after = strings.TrimSuffix(strings.TrimSuffix(after, "\U0010FFFF"), delim) // before the prefix
+			case strings.HasSuffix(after, delim):
+				after += "\U0010FFFF" // past everything under the prefix
+			}
+		}
 		if t := q.Get("continuation-token"); t != "" {
 			after = t
 		}

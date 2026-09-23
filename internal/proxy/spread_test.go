@@ -236,6 +236,38 @@ func TestSpreadListingMergesPagesAndFilters(t *testing.T) {
 	}
 }
 
+// A delimited listing that resumes after a common prefix stays exact on backends that disagree
+// about it: Garage lists the prefix again after start-after=<prefix>, VAST after <prefix>+U+10FFFF
+// (docs/reference/backend-compat.md). The merge drops anything at or before its last name.
+func TestSpreadDelimitedResumeAcrossBackendBehaviours(t *testing.T) {
+	for _, vast := range []bool{false, true} {
+		m := newMixedRig(t, nil)
+		m.garage.vastAfter, m.minio.vastAfter = vast, vast
+		spread(t, m)
+		for _, key := range []string{"a/1", "a/2", "a/3", "a/4", "a-b", "b", "b/1", "b/2", "c/9", "z"} {
+			m.acme(t, "PUT", "/spread/"+key, []byte("x"))
+		}
+		var names []string
+		token := ""
+		for page := 0; page < 20; page++ {
+			target := "/spread?list-type=2&delimiter=/&max-keys=1"
+			if token != "" {
+				target += "&continuation-token=" + token
+			}
+			r := m.acme(t, "GET", target, nil)
+			names = append(names, listKeys(t, r.body, "Key")...)
+			names = append(names, listKeys(t, r.body, "Prefix")[1:]...)
+			if !strings.Contains(string(r.body), "<IsTruncated>true</IsTruncated>") {
+				break
+			}
+			token = between(r.body, "<NextContinuationToken>", "</NextContinuationToken>")
+		}
+		if strings.Join(names, ",") != "a-b,a/,b,b/,c/,z" {
+			t.Fatalf("vast=%v: delimited pages: %v", vast, names)
+		}
+	}
+}
+
 // A leg whose bucket is gone fails the listing: an answer from the other leg alone would be
 // silently incomplete.
 func TestSpreadListingFailsWithoutALeg(t *testing.T) {
