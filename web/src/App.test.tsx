@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { App } from './App'
 import { StoreProvider } from './store'
 
@@ -23,12 +23,13 @@ beforeEach(() => {
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json(fleet)
     if (url.endsWith('/v1/status?all=1')) return Response.json(directory)
+    if (url.endsWith('/v1/audit?limit=100')) return Response.json({ changes: [{ ts: '2026-09-22T12:00:00Z', actor: 'token:abc123def456', op: 'set-target', key: 'default/ui-demo', version: 12 }] })
     if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
     return new Response('', { status: 404 })
   })
 })
 
-afterEach(() => sessionStorage.clear())
+afterEach(() => { sessionStorage.clear(); vi.restoreAllMocks() })
 
 test('shows quorum and two live proxies from the control API', async () => {
   render(<StoreProvider><App /></StoreProvider>)
@@ -37,4 +38,27 @@ test('shows quorum and two live proxies from the control API', async () => {
   expect(screen.getByText('proxy-b')).toBeInTheDocument()
   expect(screen.getByText('2 live')).toBeInTheDocument()
   await waitFor(() => expect(fetch).toHaveBeenCalledWith('/v1/control', expect.objectContaining({ headers: expect.any(Headers) })))
+})
+
+test('shows the live audit tail instead of a placeholder screen', async () => {
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Audit' }))
+  expect(await screen.findByText('token:abc123def456')).toBeInTheDocument()
+  expect(screen.getByText('set-target')).toBeInTheDocument()
+  expect(screen.getByText('default/ui-demo')).toBeInTheDocument()
+})
+
+test('names quorum loss and disables the fiction that control is healthy', async () => {
+  vi.mocked(fetch).mockImplementation(async (input) => {
+    const url = String(input)
+    if (url.endsWith('/v1/control')) return Response.json({ ...control, cluster: { ...control.cluster, started: 1, has_quorum: false, leader: '' } })
+    if (url.endsWith('/v1/fleet')) return Response.json(fleet)
+    if (url.endsWith('/v1/status?all=1')) return Response.json(directory)
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    return new Response('', { status: 404 })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  expect(await screen.findByText(/Control-plane quorum is lost/)).toBeInTheDocument()
+  expect(screen.getByText(/quorum unavailable/)).toBeInTheDocument()
 })

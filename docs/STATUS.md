@@ -93,6 +93,20 @@ filesystem:
   exposed non-empty request-rate histories for Garage and MinIO and matched the verifier's p99 by
   6.43% (28,367 us versus 26,543 us). The dashboard screenshot is intentionally left for the
   operator's manual end-to-end pass rather than adding a browser runner on this host.
+- **UI-6 done (2026-09-22; browser acceptance is manual by operator choice; ADR-0017 accepted):**
+  `make demo-ui` builds the real embedded application and leaves a seeded three-control/two-proxy
+  Garage-to-MinIO fixture running, prints every URL and credential needed by the walkthrough, and
+  starts consecutive checked workloads after the source is adopted; `make demo-ui-down` stops only
+  its recorded process groups, including the verifier. The Audit screen is live, global control
+  errors and quorum loss are explicit, and the migration finish supplies the tenant-default change
+  needed before removing the old cluster. `docs/demo-ui.md` is the complete eight-step handoff.
+  The fixture produced 68,945 verifier operations with 0 errors and teardown left no process or
+  demo port; UI build/lint and all 20 unit/accessibility tests, Go build/lint/test/race, shellcheck,
+  and the production-license gate are green (44 npm packages, no copyleft; both Go binaries fully
+  noticed). The final fleet run was green, including 13,118 operations with 0 errors through quorum
+  loss, cache restart, mover convergence, cutover and purge; telemetry p99 differed by 3.24%. At the
+  operator's request Playwright is not added: the visual flow and UI-5 screenshot are the remaining
+  manual acceptance pass, not an automated browser gate.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

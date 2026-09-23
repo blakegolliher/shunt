@@ -5,6 +5,9 @@ serves it at `/`. `make ui-dev` runs Vite on `127.0.0.1:5173` and proxies `/v1` 
 `SHUNT_CONTROL_URL` (default `http://127.0.0.1:9901`). The bearer token stays in `sessionStorage`
 and the SSE client uses authenticated `fetch`, never a token-bearing URL.
 
+`make demo-ui` builds the app before both Go binaries and leaves the full local fleet running for
+the manual script in `docs/demo-ui.md`; `make demo-ui-down` stops only that fixture's recorded PIDs.
+
 `src/api/routes.json` is the reviewed list of API routes reached by the browser. The Go parity test
 requires every entry to exist in `docs/reference/control-routes.json` and normally to name a CLI
 verb. These browser read models deliberately have no one-to-one CLI verb and are named in the

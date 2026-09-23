@@ -1,6 +1,6 @@
 # ADR-0017: a web UI over the control API
 
-Status: proposed (UI-0, 2026-09-22): the API decisions below are built in UI-0; the browser stack lands from UI-2 and the ADR is accepted at UI-6's gate. Overrides the "a web UI" entry of docs/DESIGN.md §3 (non-goals for v1) on the `distributed` branch. Supersedes item 1 of docs/prompts/P3e.md. Source: docs/prompts/webui.md.
+Status: accepted (UI-6, 2026-09-22). UI-0 through UI-6 are built and their Go, UI-unit, fleet and license gates pass; browser-flow and screenshot acceptance are manual by the operator's explicit choice. Overrides the "a web UI" entry of docs/DESIGN.md §3 (non-goals for v1) on the `distributed` branch. Supersedes item 1 of docs/prompts/P3e.md. Source: docs/prompts/webui.md.
 
 ## Context
 

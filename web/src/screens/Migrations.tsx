@@ -6,6 +6,7 @@ import {
   purgeSourceDryRun,
   removeCluster,
   removeClusterDryRun,
+  setTenantDefault,
   startOperation,
 } from '../api/client'
 import type { LedgerEntry, Operation, PlacementView, PurgeDryRun, RemoveDryRun } from '../api/client'
@@ -60,6 +61,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
   const { token, directory, fleet, lastEvent, notify, refresh } = useStore()
   const candidates = useMemo(() => (directory?.placements ?? []).filter((item) => item.target || item.source || item.state !== 'ACTIVE'), [directory])
   const key = selected || candidates[0]?.key || ''
+  const [tenant] = splitKey(key || '/')
   const [detail, setDetail] = useState<PlacementView | null>(null)
   const [operation, setOperation] = useState<Operation | null>(null)
   const [ratio, setRatio] = useState(0.5)
@@ -157,6 +159,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
   const moverNeedsAcceptance = assumedTarget || unsafeTarget
   const moverReady = detail.state === 'MIGRATING' || detail.state === 'RAMPING' && currentRatio >= 1
   const formerSourceStatus = directory?.clusters.find((cluster) => cluster.name === formerSource)
+  const sourceIsTenantDefault = Boolean(formerSourceStatus?.references?.includes(`tenants.${tenant}.default_cluster`))
   const canRemoveFormerSource = detail.state === 'ACTIVE' && Boolean(formerSource) && (formerSourceStatus?.references?.length ?? 0) === 0
   const mover = detail.mover
   const progress = operation?.progress
@@ -226,7 +229,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
 
     <Card eyebrow="Step 8" title="Purge or forget the source">
       <p className="text-sm text-muted">Purge deletes the source only after a server-side diff and confirmation token. Forget returns to ACTIVE but leaves the source bucket untouched.</p>
-      <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={busy || operation?.status === 'running'} onClick={() => void dryRunPurge()} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Dry-run purge</button><button type="button" disabled={busy || detail.state !== 'CUTOVER' || operation?.status === 'running'} onClick={() => void run('finish')} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold disabled:opacity-50">Forget source without deleting</button>{canRemoveFormerSource && <button type="button" onClick={() => void dryRunRemove()} className="rounded-lg border border-red-600 px-4 py-2 text-sm font-semibold text-red-200">Remove {formerSource}</button>}</div>
+      <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={busy || operation?.status === 'running'} onClick={() => void dryRunPurge()} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Dry-run purge</button><button type="button" disabled={busy || detail.state !== 'CUTOVER' || operation?.status === 'running'} onClick={() => void run('finish')} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold disabled:opacity-50">Forget source without deleting</button>{detail.state === 'ACTIVE' && sourceIsTenantDefault && <button type="button" disabled={busy} onClick={() => { setBusy(true); void setTenantDefault(token, tenant, detail.primary).then(async () => { notify(`${detail.primary} is now ${tenant}'s default`); await refresh() }).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')).finally(() => setBusy(false)) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.primary} tenant default</button>}{canRemoveFormerSource && <button type="button" onClick={() => void dryRunRemove()} className="rounded-lg border border-red-600 px-4 py-2 text-sm font-semibold text-red-200">Remove {formerSource}</button>}</div>
     </Card>
 
     <ConfirmDrawer open={purge !== null} title={`Purge ${purge?.source ?? 'source bucket'}`} destructive busy={busy || operation?.status === 'running'} disabled={!purge?.allowed || !purge.token} onClose={() => setPurge(null)} onConfirm={() => { if (purge?.allowed && purge.token) { setFormerSource(purge.source ?? formerSource); void run('purge-source', { token: purge.token, wait: '30s' }).then(() => setPurge(null)) } }} summary={purge?.allowed ? <p>Delete <strong>{purge.objects.toLocaleString()} objects</strong> ({humanBytes(purge.bytes)}) and abort {purge.uploads_in_flight} uploads from <span className="font-mono text-paper">{purge.source}/{purge.bucket}</span>.</p> : <p className="text-red-200">{purge?.reason}</p>}><p className="text-xs text-muted">Confirmation token expires at {purge?.expires_at ? new Date(purge.expires_at).toLocaleTimeString() : '—'}.</p></ConfirmDrawer>

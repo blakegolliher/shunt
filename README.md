@@ -16,6 +16,9 @@ make build          # → bin/shunt
 make all            # build, lint, tests, -race, fuzz
 ```
 
+For the browser workflow, `make demo-ui` builds the UI and leaves a three-control/two-proxy local
+fleet running; follow [docs/demo-ui.md](docs/demo-ui.md), then stop it with `make demo-ui-down`.
+
 ## Commands at a glance
 
 | Command | What it does |

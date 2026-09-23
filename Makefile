@@ -40,7 +40,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough demo-ui demo-ui-down s3diff s3diff-mixed bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -241,6 +241,14 @@ readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cl
 
 fleet: build ## P3c: three shunt-control nodes and two proxies sharing nothing: the fence, quorum loss, a cache restart (ADR-0015, ADR-0016); needs make e2e-up
 	$(E2E_DIR)/fleet.sh $(FLEET_ARGS)
+
+demo-ui: e2e-up ## build and leave a three-control/two-proxy UI demo fleet running
+	$(MAKE) ui
+	$(MAKE) build
+	$(E2E_DIR)/demo-ui.sh
+
+demo-ui-down: ## stop only the processes started by make demo-ui
+	$(E2E_DIR)/demo-ui.sh --down
 
 run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster at VAST_ENDPOINT (foreground)
 	@test -n "$$VAST_ACCESS_KEY_ID" && test -n "$$VAST_SECRET_ACCESS_KEY" || { echo "export VAST_ACCESS_KEY_ID and VAST_SECRET_ACCESS_KEY first"; exit 1; }

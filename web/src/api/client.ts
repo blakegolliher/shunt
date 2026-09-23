@@ -186,6 +186,14 @@ export interface LedgerEntry {
   took?: string
 }
 
+export interface AuditChange {
+  ts: string
+  actor: string
+  op: string
+  key?: string
+  version: number
+}
+
 export interface TelemetryPoint {
   start: string
   end: string
@@ -259,6 +267,8 @@ export const startOperation = (token: string, kind: string, placement: string, a
 export const getOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}`, token)
 export const purgeSourceDryRun = (token: string, tenant: string, bucket: string) => request<PurgeDryRun>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/purge-source`, token, json({ dry_run: true, wait: '30s' }))
 export const getMoverLedger = (token: string, tenant: string, bucket: string) => request<{ entries: LedgerEntry[] }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/mover-ledger?limit=20`, token)
+export const setTenantDefault = (token: string, tenant: string, cluster: string) => request(`${apiRoot}/tenants/${encodeURIComponent(tenant)}/default-cluster`, token, json({ cluster }))
+export const getAudit = (token: string, limit = 100) => request<{ changes: AuditChange[] }>(`${apiRoot}/audit?limit=${limit}`, token)
 
 export function parseSSEFrame(frame: string): StreamEvent | null {
   let id = ''
