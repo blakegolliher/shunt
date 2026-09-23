@@ -148,7 +148,14 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   ends with the destination owning it. Purge deletes only the range; finish is refused while the
   source leg keeps other keys. Gate: fleet property test on a half-bucket move, 6 runs, 0 violations
   in 54,855 operations, negative control failing every run; proxy and control tests with negative
-  controls; race suite, lint, 29 UI tests. Next: N3b (two legs on one cluster), N3c (consolidation).
+  controls; race suite, lint, 29 UI tests. **Live (2026-09-23):** a plain bucket on minio01 moved the
+  lower half of its key space to a new leg on minio02 (ramp 25/60/100% held, migrate, mover converged
+  on pass 2, 5 s cutover, purge of the range's 83 objects) under two concurrent `shunt verify` runs,
+  one per proxy: 231,172 operations, and the only errors were the 311 hold 503s of ADR-0016, which
+  the proxies counted exactly (163 and 148; verify does not retry them). Afterwards minio01 held
+  only upper-half keys (266) and minio02 only lower-half keys (271), none on both, the listing was
+  their union, and every seeded object read back. Next: N3b (two legs on one cluster), N3c
+  (consolidation).
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
