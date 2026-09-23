@@ -651,6 +651,13 @@ func (s *Store) Adopt(ctx context.Context, tenant, bucket, cluster, backend, act
 	})
 }
 
+// CreateSpread implements directory.Store.
+func (s *Store) CreateSpread(ctx context.Context, tenant, bucket string, legs []directory.Leg, actor string) error {
+	return s.mutate(ctx, actor, "create-spread", directory.Key(tenant, bucket), func(st *state) error {
+		return st.file.CreateSpread(tenant, bucket, legs, s.now())
+	})
+}
+
 // ClearTarget implements directory.Store.
 func (s *Store) ClearTarget(ctx context.Context, tenant, bucket, actor string) error {
 	return s.mutate(ctx, actor, "clear-target", directory.Key(tenant, bucket), func(st *state) error { return st.file.ClearTarget(tenant, bucket) })

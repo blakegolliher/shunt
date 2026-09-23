@@ -10,11 +10,12 @@ import (
 )
 
 // Schema v2 of a placement (ADR-0018): legs, a table of hash ranges that says which leg owns each
-// key, and at most one move. Build N1 reads it and writes v1: every decoder converts a v2 placement
-// into the v1 fields (Primary, Source, Target, Names, Ramp, Cutover) and clears the v2 ones, so
-// the rest of shunt sees one form. A v2 placement this build cannot route that way is refused,
-// never guessed at: several owners, two legs on one cluster, or a move of part of the key space
-// need the builds after N1.
+// key, and at most one move. A placement whose one leg owns every key is converted on decode into
+// the v1 fields (Primary, Source, Target, Names, Ramp, Cutover), so the rest of shunt sees one form
+// for it (N1). A placement whose keys several legs own is spread (N2): it stays in v2 form, ACTIVE,
+// with Primary and Names empty, and the proxy narrows it to one leg per key (migrate.Narrow). What
+// this build cannot route is refused, never guessed at: two legs on one cluster, a moving or tiered
+// spread placement, or a move of part of the key space need ADR-0018 N3.
 
 // MaxLegs caps a placement's legs (ADR-0018). Removal criterion: raised only by an amendment to
 // ADR-0018, once the N-way listing benchmark meets its target at the new cap.
@@ -100,8 +101,8 @@ func (p *Placement) fromV2() error {
 		}
 		names[l.Cluster] = l.Bucket
 	}
-	if len(p.Owners) != 1 {
-		return fmt.Errorf("owners: %d ranges; this build routes a placement whose one leg owns every key (ADR-0018 N2)", len(p.Owners))
+	if len(p.Owners) > 1 {
+		return checkSpread(p)
 	}
 	owner := p.Owners[0].Leg
 	v1 := *p
@@ -130,6 +131,40 @@ func (p *Placement) fromV2() error {
 	}
 	*p = v1
 	return nil
+}
+
+// Spread reports whether several legs own p's keys (ADR-0018 N2). A spread placement keeps its v2
+// fields in memory; its Primary and Names are empty.
+func (p *Placement) Spread() bool { return len(p.Owners) > 1 }
+
+// checkSpread is what N2 routes of a spread placement: ACTIVE, at rest, untiered. Moving keys
+// between legs, a target, and a cold tier across legs are N3.
+func checkSpread(p *Placement) error {
+	switch {
+	case p.State != StateActive:
+		return fmt.Errorf("state: a placement spread over legs is ACTIVE in this build; moving keys between legs is ADR-0018 N3")
+	case p.Move != nil:
+		return fmt.Errorf("move: a placement spread over legs does not move in this build (ADR-0018 N3)")
+	case p.Target != "" || p.Cold != "" || p.Tier != "" || p.Lifecycle != "":
+		return fmt.Errorf("target, cold, tier and lifecycle are not set on a placement spread over legs in this build (ADR-0018 N3)")
+	}
+	return nil
+}
+
+// EvenOwners splits the key hash space into len(legs) ranges of equal width, in the order given.
+func EvenOwners(legs []string) []Owner {
+	n := uint64(len(legs))
+	out := make([]Owner, 0, n)
+	width := math.MaxUint64 / n
+	for i, leg := range legs {
+		from := Hash(uint64(i) * width)
+		to := Hash(uint64(i+1)*width - 1)
+		if i == len(legs)-1 {
+			to = math.MaxUint64
+		}
+		out = append(out, Owner{From: from, To: to, Leg: leg})
+	}
+	return out
 }
 
 // checkV2 checks what schema v2 says on its own, before any conversion: the legs, that the owners
@@ -220,6 +255,9 @@ func checkOwners(owners []Owner, legs map[string]Leg) error {
 // holds the keys at rest the only owner (the source while a move is in progress), and the move
 // from it to the primary. It is what N2 will write; N1 uses it to prove every reader round-trips.
 func (p Placement) ToV2() Placement {
+	if p.Spread() {
+		return p.clone() // already v2
+	}
 	v2 := p.clone()
 	v2.Primary, v2.Source, v2.Names, v2.Ramp, v2.Cutover = "", "", nil, nil, nil
 	v2.Legs = make(map[string]Leg, len(p.Names))

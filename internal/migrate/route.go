@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -188,6 +189,42 @@ func InHold(r *directory.Ramp, key string) (bool, error) {
 		return false, nil
 	}
 	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes}, key)
+}
+
+// OwnerOf returns the id of the leg that owns key in a placement spread over legs (ADR-0018 N2):
+// the leg whose hash range holds the key's hash, by the placement's own hash. A placement naming a
+// hash this build does not implement is refused with ErrUnknownRampHash, never split differently.
+func OwnerOf(p *directory.Placement, key string) (string, error) {
+	if p.KeyHash != directory.RampHash {
+		return "", fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
+	}
+	h := directory.Hash(rampHash(key))
+	i := sort.Search(len(p.Owners), func(i int) bool { return p.Owners[i].To >= h })
+	if i == len(p.Owners) {
+		return "", fmt.Errorf("owners do not cover hash %016x", uint64(h)) // validation makes this unreachable
+	}
+	return p.Owners[i].Leg, nil
+}
+
+// Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the
+// key, a plain one-cluster placement that every per-object path routes as it always has. A leg is
+// the only home of its keys at rest, so there is no fallback and nothing to merge.
+func Narrow(p *directory.Placement, key string) (directory.Placement, error) {
+	id, err := OwnerOf(p, key)
+	if err != nil {
+		return directory.Placement{}, err
+	}
+	return onLeg(p, id), nil
+}
+
+// FirstLeg is a spread placement narrowed to the leg owning the start of the key space: where a
+// bucket-level request that every leg answers alike (HeadBucket, GetBucketLocation) goes.
+func FirstLeg(p *directory.Placement) directory.Placement { return onLeg(p, p.Owners[0].Leg) }
+
+func onLeg(p *directory.Placement, id string) directory.Placement {
+	l := p.Legs[id]
+	return directory.Placement{State: directory.StateActive, Primary: l.Cluster, Names: map[string]string{l.Cluster: l.Bucket},
+		Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
 }
 
 // rampHash is directory.RampHash, fnv1a-fmix64-v1. Its values are pinned by a test: changing them

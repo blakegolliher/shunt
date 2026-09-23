@@ -109,6 +109,13 @@ func (p Placement) clone() Placement {
 		ev := *p.Cutover
 		c.Cutover = &ev
 	}
+	c.Legs = maps.Clone(p.Legs)
+	c.Owners = slices.Clone(p.Owners)
+	if p.Move != nil {
+		m := *p.Move
+		m.Ramp, m.Cutover = v2ramp(p.Move.Ramp), v2cutover(p.Move.Cutover)
+		c.Move = &m
+	}
 	return c
 }
 
@@ -149,6 +156,9 @@ func References(f *File, cluster string) []string {
 	for _, k := range sortedKeys(f.Placements) {
 		p := f.Placements[k]
 		_, named := p.Names[cluster]
+		for _, l := range p.Legs {
+			named = named || l.Cluster == cluster
+		}
 		if p.Primary == cluster || p.Source == cluster || p.Target == cluster || p.Cold == cluster || named {
 			refs = append(refs, "placements."+k)
 		}
@@ -234,6 +244,8 @@ type Store interface {
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.
 	SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
+	// CreateSpread writes an ACTIVE placement spread over one leg per cluster (ADR-0018 N2).
+	CreateSpread(ctx context.Context, tenant, bucket string, legs []Leg, actor string) error
 	// ClearTarget forgets an ACTIVE placement's prepared target before any step has used it.
 	ClearTarget(ctx context.Context, tenant, bucket, actor string) error
 	// SetTenantDefault changes where a tenant's new buckets are created.

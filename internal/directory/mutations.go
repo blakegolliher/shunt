@@ -146,6 +146,35 @@ func (f *File) Adopt(tenant, bucket, cluster, backend string, now time.Time) err
 	return nil
 }
 
+// CreateSpread writes an ACTIVE placement spread over legs, one per cluster, owning equal ranges of
+// the key hash space in the order given (ADR-0018 N2). Each leg is named after its cluster. A new
+// tenant gets the first leg's cluster as its default.
+func (f *File) CreateSpread(tenant, bucket string, legs []Leg, now time.Time) error {
+	k := Key(tenant, bucket)
+	if _, ok := f.Placements[k]; ok {
+		return ErrExists
+	}
+	if len(legs) < 2 || len(legs) > MaxLegs {
+		return fmt.Errorf("%w: a spread bucket has 2 to %d legs, not %d", ErrConflict, MaxLegs, len(legs))
+	}
+	byID := make(map[string]Leg, len(legs))
+	ids := make([]string, 0, len(legs))
+	for _, l := range legs {
+		if _, dup := byID[l.Cluster]; dup {
+			return fmt.Errorf("%w: cluster %s is named twice; this build puts one leg on each cluster (ADR-0018 N3)", ErrConflict, l.Cluster)
+		}
+		byID[l.Cluster] = l
+		ids = append(ids, l.Cluster)
+	}
+	f.ensureMaps()
+	if _, ok := f.Tenants[tenant]; !ok {
+		f.Tenants[tenant] = Tenant{DefaultCluster: legs[0].Cluster}
+	}
+	f.Placements[k] = Placement{State: StateActive, Legs: byID, Owners: EvenOwners(ids), KeyHash: RampHash,
+		Created: now.UTC().Truncate(time.Millisecond)}
+	return nil
+}
+
 // SetTarget records the cluster and backend bucket an ACTIVE placement will move to (shunt expand).
 func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 	k := Key(tenant, bucket)
@@ -155,6 +184,9 @@ func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 	}
 	if p.State != StateActive {
 		return fmt.Errorf("%w: %s is %s; expand prepares an ACTIVE placement", ErrConflict, k, p.State)
+	}
+	if p.Spread() {
+		return fmt.Errorf("%w: %s is spread over %d legs; expanding it is ADR-0018 N3", ErrConflict, k, len(p.Legs))
 	}
 	if p.Target != "" && p.Target != cluster {
 		return fmt.Errorf("%w: %s is already expanded to %s", ErrConflict, k, p.Target)

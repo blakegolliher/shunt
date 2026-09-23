@@ -115,6 +115,10 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 	if !e.oneOf(k+".state", p.State, States) {
 		return
 	}
+	if p.Spread() {
+		validateSpread(e, clusters, k, pk, p, used)
+		return
+	}
 	e.ref(clusters, k+".primary", p.Primary)
 	migrating := p.State != StateActive
 	if p.Target != "" {
@@ -196,6 +200,42 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 		}
 	}
 	validateTier(e, clusters, k, p)
+}
+
+// validateSpread checks a placement spread over legs (ADR-0018 N2): its v2 shape, what N2 routes,
+// and each leg as a backend bucket, never shared with another placement.
+func validateSpread(e *errs, clusters map[string]config.Cluster, k, pk string, p Placement, used map[[2]string]string) {
+	if err := checkV2(&p); err != nil {
+		e.add(k, "%s", err.Error())
+		return
+	}
+	if err := checkSpread(&p); err != nil {
+		e.add(k, "%s", err.Error())
+	}
+	if p.Primary != "" || p.Source != "" || p.Names != nil || p.Ramp != nil || p.Cutover != nil {
+		e.add(k, "a placement spread over legs names its buckets in legs, not in primary, source, names, ramp or cutover")
+	}
+	onCluster := map[string]string{}
+	for _, id := range sortedKeys(p.Legs) {
+		l, lk := p.Legs[id], k+".legs."+id
+		if !e.ref(clusters, lk+".cluster", l.Cluster) {
+			continue
+		}
+		if other, dup := onCluster[l.Cluster]; dup {
+			e.add(lk+".cluster", "legs %s and %s are both on cluster %q; this build routes one leg per cluster (ADR-0018 N3)", other, id, l.Cluster)
+		}
+		onCluster[l.Cluster] = id
+		switch {
+		case !s3.ValidBucketName(l.Bucket):
+			e.add(lk+".bucket", "%q is not a valid S3 bucket name", l.Bucket)
+		default:
+			if other, dup := used[[2]string{l.Cluster, l.Bucket}]; dup {
+				e.add(lk+".bucket", "backend bucket %q on cluster %q is already used by placement %q; placements must never share a backend bucket", l.Bucket, l.Cluster, other)
+			} else {
+				used[[2]string{l.Cluster, l.Bucket}] = pk
+			}
+		}
+	}
 }
 
 func validateTier(e *errs, clusters map[string]config.Cluster, k string, p Placement) {

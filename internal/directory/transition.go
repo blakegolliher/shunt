@@ -66,6 +66,9 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
 	}
+	if p.Spread() {
+		return fail("the bucket is spread over %d legs; moving it is ADR-0018 N3", len(p.Legs))
+	}
 	if t.Release {
 		return release(p)
 	}

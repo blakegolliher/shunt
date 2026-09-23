@@ -87,6 +87,18 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 	if !ok || !allowed(cred, bucket) {
 		return "", nil, s3.NoSuchBucket, "The source bucket does not exist."
 	}
+	if sp.Spread() {
+		// The source object lives on the leg that owns its key (ADR-0018 N2).
+		skey, kerr := url.PathUnescape(rawKey)
+		if kerr != nil {
+			return "", nil, s3.InvalidArgument, "x-amz-copy-source is not valid."
+		}
+		nsp, nerr := migrate.Narrow(sp, skey)
+		if nerr != nil {
+			return "", nil, s3.ServiceUnavailable, "The source bucket's key split cannot be routed by this proxy version."
+		}
+		sp = &nsp
+	}
 	// The backend can copy for itself only when the object is certainly on the cluster doing the
 	// copy: one cluster, and that cluster is the destination's.
 	settled := sp.State == directory.StateActive || sp.State == directory.StateCutover

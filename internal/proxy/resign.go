@@ -84,6 +84,29 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.InvalidBucketState, fmt.Sprintf("The bucket is %s; %s is refused until its migration completes.", p.State, info.Op))
 		return nil, false
 	}
+	if p.Spread() {
+		// A bucket spread over legs (ADR-0018 N2): a key's requests go to the leg that owns it, as a
+		// plain one-cluster bucket; listings merge every leg; a bucket-level request every leg answers
+		// alike goes to the first; any other would have to reach every leg, and is not supported yet.
+		switch {
+		case info.Level == s3.LevelObject:
+			np, err := migrate.Narrow(p, info.Key)
+			if err != nil {
+				h.answer(w, r, o, s3.ServiceUnavailable, "This bucket's key split cannot be routed by this proxy version. Try again later.")
+				return nil, false
+			}
+			p = &np
+		case info.Op == s3.OpListObjectsV2 || info.Op == s3.OpListObjects:
+			h.spreadListing(ctx, w, r, o, p, clusters)
+			return nil, false
+		case info.Op == s3.OpHeadBucket || info.Op == s3.OpGetBucketLocation:
+			np := migrate.FirstLeg(p)
+			p = &np
+		default:
+			h.answer(w, r, o, s3.NotImplemented, fmt.Sprintf("%s is not supported on a bucket spread over %d backend buckets yet (ADR-0018).", info.Op, len(p.Legs)))
+			return nil, false
+		}
+	}
 
 	rawQuery := r.URL.RawQuery
 	if id.Presigned {

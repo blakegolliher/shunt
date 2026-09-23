@@ -2,6 +2,8 @@ package directory
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -119,9 +121,9 @@ func TestV1WriterUnchanged(t *testing.T) {
 // placements the file does.
 func TestV2JSONRefusals(t *testing.T) {
 	for name, body := range map[string]string{
-		"two owners":   `{"state":"ACTIVE","hash":"fnv1a-fmix64-v1","legs":{"a":{"cluster":"garage","bucket":"x"},"b":{"cluster":"minio","bucket":"x"}},"owners":[{"from":"0000000000000000","to":"7fffffffffffffff","leg":"a"},{"from":"8000000000000000","to":"ffffffffffffffff","leg":"b"}]}`,
-		"both schemas": `{"state":"ACTIVE","primary":"garage","names":{"garage":"x"},"legs":{"a":{"cluster":"garage","bucket":"x"}},"owners":[{"from":"0000000000000000","to":"ffffffffffffffff","leg":"a"}]}`,
-		"short hash":   `{"state":"ACTIVE","legs":{"a":{"cluster":"garage","bucket":"x"}},"owners":[{"from":"0","to":"ffffffffffffffff","leg":"a"}]}`,
+		"spread, moving": `{"state":"RAMPING","hash":"fnv1a-fmix64-v1","legs":{"a":{"cluster":"garage","bucket":"x"},"b":{"cluster":"minio","bucket":"x"}},"owners":[{"from":"0000000000000000","to":"7fffffffffffffff","leg":"a"},{"from":"8000000000000000","to":"ffffffffffffffff","leg":"b"}],"move":{"range":{"from":"0000000000000000","to":"7fffffffffffffff"},"from":"a","to":"b"}}`,
+		"both schemas":   `{"state":"ACTIVE","primary":"garage","names":{"garage":"x"},"legs":{"a":{"cluster":"garage","bucket":"x"}},"owners":[{"from":"0000000000000000","to":"ffffffffffffffff","leg":"a"}]}`,
+		"short hash":     `{"state":"ACTIVE","legs":{"a":{"cluster":"garage","bucket":"x"}},"owners":[{"from":"0","to":"ffffffffffffffff","leg":"a"}]}`,
 	} {
 		var p Placement
 		if err := json.Unmarshal([]byte(body), &p); err == nil {
@@ -178,6 +180,95 @@ func BenchmarkParseV2(b *testing.B) {
 	for b.Loop() {
 		if _, err := parse(data); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// A spread placement stays in v2 form in memory, validates against the sample clusters, and
+// survives the directory file's YAML and the JSON of every other reader unchanged (ADR-0018 N2).
+func TestSpreadPlacementRoundTrips(t *testing.T) {
+	f, err := loadSample(t, "testdata/valid/spread-v2.yaml", sampleClusters(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.Placements["acme/spread"]
+	if !p.Spread() || p.Primary != "" || p.Names != nil || len(p.Legs) != 2 || p.Owners[1].Leg != "minio" {
+		t.Fatalf("spread placement in memory: %+v", p)
+	}
+	if plain := f.Placements["acme/plain"]; plain.Spread() || plain.Primary != "garage" {
+		t.Fatalf("a v1 placement next to it: %+v", plain)
+	}
+	body, err := marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := parse(body)
+	if err != nil {
+		t.Fatalf("written spread directory does not parse: %v\n%s", err, body)
+	}
+	if !reflect.DeepEqual(back.Placements["acme/spread"], p) {
+		t.Fatalf("YAML round trip:\n got  %+v\n want %+v", back.Placements["acme/spread"], p)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var j Placement
+	if err := json.Unmarshal(raw, &j); err != nil || !reflect.DeepEqual(j, p) {
+		t.Fatalf("JSON round trip: %v\n got  %+v\n want %+v\n%s", err, j, p, raw)
+	}
+	if refs := References(f, "minio"); len(refs) != 1 || refs[0] != "placements.acme/spread" {
+		t.Fatalf("a leg's cluster is referenced: %v", refs)
+	}
+}
+
+// CreateSpread splits the key space evenly, one leg per cluster, and nothing moves a spread
+// placement in this build: every transition and expand refuses it.
+func TestCreateSpreadAndItsGuards(t *testing.T) {
+	f := &File{Clusters: sampleClusters(t), Tenants: map[string]Tenant{}, Placements: map[string]Placement{}}
+	legs := []Leg{{Cluster: "garage", Bucket: "s-g"}, {Cluster: "minio", Bucket: "s-m"}, {Cluster: "cold", Bucket: "s-c"}}
+	if err := f.CreateSpread("acme", "spread", legs, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := validate(f); err != nil {
+		t.Fatalf("a created spread placement is invalid: %v", err)
+	}
+	p := f.Placements["acme/spread"]
+	if len(p.Owners) != 3 || p.Owners[0].Leg != "garage" || p.Owners[2].Leg != "cold" || p.KeyHash != RampHash || f.Tenants["acme"].DefaultCluster != "garage" {
+		t.Fatalf("created: %+v, tenant %+v", p, f.Tenants["acme"])
+	}
+	if err := checkOwners(p.Owners, p.Legs); err != nil {
+		t.Fatalf("owners do not partition the key space: %v", err)
+	}
+	for name, bad := range map[string][]Leg{
+		"one leg":      legs[:1],
+		"same cluster": {{Cluster: "garage", Bucket: "a"}, {Cluster: "garage", Bucket: "b"}},
+	} {
+		if err := f.CreateSpread("acme", "x-"+strings.ReplaceAll(name, " ", "-"), bad, time.Now()); !errors.Is(err, ErrConflict) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := f.CreateSpread("acme", "spread", legs, time.Now()); !errors.Is(err, ErrExists) {
+		t.Errorf("a second create: %v", err)
+	}
+	if err := f.SetTarget("acme", "spread", "minio", "x"); !errors.Is(err, ErrConflict) {
+		t.Errorf("expand of a spread bucket: %v", err)
+	}
+	if _, err := Apply(p, Transition{To: StateRamping, Target: "minio", Name: "x"}); err == nil || !strings.Contains(err.Error(), "spread over 3 legs") {
+		t.Errorf("a step on a spread bucket: %v", err)
+	}
+}
+
+func TestEvenOwners(t *testing.T) {
+	for n := 1; n <= MaxLegs; n++ {
+		ids := make([]string, n)
+		legs := map[string]Leg{}
+		for i := range ids {
+			ids[i] = fmt.Sprintf("l%d", i)
+			legs[ids[i]] = Leg{Cluster: ids[i], Bucket: "b"}
+		}
+		if err := checkOwners(EvenOwners(ids), legs); err != nil {
+			t.Fatalf("%d legs: %v", n, err)
 		}
 	}
 }

@@ -1,0 +1,6 @@
+# expect: placements.acme/two.legs.g.bucket
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/one: { state: ACTIVE, primary: garage, names: { garage: data } }
+  acme/two: { state: ACTIVE, hash: fnv1a-fmix64-v1, legs: { g: { cluster: garage, bucket: data }, m: { cluster: minio, bucket: data } }, owners: [ { from: "0000000000000000", to: "7fffffffffffffff", leg: g }, { from: "8000000000000000", to: ffffffffffffffff, leg: m } ] }
