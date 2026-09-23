@@ -416,6 +416,9 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant, bucket, _ := directory.SplitKey(key)
 	switch {
+	case p.Spread():
+		fail(w, refuse("%s is spread over %d backend buckets; adding one or moving keys between them is ADR-0018 N3", key, len(p.Legs)))
+		return
 	case p.State != directory.StateActive:
 		fail(w, refuse("%s is %s; expand prepares an ACTIVE placement", key, p.State))
 		return
@@ -1092,6 +1095,96 @@ func (s *Server) createPlacement(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
 }
 
+// createSpread is create-backend with legs: a new bucket spread over one backend bucket per cluster
+// (ADR-0018 N2). Everything is checked before anything is made: the client name, every leg's cluster
+// and name, that no leg's bucket exists yet, and the keys. Then the buckets are created, and a
+// failure removes only those this call made.
+func (s *Server) createSpread(w http.ResponseWriter, r *http.Request, tenant, bucket string, req CreateBackendRequest) {
+	if len(req.Legs) < 2 || len(req.Legs) > directory.MaxLegs {
+		writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("a spread bucket has 2 to %d legs, not %d", directory.MaxLegs, len(req.Legs)))
+		return
+	}
+	if err := s.clientNameFree(tenant, bucket); err != nil {
+		fail(w, err)
+		return
+	}
+	snap := s.Dir.Snapshot()
+	legs := make([]directory.Leg, 0, len(req.Legs))
+	backends := make([]backend, 0, len(req.Legs))
+	for _, l := range req.Legs {
+		if l.Name == "" {
+			l.Name = bucket
+		}
+		if !s3.ValidBucketName(l.Name) {
+			writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("%q is not a valid bucket name", l.Name))
+			return
+		}
+		for _, prev := range legs {
+			if prev.Cluster == l.Cluster {
+				fail(w, refuse("cluster %s is named twice; this build puts one leg on each cluster (ADR-0018 N3)", l.Cluster))
+				return
+			}
+		}
+		if c, ok := snap.Cluster(l.Cluster); ok && c.ReadOnly {
+			fail(w, refuse("cluster %s is read-only for maintenance", l.Cluster))
+			return
+		}
+		b, err := s.backendFor(l.Cluster)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		legs, backends = append(legs, directory.Leg{Cluster: l.Cluster, Bucket: l.Name}), append(backends, b)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	for i, l := range legs {
+		switch exists, herr := backends[i].bucketExists(ctx, l.Bucket); {
+		case herr != nil:
+			fail(w, herr)
+			return
+		case exists:
+			fail(w, refuse("bucket %s already exists on %s; a spread bucket's legs are new, empty buckets", l.Bucket, l.Cluster))
+			return
+		}
+	}
+	for _, k := range req.Keys {
+		k.Cluster = legs[0].Cluster
+		res, kerr := s.storeKey(ctx, tenant, k)
+		if kerr != nil {
+			fail(w, kerr)
+			return
+		}
+		s.info(actor(r), "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
+	}
+	var made []int
+	undo := func() {
+		for _, i := range made {
+			_, _ = backends[i].do(context.WithoutCancel(ctx), http.MethodDelete, legs[i].Bucket, "", nil, nil, nil)
+		}
+	}
+	for i, l := range legs {
+		created, err := backends[i].createBucket(ctx, l.Bucket)
+		if err != nil {
+			undo()
+			fail(w, err)
+			return
+		}
+		if created {
+			made = append(made, i)
+		}
+	}
+	if err := s.Dir.CreateSpread(r.Context(), tenant, bucket, legs, actor(r)); err != nil {
+		undo()
+		fail(w, err)
+		return
+	}
+	key := directory.Key(tenant, bucket)
+	p, _ := s.Dir.Snapshot().Lookup(tenant, bucket)
+	s.info(actor(r), "spread bucket created", "placement", key, "legs", len(legs), "version", s.Dir.Snapshot().Version())
+	writeJSON(w, http.StatusOK, s.placementStatus(key, *p))
+}
+
 // clientNameFree answers a client bucket name the tenant already uses, before adopt or create
 // touches a backend or imports a key, and says what the name is and what to do instead. The
 // directory write stays the authority: two concurrent calls both pass here, and one of them is
@@ -1100,6 +1193,9 @@ func (s *Server) clientNameFree(tenant, bucket string) error {
 	p, ok := s.Dir.Snapshot().Lookup(tenant, bucket)
 	if !ok {
 		return nil
+	}
+	if p.Spread() {
+		return nameTaken(fmt.Sprintf("%s already exists (spread over %d backend buckets); choose another client bucket name", directory.Key(tenant, bucket), len(p.Legs)))
 	}
 	return nameTaken(fmt.Sprintf("%s already exists (%s on %s as %s); choose another client bucket name, or expand %s to add a cluster to it",
 		directory.Key(tenant, bucket), p.State, p.Primary, p.Names[p.Primary], bucket))
@@ -1120,6 +1216,17 @@ type CreateBackendRequest struct {
 	// Keys are client keys the cluster knows, imported so clients can reach the new bucket through
 	// shunt (ADR-0012). Each is checked against Cluster before the bucket is created.
 	Keys []ClientKeyRequest `json:"keys,omitempty"`
+	// Legs, two or more, create a bucket spread over one backend bucket on each cluster, owning
+	// equal shares of the key space (ADR-0018 N2); Cluster and Name are then unused. Keys are
+	// checked against the first leg's cluster.
+	Legs []LegRequest `json:"legs,omitempty"`
+}
+
+// LegRequest is one leg of a spread bucket to create: a cluster, and the bucket's name there
+// (default the client bucket name).
+type LegRequest struct {
+	Cluster string `json:"cluster"`
+	Name    string `json:"name,omitempty"`
 }
 
 // createBackendPlacement is the browser's Create action: unlike the member-only /create route it
@@ -1130,6 +1237,10 @@ func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	if len(req.Legs) > 0 {
+		s.createSpread(w, r, tenant, bucket, req)
+		return
+	}
 	if req.Name == "" {
 		req.Name = bucket
 	}

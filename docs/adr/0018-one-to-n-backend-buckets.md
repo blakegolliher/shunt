@@ -1,8 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23); N1 built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1 is built (below);
-N2–N4 are not.
+Status: proposed (2026-09-23); N1 and N2 built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1 and N2 are built
+(below); N3 and N4 are not.
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -138,6 +138,28 @@ reader without 64-bit integers reads them exactly; quote a bound that YAML would
 This build refuses, with the reason, the v2 placements only later phases route: more than one
 owner (N2), two legs on one cluster or a move of part of the key space (N3), and more than
 `MaxLegs` legs.
+
+## N2 as built (2026-09-23)
+
+A bucket several legs own is **spread**. It stays in v2 form in memory (`Placement.Spread()`), with
+empty `Primary` and `Names`, and N2 routes it only at rest: ACTIVE, no move, no target, no tier, and
+one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it until N3.
+
+- **Creation only.** `create-backend` with `legs` (two to 32) makes one new, empty bucket per cluster
+  and splits the key hash space evenly (`EvenOwners`); adopting existing buckets into legs would need
+  a move. The UI's Create has a **Spread across clusters** choice.
+- **Object requests are narrowed to their owner** (`migrate.Narrow`): the proxy turns the placement
+  into a plain one-cluster placement on the leg owning the key, so PUT, GET, HEAD, DELETE, multipart,
+  conditional writes and both ends of a copy take the paths they always have.
+- **Listings** merge every leg (ADR-0019). HeadBucket and GetBucketLocation go to the first leg. Any
+  other bucket-level request, DeleteBucket, versioning, policy, lifecycle and ListMultipartUploads
+  among them, answers `NotImplemented`: it would have to reach every leg.
+- **Upload ids keep their cluster prefix.** With one leg per cluster the prefix names the leg, so the
+  leg-prefixed ids planned for N2 wait for N3, which allows two legs on one cluster.
+- **Step-out** reports a spread bucket as a blocker: its keys have to be in one leg first (N3).
+- **Backend check first:** `start-after` resumes exactly after a key on Garage and MinIO, and after a
+  common prefix only with U+10FFFF appended (docs/reference/backend-compat.md). VAST is still to
+  measure.
 
 ## Open questions
 

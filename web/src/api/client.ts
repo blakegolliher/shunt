@@ -74,6 +74,7 @@ export interface PlacementStatus {
   read_only: boolean
   reject_writes: boolean
   client_keys?: number // keys that can reach the bucket; absent when this shunt holds no keys
+  legs?: { id: string; cluster: string; bucket: string; share: number }[] // a bucket spread over legs; primary and names are empty then
   ratio?: number
   prefixes?: string[]
   ramp_writes?: Record<string, number>
@@ -258,7 +259,7 @@ export interface ClusterInput {
 export const probeCluster = (token: string, input: ClusterInput) => request<ClusterProbeResult>(`${apiRoot}/clusters/probe`, token, json(input))
 export const addCluster = (token: string, input: ClusterInput) => request<ClusterStatus>(`${apiRoot}/clusters`, token, json(input))
 export const adoptBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name?: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/adopt`, token, json(body))
-export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
+export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string; keys?: { access_key: string; secret: string; buckets?: string[] }[]; legs?: { cluster: string; name?: string }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
 export const expandBucket = (token: string, tenant: string, bucket: string, to: string, name?: string, acceptExisting = false) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, name, create: true, accept_existing_objects: acceptExisting || undefined }))
 export const clearTarget = (token: string, tenant: string, bucket: string) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/target`, token, { method: 'DELETE' })
 export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}/read-only`, token, json({ read_only: readOnly, reject }))

@@ -144,7 +144,7 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 	if ids := s.runningOperations(r.Context(), key); ids != nil {
 		view.Operations = ids
 	}
-	for _, name := range []string{p.Primary, p.Source, p.Target} {
+	for _, name := range placementClusters(p) {
 		if c, found := f.Clusters[name]; found {
 			view.Clusters[name] = clusterStatus(f, name, c)
 		}

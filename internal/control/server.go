@@ -310,9 +310,48 @@ type PlacementStatus struct {
 	Mover           *Progress                  `json:"mover,omitempty"`
 	ReadOnly        bool                       `json:"read_only"`
 	RejectWrites    bool                       `json:"reject_writes"`
+	// Legs are the backend buckets of a bucket spread over legs (ADR-0018 N2), in key-space order;
+	// Primary and Names are empty then.
+	Legs []LegStatus `json:"legs,omitempty"`
 	// ClientKeys counts the tenant's client keys whose bucket allowlist admits this bucket: 0 means
 	// no request through shunt can reach it yet. Absent when this shunt holds no client keys.
 	ClientKeys *int `json:"client_keys,omitempty"`
+}
+
+// LegStatus is one leg of a spread bucket: where it is, and the share of the key space it owns.
+type LegStatus struct {
+	ID      string  `json:"id"`
+	Cluster string  `json:"cluster"`
+	Bucket  string  `json:"bucket"`
+	Share   float64 `json:"share"` // fraction of the key hash space, 0..1
+}
+
+// legStatuses lists a spread placement's legs in the order their ranges run.
+func legStatuses(p directory.Placement) []LegStatus {
+	var out []LegStatus
+	seen := map[string]int{}
+	for _, o := range p.Owners {
+		share := (float64(o.To) - float64(o.From) + 1) / (1 << 64)
+		if i, ok := seen[o.Leg]; ok {
+			out[i].Share += share
+			continue
+		}
+		l := p.Legs[o.Leg]
+		seen[o.Leg] = len(out)
+		out = append(out, LegStatus{ID: o.Leg, Cluster: l.Cluster, Bucket: l.Bucket, Share: share})
+	}
+	return out
+}
+
+// placementClusters names every cluster a placement uses: its roles, or its legs when spread.
+func placementClusters(p directory.Placement) []string {
+	legs := legStatuses(p)
+	names := make([]string, 0, 3+len(legs))
+	names = append(names, p.Primary, p.Source, p.Target)
+	for _, l := range legs {
+		names = append(names, l.Cluster)
+	}
+	return names
 }
 
 // MigrationWindow is the fleet's last completed 10-second routing signal for one placement.
@@ -374,6 +413,9 @@ func (s *Server) placementStatus(key string, p directory.Placement) PlacementSta
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Ramp != nil {
 		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
+	}
+	if p.Spread() {
+		ps.Legs = legStatuses(p)
 	}
 	if s.Keys != nil {
 		tenant, bucket, _ := directory.SplitKey(key)
@@ -468,7 +510,7 @@ func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
 	if s.ClusterSecrets != nil {
 		secrets = s.ClusterSecrets()
 	}
-	for _, name := range []string{p.Primary, p.Source, p.Target} {
+	for _, name := range placementClusters(p) {
 		if c, found := f.Clusters[name]; found {
 			d.Clusters[name] = c
 			if v, ok := secrets[c.Credentials.SecretRef]; ok {

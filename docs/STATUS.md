@@ -127,6 +127,16 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   each (about 2 M inputs); race suite and lint green; `make walkthrough` (62,441 operations, 0
   errors) and `make readme-demo` green. `make fleet` was not run: its ports are held by the running
   UI demo.
+- **N2 done (2026-09-23): buckets spread over legs, at rest.** `create-backend` with `legs` (and
+  Create → Spread across clusters in the UI) makes a bucket whose keys are split by hash over one new
+  bucket per cluster. The proxy narrows every object request to the leg that owns its key and merges
+  listings across legs (v2 and v1) with a fixed-size token (ADR-0019); other bucket-level requests
+  answer `NotImplemented`. Nothing moves a spread bucket yet (N3). Gate: proxy tests route 60 keys
+  and multipart uploads to their owners and nowhere else, page merged listings with and without a
+  delimiter and hide a stray on the wrong leg (fails with the filter removed), fail a listing with a
+  leg missing, and copy both ways; control tests cover the create's refusals and the guards;
+  `FuzzSpreadToken` clean; `BenchmarkSpreadListingPage` about 2× a plain bucket, flat from 2 to 32
+  legs; race suite, lint and 26 UI tests green. Not yet run against live backends.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

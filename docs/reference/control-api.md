@@ -65,6 +65,8 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
 }
 ```
 
+A bucket spread over legs (ADR-0018 N2) has empty `primary` and `names` and a `legs` list instead: `{"id", "cluster", "bucket", "share"}` per leg in key-space order, `share` being its fraction of the key hash space.
+
 `client_keys` counts the tenant's client keys whose bucket allowlist admits the bucket. At 0, shunt refuses every request for the bucket until a key is imported; the field is absent when this shunt holds no client keys at all.
 
 `fallback_reads` counts read requests (GET and HEAD) that the source served after the primary answered 404, not distinct objects: `aws s3 cp` of one object sends a HEAD then a GET, so it counts two; a recursive copy sends only GETs. `ramp_writes`, `fallback_reads` and `dual_deletes` are this proxy's counters (`shunt_ramp_writes_total`, `shunt_migration_fallback_reads_total`, `shunt_migration_dual_delete_total`), read without creating series. `mover` is the last progress report, held in memory: it is lost when shunt restarts, and the next mover pass reports again.
@@ -145,7 +147,11 @@ bucket, then records it as an `ACTIVE` placement (creating the tenant when neede
 to the client bucket name. If the directory write fails, the newly created backend bucket is
 removed. An optional `"keys": [{"access_key": "…", "secret": "…", "buckets": ["data01"]}]` imports
 client keys as adopt's `keys` does: each is checked against the cluster before the bucket is
-created, and a refused key creates nothing. A client bucket name the tenant already uses answers
+created, and a refused key creates nothing. With `"legs": [{"cluster": "minio01", "name": "data02"}, {"cluster": "minio02"}]`
+(two to 32, one per cluster, `name` defaulting to the client bucket name) it creates a bucket spread over
+those legs instead (ADR-0018 N2): every leg's bucket must not exist yet, keys are checked against the
+first leg's cluster, the buckets are created, and the placement records the legs owning equal shares
+of the key hash space. `cluster` and `name` are then unused. A client bucket name the tenant already uses answers
 `conflict` as adopt does, before any backend request or key import; a backend bucket that already
 exists is refused (adopt takes over an existing bucket), and the cleanup after a failed directory
 write deletes only a bucket this call created. The member-only `/create` route remains the first half of a proxy's signed S3

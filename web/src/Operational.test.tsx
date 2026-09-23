@@ -219,3 +219,36 @@ test('clears an expanded target from the row, and expand can accept existing obj
   fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
   await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'old', create: true, accept_existing_objects: true }))
 })
+
+test('creates a bucket spread across clusters and shows its legs', async () => {
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [] }
+  let sent: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/wide/create-backend') && init?.method === 'POST') {
+      sent = JSON.parse(String(init.body))
+      const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+        legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5 }, { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5 }] }
+      directory.placements = [placement]
+      directory.version++
+      return Response.json(placement)
+    }
+    if (url.endsWith('/placements/acme/wide/view')) return Response.json({ ...directory.placements[0], fence: { version: directory.version, held: false, proxies: 0, waiting_on: [], silent: [] }, operations: [], clusters: { source, target } })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Create new' }))
+  fireEvent.change(screen.getByLabelText('Tenant'), { target: { value: 'acme' } })
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'wide' } })
+  fireEvent.click(screen.getByLabelText('source'))
+  fireEvent.click(screen.getByLabelText('target'))
+  expect(screen.getByText('(not used: spreading)')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Create bucket' }))
+  expect(await screen.findByText('Bucket acme/wide created, spread over 2 clusters')).toBeInTheDocument()
+  expect(sent).toEqual({ cluster: 'source', name: 'wide', legs: [{ cluster: 'source', name: 'wide' }, { cluster: 'target', name: 'wide' }] })
+  expect(await screen.findByText('spread: source + target')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Expand acme/wide' })).not.toBeInTheDocument()
+  fireEvent.click(screen.getByText('spread: source + target'))
+  expect(await screen.findAllByText('wide · 50% of keys', { exact: false })).toHaveLength(2)
+})

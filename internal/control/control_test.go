@@ -1085,6 +1085,60 @@ func TestExpandRefusesANonEmptyTargetAndClearsATarget(t *testing.T) {
 	rg.refused("DELETE", "/v1/placements/default/data01/target", nil, "is RAMPING, moving to vast02; a target can only be cleared before the first step")
 }
 
+// create-backend with legs makes a bucket spread over one new bucket per cluster (ADR-0018 N2):
+// everything is checked before anything is made, and nothing moves a spread bucket in this build.
+func TestCreateSpreadBucket(t *testing.T) {
+	rg := newRig(t)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+
+	rg.answers("POST", "/v1/placements/default/spd/create-backend", CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01"}}}, http.StatusBadRequest, "invalid")
+	rg.refused("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-one"}, {Cluster: "vast01", Name: "sp-two"}}}, "cluster vast01 is named twice")
+	if err := rg.vast02.be.CreateBucket("sp-b"); err != nil {
+		t.Fatal(err)
+	}
+	rg.refused("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-b"}}}, "bucket sp-b already exists on vast02")
+	if ok, _ := rg.vast01.be.BucketExists("sp-a"); ok {
+		t.Fatal("a refused spread create made a leg's bucket")
+	}
+
+	var ps PlacementStatus
+	rg.must("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-c"}}}, &ps)
+	if len(ps.Legs) != 2 || ps.Legs[0].Cluster != "vast01" || ps.Legs[1].Bucket != "sp-c" || ps.Primary != "" || ps.State != directory.StateActive {
+		t.Fatalf("created: %+v", ps)
+	}
+	if d := ps.Legs[0].Share + ps.Legs[1].Share; d < 0.999 || d > 1.001 || ps.Legs[0].Share < 0.49 {
+		t.Fatalf("shares: %+v", ps.Legs)
+	}
+	for _, b := range []struct {
+		cl   *fakeCluster
+		name string
+	}{{rg.vast01, "sp-a"}, {rg.vast02, "sp-c"}} {
+		if ok, _ := b.cl.be.BucketExists(b.name); !ok {
+			t.Fatalf("leg bucket %s was not created", b.name)
+		}
+	}
+	code, raw := rg.call("POST", "/v1/placements/default/spd/create-backend", CreateBackendRequest{Cluster: "vast01", Name: "other"}, nil)
+	if code != http.StatusConflict || !strings.Contains(raw, "default/spd already exists (spread over 2 backend buckets)") {
+		t.Fatalf("a taken spread name: HTTP %d %s", code, raw)
+	}
+	rg.refused("POST", "/v1/placements/default/spd/expand", ExpandRequest{To: "vast02", Create: true}, "spread over 2 backend buckets; adding one or moving keys between them is ADR-0018 N3")
+	rg.refused("POST", "/v1/placements/default/spd/ramp", RampRequest{Ratio: 0.5, To: "vast02", Create: true}, "spread over 2 legs")
+	var so StepOut
+	rg.must("GET", "/v1/tenants/default/step-out", nil, &so)
+	if so.Ready || len(so.Buckets) != 1 || len(so.Buckets[0].Problems) != 1 || !strings.Contains(so.Buckets[0].Problems[0], "spread over 2 backend buckets (vast01/sp-a, vast02/sp-c)") {
+		t.Fatalf("step-out of a spread bucket: %+v", so)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if len(st.Placements) != 1 || len(st.Placements[0].Legs) != 2 {
+		t.Fatalf("status: %+v", st.Placements)
+	}
+}
+
 // stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
 type stubKeys struct {
 	stored   []sigv4.Credential

@@ -65,6 +65,21 @@ func (s *Server) stepOut(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		p := f.Placements[key]
+		if p.Spread() {
+			// Its keys are split over several backend buckets: no single endpoint serves it.
+			b := StepOutBucket{Bucket: bucket, State: p.State, Problems: []string{}, Notes: []string{}}
+			var where []string
+			for _, l := range legStatuses(p) {
+				where = append(where, l.Cluster+"/"+l.Bucket)
+				if !slices.Contains(clusters, l.Cluster) {
+					clusters = append(clusters, l.Cluster)
+				}
+			}
+			b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is spread over %d backend buckets (%s): clients going direct need all its keys in one bucket; move them into one leg first (ADR-0018 N3)",
+				key, len(where), strings.Join(where, ", ")))
+			out.Buckets = append(out.Buckets, b)
+			continue
+		}
 		b := StepOutBucket{Bucket: bucket, State: p.State, Cluster: p.Primary, Name: p.Names[p.Primary], Problems: []string{}, Notes: []string{}}
 		if !slices.Contains(clusters, p.Primary) {
 			clusters = append(clusters, p.Primary)
