@@ -10,6 +10,17 @@ A_LISTEN=127.0.0.1:8038; A_ADMIN=127.0.0.1:9938
 B_LISTEN=127.0.0.1:8048; B_ADMIN=127.0.0.1:9948
 C1_API=127.0.0.1:9951; C2_API=127.0.0.1:9952; C3_API=127.0.0.1:9953
 C1_PEER=127.0.0.1:9961; C2_PEER=127.0.0.1:9962; C3_PEER=127.0.0.1:9963
+# SHUNT_DEMO_UI_BIND=0.0.0.0 (or one IPv4 address) serves the UI/control APIs and the two S3 listeners
+# there instead of loopback, for a browser on another host. Peers and admin listeners stay loopback,
+# and the local addresses above still reach everything. The control API is plain http: the bearer
+# token, cluster secrets and client secrets then cross the network in the clear.
+BIND=${SHUNT_DEMO_UI_BIND:-127.0.0.1}
+case $BIND in
+  127.*) EXPOSED= ;;
+  *[!0-9.]*|'') echo "SHUNT_DEMO_UI_BIND must be an IPv4 address or 0.0.0.0, not $BIND" >&2; exit 2 ;;
+  *) EXPOSED=1 ;;
+esac
+bound() { printf '%s:%s' "$BIND" "${1##*:}"; }
 
 case $WORK in
   "$ROOT"/test/e2e/data/*|/tmp/*) ;;
@@ -116,7 +127,7 @@ for i in $(seq 1 40); do printf 'shunt UI seed %03d\n' "$i" | on_garage s3 cp --
 for p in a b; do
   listen=$A_LISTEN; admin=$A_ADMIN; [ "$p" = b ] && { listen=$B_LISTEN; admin=$B_ADMIN; }
   cat > "$WORK/$p.yaml" <<EOF
-listener: { address: "$listen", plaintext: true }
+listener: { address: "$(bound "$listen")", plaintext: true }
 admin: { address: "$admin" }
 auth: { mode: resign }
 features: { debug_route_header: true }
@@ -139,10 +150,11 @@ wait_http() { for _ in $(seq 1 200); do curl -fsS "$1" >/dev/null 2>&1 && return
 start_control() {
   n=$1; mode=$2
   case $n in 1) api=$C1_API; peer=$C1_PEER ;; 2) api=$C2_API; peer=$C2_PEER ;; 3) api=$C3_API; peer=$C3_PEER ;; esac
+  exposure=(); [ -n "$EXPOSED" ] && exposure=(--plaintext)
   if [ "$mode" = init ]; then
-    nohup setsid "$CONTROL" init --name "c$n" --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$api" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 10s > "$WORK/c$n.log" 2>&1 &
+    nohup setsid "$CONTROL" init --name "c$n" --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$(bound "$api")" "${exposure[@]}" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 10s > "$WORK/c$n.log" 2>&1 &
   else
-    nohup setsid "$CONTROL" join --name "c$n" --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$api" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 10s --existing "http://$C1_API" > "$WORK/c$n.log" 2>&1 &
+    nohup setsid "$CONTROL" join --name "c$n" --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$(bound "$api")" "${exposure[@]}" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 10s --existing "http://$C1_API" > "$WORK/c$n.log" 2>&1 &
   fi
   pid=$!; printf 'c%s-group %s\n' "$n" "$pid" >> "$PIDS"
   wait_http "http://$api/-/healthz"
@@ -174,13 +186,19 @@ done
 [ "$(jq '[.members[] | select(.live)] | length' <<<"$fleet")" = 2 ]
 trap - ERR INT TERM
 
+UI_HOST=127.0.0.1
+if [ -n "$EXPOSED" ]; then
+  UI_HOST=$BIND
+  [ "$BIND" = 0.0.0.0 ] && UI_HOST=$(hostname -I | awk '{print $1}') # one of several; the note below lists them
+fi
+
 cat <<EOF
 
 Shunt UI demo fleet is ready.
 
-  UI:             http://$C1_API/
+  UI:             http://$UI_HOST:${C1_API##*:}/
   bearer token:   $TOKEN
-  S3 proxy:       http://$A_LISTEN
+  S3 proxy:       http://$UI_HOST:${A_LISTEN##*:} (and :${B_LISTEN##*:})
   source bucket:  ui-demo (40 seeded objects)
 
   Garage cluster: name garage, endpoint 127.0.0.1:3900, region garage
@@ -194,3 +212,7 @@ The verifier starts when default/ui-demo is adopted with the Garage client key.
 Logs and the mode-0600 environment file are in $WORK.
 Follow docs/demo-ui.md. Stop everything with: make demo-ui-down
 EOF
+if [ -n "$EXPOSED" ]; then
+  [ "$BIND" = 0.0.0.0 ] && printf '\nThis host answers on: %s\n' "$(hostname -I | xargs)"
+  printf '\nListening on %s: the control API is plain http, so the token and every secret entered in the UI\ncross the network in the clear. Use it only on a network you trust.\n' "$BIND"
+fi

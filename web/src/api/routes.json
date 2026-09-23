@@ -33,6 +33,7 @@
   {"method":"DELETE","pattern":"/v1/clusters/{name}"},
   {"method":"POST","pattern":"/v1/clusters/{name}/read-only"},
   {"method":"POST","pattern":"/v1/tenants/{tenant}/default-cluster"},
+  {"method":"POST","pattern":"/v1/tenants/{tenant}/client-keys"},
   {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/adopt"},
   {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/create-backend"},
   {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/expand"},

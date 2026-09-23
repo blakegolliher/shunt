@@ -288,7 +288,8 @@ func (s *Server) storeKey(ctx context.Context, tenant string, req ClientKeyReque
 	}
 	if err := s.Keys.Add(sigv4.Credential{AccessKey: req.AccessKey, Secret: req.Secret, Tenant: tenant, Buckets: req.Buckets}); err != nil {
 		if errors.Is(err, auth.ErrDuplicateKey) {
-			return res, refuse("shunt already holds access key %s; remove it from the credentials file to replace it", req.AccessKey)
+			detail := strings.TrimPrefix(err.Error(), auth.ErrDuplicateKey.Error()+": ")
+			return res, refuse("shunt already holds access key %s %s; remove it first (shunt client remove %s) to replace it", req.AccessKey, detail, req.AccessKey)
 		}
 		return res, err
 	}

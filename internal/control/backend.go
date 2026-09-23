@@ -37,6 +37,7 @@ type backendReply struct {
 	header http.Header
 	body   []byte
 	code   string // the XML <Code> of an error body
+	msg    string // the XML <Message> of an error body
 }
 
 // escapeKey percent-encodes an object key for a request path, keeping its slashes.
@@ -101,10 +102,11 @@ func (b backend) do(ctx context.Context, method, bucket, key string, query url.V
 		r := backendReply{status: resp.StatusCode, header: resp.Header, body: data}
 		if resp.StatusCode >= 300 {
 			var e struct {
-				Code string `xml:"Code"`
+				Code    string `xml:"Code"`
+				Message string `xml:"Message"`
 			}
 			_ = xml.Unmarshal(data, &e) //nolint:errcheck // a non-XML error body just has no code
-			r.code = e.Code
+			r.code, r.msg = e.Code, e.Message
 		}
 		return r, nil
 	}
@@ -134,7 +136,16 @@ func (b backend) createBucket(ctx context.Context, bucket string) error {
 	case r.status == http.StatusOK, r.status == http.StatusNoContent, r.code == "BucketAlreadyOwnedByYou":
 		return nil
 	}
-	return fmt.Errorf("%s: creating bucket %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+	err = fmt.Errorf("%s: creating bucket %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+	if r.msg != "" {
+		err = fmt.Errorf("%w (%s)", err, r.msg)
+	}
+	if r.status == http.StatusForbidden {
+		// VAST answers InvalidSecurity or AccessDenied to a valid key without CreateBucket
+		// (docs/reference/backend-compat.md); a wrong key was already refused when the cluster was added.
+		err = fmt.Errorf("%w: access key %s may not create buckets on %s; grant it that, or create %s there with a key that may and use that name", err, b.cl.Creds.AccessKey, b.cl.Name, bucket)
+	}
+	return err
 }
 
 // versioning returns the bucket's GetBucketVersioning status: "", "Enabled", or "Suspended".

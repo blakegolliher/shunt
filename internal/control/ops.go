@@ -1039,10 +1039,20 @@ func (s *Server) createPlacement(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
 }
 
+// CreateBackendRequest is the browser's Create: the member route's fields, less the forwarded
+// actor, plus the client keys to import as adopt takes them.
+type CreateBackendRequest struct {
+	Cluster string `json:"cluster"`
+	Name    string `json:"name"` // backend bucket name
+	// Keys are client keys the cluster knows, imported so clients can reach the new bucket through
+	// shunt (ADR-0012). Each is checked against Cluster before the bucket is created.
+	Keys []ClientKeyRequest `json:"keys,omitempty"`
+}
+
 // createBackendPlacement is the browser's Create action: unlike the member-only /create route it
 // creates the S3 bucket as well as recording the placement.
 func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) {
-	var req CreateRequest
+	var req CreateBackendRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -1065,6 +1075,15 @@ func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
+	for _, k := range req.Keys {
+		k.Cluster = req.Cluster
+		res, kerr := s.storeKey(ctx, tenant, k)
+		if kerr != nil {
+			fail(w, kerr)
+			return
+		}
+		s.info(actor(r), "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
+	}
 	if err := b.createBucket(ctx, req.Name); err != nil {
 		fail(w, err)
 		return

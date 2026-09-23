@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -133,8 +134,39 @@ func (s *Static) Len() int { return len(*s.byKey.Load()) }
 // errNoFile is returned by Add on a store that was not loaded from a file.
 var errNoFile = errors.New("auth: this shunt has no credentials file to write to")
 
-// ErrDuplicateKey is returned by Add for an access key the store already holds.
+// ErrDuplicateKey is returned by Add for an access key the store already holds under another
+// secret or tenant.
 var ErrDuplicateKey = errors.New("auth: the credentials file already holds this access key")
+
+// Merge is what adding c does to held, a key the store already has under the same access key
+// (ADR-0012). The same secret and tenant is the same client key imported again, for another bucket
+// or another cluster, and succeeds: its bucket allowlist becomes the union of both, and no
+// allowlist on either side means every bucket of the tenant. A different secret or tenant is a
+// different key under a name already in use, and is refused with ErrDuplicateKey.
+func Merge(held, c sigv4.Credential) (sigv4.Credential, error) {
+	tenant := c.Tenant
+	if tenant == "" {
+		tenant = directory.DefaultTenant
+	}
+	switch {
+	case held.Tenant != tenant:
+		return held, fmt.Errorf("%w: for tenant %s", ErrDuplicateKey, held.Tenant)
+	case subtle.ConstantTimeCompare([]byte(held.Secret), []byte(c.Secret)) != 1:
+		return held, fmt.Errorf("%w: with a different secret", ErrDuplicateKey)
+	}
+	if len(held.Buckets) == 0 || len(c.Buckets) == 0 {
+		held.Buckets = nil
+		return held, nil
+	}
+	buckets := slices.Clone(held.Buckets)
+	for _, b := range c.Buckets {
+		if !slices.Contains(buckets, b) {
+			buckets = append(buckets, b)
+		}
+	}
+	held.Buckets = buckets
+	return held, nil
+}
 
 // Add stores one client key and rewrites the credentials file with it, atomically and 0600. The
 // proxy uses the key on the next request: shunt holds the keys clients already have, so inserting
@@ -148,9 +180,6 @@ func (s *Static) Add(c sigv4.Credential) error {
 	if s.path == "" {
 		return errNoFile
 	}
-	if _, dup := (*s.byKey.Load())[c.AccessKey]; dup {
-		return fmt.Errorf("%w: %s", ErrDuplicateKey, c.AccessKey)
-	}
 	if c.AccessKey == "" || c.Secret == "" {
 		return errors.New("auth: a client key needs an access key and a secret")
 	}
@@ -158,7 +187,25 @@ func (s *Static) Add(c sigv4.Credential) error {
 	if tenant == "" {
 		tenant = directory.DefaultTenant
 	}
-	entries := append(slices.Clone(s.entries), Entry{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: tenant, Buckets: c.Buckets})
+	var entries []Entry
+	if held, dup := (*s.byKey.Load())[c.AccessKey]; dup {
+		merged, err := Merge(held, c)
+		if err != nil {
+			return err
+		}
+		if slices.Equal(merged.Buckets, held.Buckets) {
+			return nil // imported again, for a bucket it already reaches
+		}
+		c.Buckets = merged.Buckets
+		entries = slices.Clone(s.entries)
+		for i := range entries {
+			if entries[i].AccessKey == c.AccessKey {
+				entries[i].Buckets = c.Buckets // the secret or secret_ref stays as it was written
+			}
+		}
+	} else {
+		entries = append(slices.Clone(s.entries), Entry{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: tenant, Buckets: c.Buckets})
+	}
 	body, err := yaml.Marshal(File{Credentials: entries})
 	if err != nil {
 		return fmt.Errorf("auth: %w", err)

@@ -27,6 +27,17 @@ workstation and browse the local end:
 ssh -L 9951:127.0.0.1:9951 USER@HOST
 ```
 
+Or, on a network you trust, serve the UI and both S3 listeners on every address and browse the host
+directly:
+
+```sh
+SHUNT_DEMO_UI_BIND=0.0.0.0 make demo-ui
+```
+
+The script then prints the host's address instead of `127.0.0.1`. The control API is plain http
+(TLS is deferred, ADR-0015), so the bearer token and every secret typed into the UI cross the network
+in the clear. Control peers and admin listeners stay on loopback.
+
 Open `http://127.0.0.1:9951/` and paste the printed token. The token and credentials are also in
 `test/e2e/data/demo-ui/demo.env`, mode 0600.
 

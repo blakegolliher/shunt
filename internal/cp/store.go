@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,13 +460,18 @@ func (s *Store) Changes(ctx context.Context, before int64, limit int) ([]directo
 // compare-and-swapped on the directory version. Any control node may write: a conflict means
 // another node wrote first, and the change is re-applied to the newer version. On success it
 // returns once this node has installed the new version, so the caller's next Snapshot shows it.
+// errUnchanged, returned by a mutate function, ends the mutation with nothing written and no error.
+var errUnchanged = errors.New("cp: no change")
+
 func (s *Store) mutate(ctx context.Context, actor, op, key string, fn func(st *state) error) error {
 	s.writes.Lock()
 	defer s.writes.Unlock()
 	for attempt := range 8 {
 		cur := s.cur.Load()
 		next := cur.clone()
-		if err := fn(next); err != nil {
+		if err := fn(next); errors.Is(err, errUnchanged) {
+			return nil
+		} else if err != nil {
 			return err
 		}
 		next.version = cur.version + 1
@@ -734,8 +740,15 @@ func (s *Store) Add(c sigv4.Credential) error {
 	ctx, cancel := context.WithTimeout(context.Background(), keysTimeout)
 	defer cancel()
 	return s.mutate(ctx, "api", "key-add", "credentials/"+c.AccessKey, func(st *state) error {
-		if _, dup := st.creds[c.AccessKey]; dup {
-			return fmt.Errorf("%w: %s", auth.ErrDuplicateKey, c.AccessKey)
+		if held, dup := st.creds[c.AccessKey]; dup {
+			merged, err := auth.Merge(held, c)
+			if err != nil {
+				return err
+			}
+			if slices.Equal(merged.Buckets, held.Buckets) {
+				return errUnchanged // imported again, for a bucket it already reaches
+			}
+			c = merged
 		}
 		st.creds[c.AccessKey] = c
 		return nil

@@ -5,6 +5,9 @@ import type { ControlStatus, DirectoryStatus, FleetStatus, StreamEvent } from '.
 
 const tokenKey = 'shunt.control.token'
 
+export const toastMillis = 5000
+let toastSeq = 0
+
 export interface Toast {
   id: number
   tone: 'success' | 'danger' | 'neutral'
@@ -79,8 +82,12 @@ export function StoreProvider({ children }: PropsWithChildren) {
   }, [])
 
   const dismissToast = useCallback((id: number) => dispatch({ type: 'dismiss', id }), [])
+  // A success or neutral toast closes itself; a danger toast carries refusal text the operator
+  // must be able to read, so it stays until clicked.
   const notify = useCallback((message: string, tone: Toast['tone'] = 'success') => {
-    dispatch({ type: 'toast', toast: { id: Date.now(), message, tone } })
+    const id = ++toastSeq
+    dispatch({ type: 'toast', toast: { id, message, tone } })
+    if (tone !== 'danger') setTimeout(() => dispatch({ type: 'dismiss', id }), toastMillis)
   }, [])
 
   const refresh = useCallback(async () => {
@@ -111,11 +118,7 @@ export function StoreProvider({ children }: PropsWithChildren) {
             if (event.type === 'fence' && typeof event.data === 'object' && event.data !== null) {
               const record = event.data as { status?: string; kind?: string; error?: string }
               if (record.status === 'succeeded' || record.status === 'failed' || record.status === 'refused') {
-                dispatch({ type: 'toast', toast: {
-                  id: Date.now(),
-                  tone: record.status === 'succeeded' ? 'success' : 'danger',
-                  message: record.error || `${record.kind ?? 'operation'} ${record.status}`,
-                } })
+                notify(record.error || `${record.kind ?? 'operation'} ${record.status}`, record.status === 'succeeded' ? 'success' : 'danger')
               }
             }
           })
@@ -128,7 +131,7 @@ export function StoreProvider({ children }: PropsWithChildren) {
     }
     void follow()
     return () => { stopped = true; controller.abort() }
-  }, [refresh, state.token])
+  }, [notify, refresh, state.token])
 
   const value = useMemo<StoreValue>(() => ({ ...state, setToken, clearToken, refresh,
     dismissToast,

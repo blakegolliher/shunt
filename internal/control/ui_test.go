@@ -254,6 +254,16 @@ func TestUI3ProbeAndReadOnlyOperations(t *testing.T) {
 	if _, ok := rg.dir.Snapshot().Cluster("vast01"); ok {
 		t.Fatal("probe mutated the directory")
 	}
+	// A typed secret, as the UI's default mode sends it, probes without a secret_ref.
+	typed := def
+	typed.Credentials.SecretRef = ""
+	rg.must("POST", "/v1/clusters/probe", ClusterRequest{Name: "vast01", Cluster: typed, Secret: "typed-secret"}, &probe)
+	if !probe.Reachable || probe.Cluster.SecretRef != "control:vast01" {
+		t.Fatalf("typed-secret probe: %+v", probe)
+	}
+	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 0 {
+		t.Fatalf("probe stored a secret: %v", files)
+	}
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def}, nil)
 	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
 		t.Fatal(err)

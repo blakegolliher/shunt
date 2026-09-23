@@ -73,6 +73,7 @@ export interface PlacementStatus {
   names: Record<string, string>
   read_only: boolean
   reject_writes: boolean
+  client_keys?: number // keys that can reach the bucket; absent when this shunt holds no keys
   ratio?: number
   prefixes?: string[]
   ramp_writes?: Record<string, number>
@@ -257,8 +258,8 @@ export interface ClusterInput {
 export const probeCluster = (token: string, input: ClusterInput) => request<ClusterProbeResult>(`${apiRoot}/clusters/probe`, token, json(input))
 export const addCluster = (token: string, input: ClusterInput) => request<ClusterStatus>(`${apiRoot}/clusters`, token, json(input))
 export const adoptBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name?: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/adopt`, token, json(body))
-export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
-export const expandBucket = (token: string, tenant: string, bucket: string, to: string) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, create: true }))
+export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
+export const expandBucket = (token: string, tenant: string, bucket: string, to: string, name?: string) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, name, create: true }))
 export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}/read-only`, token, json({ read_only: readOnly, reject }))
 export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/read-only`, token, json({ read_only: readOnly, reject }))
 export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
@@ -267,6 +268,8 @@ export const startOperation = (token: string, kind: string, placement: string, a
 export const getOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}`, token)
 export const purgeSourceDryRun = (token: string, tenant: string, bucket: string) => request<PurgeDryRun>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/purge-source`, token, json({ dry_run: true, wait: '30s' }))
 export const getMoverLedger = (token: string, tenant: string, bucket: string) => request<{ entries: LedgerEntry[] }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/mover-ledger?limit=20`, token)
+export interface ClientKeyResult { access_key: string; tenant: string; checked?: string }
+export const importClientKey = (token: string, tenant: string, body: { access_key: string; secret: string; cluster?: string; buckets?: string[] }) => request<ClientKeyResult>(`${apiRoot}/tenants/${encodeURIComponent(tenant)}/client-keys`, token, json(body))
 export const setTenantDefault = (token: string, tenant: string, cluster: string) => request(`${apiRoot}/tenants/${encodeURIComponent(tenant)}/default-cluster`, token, json({ cluster }))
 export const getAudit = (token: string, limit = 100) => request<{ changes: AuditChange[] }>(`${apiRoot}/audit?limit=${limit}`, token)
 

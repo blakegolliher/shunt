@@ -310,6 +310,9 @@ type PlacementStatus struct {
 	Mover           *Progress                  `json:"mover,omitempty"`
 	ReadOnly        bool                       `json:"read_only"`
 	RejectWrites    bool                       `json:"reject_writes"`
+	// ClientKeys counts the tenant's client keys whose bucket allowlist admits this bucket: 0 means
+	// no request through shunt can reach it yet. Absent when this shunt holds no client keys.
+	ClientKeys *int `json:"client_keys,omitempty"`
 }
 
 // MigrationWindow is the fleet's last completed 10-second routing signal for one placement.
@@ -371,6 +374,16 @@ func (s *Server) placementStatus(key string, p directory.Placement) PlacementSta
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Ramp != nil {
 		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
+	}
+	if s.Keys != nil {
+		tenant, bucket, _ := directory.SplitKey(key)
+		n := 0
+		for _, c := range s.Keys.Tenant(tenant) {
+			if len(c.Buckets) == 0 || slices.Contains(c.Buckets, bucket) {
+				n++
+			}
+		}
+		ps.ClientKeys = &n
 	}
 	if s.Metrics != nil {
 		ps.Writes = counters(s.Metrics.RampWrites, key, "side")
@@ -609,6 +622,11 @@ func (s *Server) probeCluster(w http.ResponseWriter, r *http.Request) {
 	} else if inferType {
 		req.Cluster.Type = typeFromServer(server)
 	}
+	if req.Secret != "" && req.Cluster.Credentials.SecretRef == "" {
+		// Cluster add stores a typed secret and refers to it; the probe stores nothing, so it
+		// validates against the control: ref the stored secret would get (the only one that needs no path).
+		req.Cluster.Credentials.SecretRef = "control:" + req.Name
+	}
 	defs := map[string]config.Cluster{req.Name: req.Cluster}
 	config.ApplyClusterDefaults(defs)
 	if err := config.ValidateClusters("clusters", defs); err != nil {
@@ -813,8 +831,17 @@ func (s *Server) checkCredentials(ctx context.Context, name string, c config.Clu
 	server = reply.header.Get("Server")
 	var e struct {
 		Message string `xml:"Message"`
+		Region  string `xml:"Region"`
 	}
 	_ = xml.Unmarshal(reply.body, &e) //nolint:errcheck // no message is fine
+	if reply.code == "AuthorizationHeaderMalformed" {
+		// A request signed for the wrong region. AWS and Garage name the region they expect;
+		// without this check the add succeeds and the first bucket operation fails instead.
+		if e.Region != "" && e.Region != c.Region {
+			return fmt.Sprintf("cluster %s expects region %s, not %s: set the region to %s", name, e.Region, c.Region, e.Region), server
+		}
+		return fmt.Sprintf("cluster %s rejected the request's authorization header (%s): %s; check the region (%s)", name, reply.code, e.Message, c.Region), server
+	}
 	ak, ref := c.Credentials.AccessKey, c.Credentials.SecretRef
 	switch s3.ClassifyCredentialError(reply.code, e.Message) {
 	case s3.FaultUnknownKey:

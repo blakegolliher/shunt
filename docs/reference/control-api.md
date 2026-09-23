@@ -56,7 +56,7 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
   "placements": [
     {"key": "default/data01", "state": "RAMPING", "primary": "vast02", "source": "vast01",
      "names": {"vast01": "data01", "vast02": "data01-001"}, "ratio": 0.5,
-     "read_only": false, "reject_writes": false,
+     "read_only": false, "reject_writes": false, "client_keys": 1,
      "ramp_writes": {"primary": 4456, "source": 4353}, "fallback_reads": 37, "dual_deletes": {"both": 812},
      "mover": {"source": "vast01", "primary": "vast02", "pass": 2, "copied": 0, "skipped": 5210, "vanished": 3,
                "failed": 0, "bytes": 0, "done": true, "converged": true, "updated_at": "2026-09-16T20:31:02Z"},
@@ -64,6 +64,8 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
   ]
 }
 ```
+
+`client_keys` counts the tenant's client keys whose bucket allowlist admits the bucket. At 0, shunt refuses every request for the bucket until a key is imported; the field is absent when this shunt holds no client keys at all.
 
 `fallback_reads` counts read requests (GET and HEAD) that the source served after the primary answered 404, not distinct objects: `aws s3 cp` of one object sends a HEAD then a GET, so it counts two; a recursive copy sends only GETs. `ramp_writes`, `fallback_reads` and `dual_deletes` are this proxy's counters (`shunt_ramp_writes_total`, `shunt_migration_fallback_reads_total`, `shunt_migration_dual_delete_total`), read without creating series. `mover` is the last progress report, held in memory: it is lost when shunt restarts, and the next mover pass reports again.
 
@@ -141,7 +143,9 @@ Refused if:
 The browser's Create action. `{"cluster": "vast01", "name": "data01"}` creates the backend S3
 bucket, then records it as an `ACTIVE` placement (creating the tenant when needed). `name` defaults
 to the client bucket name. If the directory write fails, the newly created backend bucket is
-removed. The member-only `/create` route remains the first half of a proxy's signed S3
+removed. An optional `"keys": [{"access_key": "…", "secret": "…", "buckets": ["data01"]}]` imports
+client keys as adopt's `keys` does: each is checked against the cluster before the bucket is
+created, and a refused key creates nothing. The member-only `/create` route remains the first half of a proxy's signed S3
 CreateBucket flow and does not duplicate the backend request.
 
 ### `POST /v1/placements/{tenant}/{bucket}/expand`
@@ -228,6 +232,8 @@ The real call refuses in this order: the state and the evidence (`… is ACTIVE;
 ### `POST /v1/tenants/{tenant}/client-keys`
 
 Imports one client key: `{"access_key", "secret", "buckets"?, "cluster"?}` (ADR-0012). The key is checked against `cluster`, or the tenant's default cluster when that is empty, by signing `ListBuckets` with it; an unknown key or a wrong secret is refused. It is then stored in shunt's credentials file (0600, rewritten atomically) and used to verify client signatures from the next request on. Answers `{"access_key", "tenant", "checked"}`; the secret is never logged, returned, or readable through the API.
+
+Importing a key shunt already holds, with the same secret and tenant, succeeds: it is the same client key checked against another cluster or given another bucket. Its bucket allowlist becomes the union of both, and no allowlist on either side means every bucket of the tenant. The same access key with a different secret or tenant is refused (`shunt already holds access key … with a different secret`); remove it first to replace it.
 
 `shunt adopt <cluster> <bucket> --keys <file>` sends one of these per entry before the placement is written, and `shunt client add <access-key>` sends one, prompting for the secret.
 

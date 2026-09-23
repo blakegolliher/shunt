@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -127,10 +128,25 @@ func TestStoreWritesConvergeAcrossNodes(t *testing.T) {
 	if err := a.Add(sigv4.Credential{AccessKey: "CLIENT", Secret: "cs"}); !errors.Is(err, auth.ErrDuplicateKey) {
 		t.Errorf("duplicate key: %v", err)
 	}
+	// The same key again, for another bucket, widens its allowlist; for a bucket it reaches, it
+	// writes nothing; with another secret it is refused.
+	if err := a.Add(sigv4.Credential{AccessKey: "CLIENT", Secret: "cs", Tenant: "acme", Buckets: []string{"logs"}}); err != nil {
+		t.Errorf("re-import for another bucket: %v", err)
+	}
+	if ks := a.Tenant("acme"); len(ks) != 1 || !slices.Equal(ks[0].Buckets, []string{"data", "logs"}) {
+		t.Errorf("after re-import: %+v", ks)
+	}
+	before := a.Version()
+	if err := a.Add(sigv4.Credential{AccessKey: "CLIENT", Secret: "cs", Tenant: "acme", Buckets: []string{"data"}}); err != nil || a.Version() != before {
+		t.Errorf("re-import for a bucket it reaches: %v, version %d -> %d", err, before, a.Version())
+	}
+	if err := a.Add(sigv4.Credential{AccessKey: "CLIENT", Secret: "other", Tenant: "acme"}); !errors.Is(err, auth.ErrDuplicateKey) {
+		t.Errorf("re-import with another secret: %v", err)
+	}
 	if err := b.WaitVersion(wctx, a.Version()); err != nil {
 		t.Fatal(err)
 	}
-	if ks := b.Tenant("acme"); len(ks) != 1 || ks[0].Secret != "cs" || len(ks[0].Buckets) != 1 {
+	if ks := b.Tenant("acme"); len(ks) != 1 || ks[0].Secret != "cs" || len(ks[0].Buckets) != 2 {
 		t.Fatalf("node b keys: %+v", ks)
 	}
 	if all := b.All(); len(all) != 1 || all[0].AccessKey != "CLIENT" {

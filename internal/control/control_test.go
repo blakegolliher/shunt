@@ -40,6 +40,7 @@ type fakeCluster struct {
 	condDel   bool               // honor a mismatched If-Match on DELETE
 	onList    func(token string) // called before a ListObjectsV2 page is served, with its continuation token
 	keys      map[string]bool    // when set, an access key not in it answers 403 InvalidAccessKeyId
+	noCreate  bool               // CreateBucket answers 403 AccessDenied, as VAST does for a key without the permission
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -78,9 +79,14 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 				return
 			}
 		}
+		if fc.noCreate && r.Method == http.MethodPut && !strings.Contains(strings.Trim(r.URL.Path, "/"), "/") && r.URL.RawQuery == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
+			return
+		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>no</Message></Error>`))
+			_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>no</Message><Region>garage</Region></Error>`))
 			return
 		}
 		bucket, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
@@ -422,6 +428,11 @@ func TestClusterAddRefusals(t *testing.T) {
 	if _, ok := rg.dir.Snapshot().Cluster("vast01"); ok {
 		t.Fatal("a cluster with rejected credentials reached the directory")
 	}
+	// Signed for a region the cluster does not serve, as Garage answers: refused with the region it
+	// expects, by the probe as well as the add.
+	rg.vast01.reject = "AuthorizationHeaderMalformed"
+	rg.refused("POST", "/v1/clusters/probe", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, "expects region garage, not us-east-1")
+	rg.refused("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, "expects region garage, not us-east-1")
 	rg.vast01.reject = "AccessDenied"
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
 	rg.vast01.reject = ""
@@ -602,6 +613,33 @@ func TestTypeAndRegionInference(t *testing.T) {
 
 // expand measures a target's conditional PUT and DELETE when the cluster does not state them, and
 // records what it found; a stated capability is left alone.
+// A target key that may not create buckets is named in the error, with the way around it: a bucket
+// created there by someone else, given to expand by name, is used as it is.
+func TestExpandIntoABucketTheKeyCannotCreate(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.vast02.noCreate = true
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	code, raw := rg.call("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Create: true}, nil)
+	for _, want := range []string{"creating bucket data01-001: HTTP 403 AccessDenied (Access Denied)", "access key AK may not create buckets on vast02"} {
+		if code == http.StatusOK || !strings.Contains(raw, want) {
+			t.Fatalf("expand into a bucket the key cannot create: HTTP %d %s, want %q", code, raw, want)
+		}
+	}
+	if err := rg.vast02.be.CreateBucket("team-archive"); err != nil {
+		t.Fatal(err)
+	}
+	var ex ExpandResult
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Name: "team-archive", Create: true}, &ex)
+	if ex.Name != "team-archive" || ex.CreatedBucket {
+		t.Fatalf("expand by name: %+v", ex)
+	}
+}
+
 func TestExpandMeasuresConditionals(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
@@ -868,7 +906,8 @@ func TestImportClientKeys(t *testing.T) {
 		t.Fatalf("want ready with an imported key: %+v", so)
 	}
 
-	// The same key twice, and a shunt with no credentials file, are both refused.
+	// A key the store refuses as a duplicate (another secret or tenant; auth.Merge), and a shunt with
+	// no credentials file, are both refused.
 	sk.addErr = fmt.Errorf("%w: twice", auth.ErrDuplicateKey)
 	rg.refused("POST", "/v1/tenants/default/client-keys", ClientKeyRequest{AccessKey: "CLUSTERKEY", Secret: "s"}, "already holds access key CLUSTERKEY")
 	sk.addErr = nil
@@ -885,6 +924,60 @@ func TestImportClientKeys(t *testing.T) {
 	}
 	rg.ctl.Keys = nil
 	rg.refused("DELETE", "/v1/tenants/default/client-keys/CLUSTERKEY", nil, "cannot change its client keys")
+}
+
+// The browser's Create takes client keys as adopt does: each is checked before the bucket is
+// created, and status then counts the keys that can reach the bucket, so the UI can say when none can.
+func TestCreateBackendImportsClientKeys(t *testing.T) {
+	rg := newRig(t)
+	rg.vast01.keys = map[string]bool{"AK": true, "CLUSTERKEY": true}
+	sk := &stubKeys{}
+	rg.ctl.Keys = sk
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+
+	rg.refused("POST", "/v1/placements/default/data01/create-backend",
+		CreateBackendRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "NOPE", Secret: "s"}}}, "does not know this access key")
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok || len(sk.stored) != 0 {
+		t.Fatalf("a refused key created the bucket or was stored: %+v", sk.stored)
+	}
+	if _, ok := rg.dir.Snapshot().Lookup("default", "data01"); ok {
+		t.Fatal("the bucket was placed although its keys were refused")
+	}
+
+	var ps PlacementStatus
+	rg.must("POST", "/v1/placements/default/data01/create-backend",
+		CreateBackendRequest{Cluster: "vast01", Keys: []ClientKeyRequest{{AccessKey: "CLUSTERKEY", Secret: "s", Buckets: []string{"data01"}}}}, &ps)
+	if ok, _ := rg.vast01.be.BucketExists("data01"); !ok || len(sk.stored) != 1 || sk.stored[0].Tenant != "default" {
+		t.Fatalf("created bucket %v, stored %+v", ok, sk.stored)
+	}
+	if ps.ClientKeys == nil || *ps.ClientKeys != 1 {
+		t.Fatalf("client keys of the created bucket: %v", ps.ClientKeys)
+	}
+
+	// A second bucket without keys: the only key is limited to data01, so nothing reaches data02.
+	rg.must("POST", "/v1/placements/default/data02/create-backend", CreateBackendRequest{Cluster: "vast01"}, nil)
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	counts := map[string]int{}
+	for _, p := range st.Placements {
+		if p.ClientKeys == nil {
+			t.Fatalf("%s: no client key count", p.Key)
+		}
+		counts[p.Key] = *p.ClientKeys
+	}
+	if counts["default/data01"] != 1 || counts["default/data02"] != 0 {
+		t.Fatalf("client key counts: %v", counts)
+	}
+
+	// A shunt that holds no keys reports no count rather than a misleading zero.
+	rg.ctl.Keys = nil
+	var bare Status
+	rg.must("GET", "/v1/status?all=1", nil, &bare)
+	for _, p := range bare.Placements {
+		if p.ClientKeys != nil {
+			t.Fatalf("%s: a count without a key store: %d", p.Key, *p.ClientKeys)
+		}
+	}
 }
 
 // stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -148,6 +149,22 @@ func TestAddStoresAKeyAndKeepsTheFileReadable(t *testing.T) {
 	}
 	if err := s.Add(sigv4.Credential{AccessKey: "IMPORTED", Secret: "again"}); !errors.Is(err, ErrDuplicateKey) {
 		t.Fatalf("second Add = %v, want ErrDuplicateKey", err)
+	}
+	// The same key imported again for another bucket widens its allowlist; a different tenant is refused.
+	if err := s.Add(sigv4.Credential{AccessKey: "IMPORTED", Secret: "its-secret", Buckets: []string{"logs"}}); err != nil {
+		t.Fatalf("re-import for another bucket: %v", err)
+	}
+	if c, _ := s.Lookup(context.Background(), "IMPORTED"); !slices.Equal(c.Buckets, []string{"data", "logs"}) {
+		t.Fatalf("buckets after re-import: %v", c.Buckets)
+	}
+	if err := s.Add(sigv4.Credential{AccessKey: "IMPORTED", Secret: "its-secret", Tenant: "acme"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("re-import for another tenant = %v, want ErrDuplicateKey", err)
+	}
+	if err := s.Add(sigv4.Credential{AccessKey: "OLD", Secret: "ref-secret", Tenant: "acme", Buckets: []string{"x"}}); err != nil {
+		t.Fatalf("re-import of a secret_ref key: %v", err)
+	}
+	if c, _ := s.Lookup(context.Background(), "OLD"); len(c.Buckets) != 0 {
+		t.Fatalf("a key with no allowlist gained one: %v", c.Buckets)
 	}
 
 	// The file is rewritten 0600, the ref stays a ref, and a fresh Load sees both keys.

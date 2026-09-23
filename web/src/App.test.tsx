@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { App } from './App'
-import { StoreProvider } from './store'
+import { StoreProvider, toastMillis, useStore } from './store'
 
 const control = {
   node: 'c1', version: 'test', directory: 12, directory_loaded: true, last_compaction: null, join: 'shunt-control join --name <name>', fleet: [],
@@ -61,4 +61,23 @@ test('names quorum loss and disables the fiction that control is healthy', async
   render(<StoreProvider><App /></StoreProvider>)
   expect(await screen.findByText(/Control-plane quorum is lost/)).toBeInTheDocument()
   expect(screen.getByText(/quorum unavailable/)).toBeInTheDocument()
+})
+
+test('a success toast closes itself and a danger toast stays until clicked', async () => {
+  let notify: ReturnType<typeof useStore>['notify'] = () => undefined
+  function Notifier() { notify = useStore().notify; return null }
+  render(<StoreProvider><App /><Notifier /></StoreProvider>)
+  await screen.findByText('Control members')
+  vi.useFakeTimers()
+  try {
+    act(() => { notify('Cluster garage added'); notify('refused: no', 'danger') })
+    expect(screen.getByText('Cluster garage added')).toBeInTheDocument()
+    act(() => { vi.advanceTimersByTime(toastMillis) })
+    expect(screen.queryByText('Cluster garage added')).not.toBeInTheDocument()
+    expect(screen.getByText('refused: no')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('refused: no'))
+    expect(screen.queryByText('refused: no')).not.toBeInTheDocument()
+  } finally {
+    vi.useRealTimers()
+  }
 })

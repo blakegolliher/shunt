@@ -67,8 +67,9 @@ test('requires a successful unchanged probe before saving a cluster', async () =
   expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith('/v1/clusters') && (init as RequestInit)?.method === 'POST')).toBe(true)
 })
 
-test('adopts a bucket, shows the generated expand name, and hands off to Migrations', async () => {
+test('adopts a bucket, expands it under a chosen name, and hands off to Migrations', async () => {
   const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [] }
+  let expandBody: unknown
   baseMock(directory, (url, init) => {
     if (url.endsWith('/placements/acme/data/adopt')) {
       const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', names: { source: 'data' }, read_only: false, reject_writes: false }
@@ -80,7 +81,8 @@ test('adopts a bucket, shows the generated expand name, and hands off to Migrati
       return Response.json({ ...placement, fence: { version: directory.version, held: false, proxies: 0, waiting_on: [], silent: [] }, operations: [], clusters: { source, target } })
     }
     if (url.endsWith('/placements/acme/data/expand') && init?.method === 'POST') {
-      directory.placements[0] = { ...directory.placements[0], target: 'target', names: { source: 'data', target: 'data-001' } }
+      expandBody = JSON.parse(String(init.body))
+      directory.placements[0] = { ...directory.placements[0], target: 'target', names: { source: 'data', target: 'data-archive' } }
       directory.version++
       return Response.json({ key: 'acme/data', target: 'target', name: 'data-001', version: directory.version })
     }
@@ -93,10 +95,65 @@ test('adopts a bucket, shows the generated expand name, and hands off to Migrati
   fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'data' } })
   fireEvent.click(screen.getByRole('button', { name: 'Adopt bucket' }))
   expect(await screen.findByText('Bucket acme/data adopted')).toBeInTheDocument()
-  fireEvent.click((await screen.findAllByText('data'))[0])
-  fireEvent.click(await screen.findByRole('button', { name: 'Expand' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand acme/data' }))
+  expect(screen.getByRole('dialog')).toHaveTextContent('Expand acme/data')
   expect(screen.getByText('data-001')).toBeInTheDocument()
+  expect(screen.getByLabelText('Target bucket name')).toHaveAttribute('placeholder', 'data-001')
+  fireEvent.change(screen.getByLabelText('Target bucket name'), { target: { value: ' data-archive ' } })
   fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
+  await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'data-archive', create: true }))
   await waitFor(() => expect(screen.getByRole('heading', { name: 'Migrations', level: 1 })).toBeInTheDocument())
   expect(await screen.findByRole('heading', { name: 'source → target' })).toBeInTheDocument()
+})
+
+test('create imports a client key, and a bucket no key reaches is flagged', async () => {
+  const directory: DirectoryStatus = { version: 3, clusters: [source], placements: [] }
+  let sent: unknown
+  let imported: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/fresh/create-backend') && init?.method === 'POST') {
+      sent = JSON.parse(String(init.body))
+      const placement: PlacementStatus = { key: 'acme/fresh', state: 'ACTIVE', primary: 'source', names: { source: 'fresh' }, read_only: false, reject_writes: false, client_keys: 1 }
+      directory.placements = [placement, { ...placement, key: 'acme/bare', names: { source: 'bare' }, client_keys: 0 }]
+      directory.version++
+      return Response.json(placement)
+    }
+    if (url.endsWith('/v1/tenants/acme/client-keys') && init?.method === 'POST') {
+      imported = JSON.parse(String(init.body))
+      directory.placements[1] = { ...directory.placements[1], client_keys: 1 }
+      directory.version++
+      return Response.json({ access_key: 'LATEKEY', tenant: 'acme', checked: 'source' })
+    }
+    if (url.endsWith('/placements/acme/bare/view')) {
+      return Response.json({ ...directory.placements[1], fence: { version: directory.version, held: false, proxies: 0, waiting_on: [], silent: [] }, operations: [], clusters: { source } })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Create new' }))
+  expect(screen.getByText(/only with a client key shunt holds/)).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Tenant'), { target: { value: 'acme' } })
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'fresh' } })
+  fireEvent.change(screen.getByLabelText('Access key'), { target: { value: ' CLIENTKEY ' } })
+  fireEvent.change(screen.getByLabelText('Secret'), { target: { value: 'client-secret' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Create bucket' }))
+  expect(await screen.findByText('Bucket acme/fresh created')).toBeInTheDocument()
+  expect(sent).toEqual({ cluster: 'source', name: 'fresh', keys: [{ access_key: 'CLIENTKEY', secret: 'client-secret' }] })
+
+  expect(await screen.findByText('no client keys')).toBeInTheDocument()
+  fireEvent.click(screen.getByText('no client keys'))
+  expect(await screen.findByRole('alert')).toHaveTextContent('No client key can reach this bucket')
+  expect(screen.getByText(/shunt client add <access-key> --tenant acme --check source/)).toBeInTheDocument()
+
+  // The same import from the browser: checked against the primary, limited to the bucket on request.
+  fireEvent.change(screen.getByLabelText('Client access key'), { target: { value: 'LATEKEY' } })
+  fireEvent.change(screen.getByLabelText('Client secret'), { target: { value: 'late-secret' } })
+  fireEvent.click(screen.getByLabelText(/Limit this key to bare/))
+  fireEvent.click(screen.getByRole('button', { name: 'Import client key' }))
+  expect(await screen.findByText('Client key LATEKEY imported for acme/bare')).toBeInTheDocument()
+  expect(imported).toEqual({ access_key: 'LATEKEY', secret: 'late-secret', cluster: 'source', buckets: ['bare'] })
+  await waitFor(() => expect(screen.queryByText('no client keys')).not.toBeInTheDocument())
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
