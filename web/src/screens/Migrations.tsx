@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   getMoverLedger,
   getOperation,
@@ -57,6 +57,13 @@ function ReadBar({ hit, fallback, miss }: { hit: number; fallback: number; miss:
   </div>
 }
 
+// appliedRatio is the share of keys whose writes go to the target: the ramp while RAMPING, every
+// key once MIGRATING or CUTOVER (the ramp is gone then, not zero), none before the first step.
+function appliedRatio(view: { state: string; ratio?: number }) {
+  if (view.state === 'MIGRATING' || view.state === 'CUTOVER') return 1
+  return view.state === 'RAMPING' ? view.ratio ?? 0 : 0
+}
+
 export function Migrations({ selected, onSelect }: { selected: string; onSelect: (key: string) => void }) {
   const { token, directory, fleet, lastEvent, notify, refresh } = useStore()
   const candidates = useMemo(() => (directory?.placements ?? []).filter((item) => item.target || item.source || item.state !== 'ACTIVE'), [directory])
@@ -74,6 +81,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
   const [formerSource, setFormerSource] = useState('')
   const [fallbackTrend, setFallbackTrend] = useState<{ key: string; end: string; value: number }[]>([])
   const [busy, setBusy] = useState(false)
+  const synced = useRef<{ key: string; ratio: number; prefixes: string } | null>(null)
 
   const load = useCallback(async () => {
     if (!key) { setDetail(null); return }
@@ -88,8 +96,16 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
         return [...sameBucket.slice(-11), { key, end: window.end, value: window.reads.fallback_source ?? 0 }]
       })
       if (view.source) setFormerSource(view.source)
-      setRatio(Math.max(view.ratio ?? 0, 0.01))
-      setPrefixes((view.prefixes ?? []).join('\n'))
+      // The slider is the operator's draft. Every live update reloads the view, so it follows the
+      // server only when the applied ramp itself changes (or the bucket does), never on a reload.
+      const applied = appliedRatio(view)
+      const appliedPrefixes = (view.prefixes ?? []).join('\n')
+      const last = synced.current
+      if (!last || last.key !== key || last.ratio !== applied || last.prefixes !== appliedPrefixes) {
+        synced.current = { key, ratio: applied, prefixes: appliedPrefixes }
+        setRatio(Math.max(applied, 0.01))
+        setPrefixes(appliedPrefixes)
+      }
       if (view.mover) {
         try { setLedger((await getMoverLedger(token, tenant, bucket)).entries) } catch { setLedger([]) }
       }
@@ -144,7 +160,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
 
   const source = detail.source || (detail.target ? detail.primary : formerSource)
   const target = detail.target || (detail.source || formerSource ? detail.primary : '')
-  const currentRatio = detail.ratio ?? 0
+  const currentRatio = appliedRatio(detail)
   const writeSource = detail.migration_window?.writes.source ?? detail.ramp_writes?.source ?? 0
   const writeTarget = detail.migration_window?.writes.primary ?? detail.ramp_writes?.primary ?? 0
   const targetHits = detail.migration_window?.reads.target_hit ?? 0
@@ -197,9 +213,9 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
       <div className="grid gap-5 lg:grid-cols-[1fr_1fr]">
         <div>
           <div className="flex flex-wrap gap-2">{[0.01, 0.25, 0.5, 1].map((preset) => <button key={preset} type="button" disabled={preset < currentRatio} onClick={() => setRatio(preset)} className={`rounded-full border px-3 py-1.5 text-xs font-semibold disabled:opacity-30 ${ratio === preset ? 'border-ember-400 bg-ember-600 text-white' : 'border-ink-700 text-muted'}`}>{preset * 100}%</button>)}</div>
-          <label className="mt-4 block text-sm font-medium">Traffic ratio: {Math.round(ratio * 100)}% to target<input aria-label="Traffic ratio" type="range" min={Math.max(0.01, currentRatio)} max="1" step="0.01" value={ratio} onChange={(event) => setRatio(Number(event.target.value))} className="mt-3 w-full accent-ember-500" /></label>
+          <label className="mt-4 block text-sm font-medium">Traffic ratio: {Math.round(ratio * 100)}% to target <span className="text-muted">(applied {Math.round(currentRatio * 100)}%)</span><input aria-label="Traffic ratio" type="range" min={Math.max(0.01, currentRatio)} max="1" step="0.01" value={ratio} onChange={(event) => setRatio(Number(event.target.value))} className="mt-3 w-full accent-ember-500" /></label>
           <label className="mt-4 block text-sm font-medium">Prefix rules <span className="text-muted">(one per line)</span><textarea value={prefixes} onChange={(event) => setPrefixes(event.target.value)} rows={3} className={inputClass} placeholder="runs/2026-09/" /></label>
-          <button type="button" disabled={busy || ratio < currentRatio || !target || operation?.status === 'running'} onClick={() => void applyRamp()} className="mt-4 rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Apply ramp</button>
+          <button type="button" disabled={busy || ratio < currentRatio || !target || operation?.status === 'running' || (detail.state !== 'ACTIVE' && detail.state !== 'RAMPING')} onClick={() => void applyRamp()} className="mt-4 rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Apply ramp</button>
           {detail.state === 'RAMPING' && currentRatio >= 1 && <button type="button" disabled={busy || operation?.status === 'running'} onClick={() => void run('migrate', { accept_lost_write_window: acceptLoss, wait: '30s' })} className="ml-3 mt-4 rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Enter MIGRATING</button>}
         </div>
         <div className="space-y-5 rounded-lg bg-ink-950 p-4">

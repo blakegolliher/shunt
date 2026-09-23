@@ -59,7 +59,7 @@ var _ Store = (*FileDir)(nil)
 type Change struct {
 	Time    time.Time  `json:"ts"`
 	Actor   string     `json:"actor"`
-	Op      string     `json:"op"` // create | delete | set-state | set-default | adopt | set-target | cluster-put | cluster-remove
+	Op      string     `json:"op"` // create | delete | set-state | set-default | adopt | set-target | clear-target | cluster-put | cluster-remove
 	Key     string     `json:"key"`
 	Version int64      `json:"version"`
 	Before  *Placement `json:"before"`
@@ -251,6 +251,11 @@ func (d *FileDir) RemoveCluster(ctx context.Context, name, actor string) error {
 // Adopt implements Store.
 func (d *FileDir) Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
 	return d.mutate(ctx, actor, "adopt", Key(tenant, bucket), func(f *File) error { return f.Adopt(tenant, bucket, cluster, backend, d.now()) })
+}
+
+// ClearTarget implements Store.
+func (d *FileDir) ClearTarget(ctx context.Context, tenant, bucket, actor string) error {
+	return d.mutate(ctx, actor, "clear-target", Key(tenant, bucket), func(f *File) error { return f.ClearTarget(tenant, bucket) })
 }
 
 // SetTarget implements Store.

@@ -169,6 +169,29 @@ func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 	return nil
 }
 
+// ClearTarget forgets the cluster `shunt expand` prepared, while no step has used it: the placement
+// stays ACTIVE where it is. The backend bucket is left as it is; shunt may not have created it.
+func (f *File) ClearTarget(tenant, bucket string) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return ErrNotFound
+	}
+	if p.State != StateActive {
+		return fmt.Errorf("%w: %s is %s; a target can only be cleared before the first step", ErrConflict, k, p.State)
+	}
+	if p.Target == "" {
+		return fmt.Errorf("%w: %s has no target to clear", ErrConflict, k)
+	}
+	np := p.clone()
+	if np.Target != np.Cold {
+		delete(np.Names, np.Target)
+	}
+	np.Target = ""
+	f.Placements[k] = np
+	return nil
+}
+
 func (f *File) ensureMaps() {
 	if f.Clusters == nil {
 		f.Clusters = map[string]config.Cluster{}

@@ -1031,6 +1031,60 @@ func TestCreateAndAdoptRefuseATakenClientName(t *testing.T) {
 	}
 }
 
+// A move never lands in a bucket that already holds objects: expand refuses it, naming the first
+// key, unless the operator states they are this bucket's; a first step that names its own target
+// is checked the same way. clear-target forgets a target before the first step and leaves its
+// bucket alone, and only then.
+func TestExpandRefusesANonEmptyTargetAndClearsATarget(t *testing.T) {
+	rg := newRig(t)
+	for _, b := range []struct {
+		cl   *fakeCluster
+		name string
+	}{{rg.vast01, "data01"}, {rg.vast02, "old"}, {rg.vast02, "data01-001"}} {
+		if err := b.cl.be.CreateBucket(b.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := rg.vast02.be.PutObject("old", "leftover/k1", nil, strings.NewReader("stale"), 5, nil); err != nil {
+		t.Fatal(err)
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	rg.refused("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Name: "old"},
+		`bucket old on vast02 already holds objects (the first is "leftover/k1")`)
+	if p, _ := rg.dir.Snapshot().Lookup("default", "data01"); p.Target != "" {
+		t.Fatalf("a refused expand recorded %s", p.Target)
+	}
+	// The same first step without expand is refused alike.
+	rg.refused("POST", "/v1/placements/default/data01/ramp", RampRequest{Ratio: 0.1, To: "vast02", Name: "old"}, "already holds objects")
+
+	// Stated to be this bucket's own objects: accepted.
+	var ex ExpandResult
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Name: "old", AcceptObjects: true}, &ex)
+	if ex.Target != "vast02" || ex.Name != "old" {
+		t.Fatalf("expand: %+v", ex)
+	}
+
+	// clear-target forgets it; the bucket and its object stay.
+	var cl ClearTargetResult
+	rg.must("DELETE", "/v1/placements/default/data01/target", nil, &cl)
+	p, _ := rg.dir.Snapshot().Lookup("default", "data01")
+	if cl.Target != "vast02" || cl.Name != "old" || p.Target != "" || p.Names["vast02"] != "" || p.State != directory.StateActive {
+		t.Fatalf("after clear: result %+v, placement %+v", cl, p)
+	}
+	if ok, _ := rg.vast02.be.BucketExists("old"); !ok {
+		t.Fatal("clearing the target deleted its bucket")
+	}
+	rg.refused("DELETE", "/v1/placements/default/data01/target", nil, "has no target to clear")
+
+	// An empty bucket needs no statement; once a step has used the target it can no longer be cleared.
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02"}, &ex)
+	rg.must("POST", "/v1/placements/default/data01/ramp", RampRequest{Ratio: 0.1}, nil)
+	rg.refused("DELETE", "/v1/placements/default/data01/target", nil, "is RAMPING, moving to vast02; a target can only be cleared before the first step")
+}
+
 // stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
 type stubKeys struct {
 	stored   []sigv4.Credential

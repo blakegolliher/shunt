@@ -153,6 +153,29 @@ func (b backend) createBucket(ctx context.Context, bucket string) (created bool,
 	return false, err
 }
 
+// targetEmpty refuses a move into a bucket that already holds an object. Its objects would join
+// the moving bucket: in its listings, in target-first reads of any key they share with it, and
+// ahead of the mover, whose If-None-Match copy skips a key the target already has, so the stale
+// object would win at cutover. override names how to say the objects are the bucket's own.
+func targetEmpty(ctx context.Context, b backend, cluster, bucket, override string) error {
+	r, err := b.do(ctx, http.MethodGet, bucket, "", url.Values{"list-type": {"2"}, "max-keys": {"1"}, "encoding-type": {"url"}}, nil, nil)
+	if err != nil {
+		return err
+	}
+	if r.status != http.StatusOK {
+		return fmt.Errorf("%s: listing %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+	}
+	var page s3response.ListObjectsV2Result
+	if err := xml.Unmarshal(r.body, &page); err != nil {
+		return fmt.Errorf("%s: listing %s: %w", b.cl.Name, bucket, err)
+	}
+	if len(page.Contents) == 0 || page.Contents[0].Key == nil {
+		return nil
+	}
+	return refuse("bucket %s on %s already holds objects (the first is %q); a move into it would mix them into this bucket and could let one win over this bucket's own object of the same key: use an empty bucket or a new name, empty it, or, if they are this bucket's objects copied ahead, use %s",
+		bucket, cluster, s3.DecodeListingKey(*page.Contents[0].Key), override)
+}
+
 // versioning returns the bucket's GetBucketVersioning status: "", "Enabled", or "Suspended".
 func (b backend) versioning(ctx context.Context, bucket string) (string, error) {
 	r, err := b.do(ctx, http.MethodGet, bucket, "", url.Values{"versioning": {""}}, nil, nil)

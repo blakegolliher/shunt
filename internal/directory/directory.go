@@ -234,6 +234,8 @@ type Store interface {
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.
 	SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
+	// ClearTarget forgets an ACTIVE placement's prepared target before any step has used it.
+	ClearTarget(ctx context.Context, tenant, bucket, actor string) error
 	// SetTenantDefault changes where a tenant's new buckets are created.
 	SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error
 	// PutCluster adds or replaces a cluster. secret, when not empty, is the cluster's secret key for

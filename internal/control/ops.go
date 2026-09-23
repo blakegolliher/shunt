@@ -295,6 +295,11 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 				return TransitionResult{}, err
 			}
 			res.CreatedBucket = name
+		case p.Target == "":
+			// A first step that names its own target; one expand prepared was checked there.
+			if err := targetEmpty(ctx, target, np.Primary, name, "expand, which can accept them (--accept-existing-objects), before the first step"); err != nil {
+				return TransitionResult{}, err
+			}
 		}
 	}
 	if np.State == directory.StateRamping || np.State == directory.StateMigrating {
@@ -379,6 +384,10 @@ type ExpandRequest struct {
 	To     string `json:"to"`
 	Name   string `json:"name,omitempty"` // default <primary backend name>-NNN, the lowest unused
 	Create bool   `json:"create,omitempty"`
+	// AcceptObjects takes a target bucket that already holds objects, stating they are this
+	// bucket's (copied ahead, by backend replication for instance). Without it expand refuses a
+	// bucket with any object: a move would mix them in (targetEmpty).
+	AcceptObjects bool `json:"accept_existing_objects,omitempty"`
 }
 
 // ExpandResult reports what expand checked and recorded.
@@ -458,6 +467,11 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		res.CreatedBucket = true
+	case !req.AcceptObjects:
+		if err = targetEmpty(ctx, tb, req.To, req.Name, "expand --accept-existing-objects"); err != nil {
+			fail(w, err)
+			return
+		}
 	}
 	if err = refuseVersioned(ctx, pb, "source", p.Names[p.Primary]); err != nil {
 		fail(w, err)
@@ -497,6 +511,41 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 	res.Version = s.Dir.Snapshot().Version()
 	s.info(actor(r), "target recorded", "placement", key, "target", req.To, "bucket", req.Name, "created_bucket", res.CreatedBucket, "canary", "ok",
 		"conditional_write", res.ConditionalWrite, "conditional_delete", res.ConditionalDelete, "measured", res.Measured, "version", res.Version)
+	writeJSON(w, http.StatusOK, res)
+}
+
+// ClearTargetResult is what DELETE /v1/placements/{tenant}/{bucket}/target forgot.
+type ClearTargetResult struct {
+	Key     string `json:"key"`
+	Target  string `json:"target"` // the cluster expand had prepared
+	Name    string `json:"name"`   // its bucket there, left as it is
+	Version int64  `json:"version"`
+}
+
+// clearTarget undoes expand before the first step: the target is recorded while ACTIVE and routes
+// nothing, so forgetting it needs no fence. The bucket expand checked or created stays on the
+// cluster; shunt may not have created it, so it never deletes it.
+func (s *Server) clearTarget(w http.ResponseWriter, r *http.Request) {
+	key, p, _, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	tenant, bucket, _ := directory.SplitKey(key)
+	switch {
+	case p.State != directory.StateActive:
+		fail(w, refuse("%s is %s, moving to %s; a target can only be cleared before the first step", key, p.State, p.Primary))
+		return
+	case p.Target == "":
+		fail(w, refuse("%s has no target to clear", key))
+		return
+	}
+	res := ClearTargetResult{Key: key, Target: p.Target, Name: p.Names[p.Target]}
+	if err := s.Dir.ClearTarget(r.Context(), tenant, bucket, actor(r)); err != nil {
+		fail(w, err)
+		return
+	}
+	res.Version = s.Dir.Snapshot().Version()
+	s.info(actor(r), "target cleared", "placement", key, "target", res.Target, "bucket", res.Name, "version", res.Version)
 	writeJSON(w, http.StatusOK, res)
 }
 

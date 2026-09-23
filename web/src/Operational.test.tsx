@@ -187,3 +187,35 @@ test('naming an existing client bucket offers Expand instead of adding it twice'
   fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
   await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'data-minio', create: true }))
 })
+
+test('clears an expanded target from the row, and expand can accept existing objects', async () => {
+  const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', target: 'target', names: { source: 'data', target: 'old' }, read_only: false, reject_writes: false }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let cleared = false
+  let expandBody: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/data/target') && init?.method === 'DELETE') {
+      cleared = true
+      directory.placements = [{ ...placement, target: undefined, names: { source: 'data' } }]
+      directory.version++
+      return Response.json({ key: 'acme/data', target: 'target', name: 'old', version: directory.version })
+    }
+    if (url.endsWith('/placements/acme/data/expand') && init?.method === 'POST') {
+      expandBody = JSON.parse(String(init.body))
+      return Response.json({ key: 'acme/data', target: 'target', name: 'old', version: 5 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  expect(screen.queryByRole('button', { name: 'Expand acme/data' })).not.toBeInTheDocument()
+  fireEvent.click(await screen.findByRole('button', { name: 'Clear target of acme/data' }))
+  expect(await screen.findByText('acme/data: target target cleared; its bucket is still there')).toBeInTheDocument()
+  expect(cleared).toBe(true)
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand acme/data' }))
+  fireEvent.change(screen.getByLabelText('Target bucket name'), { target: { value: 'old' } })
+  fireEvent.click(screen.getByLabelText(/already holds this bucket's objects/))
+  fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
+  await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'old', create: true, accept_existing_objects: true }))
+})

@@ -153,16 +153,20 @@ CreateBucket flow and does not duplicate the backend request.
 
 ### `POST /v1/placements/{tenant}/{bucket}/expand`
 
-`{"to": "vast02", "name": "data01-001", "create": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
+`{"to": "vast02", "name": "data01-001", "create": false, "accept_existing_objects": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
 
 Prepares the target while the placement stays `ACTIVE`, in this order:
 1. Refuses if either bucket was ever versioned.
-2. Verifies the target bucket exists, or creates it with `create`.
+2. Verifies the target bucket exists, or creates it with `create`. An existing bucket must be empty: a one-key listing that finds an object refuses, naming the key, because the bucket's objects would join the moving bucket (in its listings, in target-first reads of a shared key, and ahead of the mover's `If-None-Match` copy, so a stale object would win at cutover). `accept_existing_objects` states they are this bucket's objects, copied ahead (by backend replication, for instance), and skips the check. A first `ramp` or `migrate` step that names its own target with `to` is checked the same way.
 3. Runs a canary PUT, GET and DELETE of `.shunt-canary-<hex>`.
 4. If the target cluster's `conditional_write` or `conditional_delete` is unset, measures it on a scratch object: a PUT with `If-None-Match: *` over it must get 412, and a DELETE with a wrong `If-Match` must get 412. It records the results on the cluster (`measured: true` in the answer). A capability set explicitly is left alone.
 5. Records `target` and its name on the placement.
 
 Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_write", "conditional_delete", "measured", "version"}`. Later `ramp` and `migrate` calls use the recorded target.
+
+### `DELETE /v1/placements/{tenant}/{bucket}/target`
+
+Forgets the target `expand` recorded, while the placement is still `ACTIVE`, so it can be expanded somewhere else. A recorded target routes nothing, so this needs no fence round. The target's bucket stays on its cluster, since shunt may not have created it. Returns `{"key", "target", "name", "version"}`. Refused once a step has used the target (`… is RAMPING, moving to …`) and when there is none. `shunt expand <bucket> --clear` calls it.
 
 ### `POST /v1/placements/{tenant}/{bucket}/read-only`
 

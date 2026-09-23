@@ -86,3 +86,31 @@ test('reaches purge before cutover and renders the API refusal verbatim', async 
   expect((await screen.findAllByText(reason)).length).toBeGreaterThanOrEqual(1)
   expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled()
 })
+
+// Every live event reloads the view. The slider is the operator's draft: a reload must not move it,
+// and once MIGRATING it stands at 100%, where every write goes (the ramp is gone then, not zero).
+test('the ramp slider keeps its setting across live reloads', async () => {
+  const view: PlacementView = { ...expandedView(), state: 'RAMPING', primary: 'target', source: 'source', target: undefined, ratio: 0.01 }
+  let seq = 0
+  let views = 0
+  migrationMock(view, (url) => {
+    if (url.endsWith('/v1/events')) { seq++; return new Response(`id: ${seq}\nevent: telemetry\ndata: {}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } }) }
+    if (url.endsWith('/placements/default/data/view')) { views++; return Response.json(view) }
+  })
+  await openMigrations()
+  const reloads = async () => { const from = views; await waitFor(() => expect(views).toBeGreaterThan(from + 1), { timeout: 3000 }) }
+
+  fireEvent.change(screen.getByLabelText('Traffic ratio'), { target: { value: '0.5' } })
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 50% to target/)).toHaveTextContent('(applied 1%)')
+
+  view.ratio = 0.5 // the step applied: the slider follows the server once
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 50% to target/)).toHaveTextContent('(applied 50%)')
+
+  view.state = 'MIGRATING'
+  view.ratio = undefined
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 100% to target/)).toHaveTextContent('(applied 100%)')
+  expect(screen.getByRole('button', { name: 'Apply ramp' })).toBeDisabled()
+})

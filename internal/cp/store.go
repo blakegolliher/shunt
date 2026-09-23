@@ -651,6 +651,11 @@ func (s *Store) Adopt(ctx context.Context, tenant, bucket, cluster, backend, act
 	})
 }
 
+// ClearTarget implements directory.Store.
+func (s *Store) ClearTarget(ctx context.Context, tenant, bucket, actor string) error {
+	return s.mutate(ctx, actor, "clear-target", directory.Key(tenant, bucket), func(st *state) error { return st.file.ClearTarget(tenant, bucket) })
+}
+
 // SetTarget implements directory.Store.
 func (s *Store) SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error {
 	return s.mutate(ctx, actor, "set-target", directory.Key(tenant, bucket), func(st *state) error { return st.file.SetTarget(tenant, bucket, cluster, backend) })

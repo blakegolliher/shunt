@@ -392,13 +392,18 @@ func readClientKeys(path string) ([]control.ClientKeyRequest, error) {
 
 func newExpand() *cobra.Command {
 	var (
-		o   apiOptions
-		req control.ExpandRequest
+		o           apiOptions
+		req         control.ExpandRequest
+		clearTarget bool
 	)
 	cmd := &cobra.Command{
 		Use:   "expand <bucket>",
 		Short: "Prepare a second cluster for a bucket: its bucket, a versioning check, and a canary",
-		Args:  cobra.ExactArgs(1),
+		Long: "Records the cluster and bucket a later ramp or migrate step moves the bucket to. The target\n" +
+			"bucket must be empty: its objects would join this bucket (--accept-existing-objects takes one\n" +
+			"whose objects are this bucket's, copied ahead). --clear forgets the target again before the\n" +
+			"first step, leaving its bucket where it is.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := placementPath(args[0])
 			if err != nil {
@@ -406,6 +411,18 @@ func newExpand() *cobra.Command {
 			}
 			api, err := o.client()
 			if err != nil {
+				return err
+			}
+			if clearTarget {
+				var out control.ClearTargetResult
+				if callErr := api.call(cmd.Context(), "DELETE", path+"/target", nil, &out); callErr != nil {
+					return callErr
+				}
+				if o.json {
+					return printJSON(cmd, out)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s cleared; the bucket is still on %s (directory version %d)\n",
+					shown(out.Key), out.Target, out.Name, out.Target, out.Version)
 				return err
 			}
 			var out control.ExpandResult
@@ -440,6 +457,8 @@ func newExpand() *cobra.Command {
 	f.StringVar(&req.To, "to", "", "the cluster the bucket will move to")
 	f.StringVar(&req.Name, "name", "", "the bucket's name there (default: <name>-001, the lowest unused)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket there if it does not exist")
+	f.BoolVar(&req.AcceptObjects, "accept-existing-objects", false, "take a target bucket that holds objects: they are this bucket's, copied ahead")
+	f.BoolVar(&clearTarget, "clear", false, "forget the target expand recorded, before the first step")
 	return cmd
 }
 

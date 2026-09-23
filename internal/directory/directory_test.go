@@ -923,3 +923,31 @@ func TestHeldSteps(t *testing.T) {
 		t.Errorf("hold after a round trip: %+v\n%s", got, data)
 	}
 }
+
+// ClearTarget forgets what expand recorded, only while ACTIVE and only when there is a target, and
+// keeps a backend name the cold tier still uses.
+func TestClearTarget(t *testing.T) {
+	f := &File{Placements: map[string]Placement{
+		"acme/data": {State: StateActive, Primary: "garage", Target: "minio", Names: map[string]string{"garage": "data", "minio": "data-001"}},
+		"acme/cold": {State: StateActive, Primary: "garage", Target: "cold", Cold: "cold", Names: map[string]string{"garage": "c", "cold": "c"}},
+		"acme/move": {State: StateRamping, Primary: "minio", Source: "garage", Names: map[string]string{"garage": "m", "minio": "m"}},
+		"acme/none": active("garage"),
+	}}
+	if err := f.ClearTarget("acme", "data"); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.Placements["acme/data"]; p.Target != "" || len(p.Names) != 1 || p.Primary != "garage" {
+		t.Fatalf("after clear: %+v", p)
+	}
+	if err := f.ClearTarget("acme", "cold"); err != nil || f.Placements["acme/cold"].Names["cold"] != "c" {
+		t.Fatalf("cold name dropped: %v %+v", err, f.Placements["acme/cold"])
+	}
+	for _, b := range []string{"move", "none", "data"} {
+		if err := f.ClearTarget("acme", b); !errors.Is(err, ErrConflict) {
+			t.Errorf("clear %s: %v, want ErrConflict", b, err)
+		}
+	}
+	if err := f.ClearTarget("acme", "gone"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("clear of a missing placement: %v", err)
+	}
+}
