@@ -107,6 +107,26 @@ filesystem:
   loss, cache restart, mover convergence, cutover and purge; telemetry p99 differed by 3.24%. At the
   operator's request Playwright is not added: the visual flow and UI-5 screenshot are the remaining
   manual acceptance pass, not an automated browser gate.
+- **UI-7 (2026-09-23):** fixes from the first hands-on browser demo (commit 74bddd4); `distributed`
+  was then fast-forwarded into `master`.
+
+## The `1-to-n-bucket-support` branch (ADR-0018, proposed)
+
+One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1–N4.
+
+- **N1 done (2026-09-23): placement schema v2 is read everywhere, written nowhere.** A placement may
+  be written as `legs`, `owners` (hash ranges that partition the key space, 16-hex-digit bounds)
+  and one `move`; every reader converts it into the v1 fields on decode (`internal/directory/legs.go`):
+  the directory file, the control plane's etcd store, `GET /v1/directory`, the member cache and the
+  change records. A v2 placement this build cannot route (several owners, two legs on one cluster,
+  a partial move, more than 32 legs) is refused with the reason, never guessed at. The writer is
+  unchanged, so no byte on disk, in etcd or on the wire moved. Gate: `mixed-v2.yaml` loads to
+  exactly `mixed.yaml`'s placements; every v1 shape round-trips v1 → v2 → v1 through YAML and JSON;
+  17 invalid v2 samples name their key; the etcd store and a member (long poll and cache) read v2,
+  and both tests fail with the conversion removed; `FuzzParse` and `FuzzParseV2` clean for 30 s
+  each (about 2 M inputs); race suite and lint green; `make walkthrough` (62,441 operations, 0
+  errors) and `make readme-demo` green. `make fleet` was not run: its ports are held by the running
+  UI demo.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

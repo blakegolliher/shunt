@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -319,5 +320,33 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 			t.Fatalf("waiting for %s: still not so after %s", what, d)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A control plane that serves placements in schema v2 (ADR-0018) routes exactly as one serving v1,
+// through the long poll and again from the member's cache.
+func TestMemberReadsPlacementSchemaV2(t *testing.T) {
+	f := newFakeControl(t)
+	want := f.dir.Placements["acme/data"]
+	f.dir.Placements = map[string]directory.Placement{"acme/data": want.ToV2()}
+	c := newClient(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	go c.Run(ctx)
+	waitFor(t, 2*time.Second, "the v2 placement installed", func() bool {
+		p, ok := c.Snapshot().Lookup("acme", "data")
+		return ok && reflect.DeepEqual(*p, want)
+	})
+	cancel()
+	f.down.Store(true)
+	c2 := New(c.cfg, slog.New(slog.DiscardHandler))
+	if err := c2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := c2.Snapshot().Lookup("acme", "data"); !ok || !reflect.DeepEqual(*p, want) {
+		t.Fatalf("from the cache: %+v, want %+v", p, want)
 	}
 }

@@ -1,7 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. Nothing here is built.
+Status: proposed (2026-09-23); N1 built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1 is built (below);
+N2–N4 are not.
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -111,6 +112,32 @@ backend buckets, one of them on the cluster that was already primary.
 3. **N3, moves between any two legs.** Range moves, range purge, split, retire, and legs on the
    same cluster (the same-cluster rename).
 4. **N4, UI and CLI.**
+
+## N1 as built (2026-09-23)
+
+Schema v2 is read everywhere and written nowhere yet: readers ship first, as the rollout order
+above requires. `Placement` carries `legs`, `owners`, `hash` and `move` next to the v1 fields; the
+YAML decoder checks them as strictly as any other key, and a JSON hook on `Placement` covers every
+JSON reader. Either decoder converts a v2 placement into the v1 fields and clears the v2 ones
+before anything else sees it, so routing, the API and the writers are untouched. In v2, `target`
+and `cold` name legs. A leg converted from v1 is named after its cluster, so v1 → v2 → v1 is
+exact.
+
+```yaml
+acme/runs:
+  state: RAMPING
+  legs: { onprem: { cluster: vast-a, bucket: runs }, cloud: { cluster: aws-use1, bucket: acme-7f3a-runs } }
+  owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: onprem } ]
+  move: { range: { from: "0000000000000000", to: ffffffffffffffff }, from: onprem, to: cloud,
+          ramp: { hash: fnv1a-fmix64-v1, prefixes: ["2026-09/"] } }
+```
+
+During a move the owner is the leg the keys are moving **from**: owners change when the move
+completes, not when it starts. Hash bounds are inclusive and written as 16 hex digits, so a JSON
+reader without 64-bit integers reads them exactly; quote a bound that YAML would read as a number.
+This build refuses, with the reason, the v2 placements only later phases route: more than one
+owner (N2), two legs on one cluster or a move of part of the key space (N3), and more than
+`MaxLegs` legs.
 
 ## Open questions
 

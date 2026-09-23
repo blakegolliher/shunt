@@ -1,0 +1,277 @@
+package directory
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"regexp"
+	"slices"
+	"strconv"
+)
+
+// Schema v2 of a placement (ADR-0018): legs, a table of hash ranges that says which leg owns each
+// key, and at most one move. Build N1 reads it and writes v1: every decoder converts a v2 placement
+// into the v1 fields (Primary, Source, Target, Names, Ramp, Cutover) and clears the v2 ones, so
+// the rest of shunt sees one form. A v2 placement this build cannot route that way is refused,
+// never guessed at: several owners, two legs on one cluster, or a move of part of the key space
+// need the builds after N1.
+
+// MaxLegs caps a placement's legs (ADR-0018). Removal criterion: raised only by an amendment to
+// ADR-0018, once the N-way listing benchmark meets its target at the new cap.
+const MaxLegs = 32
+
+// Leg is one backend bucket a placement spans.
+type Leg struct {
+	Cluster string `yaml:"cluster" json:"cluster"`
+	Bucket  string `yaml:"bucket" json:"bucket"`
+}
+
+// Hash is a point of the 64-bit key hash space, written as 16 lowercase hex digits so that JSON
+// readers without 64-bit integers (the browser) see it exactly.
+type Hash uint64
+
+// MarshalText writes h as 16 hex digits.
+func (h Hash) MarshalText() ([]byte, error) { return fmt.Appendf(nil, "%016x", uint64(h)), nil }
+
+// UnmarshalText reads exactly 16 hex digits.
+func (h *Hash) UnmarshalText(b []byte) error {
+	if len(b) != 16 {
+		return fmt.Errorf("hash %q: want 16 hex digits", b)
+	}
+	v, err := strconv.ParseUint(string(b), 16, 64)
+	if err != nil {
+		return fmt.Errorf("hash %q: want 16 hex digits", b)
+	}
+	*h = Hash(v)
+	return nil
+}
+
+// HashRange is an inclusive range of the key hash space.
+type HashRange struct {
+	From Hash `yaml:"from" json:"from"`
+	To   Hash `yaml:"to" json:"to"`
+}
+
+// FullRange is the whole key hash space.
+var FullRange = HashRange{From: 0, To: math.MaxUint64}
+
+// Owner says which leg holds the keys whose hash falls in [From, To].
+type Owner struct {
+	From Hash   `yaml:"from" json:"from"`
+	To   Hash   `yaml:"to" json:"to"`
+	Leg  string `yaml:"leg" json:"leg"`
+}
+
+// Move transfers the keys of one range from one leg to another, through the placement's state
+// (RAMPING, MIGRATING, CUTOVER). Ramp and cutover evidence belong to the move.
+type Move struct {
+	Range   HashRange        `yaml:"range" json:"range"`
+	From    string           `yaml:"from" json:"from"`
+	To      string           `yaml:"to" json:"to"`
+	Ramp    *Ramp            `yaml:"ramp,omitempty" json:"ramp,omitempty"`
+	Cutover *CutoverEvidence `yaml:"cutover,omitempty" json:"cutover,omitempty"`
+}
+
+// legID is what a leg may be called. A leg converted from v1 is named after its cluster, so the
+// rule is the cluster name rule (internal/control).
+var legID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+
+// isV2 reports whether p was decoded from schema v2.
+func (p *Placement) isV2() bool { return p.Legs != nil || p.Owners != nil || p.Move != nil }
+
+// fromV2 converts a placement decoded from schema v2 into the v1 fields this build routes by, and
+// clears the v2 ones. A v1 placement is left as it is.
+func (p *Placement) fromV2() error {
+	if !p.isV2() {
+		return nil
+	}
+	if p.Primary != "" || p.Source != "" || p.Names != nil || p.Ramp != nil || p.Cutover != nil {
+		return fmt.Errorf("a placement is written in one schema: legs, owners and move (v2), or primary, source, names, ramp and cutover (v1), not both")
+	}
+	if err := checkV2(p); err != nil {
+		return err
+	}
+	cluster := func(leg string) string { return p.Legs[leg].Cluster }
+	names := make(map[string]string, len(p.Legs))
+	for _, id := range sortedKeys(p.Legs) {
+		l := p.Legs[id]
+		if _, dup := names[l.Cluster]; dup {
+			return fmt.Errorf("legs: two legs on cluster %q; this build routes one leg per cluster (ADR-0018 N3)", l.Cluster)
+		}
+		names[l.Cluster] = l.Bucket
+	}
+	if len(p.Owners) != 1 {
+		return fmt.Errorf("owners: %d ranges; this build routes a placement whose one leg owns every key (ADR-0018 N2)", len(p.Owners))
+	}
+	owner := p.Owners[0].Leg
+	v1 := *p
+	v1.Legs, v1.Owners, v1.Move, v1.KeyHash = nil, nil, nil, ""
+	v1.Names = names
+	switch m := p.Move; {
+	case p.State == StateActive && m != nil:
+		return fmt.Errorf("move: not allowed in state ACTIVE")
+	case p.State == StateActive:
+		v1.Primary = cluster(owner)
+	case m == nil:
+		return fmt.Errorf("move: required in state %s", p.State)
+	case m.Range != FullRange:
+		return fmt.Errorf("move.range: a move of part of the key space needs ADR-0018 N3; this build moves every key")
+	case m.From != owner:
+		return fmt.Errorf("move.from: %q does not own the range it moves; %q does", m.From, owner)
+	default:
+		v1.Source, v1.Primary = cluster(m.From), cluster(m.To)
+		v1.Ramp, v1.Cutover = m.Ramp, m.Cutover
+	}
+	if p.Target != "" {
+		v1.Target = cluster(p.Target)
+	}
+	if p.Cold != "" {
+		v1.Cold = cluster(p.Cold)
+	}
+	*p = v1
+	return nil
+}
+
+// checkV2 checks what schema v2 says on its own, before any conversion: the legs, that the owners
+// partition the key space, and that the move and the leg references name legs.
+func checkV2(p *Placement) error {
+	if len(p.Legs) == 0 {
+		return fmt.Errorf("legs: at least one leg is required")
+	}
+	if len(p.Legs) > MaxLegs {
+		return fmt.Errorf("legs: %d legs; a placement has at most %d (ADR-0018)", len(p.Legs), MaxLegs)
+	}
+	for _, id := range sortedKeys(p.Legs) {
+		l := p.Legs[id]
+		switch {
+		case !legID.MatchString(id):
+			return fmt.Errorf("legs.%s: a leg id is lowercase letters, digits, - and _, starting with a letter or digit", id)
+		case l.Cluster == "":
+			return fmt.Errorf("legs.%s.cluster: required", id)
+		case l.Bucket == "":
+			return fmt.Errorf("legs.%s.bucket: required", id)
+		}
+	}
+	if p.KeyHash != "" && !validRampHashName(p.KeyHash) {
+		return fmt.Errorf("hash: %q is not a hash name", p.KeyHash)
+	}
+	if len(p.Owners) > 1 && p.KeyHash == "" {
+		return fmt.Errorf("hash: required when owners split the key space, e.g. %s", RampHash)
+	}
+	if err := checkOwners(p.Owners, p.Legs); err != nil {
+		return err
+	}
+	if m := p.Move; m != nil {
+		switch {
+		case m.Range.From > m.Range.To:
+			return fmt.Errorf("move.range: from is after to")
+		case !hasLeg(p.Legs, m.From):
+			return fmt.Errorf("move.from: unknown leg %q", m.From)
+		case !hasLeg(p.Legs, m.To):
+			return fmt.Errorf("move.to: unknown leg %q", m.To)
+		case m.From == m.To:
+			return fmt.Errorf("move.to: must differ from move.from")
+		}
+	}
+	if p.Target != "" && !hasLeg(p.Legs, p.Target) {
+		return fmt.Errorf("target: unknown leg %q", p.Target)
+	}
+	if p.Cold != "" && !hasLeg(p.Legs, p.Cold) {
+		return fmt.Errorf("cold: unknown leg %q", p.Cold)
+	}
+	return nil
+}
+
+func hasLeg(legs map[string]Leg, id string) bool {
+	_, ok := legs[id]
+	return ok
+}
+
+// checkOwners requires the owners to cover the key hash space exactly once, in order, each range
+// naming a leg.
+func checkOwners(owners []Owner, legs map[string]Leg) error {
+	if len(owners) == 0 {
+		return fmt.Errorf("owners: at least one range is required")
+	}
+	next := Hash(0)
+	for i, o := range owners {
+		switch {
+		case !hasLeg(legs, o.Leg):
+			return fmt.Errorf("owners[%d].leg: unknown leg %q", i, o.Leg)
+		case i == 0 && o.From != 0:
+			return fmt.Errorf("owners[0]: starts at %016x; the first range starts at 0000000000000000", uint64(o.From))
+		case o.From != next:
+			return fmt.Errorf("owners[%d]: starts at %016x; the previous range ends at %016x, and the ranges must follow on without a gap or an overlap", i, uint64(o.From), uint64(next)-1)
+		case o.To < o.From:
+			return fmt.Errorf("owners[%d]: from is after to", i)
+		}
+		if o.To == math.MaxUint64 {
+			if i != len(owners)-1 {
+				return fmt.Errorf("owners[%d]: ends the key space, but more ranges follow", i)
+			}
+			return nil
+		}
+		next = o.To + 1
+	}
+	return fmt.Errorf("owners: the ranges stop at %016x; they must cover the key space up to ffffffffffffffff", uint64(next)-1)
+}
+
+// ToV2 returns p in schema v2: every backend bucket a leg named after its cluster, the leg that
+// holds the keys at rest the only owner (the source while a move is in progress), and the move
+// from it to the primary. It is what N2 will write; N1 uses it to prove every reader round-trips.
+func (p Placement) ToV2() Placement {
+	v2 := p.clone()
+	v2.Primary, v2.Source, v2.Names, v2.Ramp, v2.Cutover = "", "", nil, nil, nil
+	v2.Legs = make(map[string]Leg, len(p.Names))
+	for cl, bucket := range p.Names {
+		v2.Legs[cl] = Leg{Cluster: cl, Bucket: bucket}
+	}
+	owner := p.Primary
+	if p.State != StateActive {
+		owner = p.Source
+		v2.Move = &Move{Range: FullRange, From: p.Source, To: p.Primary, Ramp: v2ramp(p.Ramp), Cutover: v2cutover(p.Cutover)}
+	}
+	v2.Owners = []Owner{{From: FullRange.From, To: FullRange.To, Leg: owner}}
+	return v2
+}
+
+func v2ramp(r *Ramp) *Ramp {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	c.Prefixes = slices.Clone(r.Prefixes)
+	if r.Hold != nil {
+		h := *r.Hold
+		h.Prefixes = slices.Clone(r.Hold.Prefixes)
+		c.Hold = &h
+	}
+	return &c
+}
+
+func v2cutover(ev *CutoverEvidence) *CutoverEvidence {
+	if ev == nil {
+		return nil
+	}
+	c := *ev
+	return &c
+}
+
+// placementJSON is Placement without its methods, so UnmarshalJSON can decode into it.
+type placementJSON Placement
+
+// UnmarshalJSON decodes either schema and converts v2 into v1 (fromV2). It covers every JSON
+// reader at once: the control plane's store, GET /v1/directory, a member's cache and the change
+// records.
+func (p *Placement) UnmarshalJSON(b []byte) error {
+	var w placementJSON
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	pl := Placement(w)
+	if err := pl.fromV2(); err != nil {
+		return err
+	}
+	*p = pl
+	return nil
+}

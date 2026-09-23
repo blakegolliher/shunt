@@ -68,20 +68,28 @@ type CutoverEvidence struct {
 // Placement maps one (tenant, bucket) to clusters and a state.
 type Placement struct {
 	State   string `yaml:"state" json:"state"`
-	Primary string `yaml:"primary" json:"primary"`
+	Primary string `yaml:"primary,omitempty" json:"primary,omitempty"` // always set in v1; empty in v2
 	Source  string `yaml:"source,omitempty" json:"source,omitempty"`
 	// Target is the cluster `shunt expand` prepared for the move, recorded while ACTIVE so the
 	// first ramp or migrate step needs no --to. Its backend name is in Names.
 	Target       string            `yaml:"target,omitempty" json:"target,omitempty"`
 	Cutover      *CutoverEvidence  `yaml:"cutover,omitempty" json:"cutover,omitempty"`
 	Ramp         *Ramp             `yaml:"ramp,omitempty" json:"ramp,omitempty"`
-	Names        map[string]string `yaml:"names" json:"names"` // cluster → backend bucket name
+	Names        map[string]string `yaml:"names,omitempty" json:"names,omitempty"` // cluster → backend bucket name; v1 only
 	Cold         string            `yaml:"cold,omitempty" json:"cold,omitempty"`
 	Tier         string            `yaml:"tier,omitempty" json:"tier,omitempty"` // native | emulated
 	Lifecycle    string            `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
 	Created      time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
 	ReadOnly     bool              `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	RejectWrites bool              `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
+
+	// Schema v2 (ADR-0018, legs.go). Only a decoder sets these, and it converts them into the v1
+	// fields above before anything else sees the placement, so outside legs.go they are always
+	// empty. In v2, Target and Cold name legs instead of clusters.
+	Legs    map[string]Leg `yaml:"legs,omitempty" json:"legs,omitempty"`
+	Owners  []Owner        `yaml:"owners,omitempty" json:"owners,omitempty"`
+	KeyHash string         `yaml:"hash,omitempty" json:"hash,omitempty"` // splits the key space among Owners
+	Move    *Move          `yaml:"move,omitempty" json:"move,omitempty"`
 }
 
 func (p Placement) clone() Placement {
@@ -175,6 +183,13 @@ func parse(data []byte) (*File, error) {
 			return &File{}, nil
 		}
 		return nil, config.KeyedDecodeError("directory", data, err)
+	}
+	for _, k := range sortedKeys(f.Placements) {
+		p := f.Placements[k]
+		if err := p.fromV2(); err != nil {
+			return nil, &config.Error{Key: "placements." + k, Msg: err.Error()}
+		}
+		f.Placements[k] = p
 	}
 	config.ApplyClusterDefaults(f.Clusters)
 	return f, nil

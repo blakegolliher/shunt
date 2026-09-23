@@ -1,0 +1,5 @@
+# expect: placements.acme/data: move.range: a move of part of the key space
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: MIGRATING, legs: { g: { cluster: garage, bucket: data }, m: { cluster: minio, bucket: data } }, owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: g } ], move: { range: { from: "0000000000000000", to: "7fffffffffffffff" }, from: g, to: m } }
