@@ -304,7 +304,7 @@ func (fr *fleetRun) run(t *testing.T, dur time.Duration, operator func(stop <-ch
 	<-opDone
 }
 
-var fleetSteps = []float64{0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1}
+var fleetRatios = []float64{0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1}
 
 func (fr *fleetRun) post(path string, body any) (int, string) {
 	data, _ := json.Marshal(body)
@@ -317,7 +317,16 @@ func (fr *fleetRun) post(path string, body any) (int, string) {
 	return resp.StatusCode, string(out)
 }
 
-func TestFleetStepsKeepTheClientsView(t *testing.T) {
+func TestFleetStepsKeepTheClientsView(t *testing.T) { fleetSteps(t, nil) }
+
+// TestFleetRangeMoveKeepsTheClientsView is the same run for a move of part of the bucket (ADR-0018
+// N3): only the lower half of the key space moves, so clients' keys in the other half stay on the
+// source throughout, and the property holds for both.
+func TestFleetRangeMoveKeepsTheClientsView(t *testing.T) {
+	fleetSteps(t, &directory.HashRange{From: 0, To: 1<<63 - 1})
+}
+
+func fleetSteps(t *testing.T, rg *directory.HashRange) {
 	fr := newFleetRun(t, 60*time.Millisecond)
 	b := fr.proxies[1]
 	cut := &fr.cut // set: B is severed from the control plane, its heartbeats and polls fail
@@ -332,7 +341,7 @@ func TestFleetStepsKeepTheClientsView(t *testing.T) {
 				return true
 			}
 		}
-		for i, ratio := range fleetSteps {
+		for i, ratio := range fleetRatios {
 			if !pause(250 * time.Millisecond) {
 				return
 			}
@@ -348,7 +357,11 @@ func TestFleetStepsKeepTheClientsView(t *testing.T) {
 					t.Error("B is not stale with its link to the control plane cut")
 				}
 			}
-			code, body := fr.post("/v1/placements/acme/data/ramp", control.RampRequest{Ratio: ratio, Wait: "5s"})
+			req := control.RampRequest{Ratio: ratio, Wait: "5s"}
+			if i == 0 {
+				req.Range = rg // the first step starts the move: of every key, or of the range
+			}
+			code, body := fr.post("/v1/placements/acme/data/ramp", req)
 			if code != http.StatusOK {
 				t.Errorf("ramp %v: %d %s", ratio, code, body)
 				return
@@ -374,11 +387,14 @@ func TestFleetStepsKeepTheClientsView(t *testing.T) {
 	})
 
 	p, _ := fr.tc.Snapshot().Lookup("acme", "data")
-	t.Logf("%d client operations, %d writes retried after a 503; %d of %d steps held; ended %s", fr.ops.Load(), fr.retried.Load(), held, len(fleetSteps), p.State)
+	t.Logf("%d client operations, %d writes retried after a 503; %d of %d steps held; ended %s", fr.ops.Load(), fr.retried.Load(), held, len(fleetRatios), p.State)
 	if p.State != directory.StateMigrating {
 		t.Errorf("the run ended in %s before every step was taken", p.State)
 	}
-	if held < len(fleetSteps)-2 {
+	if rg != nil && (p.Move == nil || p.Move.Range != *rg) {
+		t.Errorf("the run was to move part of the bucket, and ended with move %+v", p.Move)
+	}
+	if held < len(fleetRatios)-2 {
 		t.Errorf("only %d steps were held: B was a member for all but one of them", held)
 	}
 	if v := fr.violations(); len(v) > 0 {
@@ -388,18 +404,30 @@ func TestFleetStepsKeepTheClientsView(t *testing.T) {
 
 // The negative control: the same run with the steps written straight into the store, no fence
 // and no hold. B's lag must show up as a lost write or a stale read.
-func TestFleetWithoutTheFence(t *testing.T) {
+func TestFleetWithoutTheFence(t *testing.T) { fleetWithoutTheFence(t, nil) }
+
+// TestFleetRangeMoveWithoutTheFence is the negative control of the move of part of the bucket: it
+// must find a violation too, or the positive run proves nothing for moves.
+func TestFleetRangeMoveWithoutTheFence(t *testing.T) {
+	fleetWithoutTheFence(t, &directory.HashRange{From: 0, To: 1<<63 - 1})
+}
+
+func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange) {
 	fr := newFleetRun(t, 60*time.Millisecond)
 	ctx := context.Background()
 	fr.run(t, 8*time.Second, func(stop <-chan struct{}) {
 		from := directory.StateActive
-		for _, ratio := range fleetSteps {
+		for i, ratio := range fleetRatios {
 			select {
 			case <-stop:
 				return
 			case <-time.After(250 * time.Millisecond):
 			}
-			if err := fr.tc.SetState(ctx, "acme", "data", from, directory.Transition{To: directory.StateRamping, Ratio: ratio}, "test"); err != nil {
+			tr := directory.Transition{To: directory.StateRamping, Ratio: ratio}
+			if i == 0 {
+				tr.Range = rg
+			}
+			if err := fr.tc.SetState(ctx, "acme", "data", from, tr, "test"); err != nil {
 				t.Errorf("ramp %v: %v", ratio, err)
 				return
 			}
