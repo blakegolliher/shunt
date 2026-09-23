@@ -151,3 +151,13 @@ owner (N2), two legs on one cluster or a move of part of the key space (N3), and
   measured on the lab clusters.
 - **Rebalancing policy.** This ADR provides the mechanism (split, move). Whether shunt ever
   proposes moves itself (by capacity or load) is a separate decision.
+- **Concurrent moves (deferred, 2026-09-23; one at a time until revisited).** Moves over disjoint
+  ranges would keep every key two-sided, since a key's hash lies in exactly one range; so the
+  per-key arguments (routing, dual delete order, conditional checks, the mover's guard, the hold)
+  would hold unchanged, and consolidating several legs into one (A→D, B→D, C→D) would qualify,
+  the owners being a partition. What is not per key would have to become per move first:
+  `moves: [...]` in the directory, each with its own state, ramp, hold and cutover evidence;
+  fallback reads and mover convergence labelled by source leg, so one move's fallback reads do
+  not block another's cutover; and the fleet property test extended to interleaved steps of
+  several moves, with its negative control still failing. Fenced steps would stay one at a time
+  per placement.
