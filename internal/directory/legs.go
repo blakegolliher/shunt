@@ -101,7 +101,7 @@ func (p *Placement) fromV2() error {
 		}
 		names[l.Cluster] = l.Bucket
 	}
-	if len(p.Owners) > 1 {
+	if len(p.Owners) > 1 || (p.Move != nil && p.Move.Range != FullRange) {
 		return checkSpread(p)
 	}
 	owner := p.Owners[0].Leg
@@ -133,20 +133,38 @@ func (p *Placement) fromV2() error {
 	return nil
 }
 
-// Spread reports whether several legs own p's keys (ADR-0018 N2). A spread placement keeps its v2
-// fields in memory; its Primary and Names are empty.
-func (p *Placement) Spread() bool { return len(p.Owners) > 1 }
+// Spread reports whether p keeps its v2 fields in memory (ADR-0018): several legs own its keys
+// (N2), or part of its keys is moving to another leg (N3). Its Primary and Names are empty then.
+func (p *Placement) Spread() bool { return len(p.Owners) > 1 || p.Move != nil }
 
-// checkSpread is what N2 routes of a spread placement: ACTIVE, at rest, untiered. Moving keys
-// between legs, a target, and a cold tier across legs are N3.
+// checkSpread is what this build routes of a spread placement: untiered, one leg per cluster, and
+// at rest when ACTIVE, or moving one range that a single leg owns from that leg to another.
 func checkSpread(p *Placement) error {
 	switch {
-	case p.State != StateActive:
-		return fmt.Errorf("state: a placement spread over legs is ACTIVE in this build; moving keys between legs is ADR-0018 N3")
-	case p.Move != nil:
-		return fmt.Errorf("move: a placement spread over legs does not move in this build (ADR-0018 N3)")
 	case p.Target != "" || p.Cold != "" || p.Tier != "" || p.Lifecycle != "":
-		return fmt.Errorf("target, cold, tier and lifecycle are not set on a placement spread over legs in this build (ADR-0018 N3)")
+		return fmt.Errorf("target, cold, tier and lifecycle are not set on a placement spread over legs in this build")
+	case p.State == StateActive && p.Move != nil:
+		return fmt.Errorf("move: not allowed in state ACTIVE")
+	case p.State != StateActive && p.Move == nil:
+		return fmt.Errorf("move: required in state %s", p.State)
+	}
+	m := p.Move
+	if m == nil {
+		return nil
+	}
+	if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To }) {
+		return fmt.Errorf("move.range: leg %q does not own all of %s", m.From, rangeText(m.Range))
+	}
+	if p.Legs[m.From].Cluster == p.Legs[m.To].Cluster {
+		return fmt.Errorf("move: legs %s and %s are on one cluster; this build moves between clusters (ADR-0018 N3b)", m.From, m.To)
+	}
+	switch {
+	case p.State == StateRamping && m.Ramp == nil:
+		return fmt.Errorf("move.ramp: required in state RAMPING")
+	case p.State != StateRamping && m.Ramp != nil:
+		return fmt.Errorf("move.ramp: only allowed in state RAMPING")
+	case p.State != StateCutover && m.Cutover != nil:
+		return fmt.Errorf("move.cutover: only allowed in state CUTOVER")
 	}
 	return nil
 }
@@ -279,6 +297,10 @@ func v2ramp(r *Ramp) *Ramp {
 	}
 	c := *r
 	c.Prefixes = slices.Clone(r.Prefixes)
+	if r.Range != nil {
+		rg := *r.Range
+		c.Range = &rg
+	}
 	if r.Hold != nil {
 		h := *r.Hold
 		h.Prefixes = slices.Clone(r.Hold.Prefixes)

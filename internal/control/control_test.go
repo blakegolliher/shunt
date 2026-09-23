@@ -1126,7 +1126,7 @@ func TestCreateSpreadBucket(t *testing.T) {
 		t.Fatalf("a taken spread name: HTTP %d %s", code, raw)
 	}
 	rg.refused("POST", "/v1/placements/default/spd/expand", ExpandRequest{To: "vast02", Create: true}, "spread over 2 backend buckets; adding one or moving keys between them is ADR-0018 N3")
-	rg.refused("POST", "/v1/placements/default/spd/ramp", RampRequest{Ratio: 0.5, To: "vast02", Create: true}, "spread over 2 legs")
+	rg.refused("POST", "/v1/placements/default/spd/ramp", RampRequest{Ratio: 0.5, To: "vast02", Create: true}, "name the range of keys to move")
 	var so StepOut
 	rg.must("GET", "/v1/tenants/default/step-out", nil, &so)
 	if so.Ready || len(so.Buckets) != 1 || len(so.Buckets[0].Problems) != 1 || !strings.Contains(so.Buckets[0].Problems[0], "spread over 2 backend buckets (vast01/sp-a, vast02/sp-c)") {

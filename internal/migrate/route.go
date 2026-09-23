@@ -165,6 +165,9 @@ func InRange(r *directory.Ramp, key string) (bool, error) {
 	if r == nil {
 		return false, nil
 	}
+	if r.Range != nil {
+		return inRangeOf(r, key)
+	}
 	for _, p := range r.Prefixes {
 		if strings.HasPrefix(key, p) {
 			return true, nil
@@ -182,13 +185,45 @@ func InRange(r *directory.Ramp, key string) (bool, error) {
 	return rampHash(key) < uint64(r.Ratio*float64(math.MaxUint64)), nil
 }
 
+// inRangeOf is InRange for a ramp limited to a hash range (ADR-0018 N3): a key outside the range
+// is never moved; inside it, a prefix moves it, and the ratio is a share of the range, counted from
+// its start. The range always needs the hash, so a ramp naming another one is always refused.
+func inRangeOf(r *directory.Ramp, key string) (bool, error) {
+	if r.Hash != directory.RampHash {
+		return false, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, r.Hash, directory.RampHash)
+	}
+	h := rampHash(key)
+	from, to := uint64(r.Range.From), uint64(r.Range.To)
+	if h < from || h > to {
+		return false, nil
+	}
+	for _, p := range r.Prefixes {
+		if strings.HasPrefix(key, p) {
+			return true, nil
+		}
+	}
+	switch {
+	case r.Ratio <= 0:
+		return false, nil
+	case r.Ratio >= 1:
+		return true, nil
+	}
+	return float64(h-from) < r.Ratio*(float64(to-from)+1), nil
+}
+
+// InRangeHash reports whether key's hash falls in rg, by the hash the placement names.
+func InRangeHash(rg directory.HashRange, key string) bool {
+	h := directory.Hash(rampHash(key))
+	return h >= rg.From && h <= rg.To
+}
+
 // InHold reports whether a key falls inside the ramp's held step (directory.Ramp.Hold), split by
 // the same hash. A key already in the ramp is in force, not held; callers ask InRange first.
 func InHold(r *directory.Ramp, key string) (bool, error) {
 	if r == nil || r.Hold == nil {
 		return false, nil
 	}
-	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes}, key)
+	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes, Range: r.Range}, key)
 }
 
 // OwnerOf returns the id of the leg that owns key in a placement spread over legs (ADR-0018 N2):

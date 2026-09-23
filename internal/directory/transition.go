@@ -26,6 +26,10 @@ type Transition struct {
 	// write happens: a hold released concurrently must not be completed, or the step would move
 	// writes that no proxy held.
 	Complete bool
+	// Range, leaving ACTIVE, moves only the keys whose hash it holds (ADR-0018 N3): from the leg that
+	// owns them to the target, which becomes a new leg unless one is on that cluster already. Later
+	// steps of the move name it again or not at all.
+	Range *HashRange
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -66,8 +70,11 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
 	}
-	if p.Spread() {
-		return fail("the bucket is spread over %d legs; moving it is ADR-0018 N3", len(p.Legs))
+	if t.Range != nil && *t.Range == FullRange && !p.Spread() {
+		t.Range = nil // the whole bucket: a migration as before
+	}
+	if p.Spread() || t.Range != nil {
+		return applyMove(p, t)
 	}
 	if t.Release {
 		return release(p)
@@ -213,5 +220,10 @@ func release(p Placement) (Placement, error) {
 	return np, nil
 }
 
-// Held reports whether p has a ramp step written but not yet in force.
-func (p Placement) Held() bool { return p.Ramp != nil && p.Ramp.Hold != nil }
+// Held reports whether p has a ramp step written but not yet in force: its own, or its move's.
+func (p Placement) Held() bool {
+	if p.Move != nil {
+		return p.Move.Ramp != nil && p.Move.Ramp.Hold != nil
+	}
+	return p.Ramp != nil && p.Ramp.Hold != nil
+}

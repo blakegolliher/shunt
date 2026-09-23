@@ -254,8 +254,8 @@ func TestCreateSpreadAndItsGuards(t *testing.T) {
 	if err := f.SetTarget("acme", "spread", "minio", "x"); !errors.Is(err, ErrConflict) {
 		t.Errorf("expand of a spread bucket: %v", err)
 	}
-	if _, err := Apply(p, Transition{To: StateRamping, Target: "minio", Name: "x"}); err == nil || !strings.Contains(err.Error(), "spread over 3 legs") {
-		t.Errorf("a step on a spread bucket: %v", err)
+	if _, err := Apply(p, Transition{To: StateRamping, Target: "minio", Name: "x"}); err == nil || !strings.Contains(err.Error(), "name the range of keys to move") {
+		t.Errorf("a step on a spread bucket without a range: %v", err)
 	}
 }
 

@@ -39,6 +39,9 @@ type Ramp struct {
 	Hash     string   `yaml:"hash" json:"hash"`
 	Ratio    float64  `yaml:"ratio,omitempty" json:"ratio,omitempty"`
 	Prefixes []string `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
+	// Range limits the ramp to the keys whose hash it holds, and makes Ratio a share of it: the
+	// ramp of a move of part of a bucket (ADR-0018 N3). Nil is every key, as before N3.
+	Range *HashRange `yaml:"range,omitempty" json:"range,omitempty"`
 	// Hold is a ramp step that has been written but is not in force yet (ADR-0016). A key inside
 	// Hold but outside the ramp is held: its writes are refused with 503 until the step reaches
 	// every proxy, so no proxy writes it to the target while another still writes it to the source.
@@ -95,16 +98,7 @@ type Placement struct {
 func (p Placement) clone() Placement {
 	c := p
 	c.Names = maps.Clone(p.Names)
-	if p.Ramp != nil {
-		r := *p.Ramp
-		r.Prefixes = slices.Clone(p.Ramp.Prefixes)
-		if p.Ramp.Hold != nil {
-			h := *p.Ramp.Hold
-			h.Prefixes = slices.Clone(p.Ramp.Hold.Prefixes)
-			r.Hold = &h
-		}
-		c.Ramp = &r
-	}
+	c.Ramp = v2ramp(p.Ramp)
 	if p.Cutover != nil {
 		ev := *p.Cutover
 		c.Cutover = &ev

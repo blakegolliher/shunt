@@ -285,3 +285,48 @@ func TestHeldKeys(t *testing.T) {
 		}
 	}
 }
+
+// A ramp limited to a hash range moves only keys inside it: its ratio is a share of the range,
+// counted from the range's start, and a prefix moves only the prefixed keys inside it (ADR-0018 N3).
+func TestRampLimitedToARange(t *testing.T) {
+	lower := directory.HashRange{From: 0, To: 1<<63 - 1}
+	var inside, outside []string
+	for i := 0; len(inside) < 400 || len(outside) < 50; i++ {
+		k := fmt.Sprintf("k/%05d", i)
+		if InRangeHash(lower, k) {
+			inside = append(inside, k)
+		} else {
+			outside = append(outside, k)
+		}
+	}
+	all := &directory.Ramp{Hash: directory.RampHash, Ratio: 1, Range: &lower}
+	half := &directory.Ramp{Hash: directory.RampHash, Ratio: 0.5, Range: &lower, Prefixes: []string{"p/"}}
+	moved := 0
+	for _, k := range inside {
+		if in, err := InRange(all, k); err != nil || !in {
+			t.Fatalf("%s is inside the range: %v %v", k, in, err)
+		}
+		if in, _ := InRange(half, k); in {
+			moved++
+		}
+	}
+	if moved < 160 || moved > 240 { // about half of 400
+		t.Fatalf("ratio 0.5 of the range moved %d of %d keys", moved, len(inside))
+	}
+	for _, k := range outside {
+		for _, r := range []*directory.Ramp{all, half, {Hash: directory.RampHash, Ratio: 1, Range: &lower, Hold: &directory.RampHold{Ratio: 1}}} {
+			if in, _ := InRange(r, k); in {
+				t.Fatalf("%s is outside the range but moved", k)
+			}
+			if held, _ := InHold(r, k); held {
+				t.Fatalf("%s is outside the range but held", k)
+			}
+		}
+		if in, _ := InRange(half, "p/"+k); in && !InRangeHash(lower, "p/"+k) {
+			t.Fatalf("a prefix moved p/%s from outside the range", k)
+		}
+	}
+	if _, err := InRange(&directory.Ramp{Hash: "other-v9", Ratio: 1, Range: &lower}, "x"); err == nil {
+		t.Fatal("a ranged ramp by an unknown hash must be refused: the range needs the hash")
+	}
+}

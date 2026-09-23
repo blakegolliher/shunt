@@ -147,30 +147,7 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 			e.add(k+".source", "must differ from primary")
 		}
 	}
-	if p.Ramp != nil {
-		if p.State != StateRamping {
-			e.add(k+".ramp", "only allowed in state RAMPING")
-		}
-		if !validRampHashName(p.Ramp.Hash) {
-			e.add(k+".ramp.hash", "required: the name of the hash that splits the ramp's keys, e.g. %s; got %q", RampHash, p.Ramp.Hash)
-		}
-		if p.Ramp.Ratio < 0 || p.Ramp.Ratio > 1 {
-			e.add(k+".ramp.ratio", "must be within [0, 1], got %v", p.Ramp.Ratio)
-		}
-		if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 && p.Ramp.Hold == nil {
-			e.add(k+".ramp", "needs a ratio or at least one prefix")
-		}
-		if h := p.Ramp.Hold; h != nil {
-			if h.Ratio < 0 || h.Ratio > 1 {
-				e.add(k+".ramp.hold.ratio", "must be within [0, 1], got %v", h.Ratio)
-			}
-			if h.Ratio == 0 && len(h.Prefixes) == 0 {
-				e.add(k+".ramp.hold", "needs a ratio or at least one prefix")
-			}
-		}
-	} else if p.State == StateRamping {
-		e.add(k+".ramp", "required in state RAMPING")
-	}
+	validateRamp(e, k, p.State, p.Ramp)
 	for _, cl := range sortedKeys(p.Names) {
 		nk := k + ".names." + cl
 		e.ref(clusters, nk, cl)
@@ -202,6 +179,37 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 	validateTier(e, clusters, k, p)
 }
 
+// validateRamp checks a ramp where it sits: a placement's, or a move's (ADR-0018 N3).
+func validateRamp(e *errs, k, state string, r *Ramp) {
+	if r != nil {
+		if state != StateRamping {
+			e.add(k+".ramp", "only allowed in state RAMPING")
+		}
+		if !validRampHashName(r.Hash) {
+			e.add(k+".ramp.hash", "required: the name of the hash that splits the ramp's keys, e.g. %s; got %q", RampHash, r.Hash)
+		}
+		if r.Ratio < 0 || r.Ratio > 1 {
+			e.add(k+".ramp.ratio", "must be within [0, 1], got %v", r.Ratio)
+		}
+		if r.Ratio == 0 && len(r.Prefixes) == 0 && r.Hold == nil {
+			e.add(k+".ramp", "needs a ratio or at least one prefix")
+		}
+		if h := r.Hold; h != nil {
+			if h.Ratio < 0 || h.Ratio > 1 {
+				e.add(k+".ramp.hold.ratio", "must be within [0, 1], got %v", h.Ratio)
+			}
+			if h.Ratio == 0 && len(h.Prefixes) == 0 {
+				e.add(k+".ramp.hold", "needs a ratio or at least one prefix")
+			}
+		}
+	} else if state == StateRamping {
+		e.add(k+".ramp", "required in state RAMPING")
+	}
+	if r != nil && r.Range != nil && r.Range.From > r.Range.To {
+		e.add(k+".ramp.range", "from is after to")
+	}
+}
+
 // validateSpread checks a placement spread over legs (ADR-0018 N2): its v2 shape, what N2 routes,
 // and each leg as a backend bucket, never shared with another placement.
 func validateSpread(e *errs, clusters map[string]config.Cluster, k, pk string, p Placement, used map[[2]string]string) {
@@ -211,6 +219,9 @@ func validateSpread(e *errs, clusters map[string]config.Cluster, k, pk string, p
 	}
 	if err := checkSpread(&p); err != nil {
 		e.add(k, "%s", err.Error())
+	}
+	if p.Move != nil {
+		validateRamp(e, k+".move", p.State, p.Move.Ramp)
 	}
 	if p.Primary != "" || p.Source != "" || p.Names != nil || p.Ramp != nil || p.Cutover != nil {
 		e.add(k, "a placement spread over legs names its buckets in legs, not in primary, source, names, ramp or cutover")
