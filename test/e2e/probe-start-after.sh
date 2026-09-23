@@ -5,6 +5,12 @@
 # hold both.
 # usage: test/e2e/probe-start-after.sh <endpoint-url> <region> <access-key> <secret> <scratch-bucket>
 set -uo pipefail
+if [ $# -ne 5 ]; then
+  echo "usage: $0 <endpoint-url> <region> <access-key> <secret> <scratch-bucket>" >&2
+  echo "  e.g. $0 http://s3.example.com us-east-1 AKIA... \"\$SECRET\" shunt-probe-startafter" >&2
+  echo "  The scratch bucket must not exist; the probe creates it, writes 8 objects, and deletes it." >&2
+  exit 2
+fi
 EP=$1 REGION=$2 AK=$3 SK=$4 B=$5
 export AWS_CONFIG_FILE=$(mktemp) AWS_SHARED_CREDENTIALS_FILE=/dev/null
 printf '[default]\ns3 =\n  addressing_style = path\n' > "$AWS_CONFIG_FILE"
