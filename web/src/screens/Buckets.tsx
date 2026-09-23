@@ -65,7 +65,13 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
   const growing = useMemo(() => placements.find((item) => item.key === expanding), [placements, expanding])
   const targets = growing ? clusters.filter((item) => item.name !== growing.primary) : []
   const generated = growing && target ? generatedName(growing, target, placements) : ''
-  const openExpand = (placement: PlacementStatus) => { setTarget(clusters.find((item) => item.name !== placement.primary)?.name ?? ''); setExpanding(placement.key) }
+  const openExpand = (placement: PlacementStatus, prefer = '', name = '') => {
+    const to = prefer && prefer !== placement.primary && clusters.some((item) => item.name === prefer) ? prefer : clusters.find((item) => item.name !== placement.primary)?.name ?? ''
+    setTarget(to); setExpandName(name); setExpanding(placement.key)
+  }
+  // The client bucket the add form names, when the tenant already has it: that is expand, not add.
+  const existing = placements.find((item) => item.key === `${tenant.trim()}/${bucket.trim()}`)
+  const tenantBuckets = placements.map((item) => splitKey(item.key)).filter(([t]) => t === tenant.trim()).map(([, b]) => b)
   const act = async (fn: () => Promise<unknown>, success: string) => {
     setBusy(true)
     try { await fn(); notify(success); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
@@ -81,6 +87,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
   const resetAdd = () => { setAdding(false); setBucket(''); setBackend(''); setKeyAccess(''); setKeySecret('') }
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (existing) return
     const name = backend.trim() || bucket.trim()
     const keys = keyAccess && keySecret ? [{ access_key: keyAccess.trim(), secret: keySecret }] : undefined
     const ok = mode === 'adopt'
@@ -97,12 +104,20 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
       </table></div>}
     </Card>
 
-    <Drawer open={adding} title="Add a bucket" eyebrow="Buckets" onClose={resetAdd} footer={<button form="bucket-add" type="submit" disabled={busy || !tenant.trim() || !bucket.trim() || !selectedCluster} className="w-full rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white disabled:opacity-50">{mode === 'adopt' ? 'Adopt bucket' : 'Create bucket'}</button>}>
+    <Drawer open={adding} title="Add a bucket" eyebrow="Buckets" onClose={resetAdd} footer={<button form="bucket-add" type="submit" disabled={busy || !tenant.trim() || !bucket.trim() || !selectedCluster || Boolean(existing)} className="w-full rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white disabled:opacity-50">{mode === 'adopt' ? 'Adopt bucket' : 'Create bucket'}</button>}>
       <form id="bucket-add" onSubmit={(event) => void submit(event)} className="grid gap-4">
         <div className="grid grid-cols-2 gap-2 rounded-lg bg-ink-950 p-1"><button type="button" onClick={() => setMode('adopt')} className={`rounded-md px-3 py-2 text-sm ${mode === 'adopt' ? 'bg-ember-600 text-white' : 'text-muted'}`}>Adopt existing</button><button type="button" onClick={() => setMode('create')} className={`rounded-md px-3 py-2 text-sm ${mode === 'create' ? 'bg-ember-600 text-white' : 'text-muted'}`}>Create new</button></div>
-        <div className="grid grid-cols-2 gap-3"><label className="text-sm font-medium">Tenant<input value={tenant} onChange={(event) => setTenant(event.target.value)} className={inputClass} /></label><label className="text-sm font-medium">Client bucket<input value={bucket} onChange={(event) => setBucket(event.target.value)} className={inputClass} /></label></div>
+        <div className="grid grid-cols-2 gap-3"><label className="text-sm font-medium">Tenant<input value={tenant} onChange={(event) => setTenant(event.target.value)} className={inputClass} /></label><label className="text-sm font-medium">Client bucket<input value={bucket} onChange={(event) => setBucket(event.target.value)} className={inputClass} list="client-buckets" placeholder="new name, or pick one" autoComplete="off" /></label><datalist id="client-buckets">{tenantBuckets.map((name) => <option key={name} value={name} />)}</datalist></div>
         <label className="text-sm font-medium">Cluster<select value={selectedCluster} onChange={(event) => setCluster(event.target.value)} className={inputClass}>{clusters.map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
         <label className="text-sm font-medium">Backend bucket name <span className="text-muted">(defaults to client name)</span><input value={backend} onChange={(event) => setBackend(event.target.value)} className={inputClass} placeholder={bucket || 'bucket-name'} /></label>
+        {existing && <div role="status" className="rounded-lg border border-ember-500 bg-ink-950 p-4 text-sm">
+          <p><span className="font-mono text-paper">{existing.key}</span> already exists: {existing.state} on {existing.primary} as <span className="font-mono">{existing.names[existing.primary]}</span>. Clients keep one name per bucket, so adding a cluster to it is Expand, not {mode === 'adopt' ? 'Adopt' : 'Create'}.</p>
+          {expandable(existing)
+            ? <button type="button" onClick={() => { const found = existing; const to = selectedCluster !== existing.primary ? selectedCluster : clusters.find((item) => item.name !== existing.primary)?.name; const name = backend.trim(); resetAdd(); openExpand(found, to, name) }} className="mt-3 rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white">Expand {splitKey(existing.key)[1]} to {selectedCluster !== existing.primary ? selectedCluster : clusters.find((item) => item.name !== existing.primary)?.name}</button>
+            : existing.target || existing.state !== 'ACTIVE'
+              ? <button type="button" onClick={() => { const key = existing.key; resetAdd(); onMigrate(key) }} className="mt-3 rounded-lg border border-ember-500 px-4 py-2 font-semibold">Continue its migration</button>
+              : <p className="mt-2 text-muted">Add another cluster first; expand needs one other than {existing.primary}.</p>}
+        </div>}
         <fieldset className="rounded-lg border border-ink-700 p-4"><legend className="px-2 text-sm font-medium">Optional client key import</legend>{showKeyHint && <p className="mb-3 text-xs text-amber-200">Clients reach a bucket through shunt only with a client key shunt holds{tenantHasNoKeys ? `, and tenant ${tenant.trim()} has none yet` : ''}. Import one the cluster knows, or add one later with shunt client add.</p>}<p className="mb-3 text-xs text-muted">The secret is checked against the cluster and stored by reference in the control plane; it is never returned.</p><label className="text-sm">Access key<input value={keyAccess} onChange={(event) => setKeyAccess(event.target.value)} className={inputClass} autoComplete="off" /></label><label className="mt-3 block text-sm">Secret<input type="password" value={keySecret} onChange={(event) => setKeySecret(event.target.value)} className={inputClass} autoComplete="off" /></label></fieldset>
       </form>
     </Drawer>

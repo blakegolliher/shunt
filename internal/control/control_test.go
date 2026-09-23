@@ -41,6 +41,7 @@ type fakeCluster struct {
 	onList    func(token string) // called before a ListObjectsV2 page is served, with its continuation token
 	keys      map[string]bool    // when set, an access key not in it answers 403 InvalidAccessKeyId
 	noCreate  bool               // CreateBucket answers 403 AccessDenied, as VAST does for a key without the permission
+	owned     bool               // CreateBucket of an existing bucket answers 409 BucketAlreadyOwnedByYou, as MinIO does
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -83,6 +84,13 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
 			return
+		}
+		if fc.owned && r.Method == http.MethodPut && !strings.Contains(strings.Trim(r.URL.Path, "/"), "/") && r.URL.RawQuery == "" {
+			if ok, _ := fc.be.BucketExists(strings.Trim(r.URL.Path, "/")); ok {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`<Error><Code>BucketAlreadyOwnedByYou</Code><Message>yours</Message></Error>`))
+				return
+			}
 		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
@@ -977,6 +985,49 @@ func TestCreateBackendImportsClientKeys(t *testing.T) {
 		if p.ClientKeys != nil {
 			t.Fatalf("%s: a count without a key store: %d", p.Key, *p.ClientKeys)
 		}
+	}
+}
+
+// A client bucket name the tenant already uses is refused before create or adopt touches a
+// backend or imports a key, naming the bucket and pointing at expand. Create refuses a backend
+// bucket that already exists (that is adopt's job), and never deletes a bucket it did not make.
+func TestCreateAndAdoptRefuseATakenClientName(t *testing.T) {
+	rg := newRig(t)
+	rg.vast02.keys = map[string]bool{"AK": true, "CLUSTERKEY": true}
+	sk := &stubKeys{}
+	rg.ctl.Keys = sk
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/create-backend", CreateBackendRequest{Cluster: "vast01"}, nil)
+
+	taken := "default/data01 already exists (ACTIVE on vast01 as data01); choose another client bucket name, or expand data01"
+	conflict := func(path string, body any) {
+		t.Helper()
+		code, raw := rg.call("POST", path, body, nil)
+		var e Error
+		_ = json.Unmarshal([]byte(raw), &e)
+		if code != http.StatusConflict || e.Code != "conflict" || !strings.Contains(e.Message, taken) {
+			t.Fatalf("POST %s: want 409 conflict %q, got HTTP %d %s", path, taken, code, raw)
+		}
+	}
+	conflict("/v1/placements/default/data01/create-backend",
+		CreateBackendRequest{Cluster: "vast02", Name: "data01-b", Keys: []ClientKeyRequest{{AccessKey: "CLUSTERKEY", Secret: "s"}}})
+	if ok, _ := rg.vast02.be.BucketExists("data01-b"); ok || len(sk.stored) != 0 {
+		t.Fatalf("a refused create made a bucket or imported a key: %+v", sk.stored)
+	}
+	if err := rg.vast02.be.CreateBucket("found"); err != nil {
+		t.Fatal(err)
+	}
+	conflict("/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast02", Name: "found"})
+
+	// Create names a bucket that is already there: refused, and the bucket stays.
+	rg.refused("POST", "/v1/placements/default/data02/create-backend", CreateBackendRequest{Cluster: "vast02", Name: "found"},
+		"bucket found already exists on vast02; Adopt takes over a bucket that is already there")
+	if ok, _ := rg.vast02.be.BucketExists("found"); !ok {
+		t.Fatal("create deleted a bucket it did not make")
+	}
+	if _, ok := rg.dir.Snapshot().Lookup("default", "data02"); ok {
+		t.Fatal("a refused create was placed")
 	}
 }
 

@@ -127,14 +127,19 @@ func (b backend) bucketExists(ctx context.Context, bucket string) (bool, error) 
 	return false, fmt.Errorf("%s: HEAD bucket %s answered HTTP %d", b.cl.Name, bucket, r.status)
 }
 
-// createBucket creates bucket; a bucket this account already owns counts as created.
-func (b backend) createBucket(ctx context.Context, bucket string) error {
+// createBucket creates bucket; a bucket this account already owns counts as created. created
+// says whether this call made it, so a caller that undoes its work never deletes a bucket it
+// found. AWS in us-east-1 answers 200 to re-creating a bucket the account owns, so created can be
+// true for a bucket that was already there: a caller that may delete checks existence first.
+func (b backend) createBucket(ctx context.Context, bucket string) (created bool, err error) {
 	r, err := b.do(ctx, http.MethodPut, bucket, "", nil, nil, nil)
 	switch {
 	case err != nil:
-		return err
-	case r.status == http.StatusOK, r.status == http.StatusNoContent, r.code == "BucketAlreadyOwnedByYou":
-		return nil
+		return false, err
+	case r.status == http.StatusOK, r.status == http.StatusNoContent:
+		return true, nil
+	case r.code == "BucketAlreadyOwnedByYou":
+		return false, nil
 	}
 	err = fmt.Errorf("%s: creating bucket %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
 	if r.msg != "" {
@@ -145,7 +150,7 @@ func (b backend) createBucket(ctx context.Context, bucket string) error {
 		// (docs/reference/backend-compat.md); a wrong key was already refused when the cluster was added.
 		err = fmt.Errorf("%w: access key %s may not create buckets on %s; grant it that, or create %s there with a key that may and use that name", err, b.cl.Creds.AccessKey, b.cl.Name, bucket)
 	}
-	return err
+	return false, err
 }
 
 // versioning returns the bucket's GetBucketVersioning status: "", "Enabled", or "Suspended".

@@ -157,3 +157,33 @@ test('create imports a client key, and a bucket no key reaches is flagged', asyn
   await waitFor(() => expect(screen.queryByText('no client keys')).not.toBeInTheDocument())
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
+
+test('naming an existing client bucket offers Expand instead of adding it twice', async () => {
+  const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', names: { source: 'data' }, read_only: false, reject_writes: false }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let expandBody: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/data/expand') && init?.method === 'POST') {
+      expandBody = JSON.parse(String(init.body))
+      return Response.json({ key: 'acme/data', target: 'target', name: 'data-minio', version: 4 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Create new' }))
+  fireEvent.change(screen.getByLabelText('Tenant'), { target: { value: 'acme' } })
+  expect(document.querySelector('#client-buckets option[value="data"]')).not.toBeNull()
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'data' } })
+  fireEvent.change(screen.getByLabelText('Cluster'), { target: { value: 'target' } })
+  fireEvent.change(screen.getByLabelText(/Backend bucket name/), { target: { value: 'data-minio' } })
+  expect(screen.getByRole('status')).toHaveTextContent('acme/data already exists: ACTIVE on source as data')
+  expect(screen.getByRole('button', { name: 'Create bucket' })).toBeDisabled()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Expand data to target' }))
+  expect(screen.getByRole('dialog')).toHaveTextContent('Expand acme/data')
+  expect(screen.getByLabelText('Target bucket name')).toHaveValue('data-minio')
+  fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
+  await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'data-minio', create: true }))
+})

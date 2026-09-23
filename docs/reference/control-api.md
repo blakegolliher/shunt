@@ -136,7 +136,7 @@ Takes over a bucket that already exists: a signed HEAD checks it is there, then 
 Refused if:
 - the bucket is missing;
 - it has ever been versioned;
-- the placement already exists (`conflict`).
+- the placement already exists (`conflict`), checked before anything else: the message names the bucket's state, cluster and backend name, and points at `expand` for adding a cluster to it.
 
 ### `POST /v1/placements/{tenant}/{bucket}/create-backend`
 
@@ -145,7 +145,10 @@ bucket, then records it as an `ACTIVE` placement (creating the tenant when neede
 to the client bucket name. If the directory write fails, the newly created backend bucket is
 removed. An optional `"keys": [{"access_key": "…", "secret": "…", "buckets": ["data01"]}]` imports
 client keys as adopt's `keys` does: each is checked against the cluster before the bucket is
-created, and a refused key creates nothing. The member-only `/create` route remains the first half of a proxy's signed S3
+created, and a refused key creates nothing. A client bucket name the tenant already uses answers
+`conflict` as adopt does, before any backend request or key import; a backend bucket that already
+exists is refused (adopt takes over an existing bucket), and the cleanup after a failed directory
+write deletes only a bucket this call created. The member-only `/create` route remains the first half of a proxy's signed S3
 CreateBucket flow and does not duplicate the backend request.
 
 ### `POST /v1/placements/{tenant}/{bucket}/expand`

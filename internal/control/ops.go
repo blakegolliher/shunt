@@ -291,7 +291,7 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 		case !exists && !create:
 			return TransitionResult{}, refuse("bucket %s does not exist on %s; create it there, or ask for it to be created (--create)", name, np.Primary)
 		case !exists:
-			if err := target.createBucket(ctx, name); err != nil {
+			if _, err := target.createBucket(ctx, name); err != nil {
 				return TransitionResult{}, err
 			}
 			res.CreatedBucket = name
@@ -336,6 +336,10 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) {
 	key := directory.Key(tenant, bucket)
 	if req.Name == "" {
 		req.Name = bucket
+	}
+	if err := s.clientNameFree(tenant, bucket); err != nil {
+		fail(w, err)
+		return
 	}
 	b, err := s.backendFor(req.Cluster)
 	if err != nil {
@@ -449,7 +453,7 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		fail(w, refuse("bucket %s does not exist on %s; create it there, or ask expand to create it (--create)", req.Name, req.To))
 		return
 	case !exists:
-		if err = tb.createBucket(ctx, req.Name); err != nil {
+		if _, err = tb.createBucket(ctx, req.Name); err != nil {
 			fail(w, err)
 			return
 		}
@@ -1039,6 +1043,26 @@ func (s *Server) createPlacement(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, VersionResult{Key: directory.Key(tenant, bucket), Version: s.Dir.Snapshot().Version()})
 }
 
+// clientNameFree answers a client bucket name the tenant already uses, before adopt or create
+// touches a backend or imports a key, and says what the name is and what to do instead. The
+// directory write stays the authority: two concurrent calls both pass here, and one of them is
+// refused there.
+func (s *Server) clientNameFree(tenant, bucket string) error {
+	p, ok := s.Dir.Snapshot().Lookup(tenant, bucket)
+	if !ok {
+		return nil
+	}
+	return nameTaken(fmt.Sprintf("%s already exists (%s on %s as %s); choose another client bucket name, or expand %s to add a cluster to it",
+		directory.Key(tenant, bucket), p.State, p.Primary, p.Names[p.Primary], bucket))
+}
+
+// nameTaken is directory.ErrExists with a message that says what to do: the API answers it as
+// before (409 conflict), in these words.
+type nameTaken string
+
+func (e nameTaken) Error() string { return string(e) }
+func (e nameTaken) Unwrap() error { return directory.ErrExists }
+
 // CreateBackendRequest is the browser's Create: the member route's fields, less the forwarded
 // actor, plus the client keys to import as adopt takes them.
 type CreateBackendRequest struct {
@@ -1064,6 +1088,10 @@ func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("%q is not a valid bucket name", req.Name))
 		return
 	}
+	if err := s.clientNameFree(tenant, bucket); err != nil {
+		fail(w, err)
+		return
+	}
 	if c, ok := s.Dir.Snapshot().Cluster(req.Cluster); ok && c.ReadOnly {
 		fail(w, refuse("cluster %s is read-only for maintenance", req.Cluster))
 		return
@@ -1075,6 +1103,14 @@ func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
+	switch exists, herr := b.bucketExists(ctx, req.Name); {
+	case herr != nil:
+		fail(w, herr)
+		return
+	case exists:
+		fail(w, refuse("bucket %s already exists on %s; Adopt takes over a bucket that is already there", req.Name, req.Cluster))
+		return
+	}
 	for _, k := range req.Keys {
 		k.Cluster = req.Cluster
 		res, kerr := s.storeKey(ctx, tenant, k)
@@ -1084,12 +1120,15 @@ func (s *Server) createBackendPlacement(w http.ResponseWriter, r *http.Request) 
 		}
 		s.info(actor(r), "client key imported", "tenant", res.Tenant, "access_key", res.AccessKey, "checked", res.Checked)
 	}
-	if err := b.createBucket(ctx, req.Name); err != nil {
+	created, err := b.createBucket(ctx, req.Name)
+	if err != nil {
 		fail(w, err)
 		return
 	}
 	if err := s.Dir.Adopt(r.Context(), tenant, bucket, req.Cluster, req.Name, actor(r)); err != nil {
-		_, _ = b.do(context.WithoutCancel(ctx), http.MethodDelete, req.Name, "", nil, nil, nil)
+		if created { // never a bucket this call found: someone may have made it in between
+			_, _ = b.do(context.WithoutCancel(ctx), http.MethodDelete, req.Name, "", nil, nil, nil)
+		}
 		fail(w, err)
 		return
 	}
