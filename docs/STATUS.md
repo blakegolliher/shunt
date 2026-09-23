@@ -136,7 +136,12 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   delimiter and hide a stray on the wrong leg (fails with the filter removed), fail a listing with a
   leg missing, and copy both ways; control tests cover the create's refusals and the guards;
   `FuzzSpreadToken` clean; `BenchmarkSpreadListingPage` about 2× a plain bucket, flat from 2 to 32
-  legs; race suite, lint and 26 UI tests green. Not yet run against live backends.
+  legs; race suite, lint and 26 UI tests green. **Live on two MinIO clusters (2026-09-23):** a bucket
+  spread over them took two concurrent `shunt verify` runs, one through each proxy, at 0 errors in
+  119,177 operations, and a 12 MiB three-part upload read back identical through the other proxy.
+  Listed directly, the legs held 204 and 209 keys with none on both; through either proxy, paged by
+  1000 or 37, v2 or v1, the listing was exactly their 413; the delimited listing gave each of 4
+  prefixes once; GetBucketVersioning answered `NotImplemented`.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
