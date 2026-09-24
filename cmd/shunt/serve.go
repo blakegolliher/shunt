@@ -27,6 +27,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/listener"
 	"github.com/blakegolliher/shunt/internal/member"
 	"github.com/blakegolliher/shunt/internal/proxy"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
@@ -130,14 +131,14 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	case cfg.Control.Member():
 		// A fleet member (ADR-0015): the directory, the client keys and the cluster secrets come
 		// from shunt-control, and nothing on this host is shared with another.
-		m, registry, err := startMember(ctx, cfg, metrics, log)
+		m, registry, rt, err := startMember(ctx, cfg, metrics, log)
 		if err != nil {
 			return err
 		}
 		defer registry.Close()
 		mem = m
 		m.Telemetry = windows
-		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir, hcfg.Stale = proxy.ModeResign, m.Keys(), registry, m, m.Stale
+		hcfg.Mode, hcfg.Runtime, hcfg.Dir, hcfg.Stale = proxy.ModeResign, rt, m, m.Stale
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
 		publishRouteState(metrics, m.Snapshot())
 	case cfg.Auth.Mode == "resign":
@@ -191,14 +192,24 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		commit()
 		dir.Prepare = applyClusters
 		events := control.NewEvents(0)
+		// The runtime bundle follows the directory, the key file and the registry: after an install
+		// the registry has committed that version's clusters, and a key change keeps the directory.
+		rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: store.Table(), Clusters: registry.Load()})
+		republish := func(s *directory.Snapshot, keys auth.Table) {
+			if perr := rt.Refresh(s, keys, registry.Load()); perr != nil {
+				log.Error("runtime bundle not published", "err", perr.Error())
+			}
+		}
+		store.OnChange = func(t auth.Table) { republish(dir.Snapshot(), t) }
 		dir.OnInstall = func(s *directory.Snapshot) {
+			republish(s, store.Table())
 			publishRouteState(metrics, s)
 			warnUnknownRampHashes(log, s)
 			events.Directory(s)
 		}
 		events.Directory(dir.Snapshot()) // the baseline: the first write is the first event
 		warnUnknownRampHashes(log, dir.Snapshot())
-		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, registry, dir
+		hcfg.Mode, hcfg.Runtime, hcfg.Dir = proxy.ModeResign, rt, dir
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = rewrite, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
 		if hcfg.DebugRoute {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
@@ -330,7 +341,7 @@ func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
 
 // startMember builds a fleet member's directory client and its cluster registry, loads the cached
 // directory, and registers with the control plane before the proxy serves anything (ADR-0016).
-func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, error) {
+func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, *runtimecfg.Publisher, error) {
 	mcfg := member.Config{Endpoints: cfg.Control.Endpoints, ProxyID: cfg.Control.ProxyID, CacheDir: cfg.Control.CacheDir,
 		Interval: cfg.Control.HeartbeatInterval, LeaseTTL: cfg.Control.LeaseTTL, Version: version}
 	if host, err := os.Hostname(); err == nil {
@@ -339,20 +350,20 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	if ref := cfg.Control.TokenRef; ref != "" {
 		tok, err := config.ResolveSecret(ref)
 		if err != nil {
-			return nil, nil, fmt.Errorf("control.token_ref: %w", err)
+			return nil, nil, nil, fmt.Errorf("control.token_ref: %w", err)
 		}
 		mcfg.Token = tok
 	}
 	if mcfg.ProxyID == "" {
 		host, err := os.Hostname()
 		if err != nil {
-			return nil, nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
+			return nil, nil, nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
 		}
 		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
 		mcfg.ProxyID = defaultProxyID(host, port)
 	}
 	if !config.ValidProxyID(mcfg.ProxyID) {
-		return nil, nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", mcfg.ProxyID)
+		return nil, nil, nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", mcfg.ProxyID)
 	}
 	m := member.New(mcfg, log)
 	m.Metrics = metrics
@@ -379,13 +390,19 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 			}
 		}, nil
 	}
+	// Each installed version is published as one bundle: the member has committed its clusters and
+	// swapped its keys before OnInstall, under its install lock, so bundles never go back (ADR-0021).
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: m.Snapshot(), Keys: m.Keys().Table(), Clusters: registry.Load()})
 	m.OnInstall = func(s *directory.Snapshot) {
+		if err := rt.Refresh(s, m.Keys().Table(), registry.Load()); err != nil {
+			log.Error("runtime bundle not published", "err", err.Error())
+		}
 		publishRouteState(metrics, s)
 		warnUnknownRampHashes(log, s)
 	}
 	metrics.FleetStale.Set(1) // until the first heartbeat is answered
 	if err := m.Load(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	log.Info("fleet member", "proxy", mcfg.ProxyID, "control", cfg.Control.Endpoints, "heartbeat", mcfg.Interval.String(), "lease_ttl", mcfg.LeaseTTL.String(),
 		"cache_dir", cfg.Control.CacheDir, "control_channel", "PLAINTEXT http (control.plaintext: true; secrets and client keys cross the network in the clear)")
@@ -397,7 +414,7 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 		log.Warn("fleet member could not register with the control plane before serving: starting stale (writes on moving buckets are refused until it can)",
 			"proxy", mcfg.ProxyID, "err", err.Error())
 	}
-	return m, registry, nil
+	return m, registry, rt, nil
 }
 
 // defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',

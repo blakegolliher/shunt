@@ -20,6 +20,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/cp/cptest"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/member"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -188,6 +189,12 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 		}
 		return func() { cand.Commit() }, nil
 	}
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: mem.Snapshot(), Keys: mem.Keys().Table(), Clusters: set.Load()})
+	mem.OnInstall = func(s *directory.Snapshot) {
+		if err := rt.Refresh(s, mem.Keys().Table(), set.Load()); err != nil {
+			t.Error(err)
+		}
+	}
 	if err := mem.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +207,7 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 	}
 	go mem.Run(ctx)
 	h := New(Handler{
-		Mode: ModeResign, Store: mem.Keys(), Clusters: set, Dir: mem, Rewrite: true, Stale: mem.Stale,
+		Mode: ModeResign, Runtime: rt, Dir: mem, Rewrite: true, Stale: mem.Stale,
 		Domains: s3.NewDomains([]string{"*.shunt.example.com"}), Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil),
 		Slow: telemetry.NewSlowRing(10, time.Hour), IdleTimeout: 2 * time.Second, MetadataTimeout: 5 * time.Second, Via: "1.1 shunt/test",
 	}, 64<<10)

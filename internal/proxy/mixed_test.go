@@ -654,7 +654,7 @@ func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.
 		store = mapStore{acmeAK: {AccessKey: acmeAK, Secret: acmeSK, Tenant: "acme"}, zedAK: {AccessKey: zedAK, Secret: zedSK, Tenant: "zed"}}
 	}
 	m.h = New(Handler{
-		Mode: ModeResign, Store: store, Clusters: set, Dir: m.dir, Rewrite: true, DebugRoute: rigDebugRoute,
+		Mode: ModeResign, Runtime: follow(t, m.dir, store, set), Dir: m.dir, Rewrite: true, DebugRoute: rigDebugRoute,
 		Domains: s3.NewDomains([]string{"*.shunt.example.com"}), Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(m.accessLog),
 		Slow: telemetry.NewSlowRing(10, time.Hour), IdleTimeout: 2 * time.Second, MetadataTimeout: 5 * time.Second, Via: "1.1 shunt/test",
 		Log: slog.New(slog.NewJSONHandler(m.alerts, nil)),

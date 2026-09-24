@@ -14,6 +14,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/s3/xmlrw"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -30,9 +31,11 @@ type Handler struct {
 	// routed by its placement in Dir to one of Clusters under that cluster's backend bucket name,
 	// and re-signed with the cluster's credentials. Rewrite (off by kill_switches.xml_rewrite_disable) rewrites the
 	// response echoes of backend names, endpoints, and uploadIds (ADR-0006).
-	Mode      Mode
-	Store     sigv4.CredentialStore
-	Clusters  *upstream.Registry
+	Mode Mode
+	// Runtime is the resign-mode runtime bundle (ADR-0021 D1): a request takes one bundle before
+	// it authenticates, and its keys, placements and clusters are that bundle's to its end. Dir is
+	// only for writes (a bucket's create and delete), never read on the request path.
+	Runtime   *runtimecfg.Publisher
 	Dir       directory.Directory
 	Rewrite   bool
 	ClockSkew time.Duration

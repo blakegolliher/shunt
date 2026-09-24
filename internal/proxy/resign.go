@@ -38,7 +38,10 @@ var refusedOps = map[s3.Op]bool{
 // for the cluster the placement routes to. It returns false when shunt has already answered.
 func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, inBody *progressReader) (*prepared, bool) {
 	t0 := time.Now()
-	id, aerr := sigv4.Verify(ctx, r, h.Store, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
+	// One bundle for the whole request: the keys that verify the client, the placement that routes
+	// it and the clusters that sign it come from one published version (ADR-0021 D1).
+	rt := h.Runtime.Load()
+	id, aerr := sigv4.Verify(ctx, r, rt.Keys, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
 	if aerr != nil {
 		h.Metrics.AuthFailures.WithLabelValues(string(aerr.Reason)).Inc()
 		o.status = aerr.Err.Status
@@ -53,8 +56,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	h.Metrics.AuthDuration.WithLabelValues(mode).Observe(time.Since(t0).Seconds())
 	o.tenant, o.accessKey = id.Credential.Tenant, id.Credential.AccessKey
 	info := o.info
-	snap := h.Dir.Snapshot()
-	clusters := h.Clusters.Load() // live since POC-5; the pointers this request takes stay valid to its end
+	snap, clusters := rt.Snapshot, rt.Clusters
 
 	switch {
 	case info.Level == s3.LevelService && info.Op == s3.OpListBuckets:

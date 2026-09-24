@@ -47,6 +47,9 @@ type Entry struct {
 // (ADR-0012). Writes are serialized by mu and rewrite the file.
 type Static struct {
 	byKey atomic.Pointer[map[string]sigv4.Credential]
+	// OnChange, if set, is called after every swap of the key table (Add, Remove, Replace), with
+	// the new table: the lab proxy republishes its runtime bundle (internal/runtimecfg).
+	OnChange func(Table)
 
 	mu      sync.Mutex
 	path    string  // the credentials file, when Load read one; "" for a parsed-only store
@@ -117,6 +120,44 @@ func parse(data []byte) (*Static, error) {
 	s.entries = f.Credentials
 	s.byKey.Store(&byKey)
 	return s, nil
+}
+
+// Table is an immutable snapshot of the key table: a map the store never writes again once it is
+// published, so a request that took it authenticates against one set of keys to its end.
+type Table struct{ byKey map[string]sigv4.Credential }
+
+// Table returns the current key table.
+func (s *Static) Table() Table { return Table{byKey: *s.byKey.Load()} }
+
+// Lookup implements sigv4.CredentialStore.
+func (t Table) Lookup(_ context.Context, accessKey string) (sigv4.Credential, error) {
+	c, ok := t.byKey[accessKey]
+	if !ok {
+		return sigv4.Credential{}, sigv4.ErrUnknownAccessKey
+	}
+	return c, nil
+}
+
+// Len returns the number of credentials in the table.
+func (t Table) Len() int { return len(t.byKey) }
+
+// NewTable is a table of creds, the default tenant filled in, for a bundle built from a directory
+// version that carries its client keys (a member's, from the control plane).
+func NewTable(creds []sigv4.Credential) Table {
+	m := make(map[string]sigv4.Credential, len(creds))
+	for _, c := range creds {
+		if c.Tenant == "" {
+			c.Tenant = directory.DefaultTenant
+		}
+		m[c.AccessKey] = c
+	}
+	return Table{byKey: m}
+}
+
+func (s *Static) changed(next map[string]sigv4.Credential) {
+	if s.OnChange != nil {
+		s.OnChange(Table{byKey: next})
+	}
 }
 
 // Lookup implements sigv4.CredentialStore.
@@ -217,6 +258,7 @@ func (s *Static) Add(c sigv4.Credential) error {
 	next[c.AccessKey] = sigv4.Credential{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: tenant, Buckets: c.Buckets}
 	s.entries = entries
 	s.byKey.Store(&next)
+	s.changed(next)
 	return nil
 }
 
@@ -247,6 +289,7 @@ func (s *Static) Remove(accessKey string) error {
 	delete(next, accessKey)
 	s.entries = entries
 	s.byKey.Store(&next)
+	s.changed(next)
 	return nil
 }
 
@@ -299,6 +342,7 @@ func (s *Static) Replace(creds []sigv4.Credential) {
 		next[c.AccessKey] = c
 	}
 	s.byKey.Store(&next)
+	s.changed(next)
 }
 
 // NewEmpty returns a store with no keys and no file, filled by Replace.

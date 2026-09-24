@@ -186,6 +186,17 @@ commit that runs only for an installed version (`internal/upstream`, `Registry.P
 secret-only rotation builds a new signer over the old transport. What remains for H1 is
 everything below about one coherent bundle, generations, retained-bundle limits and the cache.
 
+**Landed (2026-09-24, H1a):** the runtime bundle. `internal/runtimecfg` publishes one immutable
+`Bundle` (directory snapshot, client key table, cluster set); a resign-mode request loads it once
+before authentication and verifies, routes and signs from it alone, and `Publish` refuses an older
+version or another lineage. The member publishes one per install from `OnInstall`, under its
+install lock; the lab proxy on each directory install and each key-file change. `auth.Table` is an
+immutable snapshot of the key store. A test publishes a rotated-secret bundle while a request is
+authenticating and shows that request signing with the secret of the bundle it took; its negative
+control (reading the clusters again after authentication) signs both requests with the new secret.
+Remaining for H1: secret generations, resource lifetimes and the retained-bundle bound, the
+restart cache, rotation API/CLI/GUI and fleet install diagnostics.
+
 ### Runtime bundle and installation
 
 Introduce a concrete immutable runtime bundle (suggested home:
