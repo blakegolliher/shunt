@@ -89,7 +89,13 @@ func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.D
 	store := New(tc.nodes[i].Client(), c, slog.New(slog.DiscardHandler))
 	registry := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, store.Resolve)
 	t.Cleanup(registry.Close)
-	store.Prepare = func(f *directory.File) error { _, _, err := registry.Apply(f.Clusters); return err }
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
+	}
 	events := control.NewEvents(256)
 	store.OnInstall = events.Directory
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

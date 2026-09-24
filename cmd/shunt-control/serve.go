@@ -202,18 +202,20 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, Token: token,
 		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"),
 		Mover: worker.Run, MoverLedger: worker.Ledger}
-	store.Prepare = func(f *directory.File) error {
-		added, removed, aerr := registry.Apply(f.Clusters)
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, aerr := registry.Prepare(f.Clusters, resolve)
 		if aerr != nil {
-			return aerr
+			return nil, aerr
 		}
-		for _, name := range added {
-			log.Info("cluster ready", "cluster", name)
-		}
-		for _, name := range removed {
-			log.Info("cluster removed", "cluster", name)
-		}
-		return nil
+		return func() {
+			added, removed := cand.Commit()
+			for _, name := range added {
+				log.Info("cluster ready", "cluster", name)
+			}
+			for _, name := range removed {
+				log.Info("cluster removed", "cluster", name)
+			}
+		}, nil
 	}
 	// The store loads once there is quorum; until then /v1/ answers 503 and status says so. A
 	// node restarting alone after an outage must serve its API for the operator to see that. The

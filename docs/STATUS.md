@@ -26,7 +26,13 @@ do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) pro
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
-All H0–H5 slices are pending. New endpoints/commands in those documents are design
+All H0–H5 slices are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
+that fails when its fix is reverted: T01 (monotonic member installs), T02 (a refused or
+uncommitted candidate changes no live secret, key or cluster, on the member, the control node
+and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease
+follows the server's grant from the send time). Decided the same day: no protocol-1 fleet is
+deployed, so protocol 2 replaces it with no handover; the file backend stays lab-only and etcd
+carries the transaction contract (ADR-0021). New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

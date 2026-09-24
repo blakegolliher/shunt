@@ -158,33 +158,37 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		defer registry.Close()
 		rewrite := !cfg.KillSwitches.XMLRewriteDisable
 		started := false
-		applyClusters := func(f *directory.File) error {
-			before := registry.Load()
-			added, removed, aerr := registry.Apply(f.Clusters)
+		applyClusters := func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+			cand, aerr := registry.Prepare(f.Clusters, resolve)
 			if aerr != nil {
 				log.Error("directory version refused: a cluster could not be built", "version", f.Version, "err", aerr.Error())
-				return aerr
+				return nil, aerr
 			}
-			for _, name := range added {
-				cl, _ := registry.Load().Get(name)
-				event := "cluster added"
-				switch _, existed := before.Get(name); {
-				case !started:
-					event = "cluster ready"
-				case existed:
-					event = "cluster updated"
+			return func() {
+				before := registry.Load()
+				added, removed := cand.Commit()
+				for _, name := range added {
+					cl, _ := registry.Load().Get(name)
+					event := "cluster added"
+					switch _, existed := before.Get(name); {
+					case !started:
+						event = "cluster ready"
+					case existed:
+						event = "cluster updated"
+					}
+					logCluster(log, event, cl, f.Clusters[name], rewrite)
 				}
-				logCluster(log, event, cl, f.Clusters[name], rewrite)
-			}
-			started = true
-			for _, name := range removed {
-				log.Info("cluster removed", "cluster", name)
-			}
-			return nil
+				started = true
+				for _, name := range removed {
+					log.Info("cluster removed", "cluster", name)
+				}
+			}, nil
 		}
-		if applyErr := applyClusters(dir.Snapshot().File()); applyErr != nil {
+		commit, applyErr := applyClusters(dir.Snapshot().File(), nil)
+		if applyErr != nil {
 			return applyErr
 		}
+		commit()
 		dir.Prepare = applyClusters
 		events := control.NewEvents(0)
 		dir.OnInstall = func(s *directory.Snapshot) {
@@ -354,24 +358,26 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	m.Metrics = metrics
 	registry := upstream.NewRegistry(upstream.Options{}, m.Resolve)
 	rewrite := !cfg.KillSwitches.XMLRewriteDisable
-	m.Prepare = func(f *directory.File) error {
-		before := registry.Load()
-		added, removed, err := registry.Apply(f.Clusters)
+	m.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.Prepare(f.Clusters, resolve)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		for _, name := range added {
-			cl, _ := registry.Load().Get(name)
-			event := "cluster added"
-			if _, existed := before.Get(name); existed {
-				event = "cluster updated"
+		return func() {
+			before := registry.Load()
+			added, removed := cand.Commit()
+			for _, name := range added {
+				cl, _ := registry.Load().Get(name)
+				event := "cluster added"
+				if _, existed := before.Get(name); existed {
+					event = "cluster updated"
+				}
+				logCluster(log, event, cl, f.Clusters[name], rewrite)
 			}
-			logCluster(log, event, cl, f.Clusters[name], rewrite)
-		}
-		for _, name := range removed {
-			log.Info("cluster removed", "cluster", name)
-		}
-		return nil
+			for _, name := range removed {
+				log.Info("cluster removed", "cluster", name)
+			}
+		}, nil
 	}
 	m.OnInstall = func(s *directory.Snapshot) {
 		publishRouteState(metrics, s)

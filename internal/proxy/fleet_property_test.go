@@ -117,7 +117,13 @@ func newFleetRun(t *testing.T, lag time.Duration) *fleetRun {
 	store := cp.New(node.Client(), c, slog.New(slog.DiscardHandler))
 	registry := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, store.Resolve)
 	t.Cleanup(registry.Close)
-	store.Prepare = func(f *directory.File) error { _, _, err := registry.Apply(f.Clusters); return err }
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := store.Start(ctx); err != nil {
@@ -172,12 +178,15 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 		Interval: 40 * time.Millisecond, LeaseTTL: 200 * time.Millisecond, LongPoll: 500 * time.Millisecond}, slog.New(slog.DiscardHandler))
 	set := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, mem.Resolve)
 	t.Cleanup(set.Close)
-	mem.Prepare = func(f *directory.File) error {
+	mem.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
 		if lag > 0 {
 			time.Sleep(lag)
 		}
-		_, _, err := set.Apply(f.Clusters)
-		return err
+		cand, err := set.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
 	}
 	if err := mem.Load(); err != nil {
 		t.Fatal(err)

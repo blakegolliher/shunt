@@ -779,6 +779,42 @@ func TestAdoptExpandAndCutoverEvidence(t *testing.T) {
 	}
 }
 
+// T02 on the file backend: a candidate whose write never reaches disk is never committed, so
+// what it prepared (the proxy's clusters) never goes live.
+func TestPrepareIsNotCommittedWhenTheWriteFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	ctx := context.Background()
+	path := writeDir(t, 1)
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prepared, committed []int64
+	d.Prepare = func(f *File, _ func(string) (string, error)) (func(), error) {
+		prepared = append(prepared, f.Version)
+		return func() { committed = append(committed, f.Version) }, nil
+	}
+	if err := d.Create(ctx, "acme", "data", "garage", "acme-0000-data", "t"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := d.Create(ctx, "acme", "more", "garage", "acme-0000-more", "t"); err == nil {
+		t.Fatal("a write into a read-only directory succeeded")
+	}
+	if len(prepared) != 2 || len(committed) != 1 || committed[0] != 2 {
+		t.Fatalf("prepared %v, committed %v: want 2 and 3 prepared, only 2 committed", prepared, committed)
+	}
+	if d.Snapshot().Version() != 2 {
+		t.Fatalf("installed version %d after a failed write", d.Snapshot().Version())
+	}
+}
+
 // Prepare runs before a version is installed and can refuse it; OnInstall runs after, on writes
 // and reloads alike.
 func TestPrepareAndOnInstallHooks(t *testing.T) {
@@ -791,11 +827,11 @@ func TestPrepareAndOnInstallHooks(t *testing.T) {
 	var installed []int64
 	d.OnInstall = func(s *Snapshot) { installed = append(installed, s.Version()) }
 	refuse := errors.New("cannot build cluster")
-	d.Prepare = func(f *File) error {
+	d.Prepare = func(f *File, _ func(string) (string, error)) (func(), error) {
 		if _, ok := f.Clusters["broken"]; ok {
-			return refuse
+			return nil, refuse
 		}
-		return nil
+		return func() {}, nil
 	}
 	broken := config.Cluster{Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"10.0.0.9:80"}, Credentials: config.Credentials{AccessKey: "A", SecretRef: "env:NOPE"}}
 	if err := d.PutCluster(ctx, "broken", broken, "", "t"); !errors.Is(err, refuse) {

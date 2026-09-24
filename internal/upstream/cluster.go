@@ -112,6 +112,16 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 	}, nil
 }
 
+// withSecret returns a copy of c that signs with secret and shares c's transport, so a
+// secret-only rotation keeps the pooled connections. c itself keeps its secret: a request that
+// loaded it finishes signing with the secret it started with.
+func (c *Cluster) withSecret(secret string) *Cluster {
+	n := &Cluster{Name: c.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: c.ID, Endpoints: c.Endpoints, Transport: c.Transport,
+		Creds: c.Creds, EnforcesSHA256: c.EnforcesSHA256, UnsignedTrailer: c.UnsignedTrailer, ConditionalWrite: c.ConditionalWrite}
+	n.Creds.Secret = secret
+	return n
+}
+
 // Next returns the next endpoint, round-robin. Health and ejection are P3a.
 func (c *Cluster) Next() string {
 	n := c.next.Add(1) - 1

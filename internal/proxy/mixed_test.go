@@ -643,9 +643,12 @@ func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.
 	if _, _, err := set.Apply(m.dir.Snapshot().File().Clusters); err != nil {
 		t.Fatal(err)
 	}
-	m.dir.Prepare = func(f *directory.File) error {
-		_, _, aerr := set.Apply(f.Clusters)
-		return aerr
+	m.dir.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := set.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
 	}
 	if store == nil {
 		store = mapStore{acmeAK: {AccessKey: acmeAK, Secret: acmeSK, Tenant: "acme"}, zedAK: {AccessKey: zedAK, Secret: zedSK, Tenant: "zed"}}

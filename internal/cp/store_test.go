@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
 func openStore(t *testing.T, tc *testCluster, i int, key []byte) *Store {
@@ -208,15 +210,23 @@ func TestStoreSurvivesRestartAndReload(t *testing.T) {
 	if _, ok := b.Snapshot().Lookup("acme", "data"); !ok {
 		t.Fatal("node b lost the placement across a restart")
 	}
-	// Prepare sees every version, with the candidate's secrets resolvable.
+	// Prepare sees every version, with the candidate's secrets resolvable by the candidate's
+	// resolver only: a secret a write is adding does not resolve on the live store before it lands.
 	c := openStore(t, tc, 2, key)
 	seen := 0
-	c.Prepare = func(f *directory.File) error {
-		if _, err := c.Resolve("control:vast01"); err != nil {
-			return err
+	c.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		for name, cl := range f.Clusters {
+			if _, err := resolve(cl.Credentials.SecretRef); err != nil {
+				return nil, err
+			}
+			if _, live := c.Snapshot().Cluster(name); !live {
+				if _, err := c.Resolve(cl.Credentials.SecretRef); err == nil {
+					return nil, errors.New("a candidate's secret resolved on the live store before its version was installed")
+				}
+			}
 		}
 		seen++
-		return nil
+		return func() {}, nil
 	}
 	if err := c.SetTenantDefault(ctx, "acme", "vast01", "t"); err == nil || !errors.Is(err, directory.ErrConflict) {
 		t.Fatalf("setting the default to what it is: %v", err)
@@ -228,12 +238,61 @@ func TestStoreSurvivesRestartAndReload(t *testing.T) {
 		t.Error("Prepare did not run on the write")
 	}
 	refused := errors.New("cannot build")
-	c.Prepare = func(*directory.File) error { return refused }
+	c.Prepare = func(*directory.File, func(string) (string, error)) (func(), error) { return nil, refused }
 	if err := c.PutCluster(ctx, "vast04", cluster("control:vast04"), "s4", "t"); !errors.Is(err, refused) {
 		t.Errorf("Prepare's refusal did not refuse the write: %v", err)
 	}
 	if _, ok := c.Snapshot().Cluster("vast04"); ok {
 		t.Error("a refused write was installed")
+	}
+}
+
+// T02 on the control node: a write whose compare-and-swap never lands leaves the live cluster
+// registry as it was, though the write built its candidate. The version goes live only through
+// the watch, once it is in etcd.
+func TestStoreFailedWriteLeavesTheLiveClusters(t *testing.T) {
+	tc := startCluster(t, 1)
+	key := make([]byte, 32)
+	s := openStore(t, tc, 0, key)
+	reg := upstream.NewRegistry(upstream.Options{}, s.Resolve)
+	t.Cleanup(reg.Close)
+	var armed atomic.Bool
+	var cancelWrite context.CancelFunc
+	s.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		if armed.Load() {
+			cancelWrite() // the write's context ends after its candidate is built: its transaction fails
+		}
+		return func() { cand.Commit() }, nil
+	}
+	ctx := context.Background()
+	if err := s.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if cl, ok := reg.Load().Get("vast01"); !ok || cl.Creds.Secret != "s1" {
+		t.Fatalf("vast01 not live with s1 after its write: %v", ok)
+	}
+	v := s.Version()
+	var wctx context.Context
+	wctx, cancelWrite = context.WithCancel(ctx)
+	defer cancelWrite()
+	armed.Store(true)
+	err := s.PutCluster(wctx, "vast01", cluster("control:vast01"), "s2", "t")
+	armed.Store(false)
+	if err == nil {
+		t.Fatal("a write whose context ended before its transaction succeeded")
+	}
+	if s.Version() != v {
+		t.Fatalf("version %d after a failed write, want %d", s.Version(), v)
+	}
+	if cl, _ := reg.Load().Get("vast01"); cl.Creds.Secret != "s1" {
+		t.Errorf("the live registry signs with %q after a failed write, want s1", cl.Creds.Secret)
+	}
+	if sec, err := s.Resolve("control:vast01"); err != nil || sec != "s1" {
+		t.Errorf("the store resolves %q (%v) after a failed write, want s1", sec, err)
 	}
 }
 

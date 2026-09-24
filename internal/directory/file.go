@@ -41,8 +41,10 @@ type FileDir struct {
 	// Prepare, if set, is called with a validated file before it is installed, on a reload and
 	// on a write. An error rejects the file: a reload keeps the last good version, a write is
 	// refused before anything reaches disk. The proxy uses it to build the clusters a new file
-	// names before any request can route to them.
-	Prepare func(*File) error
+	// names before any request can route to them. resolve is nil here: a file's secret refs
+	// resolve from the environment or a file. commit is called only once the file is on disk,
+	// just before it is installed; a candidate whose write fails is dropped uncommitted.
+	Prepare func(f *File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after a new version is installed by a reload or a write.
 	OnInstall func(*Snapshot)
 
@@ -182,9 +184,11 @@ func (d *FileDir) Reload() (bool, error) {
 		return false, fmt.Errorf("%w: %s has version %d, loaded version is %d; keeping version %d", errStaleVersion, d.path, f.Version, cur, cur)
 	}
 	if d.Prepare != nil {
-		if perr := d.Prepare(f); perr != nil {
+		commit, perr := d.Prepare(f, nil)
+		if perr != nil {
 			return false, fmt.Errorf("directory: reload of %s rejected, keeping version %d: %w", d.path, cur, perr)
 		}
+		commit()
 	}
 	d.install(f, data, st)
 	if d.OnInstall != nil {
@@ -326,10 +330,13 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	if verr := validate(f); verr != nil {
 		return verr
 	}
+	commit := func() {}
 	if d.Prepare != nil {
-		if perr := d.Prepare(f); perr != nil {
+		c, perr := d.Prepare(f, nil)
+		if perr != nil {
 			return perr
 		}
+		commit = c
 	}
 	out, err := marshal(f)
 	if err != nil {
@@ -339,6 +346,7 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 		return classifyWrite(err)
 	}
 	st, _ := os.Stat(d.path)
+	commit()
 	d.install(f, out, st)
 	if d.OnInstall != nil {
 		d.OnInstall(d.snap.Load())

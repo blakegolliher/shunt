@@ -46,8 +46,10 @@ type Heartbeat struct {
 	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
 }
 
-// HeartbeatAnswer tells a member the current version and its lease.
+// HeartbeatAnswer tells a member the current version and its lease. Seq echoes the heartbeat it
+// answers: a member takes a lease only from the answer to the heartbeat it sent.
 type HeartbeatAnswer struct {
+	Seq      int64         `json:"seq"`
 	Version  int64         `json:"version"`
 	LeaseTTL time.Duration `json:"lease_ttl"`
 }
@@ -160,7 +162,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatAnswer{Version: s.Dir.Snapshot().Version(), LeaseTTL: ttl})
+	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Version: s.Dir.Snapshot().Version(), LeaseTTL: ttl})
 }
 
 func (s *Server) fleetList(w http.ResponseWriter, r *http.Request) {

@@ -83,9 +83,12 @@ type Store struct {
 	cipher *Cipher
 	log    *slog.Logger
 	// Prepare, if set, is called with a candidate directory before a write is committed and with
-	// each version the watch installs: shunt-control builds its clusters with it. On a write, an
-	// error refuses the write; on the watch, it is logged and the version is installed anyway.
-	Prepare func(*directory.File) error
+	// each version the watch installs: shunt-control builds its clusters with it. resolve resolves
+	// the candidate's own secrets. On a write, an error refuses the write, and the candidate is
+	// never committed: the version goes live through the watch, like another node's write, so a
+	// failed compare-and-swap leaves the live clusters as they were. On the watch, commit runs just
+	// before the version is installed; an error is logged and the version is installed anyway.
+	Prepare func(f *directory.File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after every installed version.
 	OnInstall func(*directory.Snapshot)
 	// Now stamps placements and change records; defaults to time.Now.
@@ -93,10 +96,8 @@ type Store struct {
 
 	cur  atomic.Pointer[state]
 	snap atomic.Pointer[directory.Snapshot]
-	mu   sync.Mutex // guards cond and pending
+	mu   sync.Mutex // guards cond
 	cond *sync.Cond
-	// pending holds a candidate's secrets while Prepare builds its clusters (Resolve reads them).
-	pending map[string]string
 
 	ready  atomic.Bool
 	stop   context.CancelFunc
@@ -173,7 +174,8 @@ func (s *Store) load(ctx context.Context) (int64, error) {
 	if err := directory.Validate(st.file); err != nil {
 		return 0, fmt.Errorf("the directory in etcd is invalid: %w", err)
 	}
-	_ = s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+	commit, _ := s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+	commit()
 	s.install(st)
 	return resp.Header.Revision, nil
 }
@@ -254,23 +256,22 @@ func (s *Store) apply(st *state, key string, value []byte, deleted bool) error {
 	return nil
 }
 
-// prepare runs the Prepare hook with the candidate's secrets resolvable. onWrite: an error refuses.
-func (s *Store) prepare(st *state, onWrite bool) error {
+// prepare runs the Prepare hook on a candidate, its secrets resolved from the candidate alone, and
+// returns the candidate's commit. onWrite: an error refuses. Otherwise an error is logged and the
+// commit returned keeps the live clusters as they are.
+func (s *Store) prepare(st *state, onWrite bool) (commit func(), err error) {
 	if s.Prepare == nil {
-		return nil
+		return func() {}, nil
 	}
-	s.mu.Lock()
-	s.pending = st.secrets
-	s.mu.Unlock()
-	err := s.Prepare(st.file)
-	s.mu.Lock()
-	s.pending = nil
-	s.mu.Unlock()
-	if err != nil && !onWrite {
+	commit, err = s.Prepare(st.file, st.resolve)
+	if err != nil {
+		if onWrite {
+			return nil, err
+		}
 		s.log.Error("a directory version could not be prepared on this node; installed anyway", "version", st.version, "err", err.Error())
-		return nil
+		return func() {}, nil
 	}
-	return err
+	return commit, nil
 }
 
 func (s *Store) install(st *state) {
@@ -316,7 +317,8 @@ func (s *Store) watch(ctx context.Context, rev int64) {
 				s.log.Error("a directory version in etcd is invalid; this node keeps its last version", "version", st.version, "err", err.Error())
 				continue
 			}
-			_ = s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+			commit, _ := s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+			commit()
 			s.install(st)
 		}
 		if ctx.Err() != nil {
@@ -395,20 +397,16 @@ func (s *Store) WaitVersion(ctx context.Context, v int64) error {
 	return nil
 }
 
-// Resolve resolves a cluster's secret_ref: a control: ref from this store (a candidate's during a
-// write, the installed version's otherwise), anything else from the environment or a file. It is
-// the resolver shunt-control's cluster registry is built with.
-func (s *Store) Resolve(ref string) (string, error) {
+// Resolve resolves a cluster's secret_ref: a control: ref from the installed version, anything else
+// from the environment or a file. It is the resolver shunt-control's cluster registry is built with.
+func (s *Store) Resolve(ref string) (string, error) { return s.cur.Load().resolve(ref) }
+
+// resolve resolves a secret_ref against this state's secrets.
+func (st *state) resolve(ref string) (string, error) {
 	if !strings.HasPrefix(ref, SecretRefPrefix) {
 		return config.ResolveSecret(ref)
 	}
-	s.mu.Lock()
-	pending := s.pending
-	s.mu.Unlock()
-	if v, ok := pending[ref]; ok {
-		return v, nil
-	}
-	if v, ok := s.cur.Load().secrets[ref]; ok {
+	if v, ok := st.secrets[ref]; ok {
 		return v, nil
 	}
 	return "", fmt.Errorf("no secret is stored for %s (shunt cluster add stores one)", ref)
@@ -479,7 +477,9 @@ func (s *Store) mutate(ctx context.Context, actor, op, key string, fn func(st *s
 		if err := directory.Validate(next.file); err != nil {
 			return err
 		}
-		if err := s.prepare(next, true); err != nil {
+		// The candidate is checked, not committed: the watch installs the version once it is in
+		// etcd, and prepares it again then.
+		if _, err := s.prepare(next, true); err != nil {
 			return err
 		}
 		ops, err := s.diff(cur, next)

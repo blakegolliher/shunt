@@ -62,7 +62,7 @@ Makes this proxy a **member** of a fleet run by `shunt-control` (ADR-0015, ADR-0
 | `proxy_id` | string | `<hostname>-<admin port>` | This member's id: 1-64 letters, digits, `.`, `_`, `-`. Stable across restarts, so a restarted proxy is the same member |
 | `cache_dir` | path | | Required. The last directory this proxy installed, kept 0700, and served after a restart with the control plane down (ACTIVE buckets only; moving ones refuse writes until the lease is back) |
 | `heartbeat_interval` | duration | 1s | How often a member reports the directory version it has installed |
-| `lease_ttl` | duration | 10s | At least three heartbeats. A member whose last acknowledged heartbeat is older refuses writes on moving buckets |
+| `lease_ttl` | duration | 10s | At least three heartbeats. The longest lease this member takes: a lease runs from a heartbeat's send time for the shorter of this and the control plane's grant. A member whose lease has run out refuses writes on moving buckets |
 
 Directory file schema (validated by `check-config` and `shunt directory validate`):
 

@@ -3,6 +3,7 @@ package upstream
 import (
 	"fmt"
 	"maps"
+	"net/http"
 	"reflect"
 	"slices"
 	"sync"
@@ -65,50 +66,97 @@ func (r *Registry) BuildWith(name string, def config.Cluster, secret string) (*C
 	return cl, nil
 }
 
-// Apply makes clusters the live set. A cluster whose definition is unchanged keeps its *Cluster,
-// transport and pooled connections; a new or changed one is built and its secret resolved. Nothing
-// is swapped if any cluster fails, so a definition the proxy cannot sign for never goes live.
-// Clusters that dropped out, or were replaced, have their idle connections closed after the swap.
-// It returns the names added (new or changed) and removed.
+// Apply makes clusters the live set: Prepare with the registry's own resolver, then Commit.
 func (r *Registry) Apply(clusters map[string]config.Cluster) (added, removed []string, err error) {
+	c, err := r.Prepare(clusters, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	added, removed = c.Commit()
+	return added, removed, nil
+}
+
+// Candidate is a Set that Prepare built and nothing serves from yet. Commit makes it live; a
+// candidate that is never committed is dropped, and the live set is as it was.
+type Candidate struct {
+	r     *Registry
+	next  *Set
+	defs  map[string]config.Cluster
+	added []string
+}
+
+// Prepare builds the Set clusters describe without making it live. A cluster whose definition
+// and secret are unchanged keeps its *Cluster, transport and pooled connections; one whose secret
+// alone changed gets a new *Cluster that signs with the new secret and shares the old transport;
+// a new or otherwise changed one is built. resolve turns a secret_ref into the secret for this
+// candidate only (nil: the registry's own resolver), so a candidate's secrets never reach the live
+// set before Commit. Any cluster failing fails the whole candidate.
+func (r *Registry) Prepare(clusters map[string]config.Cluster, resolve func(ref string) (string, error)) (*Candidate, error) {
+	if resolve == nil {
+		resolve = r.resolve
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old := r.cur.Load()
-	next := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: make([]string, 0, len(clusters))}
-	var built []*Cluster
-	fail := func(e error) ([]string, []string, error) {
-		for _, c := range built {
-			c.Close()
-		}
-		return nil, nil, e
-	}
+	c := &Candidate{r: r, next: &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: make([]string, 0, len(clusters))}, defs: maps.Clone(clusters)}
 	for _, name := range slices.Sorted(maps.Keys(clusters)) {
 		def := clusters[name]
-		cl, reuse := old.byName[name]
-		if !reuse || !reflect.DeepEqual(r.defs[name], def) {
-			cl, err = r.Build(name, def)
+		var secret string
+		if resolve != nil {
+			s, err := resolve(def.Credentials.SecretRef)
 			if err != nil {
-				return fail(err)
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
 			}
-			built = append(built, cl)
-			added = append(added, name)
+			secret = s
 		}
-		if other, dup := next.byID[cl.ID]; dup {
-			return fail(fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID))
+		cl, ok := old.byName[name]
+		switch {
+		case ok && reflect.DeepEqual(r.defs[name], def) && cl.Creds.Secret == secret:
+		case ok && reflect.DeepEqual(r.defs[name], def):
+			cl = cl.withSecret(secret)
+			c.added = append(c.added, name)
+		default:
+			var err error
+			if cl, err = New(name, def, r.opts); err != nil {
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
+			}
+			cl.Creds.Secret = secret
+			c.added = append(c.added, name)
 		}
-		next.byName[name], next.byID[cl.ID] = cl, cl
-		next.names = append(next.names, name)
+		if other, dup := c.next.byID[cl.ID]; dup {
+			return nil, fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID)
+		}
+		c.next.byName[name], c.next.byID[cl.ID] = cl, cl
+		c.next.names = append(c.next.names, name)
 	}
-	r.cur.Store(next)
-	r.defs = maps.Clone(clusters)
+	return c, nil
+}
+
+// Commit makes the candidate the live set and returns the names added (new or changed) and
+// removed. Clusters that dropped out or were replaced have their idle connections closed, unless
+// the live set still uses their transport. A request that loaded the old set keeps its *Cluster
+// pointers, and so its secrets, to the end.
+func (c *Candidate) Commit() (added, removed []string) {
+	r := c.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.cur.Load()
+	r.cur.Store(c.next)
+	r.defs = c.defs
+	inUse := make(map[*http.Transport]bool, len(c.next.byName))
+	for _, cl := range c.next.byName {
+		inUse[cl.Transport] = true
+	}
 	for name, cl := range old.byName {
-		if now, ok := next.byName[name]; !ok || now != cl {
+		if now, ok := c.next.byName[name]; !ok || now != cl {
 			if !ok {
 				removed = append(removed, name)
 			}
-			cl.Close()
+			if !inUse[cl.Transport] {
+				cl.Close()
+			}
 		}
 	}
 	slices.Sort(removed)
-	return added, removed, nil
+	return c.added, removed
 }

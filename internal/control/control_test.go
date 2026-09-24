@@ -186,9 +186,12 @@ func newRig(t *testing.T) *rig {
 		return "secret", nil
 	})
 	t.Cleanup(reg.Close)
-	dir.Prepare = func(f *directory.File) error {
-		_, _, err := reg.Apply(f.Clusters)
-		return err
+	dir.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
 	}
 	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), events: NewEvents(16), log: &syncLog{}}
 	// The event stream is wired as the lab proxy wires it: the directory's install hook, seeded

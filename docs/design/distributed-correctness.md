@@ -93,7 +93,9 @@ the file implementation uses its single writer and an atomically replaced
 durable operation/transition record. Extend existing seams with explicit
 transactional methods where needed; independent `Put` calls are insufficient.
 
-For the file backend, keep directory state, scope reservations and minimal
+**Amended 2026-09-24 (ADR-0021):** the file backend stays a single-writer lab
+backend in its current format; etcd carries the transaction contract, and the
+envelope below is not built. For the file backend, keep directory state, scope reservations and minimal
 unfinished-operation state in one authoritative durable envelope, replaced with
 fsync/rename under the existing writer lock. History/read models may be derived
 separately. Two independent YAML/JSON renames are not one transaction. The
@@ -136,6 +138,14 @@ until that old activity is known to have ended. An owner lease is coordination,
 not a backend fencing token.
 
 ## 3. D1 — atomic runtime installation and credential rotation
+
+**Landed (2026-09-24, on `1-to-n-bucket-support`):** T01, T02 and T03 in their pre-H0 form
+(ADR-0021, "Decisions taken 2026-09-24"). Member installs are serialized and monotonic
+(`internal/member`, `install`). `Prepare` hooks take a candidate-local resolver and return a
+commit that runs only for an installed version (`internal/upstream`, `Registry.Prepare` and
+`Candidate.Commit`; `internal/cp`, `Store.prepare`; `internal/directory`, `FileDir`). A
+secret-only rotation builds a new signer over the old transport. What remains for H1 is
+everything below about one coherent bundle, generations, retained-bundle limits and the cache.
 
 ### Runtime bundle and installation
 
@@ -339,6 +349,11 @@ GUI. Credential revocation barriers also drain all requests using the old signer
 including reads, while ordinary rotation can report installation progress first.
 
 ### Lease algorithm
+
+**Landed (2026-09-24):** T07 without identity. The lease runs from the monotonic send time for
+`min(server grant, local lease_ttl)`, the answer echoes `seq`, and a zero grant, an older or
+mismatched answer, a version behind the proxy's, or a late answer renews nothing
+(`internal/member`, `renew`). Epoch checks wait for H0.
 
 Each heartbeat has a monotonically increasing sequence and carries incarnation,
 identity and protocol capability. At monotonic send time `t0`, record the request.
@@ -577,6 +592,11 @@ alerts for a stuck hold, uncertain backend effects, expired health data and an
 incomplete recovery; a stale ACTIVE proxy alone does not make liveness fail.
 
 ## 9. Upgrade, rollback and remaining limits
+
+**Amended 2026-09-24 (ADR-0021):** no protocol-1 fleet is deployed, so the mixed-version
+machinery below (capabilities in registration, the controlled handover, the rollout flag, T18)
+is not built. Protocol 2 replaces protocol 1, and a binary that cannot read protocol-2 state
+refuses to start. The paragraphs on rollback after protocol-2 state is written still apply.
 
 Introduce `protocol: 2` plus named capabilities (`atomic_runtime`,
 `drain_barrier`, `epoch_identity`, `server_lease`) in registration and status.

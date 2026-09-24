@@ -84,7 +84,8 @@ With one proxy, nothing: every command answers as in the README. With members:
 
 ## When a proxy loses the control plane
 
-A member whose heartbeat has not been answered for `lease_ttl` is **stale**. It keeps serving
+A member whose lease has run out is **stale**: a lease runs from a heartbeat's send time for the
+shorter of the control plane's grant and the member's own `lease_ttl`. It keeps serving
 reads, and writes to buckets that are not moving; it refuses writes and deletes on moving buckets
 with `503` + `Retry-After`, and reads those buckets from the new cluster first (it may have missed
 a step). It becomes fresh again only once it has installed the version the control plane has. Its
