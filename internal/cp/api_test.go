@@ -175,18 +175,19 @@ func (n *node) refused(method, path string, body any, want string) {
 
 // member is a simulated proxy: it heartbeats to a node with the version it says it has installed.
 type member struct {
-	id      string
-	node    *node
-	applied atomic.Int64
-	follow  atomic.Bool // report the node's current version
-	seq     atomic.Int64
-	stop    chan struct{}
-	reads   atomic.Int64 // fallback reads it reports for data01
+	id          string
+	incarnation string
+	node        *node
+	applied     atomic.Int64
+	follow      atomic.Bool // report the node's current version
+	seq         atomic.Int64
+	stop        chan struct{}
+	reads       atomic.Int64 // fallback reads it reports for data01
 }
 
 func startMember(t *testing.T, n *node, id string, interval time.Duration) *member {
 	t.Helper()
-	m := &member{id: id, node: n, stop: make(chan struct{})}
+	m := &member{id: id, node: n, stop: make(chan struct{}), incarnation: fmt.Sprintf("%032x", time.Now().UnixNano())}
 	m.follow.Store(true)
 	go func() {
 		tick := time.NewTicker(interval)
@@ -210,7 +211,7 @@ func (m *member) beat() {
 		m.applied.Store(m.node.store.Version())
 	}
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: m.node.store.Snapshot().File().Identity, Seq: m.seq.Add(1), Applied: m.applied.Load(),
-		FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
+		Incarnation: m.incarnation, FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
 	m.node.call(http.MethodPost, "/v1/fleet/"+m.id+"/heartbeat", hb, nil) //nolint:errcheck // a member that cannot reach the node just misses a beat
 }
 
@@ -346,11 +347,15 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 		t.Fatalf("cutover: %+v %+v", tr, tr.Cutover)
 	}
 
-	// A bucket's first step waits for the silent member by name, until it is forgotten.
+	// A bucket's first step waits for the silent member by name, until it is forgotten. Silence is
+	// not retirement: p3's process never retired, so forget refuses until an operator resolves its
+	// incarnation (ADR-0021 D2).
 	b.must("POST", "/v1/placements/acme/logs/adopt", control.AdoptRequest{Cluster: "vast01"}, nil)
 	b.must("POST", "/v1/placements/acme/logs/expand", control.ExpandRequest{To: "vast02", Name: "logs"}, nil)
 	b.refused("POST", "/v1/placements/acme/logs/ramp", control.RampRequest{Ratio: 0.5, Wait: "300ms"}, "waiting on p3")
 	b.refused("DELETE", "/v1/fleet/p2", nil, "is live")
+	b.refused("DELETE", "/v1/fleet/p3", nil, "did not retire cleanly")
+	b.must("POST", "/v1/fleet/p3/resolve", control.ResolveRequest{Incarnation: p3.incarnation, Attestation: "test host stopped; no backend work in flight"}, nil)
 	b.must("DELETE", "/v1/fleet/p3", nil, nil)
 	tr = control.TransitionResult{}
 	b.must("POST", "/v1/placements/acme/logs/ramp", control.RampRequest{Ratio: 0.5}, &tr)

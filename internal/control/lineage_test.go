@@ -19,11 +19,14 @@ import (
 // staticFleet is a fleet table whose members are what the test says.
 type staticFleet struct{ ms []Member }
 
-func (f staticFleet) Heartbeat(context.Context, string, Heartbeat) (time.Duration, error) {
-	return time.Second, nil
+func (f staticFleet) Heartbeat(context.Context, string, Heartbeat) (Grant, error) {
+	return Grant{LeaseTTL: time.Second}, nil
 }
-func (f staticFleet) Members(context.Context) ([]Member, error) { return f.ms, nil }
-func (f staticFleet) Forget(context.Context, string) error      { return nil }
+func (f staticFleet) Members(context.Context) ([]Member, error)                     { return f.ms, nil }
+func (f staticFleet) Retire(context.Context, string, string, int64) error           { return nil }
+func (f staticFleet) RequestRetire(context.Context, string) error                   { return nil }
+func (f staticFleet) Resolve(context.Context, string, string, string, string) error { return nil }
+func (f staticFleet) Forget(context.Context, string) error                          { return nil }
 
 var (
 	lineageA = directory.Identity{ClusterID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: "11111111111111111111111111111111"}
@@ -120,14 +123,27 @@ func TestDirectoryAndHeartbeatRefuseAnotherLineage(t *testing.T) {
 		_ = json.Unmarshal(rec.Body.Bytes(), &e)
 		return rec.Code, e.Code
 	}
-	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageA, Applied: 3}); code != http.StatusOK {
+	inc := "0123456789abcdef0123456789abcdef"
+	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc}); code != http.StatusOK {
 		t.Errorf("a heartbeat on the current lineage: %d %s", code, e)
 	}
-	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageB, Applied: 40}); code != http.StatusConflict || e != CodeEpochMismatch {
+	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageB, Applied: 40, Incarnation: inc}); code != http.StatusConflict || e != CodeEpochMismatch {
 		t.Errorf("a heartbeat from another epoch: %d %s", code, e)
 	}
-	if code, e := beat(Heartbeat{Protocol: 1, Identity: lineageA, Applied: 3}); code != http.StatusBadRequest || e != CodeProtocol {
+	if code, e := beat(Heartbeat{Protocol: 1, Identity: lineageA, Applied: 3, Incarnation: inc}); code != http.StatusBadRequest || e != CodeProtocol {
 		t.Errorf("a protocol-1 heartbeat: %d %s", code, e)
+	}
+	// T20: malformed identities never reach the fleet table.
+	for _, bad := range []Heartbeat{
+		{Protocol: Protocol, Identity: lineageA, Applied: 3},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: "short"},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Uncertain: -1},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: inc, State: IncarnationUnclean}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: "fedcba9876543210fedcba9876543210", State: "active"}},
+	} {
+		if code, e := beat(bad); code != http.StatusBadRequest || e != "bad_request" {
+			t.Errorf("a heartbeat with a malformed incarnation (%+v): %d %s", bad, code, e)
+		}
 	}
 	if err := checkLineage(d.Snapshot(), lineageB, 1); !errors.As(err, new(*lineageError)) {
 		t.Errorf("checkLineage across epochs: %v", err)

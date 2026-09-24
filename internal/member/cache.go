@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -68,6 +69,20 @@ var osCacheOps = cacheOps{
 func (c *Client) Load() error {
 	if err := os.MkdirAll(c.cfg.CacheDir, 0o700); err != nil {
 		return fmt.Errorf("control.cache_dir: %w", err)
+	}
+	if c.started.IsZero() {
+		c.started = c.Now().UTC().Truncate(time.Second)
+	}
+	// The incarnation marker (ADR-0021 D2): what the previous process left, then this one's, on
+	// disk before anything is served. A marker that cannot be written keeps the proxy from
+	// starting: a process whose end no one could learn of must not serve.
+	c.previous = c.readPrevious()
+	if p := c.previous; p != nil && (p.State == control.IncarnationUnclean || p.Uncertain > 0) {
+		c.log.Warn("the previous process of this proxy did not retire cleanly; the control plane is told, and every barrier waits on it until an operator resolves it",
+			"incarnation", p.ID, "state", p.State, "uncertain", p.Uncertain)
+	}
+	if err := c.mark(control.IncarnationActive, 0); err != nil {
+		return fmt.Errorf("incarnation marker: %w", err)
 	}
 	f, err := os.Open(c.cacheFile())
 	if errors.Is(err, os.ErrNotExist) {

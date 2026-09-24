@@ -308,6 +308,22 @@
     "mutation": true
   },
   {
+    "method": "POST",
+    "pattern": "/v1/fleet/{id}/retire",
+    "verbs": [
+      "proxy retire"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/fleet/{id}/resolve",
+    "verbs": [
+      "proxy resolve"
+    ],
+    "mutation": true
+  },
+  {
     "method": "DELETE",
     "pattern": "/v1/fleet/{id}",
     "verbs": [

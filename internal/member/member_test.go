@@ -30,11 +30,14 @@ type fakeControl struct {
 	mu      sync.Mutex
 	dir     control.Directory
 	beats   []control.Heartbeat
+	retired []control.RetireRequest
 	down    atomic.Bool
 	srv     *httptest.Server
 	answers int64 // version the heartbeat answers with; 0 = the directory's
 	// answer, if set, edits each heartbeat answer before it is sent; set it with setAnswer.
 	answer func(*control.HeartbeatAnswer)
+	// retireFails, while set, answers a retirement with 503, as a control plane without quorum.
+	retireFails atomic.Bool
 }
 
 func newFakeControl(t *testing.T) *fakeControl {
@@ -107,11 +110,24 @@ func newFakeControl(t *testing.T) *fakeControl {
 			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
 			return
 		}
-		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second}
+		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second, PreviousRecorded: hb.Previous != nil}
 		if edit != nil {
 			edit(&a)
 		}
 		_ = json.NewEncoder(w).Encode(a)
+	})
+	mux.HandleFunc("POST /v1/fleet/{id}/retire", func(w http.ResponseWriter, r *http.Request) {
+		if f.retireFails.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: "unavailable", Message: "no quorum"})
+			return
+		}
+		var req control.RetireRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.mu.Lock()
+		f.retired = append(f.retired, req)
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(control.MemberResult{})
 	})
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/create", func(w http.ResponseWriter, r *http.Request) {
 		var req control.CreateRequest

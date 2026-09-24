@@ -185,6 +185,8 @@ type Error struct {
 	// unavailable, at capacity, or another operation held the scope. Retry with the same
 	// Idempotency-Key.
 	Retryable bool `json:"retryable"`
+	// Blockers name what stands in the way, on retirement_unproven.
+	Blockers []Blocker `json:"blockers,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -242,8 +244,11 @@ func errorOf(err error) (int, Error) {
 		ic  *IdempotencyConflictError
 		ce2 *CapacityError
 		cd  *codedError
+		re  *RetirementError
 	)
 	switch {
+	case errors.As(err, &re):
+		return http.StatusConflict, Error{Code: CodeRetirementUnproven, Message: err.Error(), Blockers: re.Blockers()}
 	case errors.As(err, &cd):
 		return cd.status, Error{Code: cd.code, Message: err.Error()}
 	case errors.As(err, &ic):

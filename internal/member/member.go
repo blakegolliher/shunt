@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
@@ -100,6 +101,16 @@ type Client struct {
 	// plane's (ADR-0021): another cluster, or another epoch after a restore. The member stays stale
 	// until it is re-enrolled; nothing it installed compares with the control plane's versions.
 	lineage atomic.Pointer[string]
+
+	// The incarnation protocol (incarnation.go). Gates, if set, is the proxy's admission
+	// accounting, whose uncertain count the heartbeat carries. OnRetire, if set, is called once
+	// when the control plane asks this proxy to retire; the caller drains and calls Retire.
+	incarnation  string
+	previous     *control.Incarnation
+	previousDone atomic.Bool
+	retireOnce   sync.Once
+	Gates        *admission.Gates
+	OnRetire     func()
 }
 
 var _ directory.Directory = (*Client)(nil)
@@ -112,7 +123,8 @@ func New(cfg Config, log *slog.Logger) *Client {
 	if cfg.LongPoll == 0 {
 		cfg.LongPoll = 30 * time.Second
 	}
-	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now, ops: osCacheOps}
+	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now, ops: osCacheOps,
+		incarnation: newIncarnation()}
 	c.cond = sync.NewCond(&c.mu)
 	c.snap.Store(directory.NewSnapshot(&directory.File{}))
 	empty := map[string]string{}
@@ -381,7 +393,9 @@ func (c *Client) fetch(ctx context.Context, since int64, wait time.Duration) (in
 // so the control plane counts it as a member from its first request (ADR-0016). An error means the
 // control plane could not be reached; the proxy may still start, stale, and Run keeps trying.
 func (c *Client) Register(ctx context.Context) error {
-	c.started = c.Now().UTC().Truncate(time.Second)
+	if c.started.IsZero() {
+		c.started = c.Now().UTC().Truncate(time.Second)
+	}
 	if _, err := c.fetch(ctx, c.Snapshot().Version(), 0); err != nil {
 		return err
 	}
@@ -429,7 +443,8 @@ func (c *Client) beat(ctx context.Context) error {
 	sent := c.Now()
 	snap := c.serving()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
-		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
+		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File()),
+		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
 	if installed := c.Snapshot().Version(); installed > hb.Applied {
 		hb.Installed = installed
 	}
@@ -456,6 +471,15 @@ func (c *Client) beat(ctx context.Context) error {
 	var ans control.HeartbeatAnswer
 	_, err := c.call(bctx, http.MethodPost, "/v1/fleet/"+c.cfg.ProxyID+"/heartbeat", hb, &ans)
 	if err == nil {
+		if ans.PreviousRecorded && hb.Previous != nil {
+			c.previousDone.Store(true)
+		}
+		if ans.Retire && c.OnRetire != nil {
+			c.retireOnce.Do(func() {
+				c.log.Info("the control plane asked this proxy to retire; draining", "proxy", c.cfg.ProxyID)
+				c.OnRetire()
+			})
+		}
 		err = c.renew(ctx, seq, sent, snap.Version(), ans)
 	} else {
 		err = c.checkAnswer(err)
@@ -601,11 +625,16 @@ type Status struct {
 	// plane's, when it is not.
 	Identity     directory.Identity `json:"identity,omitzero"`
 	LineageFault string             `json:"lineage_fault,omitempty"`
+	// Incarnation is this process's; Uncertain how many backend outcomes it never learned
+	// (ADR-0021 D2).
+	Incarnation string `json:"incarnation"`
+	Uncertain   int64  `json:"uncertain"`
 }
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
 func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().File().Identity}
+	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().File().Identity,
+		Incarnation: c.incarnation, Uncertain: c.Gates.Uncertain()}
 	if why := c.lineage.Load(); why != nil {
 		st.LineageFault = *why
 	}

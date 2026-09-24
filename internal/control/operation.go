@@ -97,10 +97,27 @@ type OpProgress struct {
 // Blocker is one named reason an operation is waiting or blocked. Counts and scope details are
 // bounded; it never carries an object key or a credential.
 type Blocker struct {
-	Code    string `json:"code"`
-	ProxyID string `json:"proxy_id,omitempty"`
-	Message string `json:"message,omitempty"`
+	Code        string `json:"code"`
+	ProxyID     string `json:"proxy_id,omitempty"`
+	Incarnation string `json:"incarnation,omitempty"`
+	Count       int64  `json:"count,omitempty"`
+	Message     string `json:"message,omitempty"`
 }
+
+// Blocker codes (docs/design/distributed-correctness-contracts.md §1, docs/telemetry-catalog.md).
+const (
+	BlockerOldRequests           = "old_requests"            // a proxy still has mutations in flight through the gate
+	BlockerBackendOutcomeUnknown = "backend_outcome_unknown" // a proxy never learned some mutation's outcome
+	BlockerProxyMissing          = "proxy_missing"           // a member is silent, or on another lineage
+	BlockerInstallPending        = "install_pending"         // a live member has not installed the version yet
+	BlockerIncarnationUnresolved = "incarnation_unresolved"  // a proxy's earlier process ended without retiring
+	BlockerCacheNotDurable       = "cache_not_durable"       // a proxy's restart cache is behind the barrier
+	BlockerInstallBackpressure   = "install_backpressure"    // a proxy installed the version but its requests do not use it yet
+	BlockerMultipartOpen         = "multipart_open"          // the source still has multipart uploads in progress
+	BlockerWorkerUnresolved      = "worker_unresolved"       // a mover's session expired without ending
+	BlockerOwnerLost             = "owner_lost"              // the control node running the operation is gone: resume it
+	BlockerQuorumUnavailable     = "quorum_unavailable"      // the control plane cannot be read
+)
 
 // Operation is one record.
 type Operation struct {

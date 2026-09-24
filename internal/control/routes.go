@@ -68,6 +68,8 @@ func (s *Server) routes() []Route {
 		mut("POST", "/v1/tenants/{tenant}/client-keys", "client key import", s.importKey, "adopt", "client add"),
 		mut("DELETE", "/v1/tenants/{tenant}/client-keys/{access_key}", "client key remove", s.removeKey, "client remove"),
 		mut("POST", "/v1/fleet/{id}/heartbeat", "", s.heartbeat),
+		mut("POST", "/v1/fleet/{id}/retire", "proxy retire", s.retireProxy, "proxy retire"),
+		mut("POST", "/v1/fleet/{id}/resolve", "proxy resolve", s.resolveProxy, "proxy resolve"),
 		mut("DELETE", "/v1/fleet/{id}", "proxy forget", s.forgetProxy, "proxy forget"),
 	}
 }

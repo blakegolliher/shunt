@@ -12,13 +12,16 @@ import (
 // oneMember is a fleet of one proxy, as the test describes it.
 type oneMember struct{ m control.Member }
 
-func (f oneMember) Heartbeat(context.Context, string, control.Heartbeat) (time.Duration, error) {
-	return time.Second, nil
+func (f oneMember) Heartbeat(context.Context, string, control.Heartbeat) (control.Grant, error) {
+	return control.Grant{LeaseTTL: time.Second}, nil
 }
 func (f oneMember) Members(context.Context) ([]control.Member, error) {
 	return []control.Member{f.m}, nil
 }
-func (f oneMember) Forget(context.Context, string) error { return nil }
+func (f oneMember) Retire(context.Context, string, string, int64) error           { return nil }
+func (f oneMember) RequestRetire(context.Context, string) error                   { return nil }
+func (f oneMember) Resolve(context.Context, string, string, string, string) error { return nil }
+func (f oneMember) Forget(context.Context, string) error                          { return nil }
 
 // proxy show prints one proxy's install state and what is off with it.
 func TestProxyShow(t *testing.T) {

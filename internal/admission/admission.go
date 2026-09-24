@@ -221,6 +221,25 @@ func (g *Gates) Uncertain() int64 {
 	return g.uncertain.Load()
 }
 
+// Inflight is how many tokens are out, every gate and kind together: what a process that stops
+// before they are given back leaves unknown.
+func (g *Gates) Inflight() int64 {
+	if g == nil {
+		return 0
+	}
+	var n int64
+	g.m.Range(func(_, v any) bool {
+		gt := v.(*gate) //nolint:errcheck // the map holds only *gate
+		gt.mu.Lock()
+		for k := range kinds {
+			n += gt.inflight[k]
+		}
+		gt.mu.Unlock()
+		return true
+	})
+	return n
+}
+
 // Ack is one barrier's proof from one proxy, as the heartbeat carries it (ADR-0021 D2).
 type Ack struct {
 	ID string `json:"id"`

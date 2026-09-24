@@ -2,6 +2,10 @@
   {"method":"GET","pattern":"/v1/status"},
   {"method":"GET","pattern":"/v1/control"},
   {"method":"GET","pattern":"/v1/fleet"},
+  {"method":"GET","pattern":"/v1/fleet/{id}"},
+  {"method":"POST","pattern":"/v1/fleet/{id}/retire"},
+  {"method":"POST","pattern":"/v1/fleet/{id}/resolve"},
+  {"method":"DELETE","pattern":"/v1/fleet/{id}"},
   {
     "method":"GET",
     "pattern":"/v1/events",

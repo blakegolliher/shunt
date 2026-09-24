@@ -107,8 +107,8 @@ func TestCacheFaults(t *testing.T) {
 				t.Fatalf("heartbeat applied %d durable %d, want 2 and 1", hb.Applied, hb.Durable)
 			}
 			entries, _ := os.ReadDir(c.cfg.CacheDir)
-			if len(entries) != 1 || entries[0].Name() != "directory.json" {
-				t.Fatalf("cache dir holds %v, want only directory.json", entries)
+			if len(entries) != 2 || entries[0].Name() != "directory.json" || entries[1].Name() != markerFile {
+				t.Fatalf("cache dir holds %v, want only directory.json and %s (no temporary file left)", entries, markerFile)
 			}
 			want := int64(1)
 			if stage == "dir_fsync" {

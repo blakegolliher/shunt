@@ -272,8 +272,15 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	if ctl != nil {
 		adm.Mount("/v1/", ctl.Handler())
 	}
+	retire := make(chan struct{}, 1)
 	if mem != nil {
 		adm.Mount("/-/fleet", mem)
+		mem.OnRetire = func() {
+			select {
+			case retire <- struct{}{}:
+			default:
+			}
+		}
 		mctx, stop := context.WithCancel(ctx)
 		defer stop()
 		go mem.Run(mctx)
@@ -306,6 +313,9 @@ wait:
 		case s := <-sig:
 			log.Info("signal received, draining", "signal", s.String(), "timeout", cfg.Proxy.DrainTimeout.String())
 			break wait
+		case <-retire:
+			log.Info("retirement requested by the control plane, draining", "timeout", cfg.Proxy.DrainTimeout.String())
+			break wait
 		case <-ctx.Done():
 			log.Info("context done, draining")
 			break wait
@@ -326,9 +336,22 @@ wait:
 	adm.Drain()
 	dctx, cancel := context.WithTimeout(context.Background(), cfg.Proxy.DrainTimeout)
 	defer cancel()
+	cut := int64(0)
 	if err := srv.Shutdown(dctx); err != nil {
 		log.Warn("drain deadline hit; closing remaining connections", "err", err)
 		_ = srv.Close()
+		cut = h.Gates.Inflight() // requests cut short: their backend outcomes are never learned
+	}
+	if mem != nil {
+		// A clean retirement (ADR-0021 D2): admission has stopped and every request has ended, so
+		// the control plane can count this process out of every barrier. A count of outcomes
+		// never learned makes it unclean, and an operator resolves it once the backend is quiet.
+		uncertain := h.Gates.Uncertain() + cut
+		rctx, rcancel := context.WithTimeout(context.Background(), cfg.Proxy.DrainTimeout)
+		if err := mem.Retire(rctx, uncertain); err != nil {
+			log.Warn("retirement not recorded by the control plane; the next process of this proxy reports it", "err", err.Error())
+		}
+		rcancel()
 	}
 	_ = admSrv.Shutdown(dctx)
 	log.Info("stopped")
@@ -406,6 +429,7 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	// The admission gates follow the directory (ADR-0021 D2): closed on install of a version
 	// carrying a barrier, opened once requests route by the version without it.
 	keeper := &proxy.GateKeeper{Gates: admission.New()}
+	m.Gates = keeper.Gates
 	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
 	keeper.Served(m.Snapshot())
 	m.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }

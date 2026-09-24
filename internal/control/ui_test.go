@@ -706,7 +706,7 @@ func TestRouteTableIsUnique(t *testing.T) {
 			t.Errorf("route %s: mutation %v", k, r.Mutation)
 		}
 	}
-	if len(seen) != 42 {
+	if len(seen) != 44 {
 		t.Errorf("%d routes; update this count with the route table", len(seen))
 	}
 }

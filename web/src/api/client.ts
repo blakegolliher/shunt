@@ -7,10 +7,30 @@ export interface ControlMember {
   started: boolean
 }
 
+// Incarnation is one process of a proxy (ADR-0021 D2): active, retired (stopped cleanly), unclean
+// (ended without retiring, or with backend outcomes unknown) or resolved by an operator.
+export interface Incarnation {
+  id: string
+  state: 'active' | 'retired' | 'unclean' | 'resolved'
+  started?: string
+  ended?: string
+  uncertain?: number
+  attestation?: string
+  resolved_by?: string
+  resolved_at?: string
+}
+
 export interface ProxyMember {
   id: string
   live: boolean
   applied: number
+  // incarnation is the proxy's current process; unresolved are earlier ones that did not retire
+  // cleanly, on which every barrier waits until an operator resolves them. retire_requested: an
+  // operator asked the proxy to retire. uncertain: backend outcomes this process never learned.
+  incarnation?: Incarnation
+  unresolved?: Incarnation[]
+  retire_requested?: boolean
+  uncertain?: number
   // durable is the version the proxy's restart cache holds durably; it lags applied while a cache
   // write is in progress or failing.
   durable?: number
@@ -302,6 +322,13 @@ export interface ProxyDiagnostics extends ProxyMember {
   problems: string[]
 }
 export const getProxyDiagnostics = (token: string, id: string) => request<ProxyDiagnostics>(`/v1/fleet/${encodeURIComponent(id)}`, token)
+export interface MemberResult { member: ProxyMember; retire_requested?: boolean }
+// retireProxy asks a proxy to retire (drain, record its retirement, stop); resolveProxy records an
+// operator's attestation that an unretired incarnation's backend work has ended; forgetProxy removes
+// a member that is gone, which the server refuses while an incarnation did not retire.
+export const retireProxy = (token: string, id: string) => request<MemberResult>(`/v1/fleet/${encodeURIComponent(id)}/retire`, token, json({}))
+export const resolveProxy = (token: string, id: string, incarnation: string, attestation: string) => request<MemberResult>(`/v1/fleet/${encodeURIComponent(id)}/resolve`, token, json({ incarnation, attestation }))
+export const forgetProxy = (token: string, id: string) => request<{ forgotten: string }>(`/v1/fleet/${encodeURIComponent(id)}`, token, { method: 'DELETE' })
 export const getStatus = (token: string) => request<DirectoryStatus>('/v1/status?all=1', token)
 export const getClusterView = (token: string, name: string) => request<ClusterView>(`/v1/clusters/${encodeURIComponent(name)}/view`, token)
 export const getPlacementView = (token: string, tenant: string, bucket: string) => request<PlacementView>(`/v1/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/view`, token)
