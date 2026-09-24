@@ -58,7 +58,9 @@ maximum and count in microseconds.
 
 Each window also carries exact counters by `op_class` and `cluster`: requests, request and
 response bytes, and non-success responses by status key (a fixed set of codes, other 4xx, other
-5xx, no response, and a read answered 404; docs/reference/control-api.md). The control node sums them for the same fleet,
+5xx, no response, and a read answered 404; docs/reference/control-api.md), and the same counters
+by backend cluster for each bucket spread over legs, moving, or watched (at most 32 per proxy
+window, the rest summed as `(other)`). The control node sums them for the same fleet,
 cluster and proxy scopes as the latency summaries. `/v1/telemetry/series` exposes these retained
 window counters as `requests_per_second`, `bytes_in_per_second`, `bytes_out_per_second`, and
 `errors_{0,4xx,5xx}_per_second`, `not_found_per_second` and `status_per_second`; the control node divides by the actual window duration and the UI

@@ -358,6 +358,10 @@ type PlacementStatus struct {
 	Mover           *Progress                  `json:"mover,omitempty"`
 	ReadOnly        bool                       `json:"read_only"`
 	RejectWrites    bool                       `json:"reject_writes"`
+	// Watch: an operator asked for this bucket's traffic by backend in telemetry. Spread and
+	// moving buckets have it anyway; PerBucket says whether proxies count it now.
+	Watch     bool `json:"watch,omitempty"`
+	PerBucket bool `json:"per_bucket_telemetry"`
 	// Legs are the backend buckets of a bucket spread over legs (ADR-0018 N2), in key-space order;
 	// Primary and Names are empty then.
 	Legs []LegStatus `json:"legs,omitempty"`
@@ -514,8 +518,9 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 	// migration shows the move as one; Legs and Move say which part (ADR-0018 N3).
 	p := moving(pl)
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.ClusterOf(p.Primary), Target: p.Target, Names: p.Names,
-		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites,
-		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
+		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites, Watch: pl.Watch,
+		PerBucket: pl.Spread() || pl.State != directory.StateActive || pl.Watch,
+		Cutover:   p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Source != "" {
 		ps.Source = p.ClusterOf(p.Source)
 	}
@@ -926,6 +931,28 @@ func (s *Server) setTenantDefault(w http.ResponseWriter, r *http.Request) {
 	v := s.Dir.Snapshot().Version()
 	s.info(actor(r), "tenant default changed", "tenant", tenant, "default_cluster", req.Cluster, "version", v)
 	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "default_cluster": req.Cluster, "version": v})
+}
+
+// WatchRequest is POST /v1/placements/{tenant}/{bucket}/watch.
+type WatchRequest struct {
+	Watch bool `json:"watch"`
+}
+
+// placementWatch asks proxies for, or stops, a bucket's traffic by backend cluster in telemetry.
+func (s *Server) placementWatch(w http.ResponseWriter, r *http.Request) {
+	var req WatchRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	if err := s.Dir.SetPlacementWatch(r.Context(), tenant, bucket, req.Watch, actor(r)); err != nil {
+		fail(w, err)
+		return
+	}
+	v := s.Dir.Snapshot().Version()
+	key := directory.Key(tenant, bucket)
+	s.info(actor(r), "bucket watch changed", "placement", key, "watch", req.Watch, "version", v)
+	writeJSON(w, http.StatusOK, map[string]any{"key": key, "watch": req.Watch, "version": v})
 }
 
 // backendFor returns the live cluster a placement role names.

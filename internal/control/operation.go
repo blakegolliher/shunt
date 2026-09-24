@@ -43,6 +43,7 @@ const (
 	OpClearTarget       = "clear-target"
 	OpCarve             = "carve"
 	OpMerge             = "merge"
+	OpWatch             = "watch"
 )
 
 // Statuses of an operation (ADR-0021). A request refused before any record exists is an HTTP

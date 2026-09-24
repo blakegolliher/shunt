@@ -1,4 +1,4 @@
-import { latencyChartData, scalarChartData, statusSeries } from './telemetryData'
+import { byCluster, latencyChartData, scalarChartData, statusSeries } from './telemetryData'
 import type { TelemetryPoint } from './api/client'
 
 test('passes emitted percentiles to chart data without browser math', () => {
@@ -35,10 +35,15 @@ test('shows each backend cluster share of requests, and says when a compared clu
     const url = String(input)
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
-    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 3, clusters: [cluster('minio-a'), cluster('minio-b')], placements: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 3, clusters: [cluster('minio-a'), cluster('minio-b')], placements: [
+      { key: 'default/data01', state: 'ACTIVE', primary: '', names: null, ramp_writes: {}, fallback_reads: 0, dual_deletes: {}, read_only: false, reject_writes: false, per_bucket_telemetry: true },
+    ] })
     if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
     if (url.includes('/v1/telemetry/series')) {
       const q = new URL(url, 'http://x').searchParams
+      if (q.get('scope') === 'bucket:default/data01') {
+        return Response.json({ points: [['minio-a', 5], ['minio-b', 3], ['minio-c', 2]].map(([cl, v]) => ({ start: end, end, series: q.get('series'), op: 'all', cluster: cl, value: v })) })
+      }
       const value = q.get('series') !== 'requests_per_second' ? 0 : q.get('scope') === 'cluster:minio-a' ? 30 : q.get('scope') === 'cluster:minio-b' ? 10 : 40
       if (q.get('scope') === 'cluster:minio-b' && q.get('series') === 'client_total') return Response.json({ points: [] })
       return Response.json({ points: [{ start: end, end, series: q.get('series'), op: 'all', value, count: 1, p99_us: 100 }] })
@@ -50,6 +55,8 @@ test('shows each backend cluster share of requests, and says when a compared clu
     fireEvent.click(await screen.findByRole('button', { name: 'Telemetry' }))
     expect(await screen.findByText('minio-a 75% · minio-b 25%')).toBeInTheDocument()
     expect(await screen.findByText(/No traffic reached minio-b in this window/)).toBeInTheDocument()
+    // A bucket spread over three backends draws three: the share follows whatever clusters it has.
+    expect(await screen.findByText('minio-a 50% · minio-b 30% · minio-c 20%')).toBeInTheDocument()
   } finally {
     sessionStorage.clear()
     vi.restoreAllMocks()
@@ -65,4 +72,11 @@ test('draws one line per status code the scope answered, a read 404 last and nam
     { end: 't1', '503': 2, '403': 1, '404 on read (not an error)': 9 },
     { end: 't2', '503': 4, 'no response': 1, 'other 5xx': 1 },
   ])
+})
+
+test('groups a bucket scope into one series per backend cluster', () => {
+  const p = (cluster: string, value: number) => ({ start: 't', end: 't', series: 'requests_per_second', op: 'all', cluster, value })
+  const { series, names } = byCluster([p('b', 1), p('a', 2), p('c', 3), p('a', 4)])
+  expect(names).toEqual(['a', 'b', 'c'])
+  expect(series.a.map((x) => x.value)).toEqual([2, 4])
 })

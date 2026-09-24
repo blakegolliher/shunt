@@ -94,6 +94,9 @@ type outcome struct {
 	clusterType string
 	backend     string // backend bucket name (resign mode)
 	fromSource  bool   // the answer came from a migration's source role, not its primary
+	// perBucket is the placement key when telemetry counts this bucket by backend cluster: it is
+	// spread over legs, moving, or watched (telemetry.Collector.ObserveBucket).
+	perBucket string
 }
 
 // prepared is a request ready to send: the cluster, a builder that produces the upstream request
@@ -515,9 +518,13 @@ func (h *Handler) finish(r *http.Request, o *outcome) {
 		upstreamTotal = o.tLast.Sub(tWrote)
 	}
 	if h.Telemetry != nil {
-		h.Telemetry.Observe(telemetry.Observation{At: time.Now(), Operation: op, Cluster: o.cluster,
+		obs := telemetry.Observation{At: time.Now(), Operation: op, Cluster: o.cluster,
 			Status: o.status, BytesIn: o.bytesIn, BytesOut: o.bytesOut, ClientTotal: total,
-			UpstreamTTFB: ttfb, UpstreamTotal: upstreamTotal})
+			UpstreamTTFB: ttfb, UpstreamTotal: upstreamTotal}
+		h.Telemetry.Observe(obs)
+		if o.perBucket != "" {
+			h.Telemetry.ObserveBucket(obs, o.perBucket)
+		}
 	}
 	tlsVer := ""
 	if r.TLS != nil {

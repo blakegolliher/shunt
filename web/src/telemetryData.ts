@@ -45,3 +45,11 @@ export function statusSeries(points: TelemetryPoint[]) {
   const names = Object.keys(series).sort((a, b) => order(a).localeCompare(order(b)))
   return { series, names }
 }
+
+// byCluster groups a bucket scope's points, one per backend cluster each window, into one series per
+// cluster, so a bucket spread over N backends draws N lines.
+export function byCluster(points: TelemetryPoint[]) {
+  const series: Record<string, TelemetryPoint[]> = {}
+  for (const point of points) (series[point.cluster || 'none'] ??= []).push(point)
+  return { series, names: Object.keys(series).sort() }
+}

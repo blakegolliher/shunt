@@ -154,6 +154,26 @@ type MigrationCounter struct {
 	Reads  map[string]int64 `json:"reads,omitempty"`  // target_hit | fallback_source | miss
 }
 
+// BucketCounter is one placement's exact traffic on one backend cluster in a completed window.
+// Only placements spread over legs, moving, or watched are counted (ObserveBucket), and at most
+// MaxBucketsPerWindow of them per window: bucket is not a global telemetry label.
+type BucketCounter struct {
+	Bucket   string           `json:"bucket"`
+	Cluster  string           `json:"cluster"`
+	Requests int64            `json:"requests"`
+	BytesIn  int64            `json:"bytes_in"`
+	BytesOut int64            `json:"bytes_out"`
+	Errors   map[string]int64 `json:"errors,omitempty"`
+}
+
+// MaxBucketsPerWindow bounds the placements one proxy window counts by backend; traffic of any
+// further placement is summed under OtherBuckets. It keeps a dense heartbeat within its 1 MiB cap
+// (control.TestHeartbeatPayloadBound).
+const MaxBucketsPerWindow = 32
+
+// OtherBuckets is the bucket name the counters of placements past MaxBucketsPerWindow are summed under.
+const OtherBuckets = "(other)"
+
 // Window is the last completed telemetry window carried by a proxy heartbeat.
 type Window struct {
 	Start      time.Time          `json:"start"`
@@ -161,6 +181,7 @@ type Window struct {
 	Sketches   []Sketch           `json:"sketches"`
 	Counters   []WindowCounter    `json:"counters"`
 	Migrations []MigrationCounter `json:"migrations,omitempty"`
+	Buckets    []BucketCounter    `json:"buckets,omitempty"`
 }
 
 type sketchKey struct {
@@ -173,6 +194,8 @@ type counterKey struct {
 	op      OpClass
 }
 
+type bucketKey struct{ bucket, cluster string }
+
 // Collector owns only the current raw sketches and one encoded completed window. Histograms are
 // allocated lazily on the first observation of a tuple.
 type Collector struct {
@@ -181,6 +204,8 @@ type Collector struct {
 	sketches   map[sketchKey]*hdrhistogram.Histogram
 	counters   map[counterKey]*WindowCounter
 	migrations map[string]*MigrationCounter
+	buckets    map[bucketKey]*BucketCounter
+	seen       map[string]bool // placements with their own bucket counters this window
 	last       *Window
 }
 
@@ -200,7 +225,7 @@ func (c *Collector) rotateLocked(now time.Time) {
 	if !start.After(c.start) {
 		return
 	}
-	if len(c.sketches) > 0 || len(c.migrations) > 0 {
+	if len(c.sketches) > 0 || len(c.migrations) > 0 || len(c.buckets) > 0 {
 		w := &Window{Start: c.start, End: c.start.Add(WindowDuration)}
 		keys := make([]sketchKey, 0, len(c.sketches))
 		for k := range c.sketches {
@@ -242,9 +267,20 @@ func (c *Collector) rotateLocked(now time.Time) {
 			v.Reads = maps.Clone(v.Reads)
 			w.Migrations = append(w.Migrations, v)
 		}
+		bucketKeys := slices.SortedFunc(maps.Keys(c.buckets), func(a, b bucketKey) int {
+			if n := strings.Compare(a.bucket, b.bucket); n != 0 {
+				return n
+			}
+			return strings.Compare(a.cluster, b.cluster)
+		})
+		for _, k := range bucketKeys {
+			v := *c.buckets[k]
+			v.Errors = cloneErrors(v.Errors)
+			w.Buckets = append(w.Buckets, v)
+		}
 		c.last = w
 	}
-	c.start, c.sketches, c.counters, c.migrations = start, nil, nil, nil
+	c.start, c.sketches, c.counters, c.migrations, c.buckets, c.seen = start, nil, nil, nil, nil, nil
 }
 
 func cloneErrors(in map[string]int64) map[string]int64 {
@@ -326,6 +362,46 @@ func (c *Collector) Observe(o Observation) {
 			count.Errors = map[string]int64{}
 		}
 		count.Errors[StatusKey(o.Status, op)]++
+	}
+}
+
+// ObserveBucket counts one completed request against its placement and backend cluster: for a
+// placement spread over legs, moving, or watched, so an operator sees how its traffic splits over
+// its backends. Past MaxBucketsPerWindow placements in a window, the rest count under OtherBuckets.
+func (c *Collector) ObserveBucket(o Observation, bucket string) {
+	if o.At.IsZero() {
+		o.At = time.Now()
+	}
+	if o.Cluster == "" {
+		o.Cluster = "none"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rotateLocked(o.At)
+	if c.buckets == nil {
+		c.buckets, c.seen = map[bucketKey]*BucketCounter{}, map[string]bool{}
+	}
+	if !c.seen[bucket] {
+		if len(c.seen) >= MaxBucketsPerWindow {
+			bucket = OtherBuckets
+		} else {
+			c.seen[bucket] = true
+		}
+	}
+	k := bucketKey{bucket: bucket, cluster: o.Cluster}
+	v := c.buckets[k]
+	if v == nil {
+		v = &BucketCounter{Bucket: bucket, Cluster: o.Cluster}
+		c.buckets[k] = v
+	}
+	v.Requests++
+	v.BytesIn += o.BytesIn
+	v.BytesOut += o.BytesOut
+	if o.Status == 0 || o.Status >= 400 {
+		if v.Errors == nil {
+			v.Errors = map[string]int64{}
+		}
+		v.Errors[StatusKey(o.Status, OperationClass(o.Operation))]++
 	}
 }
 
@@ -448,7 +524,7 @@ func (s *Store) Ingest(members []MemberWindow) ([]time.Time, error) {
 		if m.Live {
 			live[m.ID] = true
 		}
-		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 && len(m.Telemetry.Migrations) == 0 {
+		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 && len(m.Telemetry.Migrations) == 0 && len(m.Telemetry.Buckets) == 0 {
 			continue
 		}
 		start := m.Telemetry.Start.UnixNano()
@@ -557,9 +633,11 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 		h map[summaryKey]*hdrhistogram.Histogram
 		c map[OpClass]*WindowCounter
 		m map[string]*MigrationCounter
+		b map[string]*WindowCounter // a bucket scope's counters by backend cluster
 	}
 	newRaw := func() *rawScope {
-		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}, m: map[string]*MigrationCounter{}}
+		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}, m: map[string]*MigrationCounter{},
+			b: map[string]*WindowCounter{}}
 	}
 	raw := map[string]*rawScope{}
 	get := func(scope string) *rawScope {
@@ -629,6 +707,12 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 			m.Reads = maps.Clone(m.Reads)
 			sw.Migrations = append(sw.Migrations, m)
 		}
+		// A bucket scope keeps its counters apart by backend cluster: that split is what it is for.
+		for _, cluster := range slices.Sorted(maps.Keys(r.b)) {
+			c := *r.b[cluster]
+			c.Errors = cloneErrors(c.Errors)
+			sw.Counters = append(sw.Counters, c)
+		}
 		return sw
 	}
 	// A proxy scope is reduced and released one proxy at a time. Keeping one raw histogram per
@@ -664,6 +748,20 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 		for _, migration := range w.Migrations {
 			addMigration(get("fleet").m, migration)
 			addMigration(proxyRaw.m, migration)
+		}
+		for _, b := range w.Buckets {
+			dst := get("bucket:" + b.Bucket).b
+			d := dst[b.Cluster]
+			if d == nil {
+				d = &WindowCounter{Op: OpAll, Cluster: b.Cluster, Errors: map[string]int64{}}
+				dst[b.Cluster] = d
+			}
+			d.Requests += b.Requests
+			d.BytesIn += b.BytesIn
+			d.BytesOut += b.BytesOut
+			for k, v := range b.Errors {
+				d.Errors[k] += v
+			}
 		}
 		out = append(out, finalize("proxy:"+proxy, proxyRaw))
 	}
@@ -731,7 +829,7 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 			}
 			if series == SeriesStatusPerSecond {
 				for _, key := range slices.Sorted(maps.Keys(c.Errors)) {
-					out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Code: key, Value: float64(c.Errors[key]) / seconds})
+					out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Cluster: c.Cluster, Code: key, Value: float64(c.Errors[key]) / seconds})
 				}
 				continue
 			}
@@ -755,7 +853,7 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 			default:
 				continue
 			}
-			out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Value: float64(total) / seconds})
+			out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Cluster: c.Cluster, Value: float64(total) / seconds})
 		}
 	}
 	return out
@@ -774,6 +872,9 @@ type ScalarPoint struct {
 	End    time.Time `json:"end"`
 	Series string    `json:"series"`
 	Op     OpClass   `json:"op"`
+	// Cluster is the backend cluster of a point in a bucket scope, which answers one point per
+	// cluster each window; empty elsewhere.
+	Cluster string `json:"cluster,omitempty"`
 	// Code is the status key of a status_per_second point (StatusKey).
 	Code  string  `json:"code,omitempty"`
 	Value float64 `json:"value"`

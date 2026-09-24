@@ -727,6 +727,13 @@ func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string,
 	})
 }
 
+// SetPlacementWatch implements directory.Store.
+func (s *Store) SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error {
+	return s.mutate(ctx, actor, "placement-watch", directory.Key(tenant, bucket), func(st *state) error {
+		return st.file.SetPlacementWatch(tenant, bucket, watch)
+	})
+}
+
 // SetClusterReadOnly implements directory.Store.
 func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
 	return s.mutate(ctx, actor, "cluster-read-only", "clusters/"+name, func(st *state) error {

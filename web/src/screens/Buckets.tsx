@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { adoptBucket, clearTarget, createBackendBucket, expandBucket, startOperation, getPlacementView, importClientKey, setPlacementReadOnly } from '../api/client'
+import { adoptBucket, clearTarget, createBackendBucket, expandBucket, startOperation, getPlacementView, importClientKey, setBucketWatch, setPlacementReadOnly } from '../api/client'
 import type { PlacementStatus, PlacementView } from '../api/client'
 import { Card } from '../components/Card'
 import { CopyLine } from '../components/CopyLine'
@@ -220,7 +220,8 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
         <FenceStatus held={detail.fence.held} version={detail.fence.version} waitingOn={detail.fence.waiting_on} />
         {detail.legs?.length ? <Card title="Legs"><OwnershipBar legs={detail.legs} move={detail.move} /><dl className="mt-4 grid gap-3 text-sm">{detail.legs.map((l) => <div key={l.id} className="flex justify-between gap-4"><dt>{l.cluster}{l.id !== l.cluster && <span className="text-muted"> (leg {l.id})</span>}</dt><dd className="text-right font-mono text-muted">{l.bucket} · {l.ranges.length ? `${Math.round(l.share * 1000) / 10}% of keys` : l.idle ? 'idle' : 'no keys outside its prefix rules'}{l.ranges.map((r) => <span key={r.from} className="block text-xs">{r.from}–{r.to}</span>)}</dd></div>)}</dl></Card> : null}
         {detail.names && Object.keys(detail.names).length > 0 && <Card title="Placement names"><dl className="grid gap-3 text-sm">{Object.entries(detail.names).map(([name, value]) => <div key={name} className="flex justify-between gap-4"><dt>{name}</dt><dd className="font-mono text-muted">{value}</dd></div>)}</dl></Card>}
-        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), `${detail.key} is ${detail.read_only ? 'writable' : 'read-only'}`) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button></div>
+        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), `${detail.key} is ${detail.read_only ? 'writable' : 'read-only'}`) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setBucketWatch(token, t, b, !detail.watch), detail.watch ? `${detail.key}: no longer watched` : `${detail.key}: its traffic by backend shows on Telemetry`) }} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold">{detail.watch ? 'Stop watching traffic' : 'Watch traffic by backend'}</button></div>
+        <p className="text-xs text-muted">{detail.per_bucket_telemetry ? `Telemetry → Bucket traffic shows ${detail.key} by backend${!detail.watch ? ' (it is spread or moving, so it is counted without a watch)' : ''}.` : 'Watch this bucket to see its traffic by backend on Telemetry; spread and moving buckets are counted without one.'}</p>
       </div> : <p className="text-muted">Loading bucket detail…</p>}
     </Drawer>
   </div>

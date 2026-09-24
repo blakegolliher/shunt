@@ -223,6 +223,11 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 	return d.mutate(ctx, actor, "set-state", Key(tenant, bucket), func(f *File) error { return f.SetState(tenant, bucket, from, t) })
 }
 
+// SetPlacementWatch implements Store.
+func (d *FileDir) SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error {
+	return d.mutate(ctx, actor, "set-watch", Key(tenant, bucket), func(f *File) error { return f.SetPlacementWatch(tenant, bucket, watch) })
+}
+
 // SetPlacementReadOnly implements Store.
 func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
 	return d.mutate(ctx, actor, "placement-read-only", Key(tenant, bucket), func(f *File) error {

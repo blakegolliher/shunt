@@ -56,3 +56,21 @@ func TestOperationVerbs(t *testing.T) {
 		t.Fatal("show of an unknown operation succeeded")
 	}
 }
+
+func TestWatchVerb(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data"); err != nil {
+		t.Fatal(err)
+	}
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.must(t, "adopt", "vast01", "acme/data")
+	if out := rg.must(t, "watch", "acme/data"); !strings.Contains(out, "acme/data: watch true") {
+		t.Fatalf("watch: %s", out)
+	}
+	if p, _ := rg.dir.Snapshot().Lookup("acme", "data"); !p.Watch {
+		t.Fatal("not watched in the directory")
+	}
+	if out := rg.must(t, "watch", "acme/data", "--off"); !strings.Contains(out, "acme/data: watch false") {
+		t.Fatalf("watch --off: %s", out)
+	}
+}

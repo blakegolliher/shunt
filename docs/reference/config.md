@@ -97,6 +97,7 @@ placements:                       # key is <tenant>/<bucket>, both valid S3 buck
     tier: emulated                # native | emulated
     lifecycle: "<LifecycleConfiguration/>"
     created: 2026-09-15T18:00:00Z
+    watch: true                   # count this bucket's traffic by backend in telemetry (shunt watch)
 ```
 
 Two placements may never share a backend bucket on one cluster: that would make two tenants' buckets the same bucket. `shunt` writes `<file>.changes.jsonl` (actor, before, after) and takes `<file>.lock` for every write.

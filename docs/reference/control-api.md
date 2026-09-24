@@ -212,6 +212,15 @@ The same body and operation result as cluster read-only, scoped to one placement
 independent of migration state and is applied through a strict fleet fence. Reads continue. Writes
 and deletes answer 503 plus `Retry-After: 1` by default, or 403 with `reject: true`.
 
+### `POST /v1/placements/{tenant}/{bucket}/watch`
+
+`{"watch": true|false}`: ask proxies for this bucket's traffic by backend cluster in telemetry, or
+stop. Proxies count every bucket spread over legs or moving that way without a watch; this adds one
+that is neither. It is a directory write under an operation record (kind `watch`), and setting the
+value it has answers 409 `conflict`. Answers `{"key", "watch", "version"}`. Placement status and
+views carry `watch` and `per_bucket_telemetry`, whether proxies count the bucket by backend now.
+`shunt watch <bucket> [--off]` calls it; so does the web UI's bucket detail.
+
 ### `POST /v1/placements/{tenant}/{bucket}/ramp`
 
 `{"ratio": 0.5, "prefixes": ["runs/2026-09/"], "to": "", "name": "", "create": false, "wait": "30s"}`
@@ -393,7 +402,7 @@ Server-sent events from this control node (ADR-0017): `Content-Type: text/event-
 
 ### `GET /v1/telemetry/series`
 
-Query parameters are `scope=fleet|cluster:<name>|proxy:<id>`,
+Query parameters are `scope=fleet|cluster:<name>|proxy:<id>|bucket:<tenant>/<bucket>`,
 `series=client_total|upstream_ttfb|upstream_total|proxy_overhead` or one of the exact-counter rates
 `requests_per_second|bytes_in_per_second|bytes_out_per_second|errors_0_per_second|errors_4xx_per_second|errors_5xx_per_second|not_found_per_second|status_per_second`,
 `op=all|read|write|list|delete|multipart|other` (default `all`), and optional RFC3339 `from` /
@@ -409,6 +418,11 @@ their class and leave `not_found` out; `not_found_per_second` is that key alone;
 ```json
 {"start":"2026-09-24T16:00:00Z","end":"2026-09-24T16:00:10Z","series":"status_per_second","op":"all","code":"503","value":0.4}
 ```
+
+A `bucket:<tenant>/<bucket>` scope holds only the exact counters, with `op=all`: proxies count a
+bucket that way while it is spread over legs, moving, or watched, at most 32 buckets per proxy
+window (the rest sum as `bucket:(other)`). Its counter series answer one point per backend cluster
+each window, named by `cluster`, so a bucket spread over N backends answers N points.
 
 A latency series answers:
 
@@ -522,10 +536,11 @@ A member's S3 `CreateBucket` and `DeleteBucket`, forwarded: `{"cluster", "name",
 Sent by a member every `control.heartbeat_interval`: `{"protocol", "identity", "started", "seq", "applied", "host", "version", "fallback_reads": {"<tenant>/<bucket>": n}, "telemetry": {...}}`. `protocol` must be 2: any other answers 400 `protocol_unsupported`, since there is no mixed-version fleet (ADR-0021). `identity` is the lineage of the member's installed directory; a heartbeat from another lineage answers 409 like the directory poll and renews no lease, and a fence counts a member's `applied` only on the control plane's lineage. Fallback counters are for buckets that are not `ACTIVE` only; `host` is the member's host name and `version` its build. `telemetry` is the last non-empty completed 10-second window: compressed HdrHistogram sketches and plain counters, re-sent until another window closes. The first heartbeat from an id makes it a member (`/shunt/fleet/members/<id>`, persistent); each one renews its lease (`/shunt/fleet/proxies/<id>`, `lease_ttl` + 5 s). Answers `{"seq", "identity", "version", "lease_ttl"}`: `seq` echoes the heartbeat's, and `lease_ttl` is the grant in nanoseconds. A member takes a lease only from an answer to the heartbeat it sent, on its own lineage, with a positive grant and a version no lower than the one it reported; a member whose version is behind fetches the directory at once. Unknown fields are refused, so control nodes are upgraded before proxies.
 
 The request decoder is capped at 1 MiB. `TestHeartbeatPayloadBound` fills all 6 operation classes ×
-4 series with a realistic 10,000-value latency spread: each compressed sketch is 2,592 bytes, the
-12-cluster JSON heartbeat is 1,025,921 bytes, and 13 clusters is 1,111,406 bytes. Twelve clusters
-active on one proxy within one window is therefore the tested dense ceiling; ordinary sparse
-sketches are a few hundred bytes. Plan and load-test a larger per-proxy active-cluster count before
+4 series with a realistic 10,000-value latency spread, every status key on every counter, and the
+full per-bucket block (32 buckets, each on two clusters): each compressed sketch is 2,592 bytes,
+the 11-cluster JSON heartbeat is 975,702 bytes, and 12 clusters is 1,062,309 bytes. Eleven clusters
+active on one proxy within one window is therefore the tested dense ceiling; it was twelve before
+status codes and bucket counters were carried. Ordinary sparse sketches are a few hundred bytes. Plan and load-test a larger per-proxy active-cluster count before
 raising the cap.
 
 ### `GET /v1/fleet`

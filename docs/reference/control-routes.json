@@ -215,6 +215,14 @@
   },
   {
     "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/watch",
+    "verbs": [
+      "watch"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
     "pattern": "/v1/placements/{tenant}/{bucket}/ramp",
     "verbs": [
       "ramp"

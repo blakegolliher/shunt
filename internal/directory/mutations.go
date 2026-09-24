@@ -95,6 +95,21 @@ func (f *File) SetPlacementReadOnly(tenant, bucket string, readOnly, reject bool
 	return nil
 }
 
+// SetPlacementWatch sets whether proxies report the placement's traffic by backend cluster.
+func (f *File) SetPlacementWatch(tenant, bucket string, watch bool) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if p.Watch == watch {
+		return fmt.Errorf("%w: %s watch is already %t", ErrConflict, k, watch)
+	}
+	p.Watch = watch
+	f.Placements[k] = p
+	return nil
+}
+
 // SetClusterReadOnly updates the maintenance switch on one backend.
 func (f *File) SetClusterReadOnly(name string, readOnly, reject bool) error {
 	c, ok := f.Clusters[name]

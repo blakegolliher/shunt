@@ -35,6 +35,7 @@
   {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/expand"},
   {"method":"DELETE","pattern":"/v1/placements/{tenant}/{bucket}/target"},
   {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/read-only"},
+  {"method":"POST","pattern":"/v1/placements/{tenant}/{bucket}/watch"},
   {
     "method":"GET",
     "pattern":"/v1/clusters/{name}/view",

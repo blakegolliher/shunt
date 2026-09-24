@@ -85,6 +85,9 @@ type Placement struct {
 	Created      time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
 	ReadOnly     bool              `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	RejectWrites bool              `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
+	// Watch asks proxies for this bucket's traffic by backend cluster in telemetry, as they give it
+	// for every bucket spread over legs or moving; bounded per window (telemetry.MaxBucketsPerWindow).
+	Watch bool `yaml:"watch,omitempty" json:"watch,omitempty"`
 
 	// Schema v2 (ADR-0018, legs.go). Only a decoder sets these, and it converts them into the v1
 	// fields above before anything else sees the placement, so outside legs.go they are always
@@ -258,6 +261,8 @@ type Store interface {
 	SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error
 	// SetPlacementReadOnly changes a placement's fleet-fenced maintenance switch.
 	SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error
+	// SetPlacementWatch asks for, or stops, the placement's per-backend traffic telemetry.
+	SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error
 	// SetClusterReadOnly changes a backend's fleet-fenced maintenance switch.
 	SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error
 	// Adopt takes over an existing backend bucket as an ACTIVE placement.

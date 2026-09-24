@@ -76,6 +76,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.NoSuchBucket, "")
 		return nil, false
 	}
+	if p.Spread() || p.State != directory.StateActive || p.Watch {
+		o.perBucket = directory.Key(o.tenant, info.Bucket)
+	}
 	if !ownerMatches(r.Header, "X-Amz-Expected-Bucket-Owner", o.tenant) || !ownerMatches(r.Header, "X-Amz-Source-Expected-Bucket-Owner", o.tenant) {
 		h.answer(w, r, o, s3.AccessDenied, "")
 		return nil, false

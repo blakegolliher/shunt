@@ -104,6 +104,47 @@ func newBucketReadOnly() *cobra.Command {
 	return cmd
 }
 
+// newWatch asks proxies for a bucket's traffic by backend cluster in telemetry. Buckets spread over
+// legs or moving are counted anyway; this is for one that is neither.
+func newWatch() *cobra.Command {
+	var o apiOptions
+	var off bool
+	cmd := &cobra.Command{
+		Use:   "watch <bucket>",
+		Short: "Show a bucket's traffic by backend cluster in telemetry, or stop",
+		Long: "Proxies count the traffic of every bucket spread over legs or moving, by backend cluster, for the\n" +
+			"Telemetry screen's bucket view and GET /v1/telemetry/series?scope=bucket:<tenant>/<bucket>. Watch adds a\n" +
+			"bucket that is neither. At most 32 buckets per proxy window are counted apart; the rest sum as (other).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			path, err := placementPath(args[0])
+			if err != nil {
+				return err
+			}
+			var out struct {
+				Key     string `json:"key"`
+				Watch   bool   `json:"watch"`
+				Version int64  `json:"version"`
+			}
+			if callErr := api.call(cmd.Context(), "POST", path+"/watch", control.WatchRequest{Watch: !off}, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: watch %t (directory version %d)\n", shown(out.Key), out.Watch, out.Version)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&off, "off", false, "stop counting the bucket apart (a spread or moving bucket is still counted)")
+	return cmd
+}
+
 func newClusterAdd() *cobra.Command {
 	var (
 		o                            apiOptions

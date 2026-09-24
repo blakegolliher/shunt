@@ -75,6 +75,10 @@ export interface PlacementStatus {
   names: Record<string, string> | null
   read_only: boolean
   reject_writes: boolean
+  // watch: an operator asked for this bucket's traffic by backend; per_bucket_telemetry: proxies
+  // count it by backend now (spread, moving or watched).
+  watch?: boolean
+  per_bucket_telemetry?: boolean
   client_keys?: number // keys that can reach the bucket; absent when this shunt holds no keys
   legs?: { id: string; cluster: string; bucket: string; share: number; ranges: { from: string; to: string }[]; idle?: boolean }[] // a bucket spread over legs; primary and names are empty then. idle: owns no key in any scope
   move?: { from: string; to: string; range: { from: string; to: string }; share: number } // part of a spread bucket moving; primary and source are its clusters then
@@ -229,6 +233,8 @@ export interface TelemetryPoint {
   max_us?: number
   count?: number
   value?: number
+  // cluster is the backend cluster of a point in a bucket scope, which answers one per cluster.
+  cluster?: string
   // code is the status key of a status_per_second point: a tracked code such as "503", "4xx" or
   // "5xx" for the others, "0" for no response, "not_found" for a read answered 404.
   code?: string
@@ -297,6 +303,7 @@ export const createBackendBucket = (token: string, tenant: string, bucket: strin
 export const expandBucket = (token: string, tenant: string, bucket: string, to: string, name?: string, acceptExisting = false) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, name, create: true, accept_existing_objects: acceptExisting || undefined }))
 export const clearTarget = (token: string, tenant: string, bucket: string) => request<{ key: string; target?: string; name?: string; retired?: { id: string; cluster: string; bucket: string }[]; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/target`, token, { method: 'DELETE' })
 export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}/read-only`, token, json({ read_only: readOnly, reject }))
+export const setBucketWatch = (token: string, tenant: string, bucket: string, watch: boolean) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/watch`, token, json({ watch }))
 export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/read-only`, token, json({ read_only: readOnly, reject }))
 export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
 export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })

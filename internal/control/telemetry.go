@@ -108,7 +108,7 @@ func (s *Server) telemetryLatest(w http.ResponseWriter, _ *http.Request) {
 
 func validScope(v string) bool {
 	return v == "fleet" || strings.HasPrefix(v, "cluster:") && len(v) > len("cluster:") ||
-		strings.HasPrefix(v, "proxy:") && len(v) > len("proxy:")
+		strings.HasPrefix(v, "proxy:") && len(v) > len("proxy:") || strings.HasPrefix(v, "bucket:") && len(v) > len("bucket:")
 }
 
 func validSeries(v string) bool {
