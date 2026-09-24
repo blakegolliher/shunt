@@ -38,3 +38,26 @@ test('changes a tenant default from the cluster that blocks removal', async () =
   await screen.findByText("var204 is now tenant default's default cluster")
   expect(posted).toEqual(['/v1/tenants/default/default-cluster {"cluster":"var204"}'])
 })
+
+// The cluster detail shows where a secret rotation stands across the fleet.
+test('shows a secret rotation installing across the fleet', async () => {
+  sessionStorage.setItem('shunt.control.token', 't')
+  const clusters = [cluster('var204', ['placements.default/data02'])]
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input)
+    if (url.endsWith('/v1/control')) return Response.json(control)
+    if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 8, clusters, placements: [] })
+    if (url.includes('/v1/clusters/var204/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
+      probe: { reachable: true, latency_ms: 1, checked_at: '2026-09-24T12:00:00Z' }, secret: { generation: '12', installed: ['proxy-a'], pending: ['proxy-b'], silent: [] } })
+    if (url.includes('/v1/telemetry/series')) return Response.json({ points: [] })
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    return Response.json({ message: `unhandled ${url}` }, { status: 404 })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Clusters' }))
+  fireEvent.click(await screen.findByText('var204'))
+  expect(await screen.findByText(/Rotation installing: 1 proxy still on an older secret/)).toBeInTheDocument()
+  expect(screen.getByText('generation 12')).toBeInTheDocument()
+  expect(screen.getByText('proxy-b')).toBeInTheDocument()
+})

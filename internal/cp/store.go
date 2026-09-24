@@ -541,11 +541,17 @@ func (s *Store) mutate(ctx context.Context, actor, op, key string, fn func(st *s
 		var rotated []string // a secret changes a cluster though its definition does not
 		for name := range next.file.Clusters {
 			if ref := SecretRefPrefix + name; next.secrets[ref] != cur.secrets[ref] {
-				rotated = append(rotated, directory.ClusterResource(name))
+				rotated = append(rotated, directory.ClusterResource(name), directory.SecretResource(name))
 			}
 		}
 		if err := directory.Stamp(cur.file, next.file, rotated...); err != nil {
 			return err
+		}
+		for name := range next.file.Clusters {
+			if _, held := next.secrets[SecretRefPrefix+name]; !held {
+				// Only a secret this store holds has a generation to track.
+				delete(next.file.Generations, directory.SecretResource(name))
+			}
 		}
 		if err := directory.Validate(next.file); err != nil {
 			return err

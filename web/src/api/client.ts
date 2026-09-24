@@ -108,6 +108,9 @@ export interface Capability { value: boolean; known: boolean }
 export interface ClusterView extends ClusterStatus {
   capabilities: { conditional_write: Capability; conditional_delete: Capability }
   probe: { reachable: boolean; latency_ms: number; error?: string; checked_at: string }
+  // secret: where a rotation of the cluster's secret stands, when the control plane holds it.
+  // Installed is not drained: a request begun before the install may still sign with the old one.
+  secret?: { generation: string; installed: string[]; pending: string[]; silent: string[] }
 }
 
 export interface ClusterProbeResult {

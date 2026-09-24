@@ -534,6 +534,24 @@ func TestMemberRefusedCandidateLeavesTheLiveSecrets(t *testing.T) {
 	}
 }
 
+// The heartbeat reports the secret generation of each cluster's signer, from the installed version.
+func TestHeartbeatReportsSecretGenerations(t *testing.T) {
+	f := newFakeControl(t)
+	f.mu.Lock()
+	f.dir.Generations = map[string]int64{directory.SecretResource("vast01"): 1}
+	f.mu.Unlock()
+	c := newClient(t, f)
+	if err := c.Register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	last := f.beats[len(f.beats)-1]
+	if last.Secrets["vast01"] != "1" || len(last.Secrets) != 1 {
+		t.Fatalf("heartbeat secrets %v, want vast01 at 1", last.Secrets)
+	}
+}
+
 // fakeClock is a settable clock for the lease tests.
 type fakeClock struct {
 	mu  sync.Mutex

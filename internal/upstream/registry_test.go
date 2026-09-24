@@ -102,6 +102,35 @@ func TestRegistrySecretOnlyRotation(t *testing.T) {
 	}
 }
 
+// A secret generation that moved is a rotation even with the same secret string: a new signer,
+// carrying the generation, over the same transport.
+func TestRegistrySecretGeneration(t *testing.T) {
+	r := NewRegistry(Options{}, func(string) (string, error) { return "same", nil })
+	defs := map[string]config.Cluster{"vast01": regCluster("10.0.0.1:80", "control:vast01")}
+	gen := int64(4)
+	byGen := func(string) int64 { return gen }
+	c, err := r.PrepareWith(defs, nil, byGen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Commit()
+	first, _ := r.Load().Get("vast01")
+	if first.SecretGeneration != 4 {
+		t.Fatalf("generation %d, want 4", first.SecretGeneration)
+	}
+	gen = 9
+	if c, err = r.PrepareWith(defs, nil, byGen); err != nil {
+		t.Fatal(err)
+	}
+	if added, _ := c.Commit(); len(added) != 1 {
+		t.Fatalf("a moved generation was not a change: %v", added)
+	}
+	second, _ := r.Load().Get("vast01")
+	if second == first || second.SecretGeneration != 9 || second.Transport != first.Transport {
+		t.Fatalf("after the rotation: new signer %v, generation %d, same transport %v", second != first, second.SecretGeneration, second.Transport == first.Transport)
+	}
+}
+
 // T02 at the registry: a prepared candidate is not live, resolves its secrets with its own
 // resolver, and changes nothing if it is never committed.
 func TestRegistryCandidateIsNotLiveUntilCommitted(t *testing.T) {

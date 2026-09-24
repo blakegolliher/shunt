@@ -28,10 +28,15 @@ type Cluster struct {
 	Endpoints []string // host:port
 	Transport *http.Transport
 
-	Creds            sigv4.Credentials // set by NewSet when secrets are resolved (resign mode)
-	EnforcesSHA256   bool              // backend rejects a wrong hex x-amz-content-sha256 itself
-	UnsignedTrailer  bool              // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
-	ConditionalWrite bool              // backend honors If-None-Match: * on PUT (ADR-0004)
+	Creds sigv4.Credentials // set by NewSet when secrets are resolved (resign mode)
+	// SecretGeneration is the generation of the secret Creds signs with: the directory version
+	// that last changed it (directory.SecretResource), 0 where the directory does not track it
+	// (a lab's env: or file: ref). Proxies report it, so a rotation shows who signs with the new
+	// secret yet (ADR-0021 D1).
+	SecretGeneration int64
+	EnforcesSHA256   bool // backend rejects a wrong hex x-amz-content-sha256 itself
+	UnsignedTrailer  bool // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
+	ConditionalWrite bool // backend honors If-None-Match: * on PUT (ADR-0004)
 
 	next atomic.Uint64
 }
@@ -115,9 +120,10 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 // withSecret returns a copy of c that signs with secret and shares c's transport, so a
 // secret-only rotation keeps the pooled connections. c itself keeps its secret: a request that
 // loaded it finishes signing with the secret it started with.
-func (c *Cluster) withSecret(secret string) *Cluster {
+func (c *Cluster) withSecret(secret string, generation int64) *Cluster {
 	n := &Cluster{Name: c.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: c.ID, Endpoints: c.Endpoints, Transport: c.Transport,
-		Creds: c.Creds, EnforcesSHA256: c.EnforcesSHA256, UnsignedTrailer: c.UnsignedTrailer, ConditionalWrite: c.ConditionalWrite}
+		Creds: c.Creds, EnforcesSHA256: c.EnforcesSHA256, UnsignedTrailer: c.UnsignedTrailer, ConditionalWrite: c.ConditionalWrite,
+		SecretGeneration: generation}
 	n.Creds.Secret = secret
 	return n
 }

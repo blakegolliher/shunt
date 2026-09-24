@@ -91,6 +91,10 @@ type Heartbeat struct {
 	// Host and Version say where the member runs and which build it is, for the fleet view.
 	Host    string `json:"host,omitempty"`
 	Version string `json:"version,omitempty"`
+	// Secrets is the secret generation each cluster's signer has on the member, as decimal
+	// strings: what it signs with since its last install (ADR-0021 D1). A cluster the control plane
+	// holds no secret for is absent.
+	Secrets map[string]string `json:"secrets,omitempty"`
 	// Telemetry is the member's last completed 10-second window. It is re-sent until the next
 	// window closes, and the control node de-duplicates it by proxy and start time.
 	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
@@ -122,7 +126,10 @@ type Member struct {
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
 	Host          string             `json:"host,omitempty"`
 	Version       string             `json:"version,omitempty"` // the member's build
-	Telemetry     *telemetry.Window  `json:"telemetry,omitempty"`
+	// Secrets is the secret generation of each cluster's signer on the member, from its last
+	// heartbeat (Heartbeat.Secrets).
+	Secrets   map[string]string `json:"secrets,omitempty"`
+	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
 }
 
 // Has reports whether the member has installed version v of lineage id. A larger version from

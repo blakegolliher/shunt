@@ -160,7 +160,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		rewrite := !cfg.KillSwitches.XMLRewriteDisable
 		started := false
 		applyClusters := func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
-			cand, aerr := registry.Prepare(f.Clusters, resolve)
+			cand, aerr := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 			if aerr != nil {
 				log.Error("directory version refused: a cluster could not be built", "version", f.Version, "err", aerr.Error())
 				return nil, aerr
@@ -370,7 +370,7 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	registry := upstream.NewRegistry(upstream.Options{}, m.Resolve)
 	rewrite := !cfg.KillSwitches.XMLRewriteDisable
 	m.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
-		cand, err := registry.Prepare(f.Clusters, resolve)
+		cand, err := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 		if err != nil {
 			return nil, err
 		}
@@ -537,4 +537,10 @@ func newLogger(cfg *config.Config, stderr io.Writer) *slog.Logger {
 		log = log.With("client_listener", "PLAINTEXT http (listener.plaintext: true; lab use only)")
 	}
 	return log
+}
+
+// secretGeneration reads each cluster's secret generation from a directory version, for the
+// signers the registry builds from it (ADR-0021 D1).
+func secretGeneration(f *directory.File) func(string) int64 {
+	return func(name string) int64 { return f.Generation(directory.SecretResource(name)) }
 }

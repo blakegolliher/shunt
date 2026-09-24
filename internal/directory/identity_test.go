@@ -158,3 +158,36 @@ func itoa(i int) string {
 	}
 	return string(s)
 }
+
+// A secret's generation is carried while its cluster is there, moves only when a write names it,
+// and goes with the cluster.
+func TestStampSecretGenerations(t *testing.T) {
+	id := Identity{ClusterID: strings.Repeat("a", 32), Epoch: strings.Repeat("b", 32)}
+	prev := &File{Version: 4, Schema: SchemaVersion, Identity: id, Clusters: sampleClusters(t),
+		Generations: map[string]int64{SecretResource("garage"): 3}}
+	next := prev.clone()
+	next.Version = 5
+	if err := Stamp(prev, next); err != nil {
+		t.Fatal(err)
+	}
+	if g := next.Generation(SecretResource("garage")); g != 3 {
+		t.Fatalf("an unnamed secret moved to generation %d", g)
+	}
+	after := next.clone()
+	after.Version = 6
+	if err := Stamp(next, after, SecretResource("garage")); err != nil {
+		t.Fatal(err)
+	}
+	if g := after.Generation(SecretResource("garage")); g != 6 {
+		t.Fatalf("a rotated secret's generation is %d, want 6", g)
+	}
+	gone := after.clone()
+	gone.Version = 7
+	delete(gone.Clusters, "garage")
+	if err := Stamp(after, gone); err != nil {
+		t.Fatal(err)
+	}
+	if g := gone.Generation(SecretResource("garage")); g != 0 {
+		t.Fatalf("a removed cluster's secret kept generation %d", g)
+	}
+}

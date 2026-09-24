@@ -338,6 +338,22 @@ func TestStoreIdentityAndGenerations(t *testing.T) {
 	if fb.Identity != fa.Identity {
 		t.Fatal("a write changed the identity")
 	}
+	s1 := fb.Generation(directory.SecretResource("vast01"))
+	if s1 != fb.Version {
+		t.Fatalf("the rotated secret's generation %d, want %d", s1, fb.Version)
+	}
+	// A definition change leaves the secret's generation alone.
+	moved := cluster("control:vast01")
+	moved.Endpoints = []string{"127.0.0.1:2"}
+	if err := a.PutCluster(ctx, "vast01", moved, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g := b.Snapshot().File().Generation(directory.SecretResource("vast01")); g != s1 {
+		t.Fatalf("an endpoint change moved the secret generation %d → %d", s1, g)
+	}
 }
 
 // A directory written before schema 2 is upgraded when a node starts: one new version carrying the

@@ -194,8 +194,18 @@ install lock; the lab proxy on each directory install and each key-file change. 
 immutable snapshot of the key store. A test publishes a rotated-secret bundle while a request is
 authenticating and shows that request signing with the secret of the bundle it took; its negative
 control (reading the clusters again after authentication) signs both requests with the new secret.
-Remaining for H1: secret generations, resource lifetimes and the retained-bundle bound, the
-restart cache, rotation API/CLI/GUI and fleet install diagnostics.
+
+**Landed (2026-09-24, H1b):** secret generations. A rotation stamps `secret:<name>` with the
+directory version that changed it, beside `cluster:<name>` (an endpoint-only edit moves the
+cluster generation, not the secret's); a removed cluster or one no longer holding a control secret
+loses its secret generation. The registry reuses a cluster only when its definition, secret and
+secret generation are all unchanged, so a re-set to the same secret still counts as a rotation.
+Each member reports `secrets` (cluster → generation it signs with) in its heartbeat, and the
+cluster view answers `secret`: the generation, which live members have installed it, which are
+pending on an older one, and which are silent. Installed is not drained: a request that took the
+old bundle may still sign with the old secret until it finishes (H2 is the drain barrier).
+Remaining for H1: resource lifetimes and the retained-bundle bound, the restart cache,
+rotation API/CLI/GUI and fleet install diagnostics.
 
 ### Runtime bundle and installation
 

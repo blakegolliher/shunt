@@ -81,6 +81,11 @@ func PlacementResource(key string) string { return "placement:" + key }
 // ClusterResource is the resource key of a cluster.
 func ClusterResource(name string) string { return "cluster:" + name }
 
+// SecretResource is the resource key of a cluster's secret: its generation moves when the secret
+// does, even with the secret_ref unchanged, so a rotation is visible and countable (ADR-0021 D1).
+// Only the control plane, which holds the secrets, stamps it.
+func SecretResource(name string) string { return "secret:" + name }
+
 // TenantResource is the resource key of a tenant.
 func TenantResource(name string) string { return "tenant:" + name }
 
@@ -137,6 +142,13 @@ func Stamp(prev, next *File, changed ...string) error {
 	for name := range next.Tenants {
 		old, had := prev.Tenants[name]
 		stamp(TenantResource(name), had && reflect.DeepEqual(old, next.Tenants[name]))
+	}
+	for name := range next.Clusters {
+		// A secret's generation is carried as long as its cluster is there; only a write that
+		// changes the secret names it in changed.
+		if g := prev.Generations[SecretResource(name)]; g > 0 {
+			gens[SecretResource(name)] = g
+		}
 	}
 	for _, res := range changed {
 		gens[res] = next.Version

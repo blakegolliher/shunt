@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -463,7 +464,7 @@ func (c *Client) beat(ctx context.Context) error {
 	sent := c.Now()
 	snap := c.Snapshot()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
-		Host: c.cfg.Host, Version: c.cfg.Version}
+		Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
 	if c.Telemetry != nil {
 		hb.Telemetry = c.Telemetry.Completed(c.Now())
 	}
@@ -554,6 +555,21 @@ func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied i
 type grant struct {
 	seq   int64
 	until time.Time
+}
+
+// secretGenerations are the secret generations of the installed directory, by cluster: what the
+// runtime bundle published with it signs with, since both come from one install.
+func secretGenerations(f *directory.File) map[string]string {
+	var out map[string]string
+	for name := range f.Clusters {
+		if g := f.Generation(directory.SecretResource(name)); g > 0 {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[name] = strconv.FormatInt(g, 10)
+		}
+	}
+	return out
 }
 
 func errString(err error) string {

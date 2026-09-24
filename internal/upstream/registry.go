@@ -92,6 +92,13 @@ type Candidate struct {
 // candidate only (nil: the registry's own resolver), so a candidate's secrets never reach the live
 // set before Commit. Any cluster failing fails the whole candidate.
 func (r *Registry) Prepare(clusters map[string]config.Cluster, resolve func(ref string) (string, error)) (*Candidate, error) {
+	return r.PrepareWith(clusters, resolve, nil)
+}
+
+// PrepareWith is Prepare with each cluster's secret generation (Cluster.SecretGeneration) from
+// generation; nil leaves them 0. A cluster whose secret generation moved is a rotation even when the
+// secret string did not change: its signer is rebuilt over the same transport.
+func (r *Registry) PrepareWith(clusters map[string]config.Cluster, resolve func(ref string) (string, error), generation func(name string) int64) (*Candidate, error) {
 	if resolve == nil {
 		resolve = r.resolve
 	}
@@ -109,18 +116,22 @@ func (r *Registry) Prepare(clusters map[string]config.Cluster, resolve func(ref 
 			}
 			secret = s
 		}
+		var gen int64
+		if generation != nil {
+			gen = generation(name)
+		}
 		cl, ok := old.byName[name]
 		switch {
-		case ok && reflect.DeepEqual(r.defs[name], def) && cl.Creds.Secret == secret:
+		case ok && reflect.DeepEqual(r.defs[name], def) && cl.Creds.Secret == secret && cl.SecretGeneration == gen:
 		case ok && reflect.DeepEqual(r.defs[name], def):
-			cl = cl.withSecret(secret)
+			cl = cl.withSecret(secret, gen)
 			c.added = append(c.added, name)
 		default:
 			var err error
 			if cl, err = New(name, def, r.opts); err != nil {
 				return nil, fmt.Errorf("cluster %s: %w", name, err)
 			}
-			cl.Creds.Secret = secret
+			cl.Creds.Secret, cl.SecretGeneration = secret, gen
 			c.added = append(c.added, name)
 		}
 		if other, dup := c.next.byID[cl.ID]; dup {

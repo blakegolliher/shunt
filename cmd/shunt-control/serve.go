@@ -210,7 +210,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"),
 		Mover: worker.Run, MoverLedger: worker.Ledger}
 	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
-		cand, aerr := registry.Prepare(f.Clusters, resolve)
+		cand, aerr := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -379,4 +379,10 @@ func newLogger(format string, plaintext bool, stderr io.Writer) *slog.Logger {
 		log = log.With("control_api", "PLAINTEXT http (--plaintext; secrets and client keys cross the network in the clear)")
 	}
 	return log
+}
+
+// secretGeneration reads each cluster's secret generation from a directory version, for the
+// signers the registry builds from it (ADR-0021 D1).
+func secretGeneration(f *directory.File) func(string) int64 {
+	return func(name string) int64 { return f.Generation(directory.SecretResource(name)) }
 }

@@ -132,3 +132,26 @@ func TestDirectoryAndHeartbeatRefuseAnotherLineage(t *testing.T) {
 		t.Errorf("checkLineage across epochs: %v", err)
 	}
 }
+
+// A cluster's secret rotation reads as installed on the live members whose signer has its
+// generation, pending on those still behind, and silent on those past their lease.
+func TestSecretStatus(t *testing.T) {
+	d := lineageDir(t)
+	f := *d.Snapshot().File()
+	f.Generations = map[string]int64{"secret:vast01": 3}
+	ms := []Member{
+		{ID: "a", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}},
+		{ID: "b", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "2"}},
+		{ID: "c", Live: false, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}},
+		{ID: "d", Live: true, Identity: lineageB, Secrets: map[string]string{"vast01": "9"}},
+	}
+	s := &Server{Dir: d, Fleet: staticFleet{ms: ms}}
+	st := s.secretStatus(context.Background(), &f, "vast01")
+	if st == nil || st.Generation != "3" || len(st.Installed) != 1 || st.Installed[0] != "a" ||
+		len(st.Pending) != 2 || st.Pending[0] != "b" || st.Pending[1] != "d" || len(st.Silent) != 1 || st.Silent[0] != "c" {
+		t.Fatalf("secret status: %+v", st)
+	}
+	if s.secretStatus(context.Background(), &f, "untracked") != nil {
+		t.Fatal("a cluster with no secret generation has a status")
+	}
+}

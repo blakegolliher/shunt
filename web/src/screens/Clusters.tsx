@@ -91,6 +91,11 @@ export function Clusters() {
       {detail ? <div className="space-y-6">
         <div className="grid grid-cols-2 gap-3 text-sm"><div><p className="text-muted">Endpoint</p><p className="mt-1 font-mono">{detail.scheme}://{detail.endpoints.join(', ')}</p></div><div><p className="text-muted">Health history</p><Sparkline values={history.length ? history : [detail.probe.latency_ms]} label={`${detail.name} latency history`} /></div></div>
         <Card title="Capability profile"><dl className="grid gap-3 text-sm">{Object.entries(detail.capabilities).map(([name, value]) => <div key={name} className="flex justify-between"><dt className="text-muted">{name.replaceAll('_', ' ')}</dt><dd>{String(value.value)} · {value.known ? 'measured' : 'assumed'}</dd></div>)}</dl></Card>
+        {detail.secret && <Card title="Secret" eyebrow={`generation ${detail.secret.generation}`}>
+          <p className="text-sm">{detail.secret.pending.length === 0 && detail.secret.silent.length === 0 ? <span className="text-emerald-300">Every proxy signs with this secret.</span> : <span className="text-amber-200">Rotation installing: {detail.secret.pending.length} {detail.secret.pending.length === 1 ? 'proxy' : 'proxies'} still on an older secret{detail.secret.silent.length ? `, ${detail.secret.silent.length} silent` : ''}.</span>}</p>
+          <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs"><dt className="text-muted">Installed</dt><dd className="font-mono">{detail.secret.installed.join(', ') || '—'}</dd><dt className="text-muted">Pending</dt><dd className="font-mono">{detail.secret.pending.join(', ') || '—'}</dd><dt className="text-muted">Silent</dt><dd className="font-mono">{detail.secret.silent.join(', ') || '—'}</dd></dl>
+          <p className="mt-3 text-xs text-muted">Installed is not drained: a request a proxy began before it installed the new secret may still sign with the old one. Keep the old backend key valid until requests that old have finished.</p>
+        </Card>}
         <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => {
           // A tenant defaulting to this cluster blocks its removal; the fix is here, not on another screen.
           const tenant = /^tenants\.(.+)\.default_cluster$/.exec(ref)?.[1]
