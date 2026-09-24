@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/config"
@@ -116,12 +115,9 @@ func (s *Server) precondition(tr *tracker, strict bool, wait time.Duration) erro
 // the answer says which members have not installed the step yet. A hold that does not reach every
 // member is released, so the step either happens everywhere or nowhere.
 func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, create, acceptLoss bool, wait time.Duration) (TransitionResult, error) {
-	// One fenced step per bucket at a time: two operators stepping the same bucket would otherwise
-	// fence, release and complete each other's holds. The placement is read under the lock, so a
-	// step starts from what the previous one left.
-	tr.phase(PhaseQueued)
-	unlock := s.lockStep(key)
-	defer unlock()
+	// One fenced step per bucket at a time: the operation reserved the placement when it was
+	// created (ADR-0021), on every control node, so two operators stepping the same bucket cannot
+	// fence, release and complete each other's holds.
 	if err := s.Dir.Sync(tr.ctx); err != nil {
 		return TransitionResult{}, err
 	}
@@ -220,14 +216,6 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 	res.From, res.Held, res.CreatedBucket = p.State, true, created
 	s.settle(tr, &res, res.Version, wait)
 	return res, nil
-}
-
-// lockStep serializes fenced steps on one placement key and returns the unlock.
-func (s *Server) lockStep(key string) func() {
-	v, _ := s.steps.LoadOrStore(key, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
 }
 
 // holdText describes a held step for an operator.

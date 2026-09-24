@@ -108,10 +108,10 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 	}
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
-	for op.Status == control.StatusRunning {
+	for !op.Terminal() {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("operation %s is still running (phase %s); follow it with GET %s/v1/operations/%s", op.ID, op.Phase, c.base, op.ID)
+			return fmt.Errorf("operation %s is still %s (phase %s); follow it with GET %s/v1/operations/%s", op.ID, op.Status, op.Phase, c.base, op.ID)
 		case <-tick.C:
 		}
 		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &op); err != nil {
@@ -128,8 +128,8 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 			return json.Unmarshal(op.Result, out)
 		}
 		return nil
-	case control.StatusRefused:
-		if !strings.HasPrefix(msg, "refused") {
+	case control.StatusFailed:
+		if op.Error != nil && op.Error.Code == "refused" && !strings.HasPrefix(msg, "refused") {
 			return fmt.Errorf("refused: %s", shownText(msg))
 		}
 	}

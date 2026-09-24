@@ -415,7 +415,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	if code, raw := a.call("POST", "/v1/operations", control.OperationRequest{Kind: control.OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":0.8,"wait":"8s"}`)}, &started); code != http.StatusAccepted {
 		t.Fatalf("POST /v1/operations: %d %s", code, raw)
 	}
-	if started.ID == "" || started.Status != control.StatusRunning {
+	if started.ID == "" || started.Terminal() {
 		t.Fatalf("started: %+v", started)
 	}
 	waitFor(t, 5*time.Second, "node b did not see the hold waiting on p2", func() bool {
@@ -460,8 +460,8 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	}
 
 	// A record a node was running when it stopped is closed as failed when the node is back.
-	orphan := &control.Operation{ID: "0000000000001-abcdef", Kind: control.OpRamp, Placement: "acme/data01", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseHold}
-	if err := a.ops.Put(context.Background(), orphan); err != nil {
+	orphan := &control.Operation{ID: "0000000000001-abcdef", Kind: control.OpRamp, Placement: "acme/data01", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseHold, Sequence: 1}
+	if err := a.ops.Create(context.Background(), orphan); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.ctl.FailOrphans(context.Background()); err != nil {
@@ -469,7 +469,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	}
 	var failed control.Operation
 	a.must("GET", "/v1/operations/"+orphan.ID, nil, &failed)
-	if failed.Status != control.StatusFailed || failed.Error == nil || failed.Error.Code != "unavailable" {
+	if failed.Status != control.StatusFailed || failed.Error == nil || failed.Error.Code != "unavailable" || failed.EffectState != control.EffectUncertain {
 		t.Fatalf("the orphan: %+v", failed)
 	}
 

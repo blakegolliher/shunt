@@ -26,6 +26,9 @@ The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--
 | 404 | `not_found` | no such placement or cluster |
 | 409 | `refused` | the rules forbid this now; the message says why and what to do. The CLI prints `refused: <message>` |
 | 409 | `conflict` | already exists, or a concurrent change won |
+| 409 | `operation_conflict` | an unfinished operation owns the placement or cluster (or, for a cluster, one on a placement touching it); `operation_id` names it ([Operations](#operations)) |
+| 409 | `generation_conflict` | the placement or cluster changed since the request was made; `current_generation` is its generation now |
+| 409 | `cluster_mismatch`, `epoch_mismatch`, `resync_required` | a request made on another directory lineage; `current_identity` is the control plane's |
 | 502 | `backend` | a cluster call failed (HEAD, create, canary, listing, delete) |
 | 503 | `unavailable` | the directory is read-only or its lock timed out |
 
@@ -304,9 +307,10 @@ It answers `{"tenant", "cluster", "scheme", "endpoints", "ready", "problems", "n
 Every long-running action (a ramp step, `migrate`, the browser `mover`, `cutover`, `purge-source`, `finish`, and `DELETE /v1/clusters/{name}`) runs under an operation record (ADR-0017): which phase it is in, which proxies it is waiting on, how it ended. The action's own route writes the record, runs, and answers as it always has plus `operation`; `POST /v1/operations` writes the record and answers at once, for a browser that polls or follows [Events](#events). The CLI's `--wait` polls the record. A record is per operation, never per object.
 
 - An operation runs on the control node's lifetime, not the request's: a client that leaves does not stop it, and the record has its outcome.
-- `wait` in the args keeps the fence semantics of ADR-0016: a hold that does not reach every member within it is released, and the record ends `refused` with the same message the route gives.
-- A record is owned by the node that runs it. A control node that restarts marks its own `running` records `failed` with `the control node running this operation restarted before it finished; repeat the step to complete it`; a held step it left completes when the step is repeated.
-- Records are kept in etcd on a fleet (`/shunt/ops/<id>`, the last 1 000, readable from any control node) and in memory on a lab proxy.
+- **Scopes (ADR-0021).** Every mutation of a placement or a cluster runs under a record that reserves its scope when it is created, in the same atomic step, and releases it when the record ends: the fenced actions above, and the short ones (`create`, forwarded bucket create and delete, `adopt`, `expand`, its clear, carve and merge, `cluster-add`). At most one unfinished operation owns a placement or a cluster; a cluster operation also conflicts with an unfinished operation on any placement touching that cluster, and the other way round. A request whose scope is owned answers 409 `operation_conflict` with `operation_id`, before anything changes; a second step on a bucket is refused, not queued. The reservation compares the scope's generation and the directory's identity, so a request accepted against a view the directory has moved past answers 409 `generation_conflict`.
+- `wait` in the args keeps the fence semantics of ADR-0016: a hold that does not reach every member within it is released, and the record ends `failed` with error code `refused` and the message the route gives.
+- A record is owned by the node that runs it, and written by sequence: an update is accepted only over the sequence it read. A control node that restarts ends its own unfinished records `failed` with `the control node running this operation restarted before it finished; repeat the step to complete it`. A fleet's control nodes each keep a liveness key (`/shunt/ops-owner/<node>`, on a 10 s lease); a request blocked by a record whose node's key has lapsed ends that record the same way, and takes the scope. Either way the ended record's `effect_state` is `uncertain` unless it had not started: a held step it left completes when the step is repeated.
+- Records are kept in etcd on a fleet (`/shunt/ops/<id>`, readable from any control node; reservations under `/shunt/ops-scope/`) and in memory on a lab proxy, whose restart forgets them and their reservations. The last 1 000 ended records are kept; an unfinished record, or one whose effect is uncertain, is never dropped by that limit.
 
 ### `POST /v1/operations`
 
@@ -318,27 +322,33 @@ the body the action's own route takes; unknown fields are refused, and a `purge-
 not an operation (call its route). A missing placement or cluster is 404. Answers `202` with the
 record:
 
-The short UI mutations `cluster-add`, `adopt`, `create`, and `expand` also produce records when
+The short mutations `cluster-add`, `adopt`, `create` (and a member's forwarded bucket create), `delete`, `expand`, `clear-target`, `carve` and `merge` also produce records when
 their own routes are called. Their bodies are never copied into `args`, because they can carry a
 cluster or client secret; their secret-free response is recorded as `result`.
 
 ```json
 {"id": "1758542400123-a1b2c3", "kind": "ramp", "placement": "default/data01", "actor": "api:127.0.0.1", "node": "c1",
- "created": "2026-09-22T12:00:00Z", "updated": "2026-09-22T12:00:00Z",
- "status": "running", "phase": "queued", "args": {"ratio": 0.5, "wait": "30s"}}
+ "identity": {"cluster_id": "3f0c…", "epoch": "9a1e…"},
+ "scope": {"resource": "placement:default/data01", "generation": 41, "clusters": ["vast01", "vast02"]},
+ "sequence": 1, "created": "2026-09-22T12:00:00Z", "updated": "2026-09-22T12:00:00Z",
+ "status": "pending", "effect_state": "none", "allowed_actions": [], "phase": "queued", "args": {"ratio": 0.5, "wait": "30s"}}
 ```
 
 | Field | Meaning |
 |---|---|
-| `status` | `running`, then `succeeded`, `failed` (the error's `code` is what the route would have answered) or `refused` |
-| `phase` | where it is: `queued` (waiting for the bucket's step lock), `precondition` (waiting for every proxy to have the current version), `hold` (the hold is written; waiting for every proxy to have it), `step` (the step is being written), `settle` (the step is written; waiting for every live proxy to have it), `mover` (copying guarded objects and reporting passes), `window` (cutover's quiet window), `diff` (purge-source's listing diff), `purge` (deleting the source), `done` |
+| `status` | `pending` (accepted, scope reserved), `running`, `blocked` (waiting on `blockers`), then `succeeded`, `failed` (the error's `code` is what the route would have answered: `refused` for a step the rules refused once it ran) or `cancelled`. A request refused before a record exists is an HTTP error, never a record |
+| `effect_state` | `none` (nothing written to the directory), `committed` (at least one version written, the record's own or another writer's while it ran), `uncertain` (its owner was lost while it could have been writing). `failed` never means rolled back |
+| `identity`, `scope` | the directory lineage the operation was accepted on; the resource it reserves, that resource's generation then, and for a placement the clusters it touches |
+| `sequence` | how many times the record has been written |
+| `allowed_actions`, `blockers` | the actions the server accepts on the record now (none yet: resume and cancel arrive with the drain barriers), and named reasons it waits |
+| `phase` | where it is: `queued` (not started), `precondition` (waiting for every proxy to have the current version), `hold` (the hold is written; waiting for every proxy to have it), `step` (the step is being written), `settle` (the step is written; waiting for every live proxy to have it), `mover` (copying guarded objects and reporting passes), `window` (cutover's quiet window), `diff` (purge-source's listing diff), `purge` (deleting the source), `done` |
 | `waiting_on` | the proxies the current phase waits for, by id, as they change |
 | `silent` | members past their lease, not waited for |
 | `progress` | `{"done", "total", "unit", "ranges"?}` for a phase with a length: mover objects and cursors, cutover's window in seconds, purge-source's objects |
 | `version` | the directory version the step wrote, once it has |
 | `args` | the request as given |
 | `result` | the answer the route gives, once `succeeded`: a transition result, a purge result, or `{"removed"}` |
-| `error` | `{"code", "message"}`, once `failed` or `refused`; the message is the one the route gives |
+| `error` | `{"code", "message"}`, once `failed`; the message is the one the route gives |
 
 ### `GET /v1/operations/{id}`
 
@@ -435,7 +445,7 @@ The placement as `GET /v1/status` reports it (state, sides, names, ratio, prefix
 
 - `fence`: the fleet read once for this answer; `waiting_on` are live members that have not installed `version`, `silent` members past their lease, `held` a step written as a hold and not yet completed (ADR-0016).
 - `source_uploads_in_flight`: multipart uploads in progress on the source bucket, which a cutover would cut off; `null` without a source, or when the source could not be asked (then `source_uploads_error` says why).
-- `operations`: the running operation records on this placement.
+- `operations`: the unfinished operation records on this placement (pending, running or blocked).
 - `clusters`: the definitions of the clusters the placement names, as `GET /v1/status` lists them, without secrets.
 - `migration_window` is the latest completed fleet 10-second window for this placement: exact ramp
   write outcomes (`source`, `primary`) and migrating read outcomes (`target_hit`, `fallback_source`,

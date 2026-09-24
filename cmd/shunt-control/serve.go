@@ -194,6 +194,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	store.OnInstall = events.Directory
 	ops := cp.NewOperations(node.Client())
 	ops.OnChange = events.Fence
+	ops.Node = o.name // its liveness key: another node ends this node's operations if it is lost
 	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
 	telemetryStore := telemetry.NewStore(o.leaseTTL)
 	moverDir := filepath.Join(o.dataDir, "mover")

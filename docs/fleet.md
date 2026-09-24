@@ -65,7 +65,8 @@ With one proxy, nothing: every command answers as in the README. With members:
 - **Each step waits for every proxy.** `ramp`, `migrate start` and `cutover` answer once every live
   member has installed the change, and say `in effect on every live proxy`. One that has not
   within `--wait` (default 30s) is named (`PENDING: not yet installed on proxy-c`), and the next
-  step on that bucket is refused until it has. Each step runs as an operation record on the
+  step on that bucket is refused until it has. A second step on a bucket while one is unfinished
+  is refused with `operation_conflict` naming it, from any control node. Each step runs as an operation record on the
   control plane (`POST /v1/operations`, ADR-0017): the CLI polls it every 250 ms and prints the
   outcome, so a step outlives a dropped connection, and a `--wait` the CLI gives up on prints the
   record's id to follow with `GET /v1/operations/<id>` on any control node.

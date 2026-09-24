@@ -29,7 +29,20 @@ func openOps(t testing.TB, tc *testCluster, i int, retention int) *Operations {
 
 func record(n int, placement string) *control.Operation {
 	return &control.Operation{ID: fmt.Sprintf("%013d-%06x", 1700000000000+int64(n), n), Kind: control.OpRamp, Placement: placement,
-		Actor: "test", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseQueued}
+		Actor: "test", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseQueued, Sequence: 1}
+}
+
+// ended is record n, ended: what the history limit may drop.
+func ended(t testing.TB, ops *Operations, n int, placement string) {
+	t.Helper()
+	op := record(n, placement)
+	if err := ops.Create(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	op.Status, op.Phase, op.EffectState, op.Sequence = control.StatusSucceeded, control.PhaseDone, control.EffectNone, 2
+	if err := ops.Update(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestOperationsAcrossNodesAndRetention(t *testing.T) {
@@ -54,7 +67,7 @@ func TestOperationsAcrossNodesAndRetention(t *testing.T) {
 
 	// A record written on a is readable on b at once, before b's watch has delivered it.
 	first := record(1, "acme/data01")
-	if err := a.Put(ctx, first); err != nil {
+	if err := a.Create(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	got, err := b.Get(ctx, first.ID)
@@ -66,8 +79,8 @@ func TestOperationsAcrossNodesAndRetention(t *testing.T) {
 	}
 
 	// An update on a reaches b's OnChange exactly once, with the new status.
-	first.Status, first.Phase = control.StatusSucceeded, control.PhaseDone
-	if err := a.Put(ctx, first); err != nil {
+	first.Status, first.Phase, first.Sequence = control.StatusSucceeded, control.PhaseDone, 2
+	if err := a.Update(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "b's OnChange did not see the update once", func() bool {
@@ -82,19 +95,18 @@ func TestOperationsAcrossNodesAndRetention(t *testing.T) {
 		return n == 1
 	})
 
-	// Seven more records: only the newest five remain, on both nodes, newest first in a listing.
+	// Seven more ended records: only the newest five remain, on both nodes, newest first.
 	for i := 2; i <= 8; i++ {
-		if err := a.Put(ctx, record(i, "acme/logs")); err != nil {
-			t.Fatal(err)
-		}
+		ended(t, a, i, "acme/logs")
 	}
+	ended(t, a, 9, "acme/logs") // the history limit is applied on a create
 	waitFor(t, 5*time.Second, "retention did not leave five records on both nodes", func() bool {
 		la, _ := a.List(ctx, "", "", 100)
 		lb, _ := b.List(ctx, "", "", 100)
 		return len(la) == 5 && len(lb) == 5
 	})
 	la, _ := a.List(ctx, "", "", 100)
-	if la[0].ID != record(8, "").ID || la[4].ID != record(4, "").ID {
+	if la[0].ID != record(9, "").ID || la[4].ID != record(5, "").ID {
 		t.Fatalf("listing order: %s … %s", la[0].ID, la[4].ID)
 	}
 	if got, _ := a.Get(ctx, first.ID); got != nil {
@@ -108,14 +120,11 @@ func TestOperationsAcrossNodesAndRetention(t *testing.T) {
 	}
 }
 
-func BenchmarkOperationsPut(b *testing.B) {
+func BenchmarkOperationsCreateUpdate(b *testing.B) {
 	tc := startCluster(b, 1)
 	ops := openOps(b, tc, 0, 0)
-	ctx := context.Background()
 	b.ResetTimer()
 	for i := range b.N {
-		if err := ops.Put(ctx, record(i, "acme/data01")); err != nil {
-			b.Fatal(err)
-		}
+		ended(b, ops, i, "acme/data01")
 	}
 }

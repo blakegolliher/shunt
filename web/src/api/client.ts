@@ -150,7 +150,14 @@ export interface Operation {
   placement?: string
   cluster?: string
   actor: string
-  status: 'running' | 'succeeded' | 'failed' | 'refused'
+  // pending, running and blocked are unfinished; a refusal after the record exists ends failed
+  // with error.code 'refused' (ADR-0021).
+  status: 'pending' | 'running' | 'blocked' | 'succeeded' | 'failed' | 'cancelled'
+  effect_state?: 'none' | 'committed' | 'uncertain'
+  scope?: { resource: string; generation: number; clusters?: string[] }
+  sequence?: number
+  allowed_actions?: string[]
+  blockers?: { code: string; proxy_id?: string; message?: string }[]
   phase?: string
   waiting_on?: string[]
   silent?: string[]
@@ -158,6 +165,12 @@ export interface Operation {
   version?: number
   result?: unknown
   error?: { code: string; message: string }
+}
+
+// unfinished reports whether an operation has not ended yet: poll it, and keep its scope's actions
+// disabled.
+export function unfinished(op: Pick<Operation, 'status'> | null | undefined): boolean {
+  return op?.status === 'pending' || op?.status === 'running' || op?.status === 'blocked'
 }
 
 export interface RemoveDryRun { allowed: boolean; reason?: string; name: string; references: string[]; secret_files: number; token?: string; expires_at?: string }

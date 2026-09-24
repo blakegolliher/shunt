@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,7 +84,6 @@ type Server struct {
 	progress    map[string]Progress // placement key → the mover's last report (in memory only)
 	prevFleet   []Member            // the fleet as of the last PublishFleet, for fleet events
 	fleetSeeded bool
-	steps       sync.Map // placement key → *sync.Mutex: one fenced step per bucket at a time
 	opsOnce     sync.Once
 	defaultOps  *MemOperations
 	confirmOnce sync.Once
@@ -177,6 +177,10 @@ type Error struct {
 	Message string `json:"message"`
 	// CurrentIdentity is the control plane's directory lineage, on a lineage refusal.
 	CurrentIdentity *directory.Identity `json:"current_identity,omitempty"`
+	// OperationID is the unfinished operation in the way, on operation_conflict.
+	OperationID string `json:"operation_id,omitempty"`
+	// CurrentGeneration is the resource's generation now, on generation_conflict: a decimal string.
+	CurrentGeneration string `json:"current_generation,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -229,8 +233,14 @@ func errorOf(err error) (int, Error) {
 		te  *directory.TransitionError
 		ce  *config.Error
 		le  *lineageError
+		sb  *ScopeBusyError
+		ge  *GenerationError
 	)
 	switch {
+	case errors.As(err, &sb):
+		return http.StatusConflict, Error{Code: CodeOperationConflict, Message: err.Error(), OperationID: sb.Owner}
+	case errors.As(err, &ge):
+		return http.StatusConflict, Error{Code: CodeGenerationConflict, Message: err.Error(), CurrentGeneration: strconv.FormatInt(ge.Current, 10)}
 	case errors.As(err, &le):
 		cur := le.cur
 		return http.StatusConflict, Error{Code: le.code, Message: err.Error(), CurrentIdentity: &cur}
@@ -249,6 +259,15 @@ func errorOf(err error) (int, Error) {
 	default:
 		return http.StatusBadGateway, Error{Code: "backend", Message: err.Error()}
 	}
+}
+
+// ErrorCode is the API error code err answers with.
+func ErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	_, e := errorOf(err)
+	return e.Code
 }
 
 // fail maps an error to its HTTP answer.

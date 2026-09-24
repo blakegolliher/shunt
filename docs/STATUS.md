@@ -36,7 +36,12 @@ carries the transaction contract (ADR-0021). H0a landed the same day: a director
 (`cluster_id`, `epoch`) and per-resource generations, written in the same transaction as the
 version; schema-1 data upgraded in place when a node starts; the directory poll, heartbeat, member
 cache and fence compare lineage, with a negative regression proving a version-only fence counts a
-member that outlived a restore. H0b–H0e are pending. New endpoints/commands in those documents are design
+member that outlived a restore. H0b landed next: operation records reserve their placement or
+cluster scope atomically with their creation (checked against generation and identity), are
+written by sequence, and release the scope when they end; every placement and cluster mutation
+route runs under one, so a second step on a bucket is refused with `operation_conflict` rather
+than queued. One contract test runs against both the etcd and the lab store. H0c–H0e are
+pending. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

@@ -78,6 +78,19 @@ replaces an existing lineage requires the recovery path, not a version reset.
 
 ### Durable intent
 
+**Landed (2026-09-24, H0b):** `Operations.Create` writes a record and its scope reservation in one
+atomic step, comparing the directory identity and the scope's generation; `Update` is a
+compare-and-swap on the record's sequence, and a terminal write releases the scope in the same
+step. Placement operations name the clusters they touch; a cluster operation conflicts with them
+and they with it (on etcd, a reservation revision key closes the race between a cluster
+operation's read and its transaction). The etcd store and the lab's in-memory store pass one
+contract (`internal/control/opstest`). Unfinished and uncertain records survive the history
+limit. Every placement and cluster mutation route runs under a record, replacing the per-node step
+mutex. Owners keep a liveness key; a lost owner's record is ended `failed` with effect `uncertain`
+and its scope released, which is weaker than the reconciliation below: until H2, repeating the
+step is what completes a hold it left. Deferred: owner terms, idempotency keys and capacity (H0c),
+multi-scope child operations, and the file-backend durable envelope (dropped, ADR-0021).
+
 Extend the existing Operations seam rather than add a second job framework.
 Each safety-sensitive operation contains:
 

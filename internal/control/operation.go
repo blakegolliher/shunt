@@ -39,14 +39,30 @@ const (
 	OpAdopt             = "adopt"
 	OpCreate            = "create"
 	OpExpand            = "expand"
+	OpDelete            = "delete"
+	OpClearTarget       = "clear-target"
+	OpCarve             = "carve"
+	OpMerge             = "merge"
 )
 
-// Statuses of an operation.
+// Statuses of an operation (ADR-0021). A request refused before any record exists is an HTTP
+// error, never a record; an operation refused by the rules once it runs ends failed, with the
+// refusal's code in its error. Failed never implies rolled back: EffectState says what reached the
+// directory.
 const (
-	StatusRunning   = "running"
-	StatusSucceeded = "succeeded"
-	StatusFailed    = "failed"
-	StatusRefused   = "refused"
+	StatusPending   = "pending"   // accepted and its scope reserved; not started yet
+	StatusRunning   = "running"   // running on its owner node
+	StatusBlocked   = "blocked"   // waiting on something named in Blockers
+	StatusSucceeded = "succeeded" // ended as asked
+	StatusFailed    = "failed"    // ended otherwise
+	StatusCancelled = "cancelled" //nolint:misspell // the contract's spelling (docs/design/distributed-correctness-contracts.md); ended by a cancel before any effect committed
+)
+
+// Effect states: what an operation did to the directory.
+const (
+	EffectNone      = "none"      // nothing written
+	EffectCommitted = "committed" // at least one directory version written
+	EffectUncertain = "uncertain" // its owner was lost while it could have been writing
 )
 
 // Phases, in the order a fenced step goes through them.
@@ -76,31 +92,51 @@ type OpProgress struct {
 	Unit  string `json:"unit"`
 }
 
+// Blocker is one named reason an operation is waiting or blocked. Counts and scope details are
+// bounded; it never carries an object key or a credential.
+type Blocker struct {
+	Code    string `json:"code"`
+	ProxyID string `json:"proxy_id,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 // Operation is one record.
 type Operation struct {
-	ID        string          `json:"id"`
-	Kind      string          `json:"kind"`
-	Placement string          `json:"placement,omitempty"`
-	Cluster   string          `json:"cluster,omitempty"`
-	Actor     string          `json:"actor"`
-	Node      string          `json:"node"` // the control node running it
-	Created   time.Time       `json:"created"`
-	Updated   time.Time       `json:"updated"`
-	Status    string          `json:"status"`
-	Phase     string          `json:"phase,omitempty"`
-	WaitingOn []string        `json:"waiting_on,omitempty"`
-	Silent    []string        `json:"silent,omitempty"`
-	Progress  *OpProgress     `json:"progress,omitempty"`
-	Version   int64           `json:"version,omitempty"` // the directory version the step wrote
-	Args      json.RawMessage `json:"args,omitempty"`    // the request as given
-	Result    json.RawMessage `json:"result,omitempty"`  // the answer the route gives, once succeeded
-	Error     *Error          `json:"error,omitempty"`
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Placement string `json:"placement,omitempty"`
+	Cluster   string `json:"cluster,omitempty"`
+	Actor     string `json:"actor"`
+	Node      string `json:"node"` // the control node running it: its owner
+	// Identity is the directory lineage the operation was accepted on; Scope what it reserves.
+	Identity directory.Identity `json:"identity,omitzero"`
+	Scope    *Scope             `json:"scope,omitempty"`
+	// Sequence counts the record's writes: an update is accepted only over the sequence it read.
+	Sequence    int64     `json:"sequence"`
+	Created     time.Time `json:"created"`
+	Updated     time.Time `json:"updated"`
+	Status      string    `json:"status"`
+	EffectState string    `json:"effect_state"`
+	// AllowedActions are the actions the server accepts on the record now; none yet.
+	AllowedActions []string        `json:"allowed_actions"`
+	Blockers       []Blocker       `json:"blockers,omitempty"`
+	Phase          string          `json:"phase,omitempty"`
+	WaitingOn      []string        `json:"waiting_on,omitempty"`
+	Silent         []string        `json:"silent,omitempty"`
+	Progress       *OpProgress     `json:"progress,omitempty"`
+	Version        int64           `json:"version,omitempty"` // the directory version the step wrote
+	Args           json.RawMessage `json:"args,omitempty"`    // the request as given
+	Result         json.RawMessage `json:"result,omitempty"`  // the answer the route gives, once succeeded
+	Error          *Error          `json:"error,omitempty"`
 }
 
 func (op *Operation) clone() *Operation {
 	c := *op
 	c.WaitingOn = slices.Clone(op.WaitingOn)
 	c.Silent = slices.Clone(op.Silent)
+	c.Scope = op.Scope.clone()
+	c.AllowedActions = slices.Clone(op.AllowedActions)
+	c.Blockers = slices.Clone(op.Blockers)
 	c.Args = slices.Clone(op.Args)
 	c.Result = slices.Clone(op.Result)
 	if op.Progress != nil {
@@ -115,20 +151,32 @@ func (op *Operation) clone() *Operation {
 }
 
 // Operations is where the records live. Two implementations: MemOperations for a single-node lab
-// and tests, and the control plane's, in etcd (internal/cp), which every control node reads.
+// and tests, and the control plane's, in etcd (internal/cp), which every control node reads. Both
+// pass the same contract test (internal/control/opstest).
 type Operations interface {
-	// Put creates or replaces a record.
-	Put(ctx context.Context, op *Operation) error
+	// Create writes a new record at Sequence 1. A record with a Scope reserves it in the same
+	// atomic step: refused with a *ScopeBusyError while a conflicting unfinished operation exists
+	// (scope.go), with a *GenerationError when the scope's generation is no longer
+	// Scope.Generation, and with a lineage refusal when the directory's identity is not the
+	// record's.
+	Create(ctx context.Context, op *Operation) error
+	// Update replaces a record whose stored Sequence is op.Sequence-1, and fails with
+	// ErrStaleSequence otherwise. A terminal status releases the record's scope in the same step.
+	Update(ctx context.Context, op *Operation) error
 	// Get returns a record, or nil when there is none.
 	Get(ctx context.Context, id string) (*Operation, error)
 	// List returns the newest records first, filtered by placement or cluster when given.
 	List(ctx context.Context, placement, cluster string, limit int) ([]*Operation, error)
 }
 
-// MemOperations keeps records in memory, newest last, and forgets the oldest past Limit.
+// MemOperations keeps records in memory, newest last, and forgets the oldest ended ones past
+// Limit. It is the single-node lab's store (ADR-0021: the lab's directory has one writer), and a
+// process restart forgets its records and their reservations.
 type MemOperations struct {
 	Limit int // default 1000
-	// OnChange, if set, is called after every Put with a copy of the record.
+	// Dir, if set, is the directory Create checks scope generations and identity against.
+	Dir directory.Directory
+	// OnChange, if set, is called after every Create and Update with a copy of the record.
 	OnChange func(Operation)
 
 	mu    sync.Mutex
@@ -137,33 +185,6 @@ type MemOperations struct {
 }
 
 var _ Operations = (*MemOperations)(nil)
-
-// Put implements Operations.
-func (m *MemOperations) Put(_ context.Context, op *Operation) error {
-	m.mu.Lock()
-	if m.byID == nil {
-		m.byID = map[string]*Operation{}
-	}
-	if _, ok := m.byID[op.ID]; !ok {
-		m.order = append(m.order, op.ID)
-		limit := m.Limit
-		if limit <= 0 {
-			limit = defaultOperationLimit
-		}
-		for len(m.order) > limit {
-			delete(m.byID, m.order[0])
-			m.order = m.order[1:]
-		}
-	}
-	c := op.clone()
-	m.byID[op.ID] = c
-	fn := m.OnChange
-	m.mu.Unlock()
-	if fn != nil {
-		fn(*c.clone())
-	}
-	return nil
-}
 
 // Get implements Operations.
 func (m *MemOperations) Get(_ context.Context, id string) (*Operation, error) {
@@ -193,7 +214,7 @@ func (s *Server) ops() Operations {
 	if s.Ops != nil {
 		return s.Ops
 	}
-	s.opsOnce.Do(func() { s.defaultOps = &MemOperations{} })
+	s.opsOnce.Do(func() { s.defaultOps = &MemOperations{Dir: s.Dir} })
 	return s.defaultOps
 }
 
@@ -222,6 +243,11 @@ type tracker struct {
 	mu           sync.Mutex
 	op           Operation
 	lastProgress time.Time
+	// lost is set once an update found the record written by someone else (ErrStaleSequence): a
+	// node that saw this one's owner lost took it over, and this tracker writes it no more.
+	lost bool
+	// startVersion is the directory version when the record was created.
+	startVersion int64
 }
 
 func (tr *tracker) id() string { return tr.op.ID }
@@ -234,10 +260,24 @@ func (tr *tracker) snapshot() Operation {
 }
 
 func (tr *tracker) put() {
+	if tr.lost {
+		return
+	}
 	tr.op.Updated = tr.s.now().UTC()
+	tr.op.Sequence++
 	c := tr.op.clone()
-	if err := tr.s.ops().Put(context.WithoutCancel(tr.ctx), c); err != nil && tr.s.Log != nil {
-		tr.s.Log.Warn("operation record not written", "operation", tr.op.ID, "kind", tr.op.Kind, "err", err.Error())
+	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), c)
+	switch {
+	case errors.Is(err, ErrStaleSequence):
+		tr.lost = true
+		if tr.s.Log != nil {
+			tr.s.Log.Error("operation record taken over by another control node; this node stops writing it", "operation", tr.op.ID, "kind", tr.op.Kind)
+		}
+	case err != nil:
+		tr.op.Sequence-- // not written: the next write is still over the stored sequence
+		if tr.s.Log != nil {
+			tr.s.Log.Warn("operation record not written", "operation", tr.op.ID, "kind", tr.op.Kind, "err", err.Error())
+		}
 	}
 }
 
@@ -285,9 +325,6 @@ func (tr *tracker) finish(res any, err error) {
 		_, e := errorOf(err)
 		tr.op.Error = &e
 		tr.op.Status = StatusFailed
-		if e.Code == "refused" {
-			tr.op.Status = StatusRefused
-		}
 	default:
 		tr.op.Status = StatusSucceeded
 		if res != nil {
@@ -301,10 +338,11 @@ func (tr *tracker) finish(res any, err error) {
 			}
 		}
 	}
+	tr.settleEffect()
 	tr.put()
 	if tr.async && err != nil && tr.s.Log != nil {
 		event := tr.op.Kind + " failed"
-		if tr.op.Status == StatusRefused {
+		if tr.op.Error.Code == "refused" {
 			event = tr.op.Kind + " refused"
 		}
 		attrs := []any{"actor", tr.actor, "operation", tr.op.ID}
@@ -351,11 +389,18 @@ func (tr *tracker) finishHTTP(status int, body []byte) {
 		}
 		tr.op.Error = &e
 		tr.op.Status = StatusFailed
-		if e.Code == "refused" {
-			tr.op.Status = StatusRefused
-		}
 	}
+	tr.settleEffect()
 	tr.put()
+}
+
+// settleEffect records, on an ending operation, whether it wrote the directory: the directory
+// version moved past the one it started on while it ran. Another writer's change in the same time
+// counts too; committed is the safe side of the two. tr.mu is held.
+func (tr *tracker) settleEffect() {
+	if tr.op.EffectState == EffectNone && (tr.op.Version > 0 || tr.s.Dir.Snapshot().Version() > tr.startVersion) {
+		tr.op.EffectState = EffectCommitted
+	}
 }
 
 type operationWriter struct {
@@ -379,15 +424,23 @@ func (w *operationWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
-// recorded wraps a short mutation with an operation record without changing its HTTP contract.
-func (s *Server) recorded(kind string, scope func(*http.Request) (placement, cluster string), h http.HandlerFunc) http.HandlerFunc {
+// recorded wraps a short mutation with an operation record, which reserves its scope while it
+// runs, without changing its HTTP contract otherwise: a scope another operation owns answers 409
+// operation_conflict before the handler runs.
+func (s *Server) recorded(kind string, scope func(*http.Request) (Operation, error), h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		placement, cluster := scope(r)
-		tr, err := s.begin(actor(r), Operation{Kind: kind, Placement: placement, Cluster: cluster}, nil, false)
+		op, err := scope(r)
 		if err != nil {
 			fail(w, err)
 			return
 		}
+		op.Kind = kind
+		tr, err := s.begin(actor(r), op, nil, false)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		tr.running()
 		ow := &operationWriter{ResponseWriter: w}
 		h(ow, r)
 		status := ow.status
@@ -398,17 +451,22 @@ func (s *Server) recorded(kind string, scope func(*http.Request) (placement, clu
 	}
 }
 
-// begin writes a new running record and returns its tracker.
+// begin creates a pending record, reserving its scope, and returns its tracker. A scope another
+// operation owns, a generation the directory has moved past, or another lineage refuses here,
+// before anything runs.
 func (s *Server) begin(actor string, op Operation, args any, async bool) (*tracker, error) {
 	now := s.now().UTC()
 	var rnd [3]byte
 	if _, err := rand.Read(rnd[:]); err != nil {
 		return nil, err
 	}
+	snap := s.Dir.Snapshot()
 	op.ID = fmt.Sprintf("%013d-%s", now.UnixMilli(), hex.EncodeToString(rnd[:]))
 	op.Actor, op.Node = actor, s.node()
+	op.Identity = snap.File().Identity
 	op.Created, op.Updated = now, now
-	op.Status, op.Phase = StatusRunning, PhaseQueued
+	op.Status, op.Phase, op.Sequence = StatusPending, PhaseQueued, 1
+	op.EffectState, op.AllowedActions = EffectNone, []string{}
 	if args != nil {
 		raw, err := json.Marshal(args)
 		if err != nil {
@@ -416,11 +474,19 @@ func (s *Server) begin(actor string, op Operation, args any, async bool) (*track
 		}
 		op.Args = raw
 	}
-	tr := &tracker{s: s, ctx: s.context(), actor: actor, async: async, op: op}
-	if err := s.ops().Put(tr.ctx, op.clone()); err != nil {
+	tr := &tracker{s: s, ctx: s.context(), actor: actor, async: async, op: op, startVersion: snap.Version()}
+	if err := s.ops().Create(tr.ctx, op.clone()); err != nil {
 		return nil, err
 	}
 	return tr, nil
+}
+
+// running marks a pending record as started.
+func (tr *tracker) running() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.op.Status = StatusRunning
+	tr.put()
 }
 
 // outcome is what an operation ended with.
@@ -434,6 +500,7 @@ type outcome struct {
 func (s *Server) operate(tr *tracker, fn func(*tracker) (any, error)) <-chan outcome {
 	ch := make(chan outcome, 1)
 	go func() {
+		tr.running()
 		var out outcome
 		func() {
 			defer func() {
@@ -496,6 +563,7 @@ func (s *Server) placementKey(arg string) (string, error) {
 // POST /v1/operations go through here, so the checks and the run are written once.
 func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracker, <-chan outcome, error) {
 	start := func(op Operation, args any, fn func(*tracker) (any, error)) (*tracker, <-chan outcome, error) {
+		op.Kind = req.Kind
 		tr, err := s.begin(actor, op, args, async)
 		if err != nil {
 			return nil, nil, err
@@ -518,7 +586,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpRamp, Placement: key}, a, func(tr *tracker) (any, error) { return s.runRamp(tr, key, a) })
+		return start(s.placementOp(key, a.To), a, func(tr *tracker) (any, error) { return s.runRamp(tr, key, a) })
 	case OpMigrate:
 		var a MigrateRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -531,7 +599,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpMigrate, Placement: key}, a, func(tr *tracker) (any, error) { return s.runMigrate(tr, key, a) })
+		return start(s.placementOp(key, a.To), a, func(tr *tracker) (any, error) { return s.runMigrate(tr, key, a) })
 	case OpMover:
 		var a MoverRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -547,7 +615,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err := s.checkMover(key, a); err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpMover, Placement: key}, a, func(tr *tracker) (any, error) { return s.runMover(tr, key, a) })
+		return start(s.placementOp(key), a, func(tr *tracker) (any, error) { return s.runMover(tr, key, a) })
 	case OpCutover:
 		var a CutoverRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -563,7 +631,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpCutover, Placement: key}, a, func(tr *tracker) (any, error) { return s.runCutover(tr, key, a) })
+		return start(s.placementOp(key), a, func(tr *tracker) (any, error) { return s.runCutover(tr, key, a) })
 	case OpPurge:
 		var a PurgeRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -579,7 +647,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpPurge, Placement: key}, a, func(tr *tracker) (any, error) { return s.runPurge(tr, key, a) })
+		return start(s.placementOp(key), a, func(tr *tracker) (any, error) { return s.runPurge(tr, key, a) })
 	case OpFinish:
 		if err := decodeArgs(req.Args, &struct{}{}); err != nil {
 			return nil, nil, err
@@ -588,7 +656,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpFinish, Placement: key}, nil, func(tr *tracker) (any, error) { return s.runFinish(tr, key) })
+		return start(s.placementOp(key), nil, func(tr *tracker) (any, error) { return s.runFinish(tr, key) })
 	case OpClusterRemove:
 		var a RemoveRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -598,7 +666,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if _, ok := s.Dir.Snapshot().File().Clusters[name]; !ok {
 			return nil, nil, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, name)
 		}
-		return start(Operation{Kind: OpClusterRemove, Cluster: name}, a, func(tr *tracker) (any, error) { return s.runRemoveCluster(tr, name, a) })
+		return start(s.clusterOp(name), a, func(tr *tracker) (any, error) { return s.runRemoveCluster(tr, name, a) })
 	case OpClusterReadOnly:
 		var a ReadOnlyRequest
 		if err := decodeArgs(req.Args, &a); err != nil {
@@ -610,7 +678,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if _, ok := s.Dir.Snapshot().File().Clusters[req.Cluster]; !ok {
 			return nil, nil, fmt.Errorf("%w: cluster %q is not in the directory", directory.ErrNotFound, req.Cluster)
 		}
-		return start(Operation{Kind: OpClusterReadOnly, Cluster: req.Cluster}, a, func(tr *tracker) (any, error) {
+		return start(s.clusterOp(req.Cluster), a, func(tr *tracker) (any, error) {
 			return s.runClusterReadOnly(tr, req.Cluster, a)
 		})
 	case OpPlacementReadOnly:
@@ -625,7 +693,7 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 		if err != nil {
 			return nil, nil, err
 		}
-		return start(Operation{Kind: OpPlacementReadOnly, Placement: key}, a, func(tr *tracker) (any, error) {
+		return start(s.placementOp(key), a, func(tr *tracker) (any, error) {
 			return s.runPlacementReadOnly(tr, key, a)
 		})
 	}
@@ -718,12 +786,11 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Status != StatusRunning {
+		if op.Node != s.node() || op.Terminal() {
 			continue
 		}
-		op.Status, op.Phase, op.Updated = StatusFailed, PhaseDone, s.now().UTC()
-		op.Error = &Error{Code: "unavailable", Message: "the control node running this operation restarted before it finished; repeat the step to complete it"}
-		if err := s.ops().Put(ctx, op); err != nil {
+		orphan(op, s.now().UTC(), "the control node running this operation restarted before it finished; repeat the step to complete it")
+		if err := s.ops().Update(ctx, op); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -734,6 +801,22 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// Orphan ends a record whose owner stopped running it (a control node that restarted, or whose
+// liveness key in the control plane lapsed), ready for Update.
+func Orphan(op *Operation, now time.Time, why string) { orphan(op, now, why) }
+
+// orphan ends a record whose owner stopped running it. Its effect is uncertain unless it had not
+// started: a step interrupted between its writes may have left a hold, which repeating the step
+// completes (ADR-0016). An uncertain record stays past the history limit as evidence.
+func orphan(op *Operation, now time.Time, why string) {
+	if op.Status != StatusPending && (op.EffectState == EffectNone || op.EffectState == "") {
+		op.EffectState = EffectUncertain
+	}
+	op.Status, op.Phase, op.Updated = StatusFailed, PhaseDone, now
+	op.Sequence++
+	op.Error = &Error{Code: "unavailable", Message: why}
+}
+
 // runningOperations lists the ids of running records for a placement, for its view.
 func (s *Server) runningOperations(ctx context.Context, placement string) []string {
 	ops, err := s.ops().List(ctx, placement, "", 20)
@@ -742,7 +825,7 @@ func (s *Server) runningOperations(ctx context.Context, placement string) []stri
 	}
 	var ids []string
 	for _, op := range ops {
-		if op.Status == StatusRunning {
+		if !op.Terminal() {
 			ids = append(ids, op.ID)
 		}
 	}

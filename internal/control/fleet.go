@@ -49,6 +49,14 @@ type lineageError struct {
 
 func (e *lineageError) Error() string { return e.msg }
 
+// LineageMismatch is the refusal of a request made on lineage have when the directory is on cur.
+func LineageMismatch(cur, have directory.Identity) error {
+	if have.ClusterID != cur.ClusterID {
+		return &lineageError{code: CodeClusterMismatch, cur: cur, msg: fmt.Sprintf("this control plane serves cluster %s; the caller's directory is from cluster %s", cur.ClusterID, have.ClusterID)}
+	}
+	return &lineageError{code: CodeEpochMismatch, cur: cur, msg: fmt.Sprintf("the directory is in epoch %s; the caller's is from epoch %s, another recovery lineage: its versions compare with nothing here", cur.Epoch, have.Epoch)}
+}
+
 // checkLineage compares a caller's directory (have, at version v) with the installed one. A caller
 // with no identity has nothing installed yet. Versions compare only within one identity.
 func checkLineage(snap *directory.Snapshot, have directory.Identity, v int64) error {
@@ -56,10 +64,8 @@ func checkLineage(snap *directory.Snapshot, have directory.Identity, v int64) er
 	switch {
 	case have.IsZero():
 		return nil
-	case have.ClusterID != cur.ClusterID:
-		return &lineageError{code: CodeClusterMismatch, cur: cur, msg: fmt.Sprintf("this control plane serves cluster %s; the caller's directory is from cluster %s", cur.ClusterID, have.ClusterID)}
-	case have.Epoch != cur.Epoch:
-		return &lineageError{code: CodeEpochMismatch, cur: cur, msg: fmt.Sprintf("the directory is in epoch %s; the caller's is from epoch %s, another recovery lineage: its versions compare with nothing here", cur.Epoch, have.Epoch)}
+	case have != cur:
+		return LineageMismatch(cur, have)
 	case v > snap.Version():
 		return &lineageError{code: CodeResyncRequired, cur: cur, msg: fmt.Sprintf("the caller claims directory version %d; this control node has %d in the same epoch", v, snap.Version())}
 	}

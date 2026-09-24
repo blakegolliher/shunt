@@ -23,8 +23,9 @@ func (s *Server) routes() []Route {
 	mut := func(method, pattern, log string, h http.HandlerFunc, verbs ...string) Route {
 		return Route{Method: method, Pattern: pattern, Verbs: verbs, Mutation: true, log: log, h: h}
 	}
-	placement := func(r *http.Request) (string, string) { return pathKey(r), "" }
-	noScope := func(*http.Request) (string, string) { return "", "" }
+	// Every mutation of a placement or a cluster runs under an operation record that reserves its
+	// scope (ADR-0021): the fenced actions through launch, the short ones through recorded.
+	placement := s.placementScope
 	return []Route{
 		read("/v1/status", s.status, "status"),
 		read("/v1/directory", s.directoryHandler),
@@ -41,19 +42,19 @@ func (s *Server) routes() []Route {
 		read("/v1/placements/{tenant}/{bucket}/mover-ledger", s.moverLedger),
 		read("/v1/tenants/{tenant}/step-out", s.stepOut, "step-out"),
 		mut("POST", "/v1/operations", "operation", s.startOperation, "ramp", "migrate start", "cutover", "purge-source", "migrate finish", "cluster remove"),
-		mut("POST", "/v1/placements/{tenant}/{bucket}/create", "create", s.createPlacement),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/create", "create", s.recorded(OpCreate, placement, s.createPlacement)),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/create-backend", "create", s.recorded(OpCreate, placement, s.createBackendPlacement), "create"),
-		mut("DELETE", "/v1/placements/{tenant}/{bucket}", "delete", s.deletePlacement),
-		mut("POST", "/v1/clusters", "cluster add", s.recorded(OpClusterAdd, noScope, s.putCluster), "cluster add"),
+		mut("DELETE", "/v1/placements/{tenant}/{bucket}", "delete", s.recorded(OpDelete, placement, s.deletePlacement)),
+		mut("POST", "/v1/clusters", "cluster add", s.recorded(OpClusterAdd, s.clusterAddScope, s.putCluster), "cluster add"),
 		mut("POST", "/v1/clusters/probe", "", s.probeCluster, "cluster add"),
 		mut("DELETE", "/v1/clusters/{name}", "cluster remove", s.removeCluster, "cluster remove"),
 		mut("POST", "/v1/clusters/{name}/read-only", "cluster read-only", s.clusterReadOnly, "cluster readonly"),
 		mut("POST", "/v1/tenants/{tenant}/default-cluster", "tenant set-default", s.setTenantDefault, "tenant set-default"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/adopt", "adopt", s.recorded(OpAdopt, placement, s.adopt), "adopt"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/expand", "expand", s.recorded(OpExpand, placement, s.expand), "expand"),
-		mut("DELETE", "/v1/placements/{tenant}/{bucket}/target", "expand clear", s.clearTarget, "expand"),
-		mut("POST", "/v1/placements/{tenant}/{bucket}/prefixes", "expand carve", s.carve, "expand"),
-		mut("DELETE", "/v1/placements/{tenant}/{bucket}/prefixes", "expand merge", s.merge, "expand"),
+		mut("DELETE", "/v1/placements/{tenant}/{bucket}/target", "expand clear", s.recorded(OpClearTarget, placement, s.clearTarget), "expand"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/prefixes", "expand carve", s.recorded(OpCarve, placement, s.carve), "expand"),
+		mut("DELETE", "/v1/placements/{tenant}/{bucket}/prefixes", "expand merge", s.recorded(OpMerge, placement, s.merge), "expand"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/read-only", "placement read-only", s.placementReadOnly, "readonly"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/ramp", "ramp", s.ramp, "ramp"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/migrate", "migrate start", s.migrateStart, "migrate start"),
