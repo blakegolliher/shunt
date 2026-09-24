@@ -2,6 +2,10 @@
 
 Status: accepted (P3c-1, 2026-09-22), with the amendments at the end.
 
+Proposed follow-up: [ADR-0018](0018-distributed-correctness.md) specifies recovery
+epochs, resumable learner joins and observed health. It is not implemented and
+does not change this ADR's substrate choice.
+
 Numbering note: this ADR was drafted as 0011 in an out-of-tree doc set. 0011 through 0014 were taken
 in the meantime (stepping out, importing client keys, conditional writes across a migration,
 cross-cluster copy), so it lands as 0015. Supersedes `docs/DESIGN.md` §1.5 (Postgres) where the two
