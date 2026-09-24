@@ -277,10 +277,11 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
 - **`start-after` across backends.** Measured on Garage, MinIO and VAST (2026-09-23,
   docs/reference/backend-compat.md); AWS is not measured.
 - **The listing target** that would justify raising the cap: a p99 for a 1 000-key page at N legs,
-  measured on the lab clusters.
-- **Rebalancing policy.** This ADR provides the mechanism (split, move). Whether shunt ever
-  proposes moves itself (by capacity or load) is a separate decision.
-- **Concurrent moves (deferred, 2026-09-23; one at a time until revisited).** Moves over disjoint
+  measured on the lab clusters. Deferred (2026-09-23): the cap stays at 32 until it is set.
+- **Rebalancing policy.** Decided (2026-09-23): shunt does not propose or start moves itself, by
+  capacity, load or anything else. It provides the mechanism (moves, consolidation); every move is
+  an operator's decision.
+- **Concurrent moves (deferred, 2026-09-23, and again after N4; one at a time until revisited).** Moves over disjoint
   ranges would keep every key two-sided, since a key's hash lies in exactly one range; so the
   per-key arguments (routing, dual delete order, conditional checks, the mover's guard, the hold)
   would hold unchanged, and consolidating several legs into one (A→D, B→D, C→D) would qualify,
