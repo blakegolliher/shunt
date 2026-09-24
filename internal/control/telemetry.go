@@ -44,6 +44,10 @@ type TelemetryPoint struct {
 	P999   int64             `json:"p999_us,omitempty"`
 	Max    int64             `json:"max_us,omitempty"`
 	Value  *float64          `json:"value,omitempty"`
+	// Cluster is the backend of a bucket scope's point; Code the status key of a
+	// status_per_second point.
+	Cluster string `json:"cluster,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 func (s *Server) publishTelemetry(ms []Member) error {
@@ -193,7 +197,7 @@ func (s *Server) telemetrySeries(w http.ResponseWriter, r *http.Request) {
 		for _, point := range s.Telemetry.CounterSeries(scope, series, op, from, to) {
 			value := point.Value
 			points = append(points, TelemetryPoint{Start: point.Start, End: point.End, Series: point.Series,
-				Op: point.Op, Value: &value})
+				Op: point.Op, Value: &value, Cluster: point.Cluster, Code: point.Code})
 		}
 	}
 	if points == nil {
