@@ -568,8 +568,8 @@ func TestHeartbeatReportsTheServedVersion(t *testing.T) {
 	if first := f.beats[0]; first.Applied != 1 {
 		t.Fatalf("without Serving the heartbeat reports the installed version: %d", first.Applied)
 	}
-	if last := f.beats[len(f.beats)-1]; last.Applied != 0 || len(last.Secrets) != 0 {
-		t.Fatalf("heartbeat applied %d secrets %v, want the served version 0 and none", last.Applied, last.Secrets)
+	if last := f.beats[len(f.beats)-1]; last.Applied != 0 || len(last.Secrets) != 0 || last.Installed != 1 {
+		t.Fatalf("heartbeat applied %d installed %d secrets %v, want the served version 0, installed 1 and none", last.Applied, last.Installed, last.Secrets)
 	}
 }
 

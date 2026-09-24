@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -533,5 +534,35 @@ func TestRouteTable(t *testing.T) {
 		if (r.Method == "POST" || r.Method == "DELETE") != r.Mutation {
 			t.Errorf("route %s: mutation %v does not match its method", k, r.Mutation)
 		}
+	}
+}
+
+// A credential rotation on the control plane starts a secret generation: the version it landed in,
+// which the cluster view reports, and the control plane holds the new secret. The cluster's own
+// generation moves with it (H0a: its credentials are part of the cluster an operation expects).
+func TestRotateCredentialsOnEtcd(t *testing.T) {
+	tc := startCluster(t, 1)
+	a := startNode(t, tc, 0, make([]byte, 32), time.Second)
+	src := fakeS3(t)
+	def := config.Cluster{Type: "minio", Scheme: "http", Region: "us-east-1", Endpoints: []string{strings.TrimPrefix(src.URL, "http://")},
+		Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}
+	a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast01", Cluster: def, Secret: "s1"}, nil)
+
+	var out control.CredentialsResult
+	a.must("POST", "/v1/clusters/vast01/credentials", control.CredentialsRequest{Secret: "s2"}, &out)
+	if out.Generation != strconv.FormatInt(out.Version, 10) || out.Cluster.SecretRef != "control:vast01" {
+		t.Fatalf("rotation: %+v", out)
+	}
+	waitFor(t, 5*time.Second, "the rotation installed on the node", func() bool { return a.store.Snapshot().Version() >= out.Version })
+	if s := a.store.ClusterSecrets()["control:vast01"]; s != "s2" {
+		t.Fatalf("the control plane holds %q, want s2", s)
+	}
+	if g := a.store.Snapshot().File().Generation(directory.ClusterResource("vast01")); g != out.Version {
+		t.Fatalf("cluster generation %d after the rotation, want %d", g, out.Version)
+	}
+	var view control.ClusterView
+	a.must("GET", "/v1/clusters/vast01/view", nil, &view)
+	if view.Secret == nil || view.Secret.Generation != out.Generation {
+		t.Fatalf("cluster view secret: %+v, want generation %s", view.Secret, out.Generation)
 	}
 }

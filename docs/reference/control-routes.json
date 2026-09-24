@@ -42,6 +42,14 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/fleet/{id}",
+    "verbs": [
+      "proxy show"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/operations",
     "verbs": [
       "operation list"
@@ -138,6 +146,14 @@
     "pattern": "/v1/clusters/probe",
     "verbs": [
       "cluster add"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/clusters/{name}/credentials",
+    "verbs": [
+      "cluster credentials"
     ],
     "mutation": true
   },

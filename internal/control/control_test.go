@@ -1566,3 +1566,50 @@ func (k *stubKeys) Remove(ak string) error {
 	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
 	return nil
 }
+
+// A credential rotation replaces the cluster's secret, and its access key when given, and nothing
+// else. The new pair is checked first: a wrong one is refused and leaves the old secret in place.
+// It runs under a cluster-credentials operation record.
+func TestRotateCredentials(t *testing.T) {
+	rg := newRig(t)
+	def := rg.vast01.definition(true)
+	def.Credentials.SecretRef = ""
+	var added ClusterStatus
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "first-secret"}, &added)
+	rg.answers("POST", "/v1/clusters/nope/credentials", CredentialsRequest{Secret: "x"}, http.StatusNotFound, "not_found")
+	rg.answers("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{}, http.StatusBadRequest, "bad_request")
+	rg.answers("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{Secret: "x", SecretRef: "env:X"}, http.StatusBadRequest, "bad_request")
+
+	rg.vast01.reject = "SignatureDoesNotMatch"
+	rg.refused("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{Secret: "wrong"}, "not the secret of access key AK")
+	rg.vast01.reject = ""
+	if c, _ := rg.dir.Snapshot().Cluster("vast01"); c.Credentials.SecretRef != added.SecretRef {
+		t.Fatalf("a refused rotation changed the secret_ref: %s", c.Credentials.SecretRef)
+	}
+
+	before := rg.dir.Snapshot().Version()
+	var out CredentialsResult
+	rg.must("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{AccessKey: "AK", Secret: "second-secret"}, &out)
+	if out.Version <= before || out.Cluster.SecretRef == added.SecretRef || out.Cluster.AccessKey != "AK" {
+		t.Fatalf("rotation: %+v", out)
+	}
+	ref := strings.TrimPrefix(out.Cluster.SecretRef, "file:")
+	if b, err := os.ReadFile(ref); err != nil || string(b) != "second-secret" {
+		t.Fatalf("rotated secret file: %q %v", b, err)
+	}
+	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 1 {
+		t.Fatalf("the old secret file stayed: %v", files)
+	}
+	c, _ := rg.dir.Snapshot().Cluster("vast01")
+	if c.Type != added.Type || c.Region != added.Region || strings.Join(c.Endpoints, ",") != strings.Join(added.Endpoints, ",") {
+		t.Fatalf("the rotation changed the definition: %+v", c)
+	}
+	if strings.Contains(rg.log.String(), "second-secret") {
+		t.Fatal("the secret reached the log")
+	}
+	var ops OperationList
+	rg.must("GET", "/v1/operations?cluster=vast01", nil, &ops)
+	if len(ops.Operations) == 0 || ops.Operations[0].Kind != OpClusterRotate || ops.Operations[0].Status != StatusSucceeded {
+		t.Fatalf("operation record: %+v", ops.Operations)
+	}
+}

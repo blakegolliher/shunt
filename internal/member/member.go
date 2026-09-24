@@ -430,6 +430,12 @@ func (c *Client) beat(ctx context.Context) error {
 	snap := c.serving()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
 		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
+	if installed := c.Snapshot().Version(); installed > hb.Applied {
+		hb.Installed = installed
+	}
+	if why := c.cacheErr.Load(); why != nil {
+		hb.CacheError = *why
+	}
 	if c.Telemetry != nil {
 		hb.Telemetry = c.Telemetry.Completed(c.Now())
 	}

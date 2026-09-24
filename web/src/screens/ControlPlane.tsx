@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { getProxyDiagnostics } from '../api/client'
+import type { ProxyDiagnostics } from '../api/client'
 import { Card } from '../components/Card'
 import { CopyLine } from '../components/CopyLine'
 import { Drawer } from '../components/Drawer'
@@ -12,7 +14,16 @@ function bytes(value: number) {
 }
 
 export function ControlPlane() {
-  const { control, fleet, loading, error, refresh } = useStore()
+  const { control, fleet, loading, error, refresh, token } = useStore()
+  const [shown, setShown] = useState<string | null>(null) // the proxy whose install diagnostics the drawer shows
+  const [diagnostics, setDiagnostics] = useState<ProxyDiagnostics | null>(null)
+  const [diagnosticsError, setDiagnosticsError] = useState('')
+  useEffect(() => {
+    if (!shown) return
+    let live = true
+    getProxyDiagnostics(token, shown).then((d) => { if (live) { setDiagnostics(d); setDiagnosticsError('') } }).catch((err: unknown) => { if (live) setDiagnosticsError(err instanceof Error ? err.message : String(err)) })
+    return () => { live = false }
+  }, [shown, token, fleet])
   const [adding, setAdding] = useState(false)
   const [name, setName] = useState('')
   const [peerURL, setPeerURL] = useState('http://host:2380')
@@ -52,10 +63,22 @@ export function ControlPlane() {
     <Card eyebrow="Data plane" title="Proxy fleet">
       {members.length === 0 ? <p className="text-sm text-muted">No proxies have joined.</p> : <div className="overflow-x-auto"><table className="w-full text-left text-sm">
         <thead className="text-xs uppercase tracking-wider text-muted"><tr><th className="pb-3">Proxy</th><th className="pb-3">Host</th><th className="pb-3">Applied</th><th className="pb-3">Durable</th><th className="pb-3">State</th><th className="pb-3">Last heartbeat</th><th className="pb-3">Version</th></tr></thead>
-        <tbody className="divide-y divide-ink-700">{members.map((member) => <tr key={member.id}><td className="py-3 font-medium">{member.id}</td><td className="py-3 text-muted">{member.host || '—'}</td><td className="py-3 font-mono">{member.applied} / {fleet?.version ?? control.directory}</td><td className={`py-3 font-mono ${(member.durable ?? 0) < member.applied ? 'text-amber-200' : ''}`}>{member.durable ?? '—'}{(member.durable ?? 0) < member.applied ? ' (not durable)' : ''}</td><td className={`py-3 ${member.live ? 'text-emerald-300' : 'text-red-300'}`}>{member.live ? 'live' : 'stale'}</td><td className="py-3 text-muted">{member.seen ? new Date(member.seen).toLocaleTimeString() : '—'}</td><td className="py-3 text-muted">{member.version || '—'}</td></tr>)}</tbody>
+        <tbody className="divide-y divide-ink-700">{members.map((member) => <tr key={member.id} className="cursor-pointer hover:bg-ink-800/60" onClick={() => setShown(member.id)}><td className="py-3 font-medium text-ember-300">{member.id}</td><td className="py-3 text-muted">{member.host || '—'}</td><td className="py-3 font-mono">{member.applied} / {fleet?.version ?? control.directory}</td><td className={`py-3 font-mono ${(member.durable ?? 0) < member.applied ? 'text-amber-200' : ''}`}>{member.durable ?? '—'}{(member.durable ?? 0) < member.applied ? ' (not durable)' : ''}</td><td className={`py-3 ${member.live ? 'text-emerald-300' : 'text-red-300'}`}>{member.live ? 'live' : 'stale'}</td><td className="py-3 text-muted">{member.seen ? new Date(member.seen).toLocaleTimeString() : '—'}</td><td className="py-3 text-muted">{member.version || '—'}</td></tr>)}</tbody>
       </table></div>}
       {stale.length > 0 && <p className="mt-4 rounded-lg border border-red-600/60 bg-red-950/40 p-3 text-sm text-red-200">Stale proxies: {stale.map((member) => member.id).join(', ')}</p>}
     </Card>
+    <Drawer open={Boolean(shown)} title={shown ?? ''} eyebrow="Proxy install" onClose={() => { setShown(null); setDiagnostics(null); setDiagnosticsError('') }}>
+      {diagnosticsError ? <p role="alert" className="text-red-300">{diagnosticsError}</p> : diagnostics && diagnostics.id === shown ? <div className="space-y-5">
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+          <dt className="text-muted">Directory</dt><dd className="font-mono">{diagnostics.directory}</dd>
+          <dt className="text-muted">Requests use</dt><dd className="font-mono">{diagnostics.applied}{diagnostics.lineage ? '' : ' (other lineage)'}</dd>
+          <dt className="text-muted">Installed</dt><dd className="font-mono">{Math.max(diagnostics.installed ?? 0, diagnostics.applied)}</dd>
+          <dt className="text-muted">Restart cache</dt><dd className="font-mono">{diagnostics.durable ?? 0}</dd>
+        </dl>
+        {diagnostics.secrets.length > 0 && <Card title="Cluster secrets"><dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">{diagnostics.secrets.map((sec) => <div key={sec.cluster} className="contents"><dt className="text-muted">{sec.cluster}</dt><dd className={`font-mono ${sec.current ? '' : 'text-amber-200'}`}>generation {sec.have || 'none'}{sec.current ? '' : ` (control holds ${sec.want})`}</dd></div>)}</dl></Card>}
+        {diagnostics.problems.length === 0 ? <p className="text-sm text-emerald-300">Nothing is off with this proxy's install.</p> : <ul className="grid gap-2 text-sm text-amber-200">{diagnostics.problems.map((problem) => <li key={problem}>{problem}</li>)}</ul>}
+      </div> : <p className="text-muted">Loading proxy install…</p>}
+    </Drawer>
     <Drawer open={adding} title="Join a control member" eyebrow="Control plane" onClose={() => setAdding(false)} footer={<button type="button" disabled={!name.trim() || !peerURL.trim()} onClick={() => { setExpected(name.trim()); setAdding(false) }} className="w-full rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white disabled:opacity-50">I ran this command</button>}>
       <div className="grid gap-4"><label className="text-sm font-medium">New member name<input value={name} onChange={(event) => setName(event.target.value)} className="mt-2 w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2" /></label><label className="text-sm font-medium">Peer URL<input value={peerURL} onChange={(event) => setPeerURL(event.target.value)} className="mt-2 w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2" /></label><p className="text-sm text-muted">Run this exact command on the new host. This member will be highlighted when it appears.</p><CopyLine value={join} /></div>
     </Drawer>

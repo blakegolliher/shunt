@@ -689,6 +689,19 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("cluster name %q: use lowercase letters, digits, - and _", req.Name))
 		return
 	}
+	if !s.writeCluster(w, r, &req) {
+		return
+	}
+	c, _ := s.Dir.Snapshot().Cluster(req.Name)
+	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
+		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)})
+}
+
+// writeCluster stores req's secret, checks the cluster's credentials against it and writes the
+// definition, answering the error itself when it returns false: cluster add and credential
+// rotation share it, so a rotation is refused exactly as an add with the same pair would be.
+func (s *Server) writeCluster(w http.ResponseWriter, r *http.Request, req *ClusterRequest) bool {
 	stored, secret := "", ""
 	if req.Secret != "" && s.SecretsDir == "" {
 		// The store keeps secrets itself (internal/cp): encrypted, named by a control: ref.
@@ -698,7 +711,7 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		path, err := s.storeSecret(req.Name, req.Secret)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "unavailable", "storing the secret: "+err.Error())
-			return
+			return false
 		}
 		stored = path
 		req.Cluster.Credentials.SecretRef = "file:" + path
@@ -719,7 +732,7 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	if msg != "" {
 		discard()
 		writeError(w, http.StatusConflict, "refused", msg)
-		return
+		return false
 	}
 	if inferType {
 		req.Cluster.Type = typeFromServer(server)
@@ -728,28 +741,84 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		discard()
 		if errors.Is(err, directory.ErrSecretInline) {
 			writeError(w, http.StatusConflict, "refused", "this shunt has no secrets directory (directory.secrets_dir) and its directory file carries only secret_refs; give the cluster a --secret-ref instead")
-			return
+			return false
 		}
 		var ce *config.Error
 		if errors.As(err, &ce) || strings.Contains(err.Error(), "clusters.") {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
-			return
+			return false
 		}
 		if !isDirectoryError(err) {
 			// Prepare refused it: the proxy could not build the cluster, usually an unresolvable secret_ref.
 			writeError(w, http.StatusConflict, "refused", "the proxy cannot use this cluster: "+err.Error())
-			return
+			return false
 		}
 		fail(w, err)
-		return
+		return false
 	}
 	if stored != "" {
 		s.dropSecrets(req.Name, stored)
 	}
-	c, _ := s.Dir.Snapshot().Cluster(req.Name)
-	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
+	return true
+}
+
+// CredentialsRequest is POST /v1/clusters/{name}/credentials: a new secret for the cluster's
+// access key, or a new access key with its secret. Exactly one of Secret and SecretRef is given;
+// the rest of the definition is kept.
+type CredentialsRequest struct {
+	AccessKey string `json:"access_key,omitempty"`
+	Secret    string `json:"secret,omitempty"`
+	SecretRef string `json:"secret_ref,omitempty"`
+}
+
+// CredentialsResult is the rotation's answer: the directory version it landed in and the secret
+// generation it started, which GET /v1/clusters/{name}/view's secret reports proxies installing.
+// Generation is empty for a secret this control plane does not hold (an env: or file: ref).
+type CredentialsResult struct {
+	Name       string        `json:"name"`
+	Version    int64         `json:"version"`
+	Generation string        `json:"generation,omitempty"`
+	Cluster    ClusterStatus `json:"cluster"`
+}
+
+// rotateCredentials replaces a cluster's credentials and nothing else (ADR-0021 D1). The new pair
+// is checked with one signed ListBuckets first; a request that already took the old bundle may
+// still finish with the old secret, so the backend keeps it valid until the new generation is
+// installed everywhere and those requests have ended.
+func (s *Server) rotateCredentials(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req CredentialsRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if (req.Secret == "") == (req.SecretRef == "") {
+		writeError(w, http.StatusBadRequest, "bad_request", "give exactly one of secret and secret_ref")
+		return
+	}
+	def, ok := s.Dir.Snapshot().Cluster(name)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "no cluster "+name)
+		return
+	}
+	if req.AccessKey != "" {
+		def.Credentials.AccessKey = req.AccessKey
+	}
+	if req.SecretRef != "" {
+		def.Credentials.SecretRef = req.SecretRef
+	}
+	creq := ClusterRequest{Name: name, Cluster: def, Secret: req.Secret}
+	if !s.writeCluster(w, r, &creq) {
+		return
+	}
+	snap := s.Dir.Snapshot()
+	c, _ := snap.Cluster(name)
+	out := CredentialsResult{Name: name, Version: snap.Version(), Cluster: ClusterStatus{Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
 		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
-		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)})
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)}}
+	if g := snap.File().Generation(directory.SecretResource(name)); g != 0 {
+		out.Generation = strconv.FormatInt(g, 10)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ClusterProbeResult is the non-mutating preflight used by the add-cluster drawer. Reachability

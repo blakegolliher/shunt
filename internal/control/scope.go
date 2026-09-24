@@ -389,6 +389,11 @@ func (s *Server) placementScope(r *http.Request) (Operation, error) {
 	return s.placementOp(pathKey(r), extra...), nil
 }
 
+// clusterPathScope is the scope of a change to the cluster its path names.
+func (s *Server) clusterPathScope(r *http.Request) (Operation, error) {
+	return s.clusterOp(r.PathValue("name")), nil
+}
+
 // clusterAddScope is cluster add's scope: the cluster its body names.
 func (s *Server) clusterAddScope(r *http.Request) (Operation, error) {
 	name := peekScope(r).Name

@@ -57,6 +57,16 @@ func TestClusterAddFromURL(t *testing.T) {
 	if b, rerr := os.ReadFile(ref); rerr != nil || string(b) != "cluster-secret" || !strings.HasPrefix(ref, rg.ctl.SecretsDir) {
 		t.Fatalf("stored secret %q at %q: %v", b, ref, rerr)
 	}
+	// cluster credentials rotates the secret alone, read the same way, and keeps the definition.
+	out, stderr, err = runIn(t, "rotated-secret\n", "cluster", "credentials", "vast01", "--api", rg.url)
+	if err != nil || !strings.Contains(out, "cluster vast01: credentials rotated, access key AK") {
+		t.Fatalf("cluster credentials: %v\n%s%s", err, out, stderr)
+	}
+	rc, _ := rg.dir.Snapshot().Cluster("vast01")
+	rotated := strings.TrimPrefix(rc.Credentials.SecretRef, "file:")
+	if b, rerr := os.ReadFile(rotated); rerr != nil || string(b) != "rotated-secret" || rotated == ref || strings.Join(rc.Endpoints, ",") != strings.Join(c.Endpoints, ",") {
+		t.Fatalf("rotated secret %q at %q (was %q), endpoints %v: %v", b, rotated, ref, rc.Endpoints, rerr)
+	}
 	if _, _, err := runIn(t, "", "cluster", "add", "vast02", "http://"+rg.ep02, "--access-key", "AK", "--api", rg.url); err == nil || !strings.Contains(err.Error(), "no secret key given") {
 		t.Fatalf("an empty secret: %v", err)
 	}

@@ -231,8 +231,18 @@ plane screen's proxy table shows Durable beside Applied. A cache that is torn, a
 (64 MiB, checked before decoding), of another schema or protocol, another proxy's, or without
 identity is ignored and the proxy starts empty. T04's fault tests fail each stage and restart.
 Incarnation lifecycle metadata, and refusing a restart from a cache older than an acknowledged
-barrier, come with incarnations and barriers in H2. Remaining for H1: rotation API/CLI/GUI, fleet
-install diagnostics (which will carry the backpressure and cache state), and benchmarks.
+barrier, come with incarnations and barriers in H2.
+
+**Landed (2026-09-24, H1e):** rotation and install diagnostics on every interface. `POST
+/v1/clusters/{name}/credentials` (`shunt cluster credentials`, the cluster detail's Credentials
+form) replaces a cluster's secret, or access key and secret, and nothing else; it shares cluster
+add's credential check, so a wrong pair is refused with the old secret in place, runs under a
+`cluster-credentials` operation, and answers the secret generation it started. `GET
+/v1/fleet/{id}` (`shunt proxy show`, a click on a proxy in the Control plane screen) reports one
+proxy's served, installed and durable versions, its secret generations against the control
+plane's, and the problems in words; the heartbeat carries `installed` (while backpressured) and
+`cache_error` for it. `old_generation_drained` is the D2 barrier's to prove; until H2 the UI and
+CLI say that installed is not drained. Remaining for H1: benchmarks.
 
 ### Runtime bundle and installation
 

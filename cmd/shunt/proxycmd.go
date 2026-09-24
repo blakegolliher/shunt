@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"text/tabwriter"
 	"time"
 
@@ -20,7 +21,7 @@ func newProxy() *cobra.Command {
 			"talk to); the others are members that name it in control.endpoint and send it a heartbeat. A\n" +
 			"routing change is in effect only once every member has installed it (ADR-0016).",
 	}
-	cmd.AddCommand(newProxyList(), newProxyForget())
+	cmd.AddCommand(newProxyList(), newProxyShow(), newProxyForget())
 	return cmd
 }
 
@@ -74,6 +75,58 @@ func newProxyList() *cobra.Command {
 	}
 	addAPIFlags(cmd, &o)
 	return cmd
+}
+
+func newProxyShow() *cobra.Command {
+	var o apiOptions
+	cmd := &cobra.Command{
+		Use:   "show <proxy-id>",
+		Short: "One proxy's install state: the version its requests use, what it installed, its cache and secrets",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var d control.ProxyDiagnostics
+			if err := api.call(cmd.Context(), "GET", "/v1/fleet/"+url.PathEscape(args[0]), nil, &d); err != nil {
+				return fmt.Errorf("proxy %s: %w", args[0], err)
+			}
+			if o.json {
+				return printJSON(cmd, d)
+			}
+			out := cmd.OutOrStdout()
+			state := "live"
+			if !d.Live {
+				state = "SILENT"
+			}
+			installed := d.Applied
+			if d.Installed > installed {
+				installed = d.Installed
+			}
+			_, _ = fmt.Fprintf(out, "proxy %s (%s, %s)\n", d.ID, state, d.Host)
+			_, _ = fmt.Fprintf(out, "  directory %d; requests use %d; installed %d; restart cache durable at %d\n", d.Directory, d.Applied, installed, d.Durable)
+			for _, sec := range d.Secrets {
+				_, _ = fmt.Fprintf(out, "  cluster %s: secret generation %s, proxy signs with %s\n", sec.Cluster, sec.Want, orNone(sec.Have))
+			}
+			if len(d.Problems) == 0 {
+				_, _ = fmt.Fprintln(out, "  nothing is off")
+			}
+			for _, p := range d.Problems {
+				_, _ = fmt.Fprintf(out, "  ! %s\n", p)
+			}
+			return nil
+		},
+	}
+	addAPIFlags(cmd, &o)
+	return cmd
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none reported"
+	}
+	return s
 }
 
 func newProxyForget() *cobra.Command {

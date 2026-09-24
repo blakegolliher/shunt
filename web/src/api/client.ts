@@ -14,6 +14,10 @@ export interface ProxyMember {
   // durable is the version the proxy's restart cache holds durably; it lags applied while a cache
   // write is in progress or failing.
   durable?: number
+  // installed is set when the proxy has installed a newer version than its requests use (install
+  // backpressure); cache_error says why its restart cache is not durable.
+  installed?: number
+  cache_error?: string
   seq: number
   started?: string
   seen?: string
@@ -288,6 +292,16 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
 
 export const getControl = (token: string) => request<ControlStatus>('/v1/control', token)
 export const getFleet = (token: string) => request<FleetStatus>('/v1/fleet', token)
+// ProxyDiagnostics is GET /v1/fleet/{id}: one proxy's install state and, in words, what is off.
+export interface ProxyDiagnostics extends ProxyMember {
+  directory: number
+  lineage: boolean
+  behind: number
+  backpressure: boolean
+  secrets: { cluster: string; want: string; have: string; current: boolean }[]
+  problems: string[]
+}
+export const getProxyDiagnostics = (token: string, id: string) => request<ProxyDiagnostics>(`/v1/fleet/${encodeURIComponent(id)}`, token)
 export const getStatus = (token: string) => request<DirectoryStatus>('/v1/status?all=1', token)
 export const getClusterView = (token: string, name: string) => request<ClusterView>(`/v1/clusters/${encodeURIComponent(name)}/view`, token)
 export const getPlacementView = (token: string, tenant: string, bucket: string) => request<PlacementView>(`/v1/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/view`, token)
@@ -304,6 +318,10 @@ export interface ClusterInput {
 
 export const probeCluster = (token: string, input: ClusterInput) => request<ClusterProbeResult>(`${apiRoot}/clusters/probe`, token, json(input))
 export const addCluster = (token: string, input: ClusterInput) => request<ClusterStatus>(`${apiRoot}/clusters`, token, json(input))
+// CredentialsResult is a rotation's answer: generation is the secret generation it started, which
+// the cluster view's secret reports proxies installing; empty for an env: or file: secret_ref.
+export interface CredentialsResult { name: string; version: number; generation?: string; cluster: ClusterStatus }
+export const rotateCredentials = (token: string, name: string, body: { access_key?: string; secret?: string; secret_ref?: string }) => request<CredentialsResult>(`${apiRoot}/clusters/${encodeURIComponent(name)}/credentials`, token, json(body))
 export const adoptBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name?: string; keys?: { access_key: string; secret: string; buckets?: string[] }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/adopt`, token, json(body))
 export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string; keys?: { access_key: string; secret: string; buckets?: string[] }[]; legs?: { cluster: string; name?: string }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
 export const expandBucket = (token: string, tenant: string, bucket: string, to: string, name?: string, acceptExisting = false) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, name, create: true, accept_existing_objects: acceptExisting || undefined }))

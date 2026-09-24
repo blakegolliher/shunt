@@ -32,7 +32,7 @@ import (
 
 func newCluster() *cobra.Command {
 	cmd := &cobra.Command{Use: "cluster", Short: "Add or remove a backend cluster while shunt serves"}
-	cmd.AddCommand(newClusterAdd(), newClusterRemove(), newClusterReadOnly())
+	cmd.AddCommand(newClusterAdd(), newClusterCredentials(), newClusterRemove(), newClusterReadOnly())
 	return cmd
 }
 
@@ -222,6 +222,57 @@ func newClusterAdd() *cobra.Command {
 	f.StringVar(&c.TLS.CA, "ca", "", "https: CA bundle to verify the cluster's certificate")
 	f.BoolVar(&conditionalWrite, "conditional-write", true, "the cluster honors If-None-Match: * on PUT (default: measured by expand)")
 	f.BoolVar(&condDelete, "conditional-delete", false, "the cluster honors If-Match on DELETE (default: measured by expand)")
+	return cmd
+}
+
+func newClusterCredentials() *cobra.Command {
+	var (
+		o                    apiOptions
+		accessKey, secretRef string
+	)
+	cmd := &cobra.Command{
+		Use:   "credentials <name>",
+		Short: "Rotate a cluster's secret key, or its access key and secret, keeping the rest of its definition",
+		Long: "Replaces the credentials shunt signs a cluster's requests with, e.g.\n\n" +
+			"  shunt cluster credentials vast01                      # a new secret for the same access key\n" +
+			"  shunt cluster credentials vast01 --access-key AKIA...  # a new key and its secret\n\n" +
+			"shunt prompts for the secret key (or reads one line from stdin) and checks the pair with one signed\n" +
+			"request before anything changes; a wrong pair is refused and the old credentials stay. Requests\n" +
+			"already running finish with the old secret, so keep it valid on the backend until the cluster's\n" +
+			"view (Clusters screen, Secret) shows the new generation installed on every proxy and those\n" +
+			"requests have ended. shunt never revokes a backend key.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := control.CredentialsRequest{AccessKey: accessKey, SecretRef: secretRef}
+			if secretRef == "" {
+				secret, err := readSecret(cmd, fmt.Sprintf("%s new secret key: ", args[0]))
+				if err != nil {
+					return err
+				}
+				req.Secret = secret
+			}
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var out control.CredentialsResult
+			if callErr := api.call(cmd.Context(), "POST", "/v1/clusters/"+url.PathEscape(args[0])+"/credentials", req, &out); callErr != nil {
+				return callErr
+			}
+			if o.json {
+				return printJSON(cmd, out)
+			}
+			gen := ""
+			if out.Generation != "" {
+				gen = ", secret generation " + out.Generation + "; the Clusters screen's Secret card shows which proxies have it"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "cluster %s: credentials rotated, access key %s (directory version %d%s)\n", out.Name, out.Cluster.AccessKey, out.Version, gen)
+			return err
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().StringVar(&accessKey, "access-key", "", "a new access key (default: keep the current one)")
+	cmd.Flags().StringVar(&secretRef, "secret-ref", "", "env:NAME or file:/path holding the new secret, resolved by shunt serve, instead of prompting")
 	return cmd
 }
 

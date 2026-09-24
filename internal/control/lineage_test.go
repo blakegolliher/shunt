@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,55 @@ func TestSecretStatus(t *testing.T) {
 	}
 	if s.secretStatus(context.Background(), &f, "untracked") != nil {
 		t.Fatal("a cluster with no secret generation has a status")
+	}
+}
+
+// GET /v1/fleet/{id} says what is off with one proxy's install: behind, backpressured, on another
+// lineage, a cache that is not durable, a secret generation not installed; nothing for a proxy
+// that is current.
+func TestProxyDiagnostics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "directory.yaml")
+	body := "version: 7\nschema: 2\nidentity:\n  cluster_id: " + lineageA.ClusterID + "\n  epoch: " + lineageA.Epoch + "\n" +
+		"generations:\n  secret:vast01: 6\n" +
+		"clusters:\n  vast01:\n    type: s3\n    scheme: http\n    region: r\n    endpoints: [\"127.0.0.1:1\"]\n    credentials:\n      access_key: AK\n      secret_ref: control:vast01\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := directory.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := []Member{
+		{ID: "ok", Live: true, Identity: lineageA, Applied: 7, Durable: 7, Secrets: map[string]string{"vast01": "6"}},
+		{ID: "slow", Live: true, Identity: lineageA, Applied: 5, Installed: 7, Durable: 4, CacheError: "version 5 not durable: fsync: disk", Secrets: map[string]string{"vast01": "3"}},
+		{ID: "restored", Live: true, Identity: lineageB, Applied: 9, Durable: 9, Secrets: map[string]string{"vast01": "9"}},
+	}
+	h := (&Server{Dir: d, Fleet: staticFleet{ms: ms}}).Handler()
+	get := func(id string) (int, ProxyDiagnostics) {
+		req := httptest.NewRequest("GET", "/v1/fleet/"+id, nil)
+		req.RemoteAddr = "127.0.0.1:1"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out ProxyDiagnostics
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	if code, ok := get("ok"); code != http.StatusOK || len(ok.Problems) != 0 || !ok.Lineage || ok.Behind != 0 || len(ok.Secrets) != 1 || !ok.Secrets[0].Current {
+		t.Fatalf("a current proxy: %d %+v", code, ok)
+	}
+	_, slow := get("slow")
+	if slow.Behind != 2 || !slow.Backpressure || len(slow.Secrets) != 1 || slow.Secrets[0].Current {
+		t.Fatalf("a slow proxy: %+v", slow)
+	}
+	for _, want := range []string{"behind: its requests use version 5", "install backpressure: version 7 is installed", "restart cache not durable: version 5", "cluster vast01: signs with secret generation \"3\""} {
+		if !slices.ContainsFunc(slow.Problems, func(p string) bool { return strings.Contains(p, want) }) {
+			t.Errorf("slow proxy problems %q lack %q", slow.Problems, want)
+		}
+	}
+	if _, rs := get("restored"); rs.Lineage || rs.Behind != 0 || len(rs.Problems) != 2 || !strings.Contains(rs.Problems[0], "another lineage") {
+		t.Fatalf("a proxy on another lineage: %+v", rs)
+	}
+	if code, _ := get("nope"); code != http.StatusNotFound {
+		t.Fatalf("an unknown proxy: %d", code)
 	}
 }

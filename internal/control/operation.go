@@ -36,6 +36,7 @@ const (
 	OpClusterReadOnly   = "cluster-read-only"
 	OpPlacementReadOnly = "placement-read-only"
 	OpClusterAdd        = "cluster-add"
+	OpClusterRotate     = "cluster-credentials"
 	OpAdopt             = "adopt"
 	OpCreate            = "create"
 	OpExpand            = "expand"

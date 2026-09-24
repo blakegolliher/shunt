@@ -61,3 +61,33 @@ test('shows a secret rotation installing across the fleet', async () => {
   expect(screen.getByText('generation 12')).toBeInTheDocument()
   expect(screen.getByText('proxy-b')).toBeInTheDocument()
 })
+
+// Rotating credentials from the cluster detail posts the new secret alone (the access key is kept
+// when the field is empty) and says the new generation is installing.
+test('rotates a cluster secret from its detail', async () => {
+  sessionStorage.setItem('shunt.control.token', 't')
+  const posted: string[] = []
+  const clusters = [cluster('var204', ['placements.default/data02'])]
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = String(input)
+    if (init?.method === 'POST') { posted.push(`${url} ${String(init.body)}`); return Response.json({ name: 'var204', version: 13, generation: '13', cluster: clusters[0] }) }
+    if (url.endsWith('/v1/control')) return Response.json(control)
+    if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 8, clusters, placements: [] })
+    if (url.includes('/v1/clusters/var204/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
+      probe: { reachable: true, latency_ms: 1, checked_at: '2026-09-24T12:00:00Z' } })
+    if (url.includes('/v1/telemetry/series')) return Response.json({ points: [] })
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    return Response.json({ message: `unhandled ${url}` }, { status: 404 })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Clusters' }))
+  fireEvent.click(await screen.findByText('var204'))
+  const rotate = await screen.findByRole('button', { name: 'Rotate credentials' })
+  expect(rotate).toBeDisabled()
+  fireEvent.change(screen.getByLabelText('New secret key'), { target: { value: 'new-secret' } })
+  fireEvent.click(rotate)
+  await screen.findByText('Credentials of var204 rotated')
+  expect(await screen.findByText(/Secret generation 13 is installing/)).toBeInTheDocument()
+  expect(posted).toEqual(['/v1/clusters/var204/credentials {"secret":"new-secret"}'])
+})

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, setClusterReadOnly, setTenantDefault } from '../api/client'
+import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, rotateCredentials, setClusterReadOnly, setTenantDefault } from '../api/client'
 import type { ClusterInput, ClusterProbeResult, ClusterStatus, ClusterView, RemoveDryRun } from '../api/client'
 import { Card } from '../components/Card'
 import { Drawer } from '../components/Drawer'
@@ -37,6 +37,7 @@ export function Clusters() {
   const [busy, setBusy] = useState(false)
   const [removal, setRemoval] = useState<RemoveDryRun | null>(null)
   const [newDefault, setNewDefault] = useState<Record<string, string>>({}) // tenant → the cluster chosen to replace this one as its default
+  const [rotation, setRotation] = useState({ accessKey: '', secret: '' }) // the credentials form in the cluster detail; an empty access key keeps the current one
 
   useEffect(() => {
     let live = true
@@ -67,6 +68,18 @@ export function Clusters() {
     if (await act(() => addCluster(token, clusterInput(form)), `Cluster ${form.name} added`)) { setAdding(false); setForm(emptyForm); setProbe(null) }
   }
   const detail = selected ? views[selected] : undefined
+  const onRotate = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!detail || !rotation.secret) return
+    const accessKey = rotation.accessKey.trim()
+    let generation = ''
+    const ok = await act(async () => { generation = (await rotateCredentials(token, detail.name, { access_key: accessKey && accessKey !== detail.access_key ? accessKey : undefined, secret: rotation.secret })).generation ?? '' },
+      `Credentials of ${detail.name} rotated`)
+    if (ok) {
+      setRotation({ accessKey: '', secret: '' })
+      if (generation) notify(`Secret generation ${generation} is installing on the proxies; keep the old backend key valid until it is installed everywhere and older requests have ended`)
+    }
+  }
 
   return <div className="space-y-5">
     <Card eyebrow="Backends" title="Clusters" action={<button type="button" onClick={() => setAdding(true)} className="rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white hover:bg-ember-500">Add cluster</button>}>
@@ -87,7 +100,7 @@ export function Clusters() {
       </form>
     </Drawer>
 
-    <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Cluster detail" onClose={() => { setSelected(null); setHistory([]); setRemoval(null) }}>
+    <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Cluster detail" onClose={() => { setSelected(null); setHistory([]); setRemoval(null); setRotation({ accessKey: '', secret: '' }) }}>
       {detail ? <div className="space-y-6">
         <div className="grid grid-cols-2 gap-3 text-sm"><div><p className="text-muted">Endpoint</p><p className="mt-1 font-mono">{detail.scheme}://{detail.endpoints.join(', ')}</p></div><div><p className="text-muted">Health history</p><Sparkline values={history.length ? history : [detail.probe.latency_ms]} label={`${detail.name} latency history`} /></div></div>
         <Card title="Capability profile"><dl className="grid gap-3 text-sm">{Object.entries(detail.capabilities).map(([name, value]) => <div key={name} className="flex justify-between"><dt className="text-muted">{name.replaceAll('_', ' ')}</dt><dd>{String(value.value)} · {value.known ? 'measured' : 'assumed'}</dd></div>)}</dl></Card>
@@ -96,6 +109,14 @@ export function Clusters() {
           <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs"><dt className="text-muted">Installed</dt><dd className="font-mono">{detail.secret.installed.join(', ') || '—'}</dd><dt className="text-muted">Pending</dt><dd className="font-mono">{detail.secret.pending.join(', ') || '—'}</dd><dt className="text-muted">Silent</dt><dd className="font-mono">{detail.secret.silent.join(', ') || '—'}</dd></dl>
           <p className="mt-3 text-xs text-muted">Installed is not drained: a request a proxy began before it installed the new secret may still sign with the old one. Keep the old backend key valid until requests that old have finished.</p>
         </Card>}
+        <Card title="Credentials" eyebrow={`access key ${detail.access_key}`}>
+          <form onSubmit={(event) => void onRotate(event)} className="grid gap-3">
+            <label className="text-sm font-medium">New access key <span className="text-muted">(leave empty to keep {detail.access_key})</span><input value={rotation.accessKey} onChange={(event) => setRotation((old) => ({ ...old, accessKey: event.target.value }))} className={inputClass} autoComplete="off" /></label>
+            <label className="text-sm font-medium">New secret key<input type="password" value={rotation.secret} onChange={(event) => setRotation((old) => ({ ...old, secret: event.target.value }))} className={inputClass} autoComplete="new-password" /></label>
+            <p className="text-xs text-muted">shunt checks the new pair with one signed request before anything changes; a wrong pair is refused and the old credentials stay. It never revokes a backend key.</p>
+            <button type="submit" disabled={busy || !rotation.secret} className="justify-self-start rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold disabled:opacity-50">Rotate credentials</button>
+          </form>
+        </Card>
         <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => {
           // A tenant defaulting to this cluster blocks its removal; the fix is here, not on another screen.
           const tenant = /^tenants\.(.+)\.default_cluster$/.exec(ref)?.[1]

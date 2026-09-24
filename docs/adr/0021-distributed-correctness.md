@@ -5,7 +5,7 @@ Status: **proposed; the first four regressions landed** (T01, T02, T03, T07 on 2
 transaction contract and scope reservations), H0c (idempotency keys, expected generations and
 operation capacity), H0d (typed refusals, `shunt operation`, the Operations screen, and the
 direct-write audit) and H0e (metric catalog rows and benchmarks, docs/bench/h0.md). H0's gate
-passed on 2026-09-24. H1a (the runtime bundle), H1b (secret generations) H1c (resource lifetimes, the retained-bundle bound) and H1d (the restart cache) have landed; the rest of H1 and H2–H5 are pending.
+passed on 2026-09-24. H1a (the runtime bundle), H1b (secret generations) H1c (resource lifetimes, the retained-bundle bound), H1d (the restart cache) and H1e (rotation and install diagnostics on API, CLI and UI) have landed; the rest of H1 and H2–H5 are pending.
 
 Design baseline: `distributed` at `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`.
 This proposal amends [ADR-0015](0015-embedded-etcd.md),

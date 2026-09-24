@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,6 +91,11 @@ type Heartbeat struct {
 	// directory synced); 0 when none. It lags Applied while a write is in progress or failing
 	// (ADR-0021 D1).
 	Durable int64 `json:"durable,omitempty"`
+	// Installed is the version the member has installed, when it is ahead of Applied: installs are
+	// backpressured, waiting for a retired runtime bundle to drain (ADR-0021 D1). 0 otherwise.
+	Installed int64 `json:"installed,omitempty"`
+	// CacheError is why the member's newest version is not durable, when it is not.
+	CacheError string `json:"cache_error,omitempty"`
 	// FallbackReads is shunt_migration_fallback_reads_total for each bucket that is not ACTIVE in
 	// the member's snapshot: bounded by migrations in flight, never by buckets.
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
@@ -123,7 +130,9 @@ type Member struct {
 	// when it is the control plane's.
 	Identity      directory.Identity `json:"identity,omitzero"`
 	Applied       int64              `json:"applied"`
-	Durable       int64              `json:"durable,omitempty"` // Heartbeat.Durable
+	Durable       int64              `json:"durable,omitempty"`     // Heartbeat.Durable
+	Installed     int64              `json:"installed,omitempty"`   // Heartbeat.Installed
+	CacheError    string             `json:"cache_error,omitempty"` // Heartbeat.CacheError
 	Seq           int64              `json:"seq"`
 	Started       time.Time          `json:"started,omitzero"`
 	Seen          time.Time          `json:"seen,omitzero"`        // when its last heartbeat arrived
@@ -257,6 +266,87 @@ func (s *Server) fleetList(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := s.Dir.Snapshot()
 	writeJSON(w, http.StatusOK, FleetStatus{Identity: snap.File().Identity, Version: snap.Version(), Members: ms})
+}
+
+// ProxyDiagnostics is GET /v1/fleet/{id}: one member's install state against the control plane's
+// directory (ADR-0021 D1). Problems says in words what the fields show, empty when nothing is off.
+type ProxyDiagnostics struct {
+	Member
+	// Directory is the control plane's version and identity; Lineage whether the member's installed
+	// directory is on it (false: another cluster or epoch, and its versions compare with nothing).
+	Directory int64              `json:"directory"`
+	Current   directory.Identity `json:"current"`
+	Lineage   bool               `json:"lineage"`
+	// Behind is how many directory versions the proxy's requests are behind; Backpressure whether
+	// it has installed a newer one its requests do not use yet.
+	Behind       int64 `json:"behind"`
+	Backpressure bool  `json:"backpressure"`
+	// Secrets compares, per cluster the control plane holds a secret for, the generation it holds
+	// with the one the proxy signs with.
+	Secrets  []SecretInstall `json:"secrets"`
+	Problems []string        `json:"problems"`
+}
+
+// SecretInstall is one cluster's secret generation on the control plane (Want) and on a proxy (Have,
+// empty when it reported none).
+type SecretInstall struct {
+	Cluster string `json:"cluster"`
+	Want    string `json:"want"`
+	Have    string `json:"have"`
+	Current bool   `json:"current"`
+}
+
+func (s *Server) proxyDiagnostics(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ms, err := s.members(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	i := slices.IndexFunc(ms, func(m Member) bool { return m.ID == id })
+	if i < 0 {
+		writeError(w, http.StatusNotFound, "not_found", "no proxy "+id)
+		return
+	}
+	snap := s.Dir.Snapshot()
+	f := snap.File()
+	d := ProxyDiagnostics{Member: ms[i], Directory: snap.Version(), Current: f.Identity, Secrets: []SecretInstall{}, Problems: []string{}}
+	m := &d.Member
+	d.Lineage = m.Identity == f.Identity
+	d.Backpressure = m.Installed > m.Applied
+	if d.Lineage && m.Applied < d.Directory {
+		d.Behind = d.Directory - m.Applied
+	}
+	for _, name := range slices.Sorted(maps.Keys(f.Clusters)) {
+		g := f.Generation(directory.SecretResource(name))
+		if g == 0 {
+			continue
+		}
+		have, _ := strconv.ParseInt(m.Secrets[name], 10, 64) //nolint:errcheck // absent or malformed is behind
+		d.Secrets = append(d.Secrets, SecretInstall{Cluster: name, Want: strconv.FormatInt(g, 10), Have: m.Secrets[name], Current: d.Lineage && have >= g})
+	}
+	switch {
+	case !m.Live:
+		d.Problems = append(d.Problems, fmt.Sprintf("silent: no heartbeat within its lease (last seen %s ago)", m.SinceSeen.Round(time.Second)))
+	case !d.Lineage:
+		d.Problems = append(d.Problems, "on another lineage: it installed a directory from another cluster or epoch and must be re-enrolled with an empty control.cache_dir")
+	case d.Behind > 0:
+		d.Problems = append(d.Problems, fmt.Sprintf("behind: its requests use version %d, the directory is at %d", m.Applied, d.Directory))
+	}
+	if d.Backpressure {
+		d.Problems = append(d.Problems, fmt.Sprintf("install backpressure: version %d is installed but waits for long-running requests to release one of the retired runtime bundles; new requests still use %d", m.Installed, m.Applied))
+	}
+	if m.CacheError != "" {
+		d.Problems = append(d.Problems, "restart cache not durable: "+m.CacheError)
+	} else if m.Durable < m.Applied {
+		d.Problems = append(d.Problems, fmt.Sprintf("restart cache at version %d, behind the %d it serves", m.Durable, m.Applied))
+	}
+	for _, sec := range d.Secrets {
+		if !sec.Current {
+			d.Problems = append(d.Problems, fmt.Sprintf("cluster %s: signs with secret generation %q, the control plane holds %s", sec.Cluster, sec.Have, sec.Want))
+		}
+	}
+	writeJSON(w, http.StatusOK, d)
 }
 
 // forgetProxy removes a member: the operator's statement that the proxy is gone for good.
