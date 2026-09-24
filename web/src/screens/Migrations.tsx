@@ -11,7 +11,7 @@ import {
   startOperation,
   unfinished,
 } from '../api/client'
-import type { LedgerEntry, Operation, PlacementView, PurgeDryRun, RemoveDryRun } from '../api/client'
+import type { LedgerEntry, Operation, PlacementStatus, PlacementView, PurgeDryRun, RemoveDryRun } from '../api/client'
 import { Card } from '../components/Card'
 import { ConfirmDrawer } from '../components/ConfirmDrawer'
 import { FenceStatus } from '../components/FenceStatus'
@@ -67,7 +67,22 @@ function appliedRatio(view: { state: string; ratio?: number }) {
   return view.state === 'RAMPING' ? view.ratio ?? 0 : 0
 }
 
-export function Migrations({ selected, onSelect }: { selected: string; onSelect: (key: string) => void }) {
+// A bucket that is not migrating, and what would start one: Expand for a plain bucket, Move keys or
+// Consolidate for one spread over legs.
+function StartMigration({ placements, onPrepare }: { placements: PlacementStatus[]; onPrepare: (key: string, action: 'expand' | 'move' | 'consolidate') => void }) {
+  if (placements.length === 0) return <p className="text-sm text-muted">No other buckets.</p>
+  return <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="text-xs uppercase tracking-wider text-muted"><tr><th className="pb-3">Bucket</th><th className="pb-3">State</th><th className="pb-3">Where</th><th className="pb-3 text-right">Start</th></tr></thead>
+    <tbody className="divide-y divide-ink-700">{placements.map((p) => {
+      const spread = (p.legs?.length ?? 0) > 1
+      return <tr key={p.key}><td className="py-3 font-semibold text-ember-300">{p.key}</td><td className="py-3"><StateBadge state={p.state} /></td>
+        <td className="py-3 text-muted">{spread ? `spread: ${p.legs?.map((l) => l.cluster).join(' + ')}` : p.primary}</td>
+        <td className="py-3 text-right">{p.state !== 'ACTIVE' ? <span className="text-xs text-muted">busy</span> : spread
+          ? <><button type="button" aria-label={`Move keys of ${p.key}`} onClick={() => onPrepare(p.key, 'move')} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Move keys</button><button type="button" aria-label={`Consolidate ${p.key}`} onClick={() => onPrepare(p.key, 'consolidate')} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Consolidate</button></>
+          : <button type="button" aria-label={`Expand ${p.key}`} onClick={() => onPrepare(p.key, 'expand')} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Expand to another cluster</button>}</td></tr>
+    })}</tbody></table></div>
+}
+
+export function Migrations({ selected, onSelect, onPrepare }: { selected: string; onSelect: (key: string) => void; onPrepare: (key: string, action: 'expand' | 'move' | 'consolidate') => void }) {
   const { token, directory, fleet, lastEvent, notify, refresh } = useStore()
   const candidates = useMemo(() => (directory?.placements ?? []).filter((item) => item.target || item.source || item.state !== 'ACTIVE'), [directory])
   const key = selected || candidates[0]?.key || ''
@@ -159,7 +174,8 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
     } finally { setBusy(false) }
   }
 
-  if (!key) return <Card eyebrow="Migration workflow" title="No expanded bucket"><p className="text-sm text-muted">Expand a bucket to a target cluster first, then return here.</p></Card>
+  const others = (directory?.placements ?? []).filter((item) => !candidates.some((c) => c.key === item.key))
+  if (!key) return <Card eyebrow="Migration workflow" title="No bucket is migrating"><p className="mb-4 text-sm text-muted">A migration starts from a bucket: expand a plain bucket to another cluster, or move keys of a bucket spread over legs. Pick one to begin.</p><StartMigration placements={others} onPrepare={onPrepare} /></Card>
   if (!detail) return <Card title={key}><p className="text-muted">Loading migration state…</p></Card>
 
   const source = detail.source || (detail.target ? detail.primary : formerSource)
@@ -258,5 +274,6 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
     <ConfirmDrawer open={purge !== null} title={`Purge ${purge?.source ?? 'source bucket'}`} destructive busy={busy || unfinished(operation)} disabled={!purge?.allowed || !purge.token} onClose={() => setPurge(null)} onConfirm={() => { if (purge?.allowed && purge.token) { setFormerSource(purge.source ?? formerSource); void run('purge-source', { token: purge.token, wait: '30s' }).then(() => setPurge(null)) } }} summary={purge?.allowed ? <p>Delete <strong>{purge.objects.toLocaleString()} objects</strong> ({humanBytes(purge.bytes)}) and abort {purge.uploads_in_flight} uploads from <span className="font-mono text-paper">{purge.source}/{purge.bucket}</span>.</p> : <p className="text-red-200">{purge?.reason}</p>}><p className="text-xs text-muted">Confirmation token expires at {purge?.expires_at ? new Date(purge.expires_at).toLocaleTimeString() : '—'}.</p></ConfirmDrawer>
 
     <ConfirmDrawer open={remove !== null} title={`Remove ${formerSource}`} destructive busy={busy} disabled={!remove?.allowed || !remove.token} onClose={() => setRemove(null)} onConfirm={() => { if (remove?.allowed && remove.token) void removeCluster(token, formerSource, remove.token).then(async () => { notify(`Cluster ${formerSource} removed`); setRemove(null); await refresh() }).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')) }} summary={remove?.allowed ? <p>No placements or tenant defaults depend on this cluster. Remove its directory record and stored secret.</p> : <p className="text-red-200">{remove?.reason}</p>} />
+    {others.length > 0 && <Card eyebrow="Start another" title="Other buckets"><StartMigration placements={others} onPrepare={onPrepare} /></Card>}
   </div>
 }

@@ -71,3 +71,26 @@ test('keeps a screen that fails to render to that screen, and forgets it on anot
   rerender(<ErrorBoundary resetKey="Clusters"><p>clusters screen</p></ErrorBoundary>)
   expect(screen.getByText('clusters screen')).toBeInTheDocument()
 })
+
+// With nothing migrating, Migrations lists the buckets and what would start a migration of each;
+// the button opens that drawer on Buckets.
+test('lists the buckets on an idle Migrations screen and opens the matching drawer', async () => {
+  sessionStorage.setItem('shunt.control.token', 't')
+  const clusters = ['minio-a', 'minio-b'].map((name) => ({ name, type: 'minio', scheme: 'http', region: 'us-east-1', endpoints: [`${name}:9000`], access_key: 'AK', secret_ref: `control:${name}`,
+    conditional_write: true, conditional_delete: false, references: [], read_only: false, reject_writes: false }))
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input)
+    if (url.endsWith('/v1/control')) return Response.json(control)
+    if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 5, clusters, placements: [spread, single] })
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    return Response.json({ message: `unhandled ${url}` }, { status: 404 })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Migrations' }))
+  expect(await screen.findByText('No bucket is migrating')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Move keys of default/data01' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Consolidate default/data01' })).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Expand default/ui-demo' }))
+  expect(await screen.findByText('Expand default/ui-demo')).toBeInTheDocument()
+})

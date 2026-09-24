@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Card } from './components/Card'
 import { Buckets } from './screens/Buckets'
+import type { BucketRequest } from './screens/Buckets'
 import { Clusters } from './screens/Clusters'
 import { ControlPlane } from './screens/ControlPlane'
 import { Migrations } from './screens/Migrations'
@@ -32,13 +33,14 @@ export function App() {
   const store = useStore()
   const [page, setPage] = useState<Page>('Control plane')
   const [migration, setMigration] = useState('')
+  const [bucketRequest, setBucketRequest] = useState<BucketRequest | null>(null)
   if (!store.token) return <TokenPrompt />
   const members = store.fleet?.members ?? store.control?.fleet ?? []
   const stale = members.filter((member) => !member.live).length
   const screen = page === 'Control plane' ? <ControlPlane />
     : page === 'Clusters' ? <Clusters />
-      : page === 'Buckets' ? <Buckets onMigrate={(key) => { setMigration(key); setPage('Migrations') }} />
-        : page === 'Migrations' ? <Migrations selected={migration} onSelect={setMigration} />
+      : page === 'Buckets' ? <Buckets request={bucketRequest} onMigrate={(key) => { setMigration(key); setPage('Migrations') }} />
+        : page === 'Migrations' ? <Migrations selected={migration} onSelect={setMigration} onPrepare={(key, action) => { setBucketRequest({ key, action, nonce: Date.now() }); setPage('Buckets') }} />
           : page === 'Operations' ? <Operations />
           : page === 'Telemetry' ? <Telemetry />
             : <Audit />

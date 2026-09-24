@@ -29,7 +29,10 @@ function generatedName(placement: PlacementStatus, target: string, placements: P
   }
 }
 
-export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
+// BucketRequest asks the Buckets screen to open one bucket's drawer, from another screen.
+export interface BucketRequest { key: string; action: 'expand' | 'move' | 'consolidate'; nonce: number }
+
+export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => void; request?: BucketRequest | null }) {
   const { token, directory, refresh, notify } = useStore()
   const placements = useMemo(() => directory?.placements ?? [], [directory])
   const clusters = useMemo(() => directory?.clusters ?? [], [directory])
@@ -119,6 +122,18 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
   const openExpand = (placement: PlacementStatus, prefer = '', name = '') => {
     const to = prefer && prefer !== placement.primary && clusters.some((item) => item.name === prefer) ? prefer : clusters.find((item) => item.name !== placement.primary)?.name ?? ''
     setTarget(to); setExpandName(name); setAcceptExisting(false); setExpanding(placement.key)
+  }
+  // A request from another screen (Migrations) opens its drawer once, as soon as the bucket is
+  // known: a prop change adjusting state during render, not an effect.
+  const [seenRequest, setSeenRequest] = useState(0)
+  if (request && request.nonce !== seenRequest) {
+    const placement = placements.find((item) => item.key === request.key)
+    if (placement) {
+      setSeenRequest(request.nonce)
+      if (request.action === 'expand') openExpand(placement)
+      else if (request.action === 'move') openMove(placement)
+      else openConsolidate(placement)
+    }
   }
   // The client bucket the add form names, when the tenant already has it: that is expand, not add.
   const existing = placements.find((item) => item.key === `${tenant.trim()}/${bucket.trim()}`)
