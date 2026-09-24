@@ -8,7 +8,8 @@
 //	a successful write is readable at once, with the bytes that were written;
 //	a successful delete stays deleted (a mover may put an object back for a moment; it must be gone
 //	again within Grace, ADR-0004 race 1);
-//	every request succeeds.
+//	every request succeeds, after the retries an S3 SDK makes: a 503 that carries Retry-After (a
+//	held ramp step, ADR-0016) is retried with backoff, and counted as retried, not as an error.
 package verify
 
 import (
@@ -131,7 +132,15 @@ type Options struct {
 	Interval time.Duration // progress lines to Progress; 0: none
 	Progress io.Writer
 	Cleanup  bool // delete every key still present at the end
+	// NoRetry counts every 503 as an error, as a client without retries sees it. By default a 503
+	// with Retry-After is retried with backoff, as every S3 SDK does (maxRetries attempts).
+	NoRetry bool
 }
+
+// maxRetries is how many times a 503 with Retry-After is retried before it counts as an error: the
+// default retry budget of the AWS SDKs is smaller, but their backoff is longer; this covers the two
+// fence rounds of a held step (ADR-0016) with room to spare.
+const maxRetries = 10
 
 // Report is what a Run saw.
 type Report struct {
@@ -146,6 +155,7 @@ type Report struct {
 	Gets          int64                `json:"gets"`
 	Deletes       int64                `json:"deletes"`
 	Errors        int64                `json:"errors"`
+	Retried       int64                `json:"retried"`                 // 503s with Retry-After that a retry got past
 	ErrorSamples  []string             `json:"error_samples,omitempty"` // the first 50
 	Resurrections int64                `json:"resurrections_withdrawn"` // deleted keys seen again, then gone within the grace
 	Writes        map[string]int64     `json:"writes_by_route"`         // X-Shunt-Route of successful PUTs
@@ -166,7 +176,7 @@ type runner struct {
 	o    Options
 	keys []*Key
 
-	ops, puts, gets, deletes, errors, resurrections atomic.Int64
+	ops, puts, gets, deletes, errors, resurrections, retried atomic.Int64
 
 	mu      sync.Mutex
 	samples []string
@@ -257,7 +267,31 @@ func verifyOperation(method string) string {
 	return "Unknown"
 }
 
+// do sends a request as an S3 SDK would: a 503 that carries Retry-After is retried with exponential
+// backoff, capped at what Retry-After asks, up to maxRetries times. Each attempt is its own request
+// in the latency histogram and the telemetry windows, as the fleet sees it.
 func (r *runner) do(ctx context.Context, method, key string, body []byte, hdr map[string]string) (Reply, error) {
+	backoff := 50 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		rep, err := r.once(ctx, method, key, body, hdr)
+		if err != nil || r.o.NoRetry || attempt == maxRetries || rep.Status != http.StatusServiceUnavailable || rep.Header.Get("Retry-After") == "" {
+			return rep, err
+		}
+		r.retried.Add(1)
+		wait := backoff
+		if limit, perr := time.ParseDuration(rep.Header.Get("Retry-After") + "s"); perr == nil && limit > 0 && wait > limit {
+			wait = limit
+		}
+		select {
+		case <-ctx.Done():
+			return rep, ctx.Err()
+		case <-time.After(wait):
+		}
+		backoff *= 2
+	}
+}
+
+func (r *runner) once(ctx context.Context, method, key string, body []byte, hdr map[string]string) (Reply, error) {
 	rep, err := r.c.Do(ctx, method, key, body, hdr)
 	if err != nil {
 		return rep, err
@@ -409,7 +443,7 @@ func (r *runner) progress(ctx context.Context, start time.Time) func() {
 func (r *runner) report(start time.Time) Report {
 	rep := Report{Endpoint: r.c.Endpoint, Bucket: r.c.Bucket, Prefix: r.o.Prefix, Seed: r.o.Seed, Started: start.UTC(),
 		Seconds: time.Since(start).Seconds(), Ops: r.ops.Load(), Puts: r.puts.Load(), Gets: r.gets.Load(), Deletes: r.deletes.Load(),
-		Errors: r.errors.Load(), Resurrections: r.resurrections.Load(),
+		Errors: r.errors.Load(), Retried: r.retried.Load(), Resurrections: r.resurrections.Load(),
 		Writes: map[string]int64{}, Reads: map[string]int64{}, WriteSides: map[string]int64{}, ReadSides: map[string]int64{}}
 	r.mu.Lock()
 	rep.LatencyP50US = r.latency.ValueAtQuantile(50)

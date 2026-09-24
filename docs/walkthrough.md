@@ -371,7 +371,7 @@ verify report: http://127.0.0.1:8008/data01 prefix verify/1789655634239839728/ s
   reads by route: primary vast01 721 (8%), primary vast02 6500 (75%), source vast01 1465 (17%)
 ```
 
-**`errors: 0`** is the claim: every write and every read succeeded, wherever the object lived at that moment. `verify` exits non-zero on any error. In the routes, `primary vast01` is before the ramp, `source vast01` is keys still on vast01 during the move, and `primary vast02` is after.
+**`errors: 0`** is the claim: every write and every read succeeded, wherever the object lived at that moment. `verify` exits non-zero on any error. A write the ADR-0016 fence holds during a ramp step answers 503 with `Retry-After`; `verify` retries it with backoff as every S3 SDK does and reports the count on a `503s retried` line, not as an error. `--no-retry` counts every 503 as an error. In the routes, `primary vast01` is before the ramp, `source vast01` is keys still on vast01 during the move, and `primary vast02` is after.
 
 When you are done: `kill -TERM "$(cat shunt.pid)"`.
 

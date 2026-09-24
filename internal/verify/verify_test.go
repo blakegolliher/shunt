@@ -73,6 +73,30 @@ func TestLostWritesAreErrors(t *testing.T) {
 	}
 }
 
+// A write held by the ADR-0016 fence answers 503 with Retry-After; verify retries it as an S3
+// client does, and counts it retried rather than failed. With NoRetry it is an error.
+func TestHeldWritesAreRetried(t *testing.T) {
+	held := func() *Client {
+		var n atomic.Int64
+		return backend(t, func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+			if r.Method == http.MethodPut && n.Add(1)%3 == 0 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	rep := Run(context.Background(), held(), Options{Workers: 4, Keys: 10, Duration: 400 * time.Millisecond})
+	if rep.Errors != 0 || rep.Retried == 0 || rep.Puts == 0 {
+		t.Fatalf("held writes with retry: %+v", rep)
+	}
+	rep = Run(context.Background(), held(), Options{Workers: 4, Keys: 10, Duration: 400 * time.Millisecond, NoRetry: true})
+	if rep.Errors == 0 || rep.Retried != 0 {
+		t.Fatalf("held writes without retry: %+v", rep)
+	}
+}
+
 // With DebugRoute, writes and reads are tallied by the X-Shunt-Route the endpoint answers with.
 func TestRouteTally(t *testing.T) {
 	c := backend(t, func(w http.ResponseWriter, r *http.Request, next http.Handler) {

@@ -88,7 +88,7 @@ tail -f test/e2e/data/demo-ui/verify.log
 jq '{ops,errors,latency_p50_us,latency_p99_us}' test/e2e/data/demo-ui/verify.json
 ```
 
-Each completed report must have `errors: 0`. During the manual pass, capture the Telemetry screen
+Each completed report must have `errors: 0`; held ramp steps show up under `retried` instead. During the manual pass, capture the Telemetry screen
 after the split has produced completed windows and save it as `docs/telemetry-dashboard.png`; that
 is the intentionally manual UI-5 visual artifact.
 
