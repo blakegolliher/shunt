@@ -2,7 +2,7 @@
 
 Status: accepted (P3c-1, 2026-09-22), with the amendments at the end.
 
-Proposed follow-up: [ADR-0018](0018-distributed-correctness.md) specifies recovery
+Proposed follow-up: [ADR-0021](0021-distributed-correctness.md) specifies recovery
 epochs, resumable learner joins and observed health. It is not implemented and
 does not change this ADR's substrate choice.
 

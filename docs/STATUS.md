@@ -22,7 +22,7 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 A review of `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03` identified gaps in snapshot
 installation, in-flight request fencing, lease grants, restore lineage, secret
 rotation, interrupted joins and UI state. The historical acceptance results below
-do not cover those failures. [ADR-0018](adr/0018-distributed-correctness.md) proposes
+do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) proposes
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.

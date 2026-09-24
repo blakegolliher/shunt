@@ -4,7 +4,7 @@ Status: accepted (POC-6 item 3, 2026-09-21). Amends ADR-0004 (migration races), 
 
 Known gap and proposed follow-up: installation alone does not drain requests
 using an older snapshot, including on a single proxy. Lease expiry also does not
-prove a dispatched backend write completed. [ADR-0018](0018-distributed-correctness.md)
+prove a dispatched backend write completed. [ADR-0021](0021-distributed-correctness.md)
 specifies stronger admission/drain and recovery semantics, including changes to
 the timeout, forget and dead-member rules below. That proposal is not implemented.
 

@@ -2,7 +2,7 @@
 
 Referenced from `docs/DESIGN.md` §12. Supersedes §1.5 where they differ: Postgres is replaced by etcd embedded in `shunt-control`. ADR-0015 records the decision.
 
-**Proposed hardening:** [ADR-0018](../adr/0018-distributed-correctness.md) and
+**Proposed hardening:** [ADR-0021](../adr/0021-distributed-correctness.md) and
 [distributed correctness](distributed-correctness.md) address gaps in the
 implemented version fence, runtime installation, recovery and membership. The
 proposal is not implemented; use its [delivery plan](../prompts/distributed-hardening.md)
