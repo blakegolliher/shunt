@@ -113,7 +113,8 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 	ec.LogLevel = "warn"
 	ec.LogOutputs = []string{"stderr"}
 	// A member joining right after it was added can find the cluster's member list not yet
-	// settled ("incompatible with current running cluster"); it is a matter of seconds.
+	// settled ("incompatible with current running cluster"); it is a matter of seconds. It joins as
+	// a learner (MemberAdd), so the members it asks keep their quorum and can answer it.
 	var e *embed.Etcd
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -156,6 +157,19 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 		}
 	}
 	n := &Node{cfg: cfg, e: e, cli: v3client.New(e.Server), socket: socket, rmSock: rmSock}
+	if cfg.Existing {
+		if err := n.promote(ctx); err != nil {
+			if !restart {
+				n.Close()
+				return nil, err
+			}
+			// A learner restarting (it stopped between its join and its promotion) may find no
+			// leader to promote it yet; it runs as a learner, and its next start tries again.
+			if cfg.Log != nil {
+				cfg.Log.Warn("etcd member is still a learner: not promoted to a voting member yet", "name", cfg.Name, "err", err)
+			}
+		}
+	}
 	if cfg.Log != nil {
 		cfg.Log.Info("etcd member ready", "name", cfg.Name, "peer", cfg.PeerURL, "data_dir", cfg.DataDir, "members", len(e.Server.Cluster().Members()))
 	}
@@ -186,8 +200,12 @@ func (n *Node) Close() {
 // Err reports the member's fatal errors, if any.
 func (n *Node) Err() <-chan error { return n.e.Err() }
 
-// MemberAdd adds a member at peerURL and returns the initial-cluster string it must start with.
-// The name is the caller's; etcd learns it when the member starts.
+// MemberAdd adds a member at peerURL as a learner and returns the initial-cluster string it must
+// start with. The name is the caller's; etcd learns it when the member starts. A learner does not
+// vote, so adding it leaves the quorum as it was: added as a voter, a second member would make the
+// first alone short of quorum, unable to answer the new member's own startup checks, and the join
+// would hang on them for seconds or fail ("incompatible with current running cluster"). The member
+// promotes itself once it has caught up (promote).
 func (n *Node) MemberAdd(ctx context.Context, name, peerURL string) (string, error) {
 	for _, m := range n.e.Server.Cluster().Members() {
 		if m.Name == name {
@@ -200,7 +218,7 @@ func (n *Node) MemberAdd(ctx context.Context, name, peerURL string) (string, err
 	var err error
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		resp, err = n.cli.MemberAdd(ctx, []string{peerURL})
+		resp, err = n.cli.MemberAddAsLearner(ctx, []string{peerURL})
 		if err == nil || !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
 			break
 		}
@@ -344,6 +362,40 @@ func Restore(snapshotPath, dataDir, name, peerURL string) error {
 		return fmt.Errorf("restore: %w", err)
 	}
 	return nil
+}
+
+// promote makes this member a voter once it has caught up with the leader, which etcd requires
+// ("can only promote a learner member which is in sync with leader"); a member that votes already
+// is left as it is. The request goes to the leader through this member's own server.
+func (n *Node) promote(ctx context.Context) error {
+	id := n.e.Server.MemberID()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		learner := false
+		for _, m := range n.e.Server.Cluster().Members() {
+			if m.ID == id {
+				learner = m.IsLearner
+			}
+		}
+		if !learner {
+			return nil
+		}
+		_, err := n.cli.MemberPromote(ctx, uint64(id))
+		if err == nil {
+			if n.cfg.Log != nil {
+				n.cfg.Log.Info("etcd member promoted to a voting member", "name", n.cfg.Name)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("etcd: promoting %s to a voting member: %w", n.cfg.Name, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // WaitReady blocks until the member has a leader, or ctx ends: after a restart, before serving.

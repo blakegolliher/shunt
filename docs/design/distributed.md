@@ -146,7 +146,7 @@ membership record beside the leased `/proxies/<id>` key, not the leased key alon
 `shunt-control` exposes etcd's lifecycle as its own subcommands so an operator never sees an etcd flag:
 
 - `shunt-control init --name c1 --peer-url https://c1:2380 --client-url https://c1:2379` starts the first member and creates the internal CA (control-to-control and proxy-to-control TLS are generated at init; k3s is the precedent).
-- `shunt-control join --name c2 --peer-url ... --existing https://c1:9901` calls member-add on the existing cluster, receives the initial-cluster string and certificates, and starts.
+- `shunt-control join --name c2 --peer-url ... --existing https://c1:9901` calls member-add on the existing cluster, receives the initial-cluster string and certificates, and starts. The new member is added as an etcd **learner**, which does not vote, and promotes itself once it has caught up: added as a voter, a second member would leave the first short of quorum, unable to answer the joiner's own startup checks, and the join stalled for seconds or failed ("incompatible with current running cluster", 2026-09-23).
 - `shunt-control member list|remove <name>`; replacing a failed node is `remove` then `join` with the same name.
 - `shunt-control snapshot save <path>` and `shunt-control snapshot restore <path>` (restore is a documented, rehearsed runbook, not a button).
 - `shunt-control defrag` and automatic compaction (retain 24 h of revisions) on a schedule.

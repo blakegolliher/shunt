@@ -209,6 +209,13 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   309,059 operations, 0 errors, holds retried equal to the proxies' 59 + 72. Fixed on the way:
   purge-source reported "deleted the bucket" for a purge of part of a bucket, which keeps it.
   Next: P3 (UI; the CLI landed in P1 and P2).
+- **Fixed (2026-09-23): the control plane's etcd join flake.** A joining control node was added as
+  a voting member before it started, which left the first node short of quorum until the joiner
+  was up; the joiner's own startup checks against it then stalled ~7 s (ReadIndex timeouts, the
+  leader stepping down) and sometimes failed ("incompatible with current running cluster"), which
+  internal/cp's tests hit intermittently. A member now joins as a learner and promotes itself once
+  caught up. Same four multi-node tests ×4: 4m17s with 20 stalls before, 1m31s with none after;
+  the package ×3 under -race green.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
