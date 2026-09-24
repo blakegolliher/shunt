@@ -337,13 +337,13 @@ grep -q 'silent, not waited for: proxy-b' <<<"$OUT" || fail "a step with a silen
 kill -CONT "${PID[b]}"; member_ok proxy-b || fail "B did not catch up after being silent"
 
 say "6. Browser mover operation, cutover and purge through the control plane, with the mover signing with secrets it holds"
-mover=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+mover=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -H "Idempotency-Key: fleet-mover-$$" \
   -d '{"kind":"mover","placement":"default/fleet-a","args":{"until_converged":true,"max_passes":10}}' \
   "http://$C1_API/v1/operations") || fail "the browser mover operation was not accepted"
 mover_id=$(jq -r '.id' <<<"$mover")
 for _ in $(seq 1 600); do
   mover=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations/$mover_id") || fail "the mover operation disappeared"
-  [ "$(jq -r '.status' <<<"$mover")" = running ] || break
+  case "$(jq -r '.status' <<<"$mover")" in pending|running|blocked) ;; *) break ;; esac
   sleep 0.1
 done
 jq -e '.status == "succeeded" and .result.converged == true' <<<"$mover" >/dev/null || { printf '%s\n' "$mover"; fail "the browser mover did not converge"; }
