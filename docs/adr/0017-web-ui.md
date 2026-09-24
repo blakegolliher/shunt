@@ -2,7 +2,7 @@
 
 Status: accepted (UI-6, 2026-09-22). UI-0 through UI-6 are built and their Go, UI-unit, fleet and license gates pass; browser-flow and screenshot acceptance are manual by the operator's explicit choice. Overrides the "a web UI" entry of docs/DESIGN.md §3 (non-goals for v1) on the `distributed` branch. Supersedes item 1 of docs/prompts/P3e.md. Source: docs/prompts/webui.md.
 
-Proposed follow-up: [ADR-0018](0018-distributed-correctness.md) and its
+Proposed follow-up: [ADR-0021](0021-distributed-correctness.md) and its
 [interface contract](../design/distributed-correctness-contracts.md) tighten
 operation outcomes, maintenance evidence, health and draft/event consistency.
 They are not implemented; they retain the manual visual acceptance policy.

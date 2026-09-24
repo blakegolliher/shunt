@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
@@ -41,6 +43,9 @@ type fakeCluster struct {
 	onList    func(token string) // called before a ListObjectsV2 page is served, with its continuation token
 	keys      map[string]bool    // when set, an access key not in it answers 403 InvalidAccessKeyId
 	noCreate  bool               // CreateBucket answers 403 AccessDenied, as VAST does for a key without the permission
+	owned     bool               // CreateBucket of an existing bucket answers 409 BucketAlreadyOwnedByYou, as MinIO does
+	listMu    sync.Mutex
+	listed    []string // the prefix of every ListObjectsV2 and ListMultipartUploads request, in order
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -68,6 +73,11 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 				r.Header.Del("If-Match")
 			}
 		}
+		if q := r.URL.Query(); r.Method == http.MethodGet && (q.Get("list-type") == "2" || q.Has("uploads")) {
+			fc.listMu.Lock()
+			fc.listed = append(fc.listed, q.Get("prefix"))
+			fc.listMu.Unlock()
+		}
 		if q := r.URL.Query(); fc.onList != nil && r.Method == http.MethodGet && q.Get("list-type") == "2" {
 			fc.onList(q.Get("continuation-token"))
 		}
@@ -83,6 +93,13 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
 			return
+		}
+		if fc.owned && r.Method == http.MethodPut && !strings.Contains(strings.Trim(r.URL.Path, "/"), "/") && r.URL.RawQuery == "" {
+			if ok, _ := fc.be.BucketExists(strings.Trim(r.URL.Path, "/")); ok {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`<Error><Code>BucketAlreadyOwnedByYou</Code><Message>yours</Message></Error>`))
+				return
+			}
 		}
 		if code := fc.reject; code != "" {
 			w.WriteHeader(http.StatusForbidden)
@@ -771,7 +788,7 @@ func TestPurgeDiffIgnoresConcurrentDeletes(t *testing.T) {
 		}
 		dst.onList = nil
 	}
-	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20)
+	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -977,6 +994,521 @@ func TestCreateBackendImportsClientKeys(t *testing.T) {
 		if p.ClientKeys != nil {
 			t.Fatalf("%s: a count without a key store: %d", p.Key, *p.ClientKeys)
 		}
+	}
+}
+
+// A client bucket name the tenant already uses is refused before create or adopt touches a
+// backend or imports a key, naming the bucket and pointing at expand. Create refuses a backend
+// bucket that already exists (that is adopt's job), and never deletes a bucket it did not make.
+func TestCreateAndAdoptRefuseATakenClientName(t *testing.T) {
+	rg := newRig(t)
+	rg.vast02.keys = map[string]bool{"AK": true, "CLUSTERKEY": true}
+	sk := &stubKeys{}
+	rg.ctl.Keys = sk
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/create-backend", CreateBackendRequest{Cluster: "vast01"}, nil)
+
+	taken := "default/data01 already exists (ACTIVE on vast01 as data01); choose another client bucket name, or expand data01"
+	conflict := func(path string, body any) {
+		t.Helper()
+		code, raw := rg.call("POST", path, body, nil)
+		var e Error
+		_ = json.Unmarshal([]byte(raw), &e)
+		if code != http.StatusConflict || e.Code != "conflict" || !strings.Contains(e.Message, taken) {
+			t.Fatalf("POST %s: want 409 conflict %q, got HTTP %d %s", path, taken, code, raw)
+		}
+	}
+	conflict("/v1/placements/default/data01/create-backend",
+		CreateBackendRequest{Cluster: "vast02", Name: "data01-b", Keys: []ClientKeyRequest{{AccessKey: "CLUSTERKEY", Secret: "s"}}})
+	if ok, _ := rg.vast02.be.BucketExists("data01-b"); ok || len(sk.stored) != 0 {
+		t.Fatalf("a refused create made a bucket or imported a key: %+v", sk.stored)
+	}
+	if err := rg.vast02.be.CreateBucket("found"); err != nil {
+		t.Fatal(err)
+	}
+	conflict("/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast02", Name: "found"})
+
+	// Create names a bucket that is already there: refused, and the bucket stays.
+	rg.refused("POST", "/v1/placements/default/data02/create-backend", CreateBackendRequest{Cluster: "vast02", Name: "found"},
+		"bucket found already exists on vast02; Adopt takes over a bucket that is already there")
+	if ok, _ := rg.vast02.be.BucketExists("found"); !ok {
+		t.Fatal("create deleted a bucket it did not make")
+	}
+	if _, ok := rg.dir.Snapshot().Lookup("default", "data02"); ok {
+		t.Fatal("a refused create was placed")
+	}
+}
+
+// A move never lands in a bucket that already holds objects: expand refuses it, naming the first
+// key, unless the operator states they are this bucket's; a first step that names its own target
+// is checked the same way. clear-target forgets a target before the first step and leaves its
+// bucket alone, and only then.
+func TestExpandRefusesANonEmptyTargetAndClearsATarget(t *testing.T) {
+	rg := newRig(t)
+	for _, b := range []struct {
+		cl   *fakeCluster
+		name string
+	}{{rg.vast01, "data01"}, {rg.vast02, "old"}, {rg.vast02, "data01-001"}} {
+		if err := b.cl.be.CreateBucket(b.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := rg.vast02.be.PutObject("old", "leftover/k1", nil, strings.NewReader("stale"), 5, nil); err != nil {
+		t.Fatal(err)
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/default/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	rg.refused("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Name: "old"},
+		`bucket old on vast02 already holds objects (the first is "leftover/k1")`)
+	if p, _ := rg.dir.Snapshot().Lookup("default", "data01"); p.Target != "" {
+		t.Fatalf("a refused expand recorded %s", p.Target)
+	}
+	// The same first step without expand is refused alike.
+	rg.refused("POST", "/v1/placements/default/data01/ramp", RampRequest{Ratio: 0.1, To: "vast02", Name: "old"}, "already holds objects")
+
+	// Stated to be this bucket's own objects: accepted.
+	var ex ExpandResult
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02", Name: "old", AcceptObjects: true}, &ex)
+	if ex.Target != "vast02" || ex.Name != "old" {
+		t.Fatalf("expand: %+v", ex)
+	}
+
+	// clear-target forgets it; the bucket and its object stay.
+	var cl ClearTargetResult
+	rg.must("DELETE", "/v1/placements/default/data01/target", nil, &cl)
+	p, _ := rg.dir.Snapshot().Lookup("default", "data01")
+	if cl.Target != "vast02" || cl.Name != "old" || p.Target != "" || p.Names["vast02"] != "" || p.State != directory.StateActive {
+		t.Fatalf("after clear: result %+v, placement %+v", cl, p)
+	}
+	if ok, _ := rg.vast02.be.BucketExists("old"); !ok {
+		t.Fatal("clearing the target deleted its bucket")
+	}
+	rg.refused("DELETE", "/v1/placements/default/data01/target", nil, "has no target to clear")
+
+	// An empty bucket needs no statement; once a step has used the target it can no longer be cleared.
+	rg.must("POST", "/v1/placements/default/data01/expand", ExpandRequest{To: "vast02"}, &ex)
+	rg.must("POST", "/v1/placements/default/data01/ramp", RampRequest{Ratio: 0.1}, nil)
+	rg.refused("DELETE", "/v1/placements/default/data01/target", nil, "is RAMPING, moving to vast02; a target can only be cleared before the first step")
+}
+
+// create-backend with legs makes a bucket spread over one new bucket per cluster (ADR-0018 N2):
+// everything is checked before anything is made, and nothing moves a spread bucket in this build.
+func TestCreateSpreadBucket(t *testing.T) {
+	rg := newRig(t)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+
+	rg.answers("POST", "/v1/placements/default/spd/create-backend", CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01"}}}, http.StatusBadRequest, "invalid")
+	rg.refused("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-one"}, {Cluster: "vast01", Name: "sp-two"}}}, "cluster vast01 is named twice")
+	if err := rg.vast02.be.CreateBucket("sp-b"); err != nil {
+		t.Fatal(err)
+	}
+	rg.refused("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-b"}}}, "bucket sp-b already exists on vast02")
+	if ok, _ := rg.vast01.be.BucketExists("sp-a"); ok {
+		t.Fatal("a refused spread create made a leg's bucket")
+	}
+
+	var ps PlacementStatus
+	rg.must("POST", "/v1/placements/default/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-c"}}}, &ps)
+	if len(ps.Legs) != 2 || ps.Legs[0].Cluster != "vast01" || ps.Legs[1].Bucket != "sp-c" || ps.Primary != "" || ps.State != directory.StateActive {
+		t.Fatalf("created: %+v", ps)
+	}
+	if d := ps.Legs[0].Share + ps.Legs[1].Share; d < 0.999 || d > 1.001 || ps.Legs[0].Share < 0.49 {
+		t.Fatalf("shares: %+v", ps.Legs)
+	}
+	for _, b := range []struct {
+		cl   *fakeCluster
+		name string
+	}{{rg.vast01, "sp-a"}, {rg.vast02, "sp-c"}} {
+		if ok, _ := b.cl.be.BucketExists(b.name); !ok {
+			t.Fatalf("leg bucket %s was not created", b.name)
+		}
+	}
+	code, raw := rg.call("POST", "/v1/placements/default/spd/create-backend", CreateBackendRequest{Cluster: "vast01", Name: "other"}, nil)
+	if code != http.StatusConflict || !strings.Contains(raw, "default/spd already exists (spread over 2 backend buckets)") {
+		t.Fatalf("a taken spread name: HTTP %d %s", code, raw)
+	}
+	rg.refused("POST", "/v1/placements/default/spd/expand", ExpandRequest{To: "vast02", Create: true}, "spread over 2 backend buckets; adding one or moving keys between them is ADR-0018 N3")
+	rg.refused("POST", "/v1/placements/default/spd/ramp", RampRequest{Ratio: 0.5, To: "vast02", Create: true}, "name the range of keys to move")
+	var so StepOut
+	rg.must("GET", "/v1/tenants/default/step-out", nil, &so)
+	if so.Ready || len(so.Buckets) != 1 || len(so.Buckets[0].Problems) != 1 || !strings.Contains(so.Buckets[0].Problems[0], "spread over 2 backend buckets (vast01/sp-a, vast02/sp-c)") {
+		t.Fatalf("step-out of a spread bucket: %+v", so)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if len(st.Placements) != 1 || len(st.Placements[0].Legs) != 2 {
+		t.Fatalf("status: %+v", st.Placements)
+	}
+}
+
+// Half of a plain bucket moves to another cluster through the API (ADR-0018 N3): ramp, migrate,
+// the mover's reports, cutover and purge all act on the move; purge compares and deletes only the
+// moving range and leaves the source bucket, which keeps the other half; finish is refused while the
+// source keeps keys. Moving the other half and purging it deletes the source bucket, and the
+// bucket settles back to one cluster.
+func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	lower := directory.HashRange{From: 0, To: 1<<63 - 1}
+	upper := directory.HashRange{From: 1 << 63, To: directory.FullRange.To}
+	var in, out []string
+	for i := 0; len(in) < 4 || len(out) < 4; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		if migrate.InRangeHash(lower, k) {
+			in = append(in, k)
+		} else {
+			out = append(out, k)
+		}
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 1, To: "vast02", Name: "data01-b", Create: true, Range: &lower}, &tr)
+	if tr.To != directory.StateRamping || tr.Primary != "vast02" || tr.Source != "vast01" || tr.Range == nil || *tr.Range != lower {
+		t.Fatalf("first step of the move: %+v", tr)
+	}
+	// Status shows the move as a migration between its two clusters, and which part moves.
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if ps := st.Placements[0]; ps.Source != "vast01" || ps.Primary != "vast02" || ps.Ratio != 1 || ps.Move == nil ||
+		ps.Move.Share < 0.499 || ps.Move.Share > 0.501 || len(ps.Legs) != 2 || ps.Legs[1].Share != 0 {
+		t.Fatalf("status during the move: %+v move %+v legs %+v", ps, ps.Move, ps.Legs)
+	}
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, &tr)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+
+	// The mover copied the range except one key: purge names it, and counts the range alone.
+	for _, k := range in[1:] {
+		rg.vast02.put(t, "data01-b", k, "v")
+	}
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if dry.Allowed || len(dry.Missing) != 1 || dry.Missing[0] != in[0] || dry.Objects != len(in) {
+		t.Fatalf("dry run with one key of the range missing: %+v", dry)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/finish", nil, "keeps other keys of the bucket")
+	rg.vast02.put(t, "data01-b", in[0], "v")
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Objects != len(in) || dry.Source != "vast01" {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if pg.ObjectsDeleted != len(in) {
+		t.Fatalf("purge deleted %d objects, the range has %d", pg.ObjectsDeleted, len(in))
+	}
+	for _, k := range in {
+		if rg.vast01.has("data01", k) {
+			t.Fatalf("%s of the moved range is still on the source", k)
+		}
+	}
+	for _, k := range out {
+		if !rg.vast01.has("data01", k) {
+			t.Fatalf("%s is outside the range and was purged", k)
+		}
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if !p.Spread() || p.State != directory.StateActive || len(p.Owners) != 2 || p.Owners[0].Leg != "vast02" {
+		t.Fatalf("after the first move: %+v", p)
+	}
+
+	// The other half: the source leg owns nothing afterwards, so purge deletes its bucket.
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{To: "vast02", Range: &upper}, &tr)
+	for _, k := range out {
+		rg.vast02.put(t, "data01-b", k, "v")
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok || !pg.BucketDeleted {
+		t.Fatalf("the source leg owns nothing, but its bucket was kept (bucket_deleted %v)", pg.BucketDeleted)
+	}
+	p, _ = rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.Spread() || p.Primary != "vast02" || p.Names["vast02"] != "data01-b" || len(p.Names) != 1 {
+		t.Fatalf("after moving every key: %+v", p)
+	}
+}
+
+// A bucket moves to a new bucket on its own cluster through the API (ADR-0018 N3b): migrate names
+// the same cluster and another bucket, status keeps the two buckets apart, and purge deletes the
+// old bucket once its leg owns nothing, leaving a plain bucket under the new name.
+func TestMoveToAnotherBucketOnTheSameClusterThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{To: "vast01", Name: "data01-final", Create: true}, &tr)
+	if tr.To != directory.StateMigrating || tr.Primary != "vast01" || tr.Source != "vast01" || tr.CreatedBucket != "data01-final" {
+		t.Fatalf("migrate within vast01: %+v", tr)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if ps := st.Placements[0]; ps.PrimaryBucket != "data01-final" || ps.SourceBucket != "data01" || ps.Names["vast01"] != "data01-final" {
+		t.Fatalf("status of a move within one cluster: %+v", ps)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		rg.vast01.put(t, "data01-final", k, "v") // the mover's work
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast01", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Bucket != "data01" || dry.Objects != 3 {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok || pg.Bucket != "data01" || pg.ObjectsDeleted != 3 {
+		t.Fatalf("purge of the old bucket: %+v, still there %v", pg, ok)
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.Spread() || p.Primary != "vast01" || len(p.Names) != 1 || p.Names["vast01"] != "data01-final" {
+		t.Fatalf("after the move: %+v", p)
+	}
+}
+
+// A spread bucket consolidates into one new bucket through the API (ADR-0018 N3c): each leg's keys
+// move by naming the leg, one move at a time; each purge deletes a source leg's bucket once it owns
+// nothing; the bucket ends plain under the new name, and step-out no longer reports it spread.
+func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	// vast02's conditional-write profile is only assumed: the first step into it measures it, as
+	// expand would, or the mover would refuse the destination.
+	unmeasured := rg.vast02.definition(true)
+	unmeasured.Capabilities = config.Capabilities{}
+	rg.vast02.condPut = true
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: unmeasured}, nil)
+	rg.must("POST", "/v1/placements/acme/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-b"}}}, nil)
+	p, _ := rg.dir.Snapshot().Lookup("acme", "spd")
+	legs := map[string]struct {
+		cl     *fakeCluster
+		bucket string
+	}{"vast01": {rg.vast01, "sp-a"}, "vast02": {rg.vast02, "sp-b"}}
+	keys := map[string][]string{}
+	for i := range 12 {
+		k := fmt.Sprintf("k%02d", i)
+		owner, err := migrate.OwnerOf(p, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[owner] = append(keys[owner], k)
+		legs[owner].cl.put(t, legs[owner].bucket, k, "v")
+	}
+	if len(keys["vast01"]) == 0 || len(keys["vast02"]) == 0 {
+		t.Fatalf("every leg needs keys: %v", keys)
+	}
+	rg.refused("DELETE", "/v1/placements/acme/spd/target", nil, "no idle leg to retire")
+	rg.refused("POST", "/v1/placements/acme/spd/migrate", MigrateRequest{To: "vast02", Name: "sp-final", Leg: "nope"}, "has no leg nope")
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	moveLeg := func(leg string) {
+		t.Helper()
+		var tr TransitionResult
+		rg.must("POST", "/v1/placements/acme/spd/migrate", MigrateRequest{To: "vast02", Name: "sp-final", Create: true, Leg: leg}, &tr)
+		if tr.To != directory.StateMigrating || tr.Range == nil {
+			t.Fatalf("moving leg %s: %+v", leg, tr)
+		}
+		if cl, _ := rg.dir.Snapshot().Cluster("vast02"); cl.Capabilities.ConditionalWrite == nil || !*cl.Capabilities.ConditionalWrite || cl.Capabilities.ConditionalDelete == nil {
+			t.Fatalf("the destination's profile was not measured: %+v", cl.Capabilities)
+		}
+		if err := rg.ctl.checkMover("acme/spd", MoverRequest{}); err != nil && strings.Contains(err.Error(), "conditional-write profile") {
+			t.Fatalf("the mover refuses the move's destination: %v", err)
+		}
+		rg.refused("POST", "/v1/placements/acme/spd/ramp", RampRequest{Ratio: 1, Leg: "other"}, "finish it before moving another leg")
+		for _, k := range keys[leg] {
+			rg.vast02.put(t, "sp-final", k, "v") // the mover's work
+		}
+		rg.must("POST", "/v1/placements/acme/spd/mover-progress", Progress{Source: leg, Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+		rg.must("POST", "/v1/placements/acme/spd/cutover", CutoverRequest{Window: "1s"}, &tr)
+		var dry PurgeDryRun
+		rg.must("POST", "/v1/placements/acme/spd/purge-source", PurgeRequest{DryRun: true}, &dry)
+		if !dry.Allowed || dry.Bucket != legs[leg].bucket || dry.Objects != len(keys[leg]) {
+			t.Fatalf("dry run for leg %s: %+v", leg, dry)
+		}
+		var pg PurgeResult
+		rg.must("POST", "/v1/placements/acme/spd/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+		if ok, _ := legs[leg].cl.be.BucketExists(legs[leg].bucket); ok {
+			t.Fatalf("leg %s owns nothing, but its bucket %s was kept", leg, legs[leg].bucket)
+		}
+	}
+	moveLeg("vast01")
+	p, _ = rg.dir.Snapshot().Lookup("acme", "spd")
+	if !p.Spread() || len(p.Legs) != 2 || p.Legs["vast02-2"].Bucket != "sp-final" {
+		t.Fatalf("after the first leg: %+v", p)
+	}
+	var so StepOut
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	if so.Ready || len(so.Buckets) != 1 || !strings.Contains(strings.Join(so.Buckets[0].Problems, " "), "consolidate it first") {
+		t.Fatalf("step-out of a spread bucket: %+v", so)
+	}
+	moveLeg("vast02")
+	p, _ = rg.dir.Snapshot().Lookup("acme", "spd")
+	if p.Spread() || p.Primary != "vast02" || len(p.Names) != 1 || p.Names["vast02"] != "sp-final" {
+		t.Fatalf("after consolidating: %+v", p)
+	}
+	for _, k := range append(keys["vast01"], keys["vast02"]...) {
+		if !rg.vast02.has("sp-final", k) {
+			t.Fatalf("%s is not in the consolidated bucket", k)
+		}
+	}
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	for _, b := range so.Buckets {
+		if strings.Contains(strings.Join(b.Problems, " "), "spread over") {
+			t.Fatalf("a consolidated bucket is still reported spread: %+v", b)
+		}
+	}
+}
+
+// Prefix rules through the API (ADR-0020 P1): carve gives a prefix a scope of its own without moving
+// anything, status and step-out show it, a move is refused while it exists (P2), and merge gives
+// back the plain bucket.
+func TestCarveAndMergeThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.vast01.put(t, "data01", "archive/a", "v")
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	before, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	plain := *before
+
+	rg.answers("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{}, http.StatusBadRequest, "invalid")
+	var res PrefixResult
+	rg.must("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, &res)
+	if res.Rules != 1 || res.Prefix != "archive/" {
+		t.Fatalf("carve: %+v", res)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, "already has a rule")
+	var st Status
+	rg.must("GET", "/v1/status?bucket=acme/data01", nil, &st)
+	if ps := st.Placements[0]; len(ps.Scopes) != 1 || ps.Scopes[0].Prefix != "archive/" || len(ps.Scopes[0].Legs) != 1 || ps.Scopes[0].Legs[0].Bucket != "data01" || ps.Scopes[0].Legs[0].Share != 1 {
+		t.Fatalf("status of a carved bucket: %+v", st.Placements[0])
+	} else if len(ps.Legs) != 1 || ps.Legs[0].Idle {
+		t.Fatalf("its legs: %+v", ps.Legs)
+	}
+	var so StepOut
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	if len(so.Buckets) != 1 || !strings.Contains(strings.Join(so.Buckets[0].Problems, " "), "merge them (shunt expand data01 --merge <prefix>") {
+		t.Fatalf("step-out of a carved bucket: %+v", so)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5, To: "vast02", Name: "data01-b", Create: true, Scope: "logs/"}, "no prefix rule \"logs/\"; carve it first")
+	if ok, _ := rg.vast02.be.BucketExists("data01-b"); ok {
+		t.Fatal("a refused move made a bucket")
+	}
+	if !rg.vast01.has("data01", "archive/a") {
+		t.Fatal("carving moved data")
+	}
+
+	rg.refused("DELETE", "/v1/placements/acme/data01/prefixes?prefix=logs/", nil, "no rule")
+	rg.must("DELETE", "/v1/placements/acme/data01/prefixes?prefix=archive/", nil, &res)
+	if res.Rules != 0 {
+		t.Fatalf("merge: %+v", res)
+	}
+	after, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if !reflect.DeepEqual(*after, plain) {
+		t.Fatalf("carve then merge did not give back the plain bucket:\n got  %+v\n want %+v", *after, plain)
+	}
+}
+
+// A move of one prefix rule's keys through the API (ADR-0020 P2): archive/ is carved in a plain
+// bucket and moved whole to vast02; the purge compares and deletes archive/'s keys alone, listing
+// only that prefix, and keeps the source bucket, which holds the rest.
+func TestScopedMoveThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	archive := []string{"archive/a", "archive/b", "archive/c"}
+	rest := []string{"data/a", "data/b", "archived"} // "archived" shares the prefix's letters, not the prefix
+	for _, k := range append(slices.Clone(archive), rest...) {
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{Scope: "archive/", To: "vast02", Name: "data01-arch", Create: true}, &tr)
+	if tr.To != directory.StateMigrating || tr.Primary != "vast02" || tr.Source != "vast01" || tr.Range == nil || *tr.Range != directory.FullRange {
+		t.Fatalf("moving archive/: %+v", tr)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?bucket=acme/data01", nil, &st)
+	if m := st.Placements[0].Move; m == nil || m.Scope != "archive/" {
+		t.Fatalf("status of the move: %+v", st.Placements[0])
+	}
+	rg.refused("DELETE", "/v1/placements/acme/data01/prefixes?prefix=archive/", nil, "only at rest")
+	for _, k := range archive {
+		rg.vast02.put(t, "data01-arch", k, "v") // the mover's work
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	rg.refused("POST", "/v1/placements/acme/data01/finish", nil, "keeps other keys of the bucket")
+
+	rg.vast01.listMu.Lock()
+	rg.vast01.listed = nil
+	rg.vast01.listMu.Unlock()
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Objects != len(archive) || dry.Bucket != "data01" || !dry.KeepsBucket {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if pg.ObjectsDeleted != len(archive) || pg.BucketDeleted {
+		t.Fatalf("purge deleted %d objects (archive/ has %d), bucket deleted %v", pg.ObjectsDeleted, len(archive), pg.BucketDeleted)
+	}
+	rg.vast01.listMu.Lock()
+	listed := slices.Clone(rg.vast01.listed)
+	rg.vast01.listMu.Unlock()
+	if len(listed) == 0 || slices.ContainsFunc(listed, func(p string) bool { return p != "archive/" }) {
+		t.Fatalf("purge listed the source under %q; want archive/ only", listed)
+	}
+	for _, k := range archive {
+		if rg.vast01.has("data01", k) {
+			t.Fatalf("%s of the moved prefix is still on the source", k)
+		}
+	}
+	for _, k := range rest {
+		if !rg.vast01.has("data01", k) {
+			t.Fatalf("%s is outside the moved prefix and was purged", k)
+		}
+	}
+	if ok, _ := rg.vast01.be.BucketExists("data01"); !ok {
+		t.Fatal("the source bucket holds the rest of the bucket, but was deleted")
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.State != directory.StateActive || p.Move != nil || len(p.Prefixes) != 1 || p.Prefixes[0].Owners[0].Leg != "vast02" || p.Owners[0].Leg != "vast01" {
+		t.Fatalf("after the move: %+v", p)
 	}
 }
 

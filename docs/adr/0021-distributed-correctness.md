@@ -1,4 +1,4 @@
-# ADR-0018: coherent snapshots, drain barriers and recoverable control operations
+# ADR-0021: coherent snapshots, drain barriers and recoverable control operations
 
 Status: **proposed, implementation not started** (2026-09-24).
 

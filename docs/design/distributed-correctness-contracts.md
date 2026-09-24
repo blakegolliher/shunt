@@ -1,7 +1,7 @@
 # Distributed correctness: API, CLI and GUI contracts
 
 **Proposed interface specification, not the shipped API.** Part of
-[ADR-0018](../adr/0018-distributed-correctness.md). Read the
+[ADR-0021](../adr/0021-distributed-correctness.md). Read the
 [protocol design](distributed-correctness.md) for safety predicates and the
 [delivery plan](../prompts/distributed-hardening.md) for tests. Names below are
 implementation targets; changes require updating this contract and its parity

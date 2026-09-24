@@ -146,6 +146,35 @@ func (f *File) Adopt(tenant, bucket, cluster, backend string, now time.Time) err
 	return nil
 }
 
+// CreateSpread writes an ACTIVE placement spread over legs, one per cluster, owning equal ranges of
+// the key hash space in the order given (ADR-0018 N2). Each leg is named after its cluster. A new
+// tenant gets the first leg's cluster as its default.
+func (f *File) CreateSpread(tenant, bucket string, legs []Leg, now time.Time) error {
+	k := Key(tenant, bucket)
+	if _, ok := f.Placements[k]; ok {
+		return ErrExists
+	}
+	if len(legs) < 2 || len(legs) > MaxLegs {
+		return fmt.Errorf("%w: a spread bucket has 2 to %d legs, not %d", ErrConflict, MaxLegs, len(legs))
+	}
+	byID := make(map[string]Leg, len(legs))
+	ids := make([]string, 0, len(legs))
+	for _, l := range legs {
+		if _, dup := byID[l.Cluster]; dup {
+			return fmt.Errorf("%w: cluster %s is named twice; a new bucket spreads over different clusters, since splitting one cluster's keys over two of its buckets gains nothing", ErrConflict, l.Cluster)
+		}
+		byID[l.Cluster] = l
+		ids = append(ids, l.Cluster)
+	}
+	f.ensureMaps()
+	if _, ok := f.Tenants[tenant]; !ok {
+		f.Tenants[tenant] = Tenant{DefaultCluster: legs[0].Cluster}
+	}
+	f.Placements[k] = Placement{State: StateActive, Legs: byID, Owners: EvenOwners(ids), KeyHash: RampHash,
+		Created: now.UTC().Truncate(time.Millisecond)}
+	return nil
+}
+
 // SetTarget records the cluster and backend bucket an ACTIVE placement will move to (shunt expand).
 func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 	k := Key(tenant, bucket)
@@ -156,6 +185,9 @@ func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 	if p.State != StateActive {
 		return fmt.Errorf("%w: %s is %s; expand prepares an ACTIVE placement", ErrConflict, k, p.State)
 	}
+	if p.Spread() {
+		return fmt.Errorf("%w: %s is spread over %d legs; expanding it is ADR-0018 N3", ErrConflict, k, len(p.Legs))
+	}
 	if p.Target != "" && p.Target != cluster {
 		return fmt.Errorf("%w: %s is already expanded to %s", ErrConflict, k, p.Target)
 	}
@@ -165,6 +197,44 @@ func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 		np.Names = map[string]string{}
 	}
 	np.Names[cluster] = backend
+	f.Placements[k] = np
+	return nil
+}
+
+// ClearTarget forgets the cluster `shunt expand` prepared, while no step has used it: the placement
+// stays ACTIVE where it is. For a spread bucket it retires the legs that own nothing. The backend
+// bucket is left as it is; shunt may not have created it.
+func (f *File) ClearTarget(tenant, bucket string) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return ErrNotFound
+	}
+	if p.State != StateActive {
+		return fmt.Errorf("%w: %s is %s; a target can only be cleared before the first step", ErrConflict, k, p.State)
+	}
+	if p.Spread() {
+		// A spread bucket's prepared destinations are its legs that own nothing (a move released
+		// before it routed anything leaves one): retiring them is directory-only (ADR-0018 N3c).
+		idle := IdleLegs(p)
+		if len(idle) == 0 {
+			return fmt.Errorf("%w: every leg of %s owns keys; there is no idle leg to retire", ErrConflict, k)
+		}
+		np := p.clone()
+		for _, id := range idle {
+			delete(np.Legs, id)
+		}
+		f.Placements[k] = settle(np)
+		return nil
+	}
+	if p.Target == "" {
+		return fmt.Errorf("%w: %s has no target to clear", ErrConflict, k)
+	}
+	np := p.clone()
+	if np.Target != np.Cold {
+		delete(np.Names, np.Target)
+	}
+	np.Target = ""
 	f.Placements[k] = np
 	return nil
 }

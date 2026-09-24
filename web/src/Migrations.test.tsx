@@ -86,3 +86,58 @@ test('reaches purge before cutover and renders the API refusal verbatim', async 
   expect((await screen.findAllByText(reason)).length).toBeGreaterThanOrEqual(1)
   expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled()
 })
+
+// Every live event reloads the view. The slider is the operator's draft: a reload must not move it,
+// and once MIGRATING it stands at 100%, where every write goes (the ramp is gone then, not zero).
+test('the ramp slider keeps its setting across live reloads', async () => {
+  const view: PlacementView = { ...expandedView(), state: 'RAMPING', primary: 'target', source: 'source', target: undefined, ratio: 0.01 }
+  let seq = 0
+  let views = 0
+  migrationMock(view, (url) => {
+    if (url.endsWith('/v1/events')) { seq++; return new Response(`id: ${seq}\nevent: telemetry\ndata: {}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } }) }
+    if (url.endsWith('/placements/default/data/view')) { views++; return Response.json(view) }
+  })
+  await openMigrations()
+  const reloads = async () => { const from = views; await waitFor(() => expect(views).toBeGreaterThan(from + 1), { timeout: 3000 }) }
+
+  fireEvent.change(screen.getByLabelText('Traffic ratio'), { target: { value: '0.5' } })
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 50% to target/)).toHaveTextContent('(applied 1%)')
+
+  view.ratio = 0.5 // the step applied: the slider follows the server once
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 50% to target/)).toHaveTextContent('(applied 50%)')
+
+  view.state = 'MIGRATING'
+  view.ratio = undefined
+  await reloads()
+  expect(screen.getByText(/Traffic ratio: 100% to target/)).toHaveTextContent('(applied 100%)')
+  expect(screen.getByRole('button', { name: 'Apply ramp' })).toBeDisabled()
+})
+
+// The first step of an expanded bucket can move part of it: a leading share of the key space
+// (ADR-0018 N3); during a move the screen says which part moves.
+test('starts a move of part of the bucket and shows which part moves', async () => {
+  const view = expandedView()
+  let args: unknown
+  migrationMock(view, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      args = (JSON.parse(String(init.body)) as { args: unknown }).args
+      return Response.json({ id: 'op-ramp', kind: 'ramp', placement: view.key, actor: 'token:123', status: 'succeeded', phase: 'done', version: 5 })
+    }
+  })
+  await openMigrations()
+  fireEvent.click(screen.getByLabelText('Part of the bucket'))
+  fireEvent.change(screen.getByLabelText('Share of keys to move'), { target: { value: '0.25' } })
+  fireEvent.click(screen.getByRole('button', { name: '50%' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Apply ramp' }))
+  await waitFor(() => expect(args).toEqual({ ratio: 0.5, prefixes: [], wait: '30s', range: { from: '0000000000000000', to: '3fffffffffffffff' } }))
+  vi.restoreAllMocks()
+
+  const moving: PlacementView = { ...expandedView(), state: 'RAMPING', primary: 'target', source: 'source', target: undefined, ratio: 0.5,
+    move: { from: 'source', to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, share: 0.25 } }
+  migrationMock(moving)
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Migrations' }))
+  expect(await screen.findByText(/of the bucket's keys, leg source → leg target/)).toHaveTextContent('Moving 25% of the bucket')
+})

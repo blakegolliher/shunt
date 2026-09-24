@@ -442,3 +442,120 @@ func (k *stubKeys) Remove(ak string) error {
 	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
 	return nil
 }
+
+func TestParseRange(t *testing.T) {
+	rg, err := parseRange("0000000000000000-7fffffffffffffff")
+	if err != nil || rg == nil || rg.From != 0 || rg.To != 1<<63-1 {
+		t.Fatalf("a valid range: %+v %v", rg, err)
+	}
+	if rg, err := parseRange(""); rg != nil || err != nil {
+		t.Fatalf("no range: %+v %v", rg, err)
+	}
+	for _, bad := range []string{"0-7f", "7fffffffffffffff-0000000000000000", "0000000000000000", "zzzzzzzzzzzzzzzz-ffffffffffffffff"} {
+		if _, err := parseRange(bad); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
+	}
+}
+
+// A spread bucket through the CLI (ADR-0018 N4): adopt --create --spread makes it, status --all
+// lists its legs with their shares and ranges, and a move started by leg shows on both legs.
+func TestSpreadBucketThroughTheCLI(t *testing.T) {
+	rg := newAPIRig(t)
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.addCluster(t, "vast02", rg.ep02)
+	if out, err := rg.cli(t, "adopt", "vast01", "acme/wide", "--spread", ":x"); err == nil || !strings.Contains(out, "want <cluster>[:<bucket name>]") {
+		t.Fatalf("a --spread without a cluster: %v %s", err, out)
+	}
+	out := rg.must(t, "adopt", "vast01", "acme/wide", "--spread", "vast02:wide-b")
+	if !strings.Contains(out, "acme/wide: ACTIVE, spread over vast01/wide (50%), vast02/wide-b (50%)") {
+		t.Fatalf("adopt --spread: %s", out)
+	}
+	for _, b := range []struct {
+		be   *s3mem.Backend
+		name string
+	}{{rg.vast01, "wide"}, {rg.vast02, "wide-b"}} {
+		if ok, _ := b.be.BucketExists(b.name); !ok {
+			t.Fatalf("leg bucket %s was not created", b.name)
+		}
+	}
+	if out := rg.must(t, "status"); strings.Contains(out, "is spread over") || !strings.Contains(out, "no bucket is moving (--all lists every bucket)") {
+		t.Fatalf("status without --all lists a spread bucket at rest: %s", out)
+	}
+	out = rg.must(t, "status", "--all")
+	for _, want := range []string{"spread over 2", "acme/wide is spread over 2 backend buckets:", "vast01  vast01   wide    50.0%  0000000000000000-7ffffffffffffffe",
+		"vast02  vast02   wide-b  50.0%  7fffffffffffffff-ffffffffffffffff"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status --all lacks %q:\n%s", want, out)
+		}
+	}
+	rg.must(t, "ramp", "acme/wide", "--leg", "vast02", "--to", "vast01", "--name", "wide", "--ratio", "0.5")
+	out = rg.must(t, "status", "acme/wide")
+	for _, want := range []string{"vast01/wide", "vast02/wide-b", "in from vast02: 7fffffffffffffff-ffffffffffffffff (50.0% of keys)", "out to vast01: 7fffffffffffffff-ffffffffffffffff"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status during the move lacks %q:\n%s", want, out)
+		}
+	}
+	if out := rg.must(t, "adopt", "vast02", "acme/fresh", "--create"); !strings.Contains(out, "acme/fresh: ACTIVE on vast02/fresh") {
+		t.Fatalf("adopt --create: %s", out)
+	}
+	if ok, _ := rg.vast02.BucketExists("fresh"); !ok {
+		t.Fatal("adopt --create made no bucket")
+	}
+}
+
+// Prefix rules through the CLI (ADR-0020 P1): expand --carve and --merge, and status's scope rows.
+func TestCarveAndMergeThroughTheCLI(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.must(t, "adopt", "vast01", "acme/data01")
+	if out, err := rg.cli(t, "expand", "acme/data01", "--carve", "a/", "--merge", "a/"); err == nil || !strings.Contains(out, "not both") {
+		t.Fatalf("both flags: %v %s", err, out)
+	}
+	if out := rg.must(t, "expand", "acme/data01", "--carve", "archive/"); !strings.Contains(out, `acme/data01: prefix "archive/" carved: its keys have a scope of their own, owned as before; 1 prefix rules`) {
+		t.Fatalf("carve: %s", out)
+	}
+	out := rg.must(t, "status", "--all")
+	for _, want := range []string{"SCOPE", "(other keys)  vast01  vast01   data01  100.0%", "archive/      vast01  vast01   data01  100.0%"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status lacks %q:\n%s", want, out)
+		}
+	}
+	if out, err := rg.cli(t, "expand", "acme/data01", "--carve", "archive/"); err == nil || !strings.Contains(out, "already has a rule") {
+		t.Fatalf("a second carve: %v %s", err, out)
+	}
+	if out := rg.must(t, "expand", "acme/data01", "--merge", "archive/"); !strings.Contains(out, "merged back into its parent scope; 0 prefix rules") {
+		t.Fatalf("merge: %s", out)
+	}
+	if out := rg.must(t, "status", "--all"); strings.Contains(out, "spread over") || !strings.Contains(out, "vast01/data01") {
+		t.Fatalf("status after merging: %s", out)
+	}
+	if out := rg.must(t, "expand", "acme/data01", "--carve", "archive/"); !strings.Contains(out, "carved") {
+		t.Fatalf("carve again: %s", out)
+	}
+	// A move of the rule's keys (P2): the whole scope, which one leg owns, to vast02.
+	rg.addCluster(t, "vast02", rg.ep02)
+	out = rg.must(t, "ramp", "acme/data01", "--scope", "archive/", "--to", "vast02", "--name", "data01-arch", "--create", "--ratio", "0.5")
+	if !strings.Contains(out, `only keys under "archive/" (no longer prefix rule claims them) whose hash is in 0000000000000000-ffffffffffffffff move`) {
+		t.Fatalf("ramp --scope: %s", out)
+	}
+	out = rg.must(t, "status", "acme/data01")
+	row := func(prefix, want string) bool {
+		for _, l := range strings.Split(out, "\n") {
+			if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, prefix+" vast01 ") {
+				return strings.Contains(f, want)
+			}
+		}
+		return false
+	}
+	if !row("archive/", "data01 100.0% 0000000000000000-ffffffffffffffff out to vast02: 0000000000000000-ffffffffffffffff (100.0% of its keys)") ||
+		!row("(other keys)", "data01 100.0% 0000000000000000-ffffffffffffffff -") {
+		t.Fatalf("status during the scoped move:\n%s", out)
+	}
+	if out, err := rg.cli(t, "expand", "acme/data01", "--merge", "archive/"); err == nil || !strings.Contains(out, "only at rest") {
+		t.Fatalf("merge during the move: %v %s", err, out)
+	}
+}

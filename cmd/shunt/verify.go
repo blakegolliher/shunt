@@ -92,6 +92,7 @@ func newVerify() *cobra.Command {
 	f.Int64Var(&o.Seed, "seed", 0, "workload seed (default: from the clock; always reported)")
 	f.DurationVar(&o.Interval, "interval", 10*time.Second, "progress line interval; 0 for none")
 	f.BoolVar(&o.Cleanup, "cleanup", false, "delete the keys still present when the run ends")
+	f.BoolVar(&o.NoRetry, "no-retry", false, "count every 503 as an error; by default a 503 with Retry-After is retried with backoff, as every S3 SDK does")
 	f.StringVar(&jsonOut, "json-out", "", "also write the report as JSON to this file")
 	f.StringVar(&telemetryURL, "telemetry-url", "", "control-node base URL whose fleet client_total p99 must match this client")
 	f.StringVar(&telemetryTokenRef, "telemetry-token-ref", "", "env:NAME or file:/path holding the control API bearer token")
@@ -105,6 +106,9 @@ func printVerify(cmd *cobra.Command, rep verify.Report) {
 	_, _ = fmt.Fprintf(out, "  %d operations in %.0fs: %d PUT, %d GET, %d DELETE\n", rep.Ops, rep.Seconds, rep.Puts, rep.Gets, rep.Deletes)
 	_, _ = fmt.Fprintf(out, "  keys present at the end: %d, %d read back after the workload stopped\n", rep.Present, rep.ReadBack)
 	_, _ = fmt.Fprintf(out, "  errors: %d\n", rep.Errors)
+	if rep.Retried > 0 {
+		_, _ = fmt.Fprintf(out, "  503s retried as an S3 SDK would (Retry-After, held ramp steps): %d\n", rep.Retried)
+	}
 	_, _ = fmt.Fprintf(out, "  client latency: p50 %d us, p99 %d us\n", rep.LatencyP50US, rep.LatencyP99US)
 	for _, s := range rep.ErrorSamples {
 		_, _ = fmt.Fprintf(out, "    %s\n", s)

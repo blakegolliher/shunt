@@ -1,0 +1,92 @@
+# mixed.yaml's directory written in placement schema v2 (ADR-0018): it must load to the same placements.
+# Some leg ids differ from their cluster names, as a v2 writer may choose.
+version: 7
+clusters:
+  vast-a:
+    type: vast
+    scheme: https
+    endpoints: ["10.1.0.11:443", "10.1.0.12:443"]
+    tls: { ca: /etc/shunt/vast-a.pem }
+    region: us-east-1
+    credentials: { access_key: AKIAVASTA, secret_ref: env:VAST_A_SECRET }
+    storage_classes: emulated
+  vast-fab:
+    type: vast
+    scheme: http
+    endpoints: ["10.9.0.11:80"]
+    region: us-east-1
+    credentials: { access_key: AKIAVASTFAB, secret_ref: env:VAST_FAB_SECRET }
+    capabilities: { enforces_sha256: false, unsigned_trailer: true }
+  minio-1:
+    type: minio
+    scheme: https
+    endpoints: ["minio-1.lab:9000"]
+    tls: { ca: /etc/shunt/minio.pem }
+    region: us-east-1
+    credentials: { access_key: minioadmin, secret_ref: file:/etc/shunt/minio.secret }
+  aws-use1:
+    type: aws
+    scheme: https
+    endpoint_mode: dns
+    endpoint: s3.us-east-1.amazonaws.com
+    region: us-east-1
+    credentials: { access_key: AKIAAWS, secret_ref: env:AWS_SECRET }
+    storage_classes: native
+  vast-cold:
+    type: vast
+    scheme: https
+    endpoints: ["10.2.0.11:443"]
+    region: us-east-1
+    credentials: { access_key: AKIACOLD, secret_ref: env:VAST_COLD_SECRET }
+    storage_class: GLACIER_IR
+    access: instant
+  vault:
+    type: vast
+    scheme: https
+    endpoints: ["10.3.0.11:443"]
+    region: us-east-1
+    credentials: { access_key: AKIAVAULT, secret_ref: env:VAULT_SECRET }
+    storage_class: DEEP_ARCHIVE
+    access: restore-required
+tenants:
+  acme: { default_cluster: vast-a }
+  zed:  { default_cluster: minio-1 }
+placements:
+  acme/training-sets:
+    state: ACTIVE
+    legs: { vast-a: { cluster: vast-a, bucket: training-sets } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: vast-a } ]
+    created: 2026-09-15T18:00:00Z
+  acme/checkpoints:
+    state: RAMPING
+    legs: { vast-a: { cluster: vast-a, bucket: checkpoints }, vast-fab: { cluster: vast-fab, bucket: checkpoints } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: vast-a } ]
+    move: { range: { from: "0000000000000000", to: ffffffffffffffff }, from: vast-a, to: vast-fab, ramp: { hash: fnv1a-fmix64-v1, ratio: 0.05 } }
+  acme/runs:
+    state: RAMPING
+    legs: { onprem: { cluster: vast-a, bucket: runs }, cloud: { cluster: aws-use1, bucket: acme-7f3a-runs } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: onprem } ]
+    move: { range: { from: "0000000000000000", to: ffffffffffffffff }, from: onprem, to: cloud, ramp: { hash: fnv1a-fmix64-v1, prefixes: ["2026-09/"] } }
+  zed/data:
+    state: MIGRATING
+    legs: { aws-use1: { cluster: aws-use1, bucket: zed-91c0-data }, minio-1: { cluster: minio-1, bucket: data } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: aws-use1 } ]
+    move: { range: { from: "0000000000000000", to: ffffffffffffffff }, from: aws-use1, to: minio-1 }
+  zed/done:
+    state: CUTOVER
+    legs: { vast-a: { cluster: vast-a, bucket: done }, minio-1: { cluster: minio-1, bucket: done } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: vast-a } ]
+    move: { range: { from: "0000000000000000", to: ffffffffffffffff }, from: vast-a, to: minio-1 }
+  acme/archive:
+    state: ACTIVE
+    legs: { hot: { cluster: vast-a, bucket: archive }, frozen: { cluster: vault, bucket: archive } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: hot } ]
+    cold: frozen
+    tier: emulated
+    lifecycle: "<LifecycleConfiguration/>"
+  zed/logs:
+    state: ACTIVE
+    legs: { aws-use1: { cluster: aws-use1, bucket: zed-91c0-logs } }
+    owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: aws-use1 } ]
+    hash: fnv1a-fmix64-v1
+    tier: native

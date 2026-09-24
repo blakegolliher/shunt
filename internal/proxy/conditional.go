@@ -52,7 +52,7 @@ func hasWritePrecondition(h http.Header) bool {
 //
 // A check that cannot be made fails closed with 503: guessing either way breaks the promise.
 func (h *Handler) conditionalWrite(ctx context.Context, r *http.Request, o *outcome, info s3.RequestInfo, p *directory.Placement,
-	clusters *upstream.Set, cl *upstream.Cluster, backend string, class migrate.OpClass,
+	clusters *upstream.Set, role string, cl *upstream.Cluster, backend string, class migrate.OpClass,
 ) (condAction, s3.Code, string) {
 	if class != migrate.ClassWrite || !hasWritePrecondition(r.Header) {
 		return condAction{}, "", ""
@@ -65,12 +65,12 @@ func (h *Handler) conditionalWrite(ctx context.Context, r *http.Request, o *outc
 	var other *upstream.Cluster
 	otherBackend := ""
 	if p.State == directory.StateRamping || p.State == directory.StateMigrating {
-		otherName := p.Source
-		if cl.Name == p.Source {
-			otherName = p.Primary
+		otherRole := p.Source
+		if role == p.Source {
+			otherRole = p.Primary
 		}
-		if oc, ok := clusters.Get(otherName); ok && otherName != cl.Name && p.Names[otherName] != "" {
-			other, otherBackend = oc, p.Names[otherName]
+		if oc, ok := clusters.Get(p.ClusterOf(otherRole)); ok && otherRole != role && p.Names[otherRole] != "" {
+			other, otherBackend = oc, p.Names[otherRole]
 		}
 	}
 	// Nothing to add when the bucket sits on one cluster that judges the condition itself.
@@ -85,7 +85,7 @@ func (h *Handler) conditionalWrite(ctx context.Context, r *http.Request, o *outc
 		if err != nil {
 			if h.Log != nil {
 				h.Log.Warn("a conditional write could not be checked against the migration's other cluster; refusing rather than answering it on one side (ADR-0013)",
-					"request_id", o.rid, "bucket", p.Names[cl.Name], "other", other.Name, "err", err.Error())
+					"request_id", o.rid, "bucket", backend, "other", other.Name, "err", err.Error())
 			}
 			return condAction{}, s3.ServiceUnavailable, condUnavailable
 		}

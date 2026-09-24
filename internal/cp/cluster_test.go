@@ -94,6 +94,13 @@ func TestClusterFormsJoinsAndReports(t *testing.T) {
 	if len(st.Members) != 3 || st.Started != 3 || st.Quorum != 2 || !st.HasQuorum || st.Leader == "" {
 		t.Fatalf("status: %+v", st)
 	}
+	// A member joins as a learner, so its join leaves the quorum as it was, and promotes itself
+	// once it has caught up: every member of a formed cluster votes.
+	for _, m := range st.Members {
+		if m.Learner {
+			t.Errorf("%s is still a learner after its join", m.Name)
+		}
+	}
 	for _, nd := range tc.nodes[1:] {
 		if s2, err := nd.Status(ctx); err != nil || s2.Leader != st.Leader {
 			t.Errorf("%s sees leader %q, want %q (%v)", nd.Name(), s2.Leader, st.Leader, err)

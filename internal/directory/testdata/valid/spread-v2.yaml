@@ -1,0 +1,12 @@
+# A bucket spread over two legs (ADR-0018 N2): garage owns the lower half of the key hash space, minio the upper.
+version: 3
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/spread:
+    state: ACTIVE
+    hash: fnv1a-fmix64-v1
+    legs: { garage: { cluster: garage, bucket: spread-g }, minio: { cluster: minio, bucket: spread-m } }
+    owners:
+      - { from: "0000000000000000", to: "7fffffffffffffff", leg: garage }
+      - { from: "8000000000000000", to: ffffffffffffffff, leg: minio }
+  acme/plain: { state: ACTIVE, primary: garage, names: { garage: plain } }

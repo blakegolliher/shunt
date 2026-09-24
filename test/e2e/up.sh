@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up Garage and MinIO, wait until both answer their health endpoints, and apply Garage's
+# Bring up Garage and two MinIOs, wait until all answer their health endpoints, and apply Garage's
 # single-node layout (a fresh Garage refuses S3 calls until a layout is applied).
 # Usage: COMPOSE="docker compose" test/e2e/up.sh
 set -euo pipefail
@@ -9,9 +9,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMEOUT="${TIMEOUT:-120}"
 GARAGE_ADMIN="http://127.0.0.1:3903"
 MINIO_HEALTH="http://127.0.0.1:9000/minio/health/live"
+MINIO2_HEALTH="http://127.0.0.1:9100/minio/health/live"
 
 cd "$DIR"
-mkdir -p data/garage/meta data/garage/data data/minio
+mkdir -p data/garage/meta data/garage/data data/minio data/minio2
 $COMPOSE up -d
 
 wait_for() { # name url [curl args...]  — waits for HTTP 200
@@ -39,6 +40,7 @@ wait_for_any() { # name url — waits for any HTTP status (the port answers)
 }
 
 wait_for minio "$MINIO_HEALTH"
+wait_for minio2 "$MINIO2_HEALTH"
 
 # Garage 2.x: /health returns 503 until a layout is applied, so wait for the admin port to answer,
 # apply the single-node layout, then wait for /health to go 200. (1.x returned 200 with no layout.)
@@ -88,7 +90,7 @@ cred() { # cred <tenant> <access_key|secret>
   awk -v t="$1" -v f="$2" '/access_key:/ {ak=$3} /^ +secret:/ {sk=$2} /tenant:/ { if ($2 == t) { print (f == "access_key" ? ak : sk); exit } }' data/credentials.yaml
 }
 {
-  printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\n' "$ak" "$sk"
+  printf 'export GARAGE_ACCESS_KEY=%s\nexport GARAGE_SECRET=%s\nexport MINIO_ACCESS_KEY=minioadmin\nexport MINIO_SECRET=minioadmin\nexport MINIO2_ENDPOINT=127.0.0.1:9100\n' "$ak" "$sk"
   printf 'export SHUNT_ACCESS_KEY=%s\nexport SHUNT_SECRET=%s\n' "$(cred e2e access_key)" "$(cred e2e secret)"
   printf 'export SHUNT_A_ACCESS_KEY=%s\nexport SHUNT_A_SECRET=%s\n' "$(cred e2e-a access_key)" "$(cred e2e-a secret)"
   printf 'export SHUNT_B_ACCESS_KEY=%s\nexport SHUNT_B_SECRET=%s\n' "$(cred e2e-b access_key)" "$(cred e2e-b secret)"
@@ -104,5 +106,6 @@ echo "e2e-up: resign configs and their directories (clusters included) written t
 # S3-level readiness: any HTTP status from an unsigned GET / counts (403 is fine, refused is not).
 wait_for_any garage-s3 "http://127.0.0.1:3900/"
 wait_for_any minio-s3  "http://127.0.0.1:9000/"
+wait_for_any minio2-s3 "http://127.0.0.1:9100/"
 
-echo "e2e-up: ready — garage s3 127.0.0.1:3900 (region garage), minio 127.0.0.1:9000 (minioadmin/minioadmin)"
+echo "e2e-up: ready — garage s3 127.0.0.1:3900 (region garage), minio 127.0.0.1:9000 and minio2 127.0.0.1:9100 (minioadmin/minioadmin)"

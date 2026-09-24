@@ -5,7 +5,7 @@ Status: **design only; every implementation slice below is pending**.
 `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`.
 
 Read `CLAUDE.md`, [DESIGN](../DESIGN.md), [CONTEXT](../CONTEXT.md),
-[STATUS](../STATUS.md), [ADR-0018](../adr/0018-distributed-correctness.md), the
+[STATUS](../STATUS.md), [ADR-0021](../adr/0021-distributed-correctness.md), the
 [protocol specification](../design/distributed-correctness.md), and the
 [interface contract](../design/distributed-correctness-contracts.md).
 

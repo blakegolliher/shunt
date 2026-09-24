@@ -164,6 +164,9 @@ func InRange(r *directory.Ramp, key string) (bool, error) {
 	if r == nil {
 		return false, nil
 	}
+	if r.Range != nil {
+		return inRangeOf(r, key)
+	}
 	for _, p := range r.Prefixes {
 		if strings.HasPrefix(key, p) {
 			return true, nil
@@ -181,13 +184,106 @@ func InRange(r *directory.Ramp, key string) (bool, error) {
 	return rampHash(key) < uint64(r.Ratio*float64(math.MaxUint64)), nil
 }
 
+// inRangeOf is InRange for a ramp limited to a hash range (ADR-0018 N3): a key outside the range
+// is never moved; inside it, a prefix moves it, and the ratio is a share of the range, counted from
+// its start. The range always needs the hash, so a ramp naming another one is always refused.
+func inRangeOf(r *directory.Ramp, key string) (bool, error) {
+	if r.Hash != directory.RampHash {
+		return false, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, r.Hash, directory.RampHash)
+	}
+	h := rampHash(key)
+	from, to := uint64(r.Range.From), uint64(r.Range.To)
+	if h < from || h > to {
+		return false, nil
+	}
+	for _, p := range r.Prefixes {
+		if strings.HasPrefix(key, p) {
+			return true, nil
+		}
+	}
+	switch {
+	case r.Ratio <= 0:
+		return false, nil
+	case r.Ratio >= 1:
+		return true, nil
+	}
+	return float64(h-from) < r.Ratio*(float64(to-from)+1), nil
+}
+
+// InRangeHash reports whether key's hash falls in rg, by the hash the placement names.
+func InRangeHash(rg directory.HashRange, key string) bool {
+	h := directory.Hash(rampHash(key))
+	return h >= rg.From && h <= rg.To
+}
+
 // InHold reports whether a key falls inside the ramp's held step (directory.Ramp.Hold), split by
 // the same hash. A key already in the ramp is in force, not held; callers ask InRange first.
 func InHold(r *directory.Ramp, key string) (bool, error) {
 	if r == nil || r.Hold == nil {
 		return false, nil
 	}
-	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes}, key)
+	return InRange(&directory.Ramp{Hash: r.Hash, Ratio: r.Hold.Ratio, Prefixes: r.Hold.Prefixes, Range: r.Range}, key)
+}
+
+// OwnerOf returns the id of the leg that owns key in a placement spread over legs (ADR-0018 N2):
+// in the table of the key's scope (the longest prefix rule it starts with, ADR-0020), the leg
+// whose hash range holds the key's hash, by the placement's own hash. A placement naming a hash
+// this build does not implement is refused with ErrUnknownRampHash, never split differently.
+func OwnerOf(p *directory.Placement, key string) (string, error) {
+	if p.KeyHash != directory.RampHash {
+		return "", fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
+	}
+	h := directory.Hash(rampHash(key))
+	_, owners := p.Scope(key)
+	leg := directory.OwnerIn(owners, h)
+	if leg == "" {
+		return "", fmt.Errorf("owners do not cover hash %016x", uint64(h)) // validation makes this unreachable
+	}
+	return leg, nil
+}
+
+// InMove reports whether key is one the placement's move is taking to another leg: in the move's
+// scope and hash range. It is the one test of move membership: the proxy's narrowing, the listing
+// merge, the mover and purge all ask it (ADR-0020), so a key has the same two homes everywhere.
+func InMove(p *directory.Placement, key string) bool {
+	m := p.Move
+	if m == nil || !InRangeHash(m.Range, key) {
+		return false
+	}
+	scope, _ := p.Scope(key)
+	return scope == m.Scope
+}
+
+// Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the key,
+// a plain one-cluster placement that every per-object path routes as it always has; or, for a key
+// in the range a move is taking to another leg, the move's two-cluster migration (MoveView), which
+// every per-object migration path routes as it always has. At rest a leg is the only home of its
+// keys, so there is no fallback and nothing to merge.
+func Narrow(p *directory.Placement, key string) (directory.Placement, error) {
+	if m := p.Move; m != nil {
+		if p.KeyHash != directory.RampHash {
+			return directory.Placement{}, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
+		}
+		if InMove(p, key) {
+			// A key in the moving range: the move is the two-cluster migration it is (ADR-0018 N3).
+			return p.MoveView(), nil
+		}
+	}
+	id, err := OwnerOf(p, key)
+	if err != nil {
+		return directory.Placement{}, err
+	}
+	return onLeg(p, id), nil
+}
+
+// FirstLeg is a spread placement narrowed to the leg owning the start of the key space: where a
+// bucket-level request that every leg answers alike (HeadBucket, GetBucketLocation) goes.
+func FirstLeg(p *directory.Placement) directory.Placement { return onLeg(p, p.Owners[0].Leg) }
+
+func onLeg(p *directory.Placement, id string) directory.Placement {
+	l := p.Legs[id]
+	return directory.Placement{State: directory.StateActive, Primary: l.Cluster, Names: map[string]string{l.Cluster: l.Bucket},
+		Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
 }
 
 // rampHash is directory.RampHash, fnv1a-fmix64-v1. Its values are pinned by a test: changing them

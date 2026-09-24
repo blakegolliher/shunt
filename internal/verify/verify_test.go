@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,24 @@ func TestCleanRunHasNoErrors(t *testing.T) {
 }
 
 // A backend that acknowledges writes it did not keep is caught by the model.
+// Keys left under the prefix by an earlier run are reported as such, at once, not as deletes that
+// came back after the grace.
+func TestStaleKeysUnderThePrefix(t *testing.T) {
+	c := backend(t, nil)
+	for i := range 20 {
+		if _, err := c.Do(context.Background(), http.MethodPut, fmt.Sprintf("old/%04d", i), []byte("x"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep := Run(context.Background(), c, Options{Workers: 2, Keys: 20, Duration: 300 * time.Millisecond, Prefix: "old/", Seed: 3})
+	if rep.Errors == 0 || !strings.Contains(strings.Join(rep.ErrorSamples, "\n"), "this run never wrote it") {
+		t.Fatalf("stale keys: %+v", rep)
+	}
+	if strings.Contains(strings.Join(rep.ErrorSamples, "\n"), "deleted ") {
+		t.Fatalf("stale keys reported as resurrections: %v", rep.ErrorSamples)
+	}
+}
+
 func TestLostWritesAreErrors(t *testing.T) {
 	var n atomic.Int64
 	c := backend(t, func(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -70,6 +89,30 @@ func TestLostWritesAreErrors(t *testing.T) {
 	rep := Run(context.Background(), c, Options{Workers: 4, Keys: 10, Duration: 400 * time.Millisecond})
 	if rep.Errors == 0 || len(rep.ErrorSamples) == 0 {
 		t.Fatalf("lost writes went unnoticed: %+v", rep)
+	}
+}
+
+// A write held by the ADR-0016 fence answers 503 with Retry-After; verify retries it as an S3
+// client does, and counts it retried rather than failed. With NoRetry it is an error.
+func TestHeldWritesAreRetried(t *testing.T) {
+	held := func() *Client {
+		var n atomic.Int64
+		return backend(t, func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+			if r.Method == http.MethodPut && n.Add(1)%3 == 0 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	rep := Run(context.Background(), held(), Options{Workers: 4, Keys: 10, Duration: 400 * time.Millisecond})
+	if rep.Errors != 0 || rep.Retried == 0 || rep.Puts == 0 {
+		t.Fatalf("held writes with retry: %+v", rep)
+	}
+	rep = Run(context.Background(), held(), Options{Workers: 4, Keys: 10, Duration: 400 * time.Millisecond, NoRetry: true})
+	if rep.Errors == 0 || rep.Retried != 0 {
+		t.Fatalf("held writes without retry: %+v", rep)
 	}
 }
 

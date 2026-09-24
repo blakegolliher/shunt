@@ -1,0 +1,5 @@
+# expect: placements.acme/data: legs.Bad: a leg id is
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, legs: { Bad: { cluster: garage, bucket: data } }, owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: Bad } ] }

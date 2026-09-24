@@ -1,0 +1,17 @@
+# A spread bucket with prefix rules (ADR-0020): archive/ lives on cold alone, archive/hot/ back on
+# garage, and every other key is split between garage and minio by hash.
+version: 4
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/scoped:
+    state: ACTIVE
+    hash: fnv1a-fmix64-v1
+    legs: { garage: { cluster: garage, bucket: scoped-g }, minio: { cluster: minio, bucket: scoped-m }, cold: { cluster: cold, bucket: scoped-c } }
+    owners:
+      - { from: "0000000000000000", to: "7fffffffffffffff", leg: garage }
+      - { from: "8000000000000000", to: ffffffffffffffff, leg: minio }
+    prefixes:
+      - prefix: archive/
+        owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: cold } ]
+      - prefix: archive/hot/
+        owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: garage } ]

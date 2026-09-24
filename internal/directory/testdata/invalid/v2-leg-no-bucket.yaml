@@ -1,0 +1,5 @@
+# expect: placements.acme/data: legs.g.bucket: required
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, legs: { g: { cluster: garage } }, owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: g } ] }

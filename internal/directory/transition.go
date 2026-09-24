@@ -26,6 +26,17 @@ type Transition struct {
 	// write happens: a hold released concurrently must not be completed, or the step would move
 	// writes that no proxy held.
 	Complete bool
+	// Range, leaving ACTIVE, moves only the keys whose hash it holds (ADR-0018 N3): from the leg that
+	// owns them to the target, which becomes a new leg unless one is on that cluster already. Later
+	// steps of the move name it again or not at all.
+	Range *HashRange
+	// Leg, leaving ACTIVE, moves the keys of one leg of a spread bucket instead of a named range: the
+	// first range that leg owns (ADR-0018 N3c). Moving a leg's keys to another leg, one leg at a time,
+	// consolidates a bucket; later steps of the move name the same leg or none.
+	Leg string
+	// Scope, leaving ACTIVE, is the prefix rule whose keys move (ADR-0020); "" the keys no rule
+	// claims. Range and Leg are then read in that rule's table.
+	Scope string
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -65,6 +76,24 @@ func next(state string) []string {
 func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
+	}
+	if !p.Spread() && p.State == StateActive && t.Target != "" && t.Target == p.Primary && t.Name != "" && t.Name != p.Names[p.Primary] {
+		// Another bucket on the same cluster: a move of every key, since a plain migration's two
+		// buckets are on two clusters (ADR-0018 N3b).
+		all := FullRange
+		t.Range = &all
+	}
+	if t.Range != nil && *t.Range == FullRange && !p.Spread() && t.Target != p.Primary {
+		t.Range = nil // the whole bucket to another cluster: a migration as before
+	}
+	if t.Leg != "" && !p.Spread() {
+		if t.Leg != p.Primary {
+			return fail("%s is one bucket on %s; it has no leg %s", p.Names[p.Primary], p.Primary, t.Leg)
+		}
+		t.Leg = "" // the one leg of a plain bucket is all of it
+	}
+	if p.Spread() || t.Range != nil || t.Scope != "" {
+		return applyMove(p, t)
 	}
 	if t.Release {
 		return release(p)
@@ -210,5 +239,10 @@ func release(p Placement) (Placement, error) {
 	return np, nil
 }
 
-// Held reports whether p has a ramp step written but not yet in force.
-func (p Placement) Held() bool { return p.Ramp != nil && p.Ramp.Hold != nil }
+// Held reports whether p has a ramp step written but not yet in force: its own, or its move's.
+func (p Placement) Held() bool {
+	if p.Move != nil {
+		return p.Move.Ramp != nil && p.Move.Ramp.Hold != nil
+	}
+	return p.Ramp != nil && p.Ramp.Hold != nil
+}

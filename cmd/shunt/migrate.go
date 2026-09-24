@@ -316,11 +316,16 @@ func newAdopt() *cobra.Command {
 		o        apiOptions
 		name     string
 		keysFile string
+		create   bool
+		spread   []string
 	)
 	cmd := &cobra.Command{
 		Use:   "adopt <cluster> <bucket>",
-		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11)",
+		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11), or create one",
 		Long: "Takes over a bucket that already exists on a cluster, keeping its name.\n\n" +
+			"--create makes a new, empty bucket on the cluster instead. --spread <cluster>[:<name>], once per\n" +
+			"further cluster, creates a bucket spread over one new bucket on each (ADR-0018): every key lives\n" +
+			"in exactly one of them, chosen by its hash, and listings merge them all. It implies --create.\n\n" +
 			"--keys imports the client keys that cluster already issued, in the credentials-file schema\n" +
 			"(access_key and secret per entry). shunt checks each against the cluster and then verifies\n" +
 			"client signatures with them, so clients keep the credentials they have today and keep them\n" +
@@ -340,8 +345,26 @@ func newAdopt() *cobra.Command {
 				return err
 			}
 			var out control.PlacementStatus
-			if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name, Keys: keys}, &out); callErr != nil {
-				return callErr
+			switch {
+			case create || len(spread) > 0:
+				req := control.CreateBackendRequest{Cluster: args[0], Name: name, Keys: keys}
+				if len(spread) > 0 {
+					req.Legs = []control.LegRequest{{Cluster: args[0], Name: name}}
+					for _, l := range spread {
+						c, n, _ := strings.Cut(l, ":")
+						if c == "" {
+							return fmt.Errorf("--spread %q: want <cluster>[:<bucket name>]", l)
+						}
+						req.Legs = append(req.Legs, control.LegRequest{Cluster: c, Name: n})
+					}
+				}
+				if callErr := api.call(cmd.Context(), "POST", path+"/create-backend", req, &out); callErr != nil {
+					return callErr
+				}
+			default:
+				if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name, Keys: keys}, &out); callErr != nil {
+					return callErr
+				}
 			}
 			if o.json {
 				return printJSON(cmd, out)
@@ -351,11 +374,21 @@ func newAdopt() *cobra.Command {
 					return perr
 				}
 			}
+			if len(out.Legs) > 0 {
+				where := make([]string, 0, len(out.Legs))
+				for _, l := range out.Legs {
+					where = append(where, fmt.Sprintf("%s/%s (%.0f%%)", l.Cluster, l.Bucket, 100*l.Share))
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE, spread over %s\n", shown(out.Key), strings.Join(where, ", "))
+				return err
+			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", shown(out.Key), out.Primary, out.Names[out.Primary])
 			return err
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&create, "create", false, "create a new, empty bucket on the cluster instead of adopting one")
+	cmd.Flags().StringArrayVar(&spread, "spread", nil, "also spread the new bucket over this `cluster[:name]` (repeatable; implies --create)")
 	cmd.Flags().StringVar(&name, "name", "", "the bucket's name on the cluster (default: the same name)")
 	cmd.Flags().StringVar(&keysFile, "keys", "", "a credentials-file `path` of client keys the cluster already issued, to import")
 	return cmd
@@ -392,13 +425,23 @@ func readClientKeys(path string) ([]control.ClientKeyRequest, error) {
 
 func newExpand() *cobra.Command {
 	var (
-		o   apiOptions
-		req control.ExpandRequest
+		o           apiOptions
+		req         control.ExpandRequest
+		clearTarget bool
+		carve       string
+		merge       string
 	)
 	cmd := &cobra.Command{
 		Use:   "expand <bucket>",
 		Short: "Prepare a second cluster for a bucket: its bucket, a versioning check, and a canary",
-		Args:  cobra.ExactArgs(1),
+		Long: "Records the cluster and bucket a later ramp or migrate step moves the bucket to. The target\n" +
+			"bucket must be empty: its objects would join this bucket (--accept-existing-objects takes one\n" +
+			"whose objects are this bucket's, copied ahead). --clear forgets the target again before the\n" +
+			"first step, leaving its bucket where it is.\n\n" +
+			"--carve <prefix> gives the keys under a prefix a scope of their own, owned exactly as they are now,\n" +
+			"so later moves can place that prefix on its own (ADR-0020); no data moves. --merge <prefix>\n" +
+			"removes a scope again once its keys are owned as the rest of their parent scope is.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := placementPath(args[0])
 			if err != nil {
@@ -406,6 +449,45 @@ func newExpand() *cobra.Command {
 			}
 			api, err := o.client()
 			if err != nil {
+				return err
+			}
+			if carve != "" || merge != "" {
+				if carve != "" && merge != "" {
+					return errors.New("give --carve or --merge, not both")
+				}
+				var out control.PrefixResult
+				method, route, body, did := "POST", path+"/prefixes", any(control.PrefixRequest{Prefix: carve}), "carved: its keys have a scope of their own, owned as before"
+				if merge != "" {
+					method, route, body, did = "DELETE", path+"/prefixes?prefix="+url.QueryEscape(merge), nil, "merged back into its parent scope"
+				}
+				if callErr := api.call(cmd.Context(), method, route, body, &out); callErr != nil {
+					return callErr
+				}
+				if o.json {
+					return printJSON(cmd, out)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: prefix %q %s; %d prefix rules (directory version %d)\n", shown(out.Key), out.Prefix, did, out.Rules, out.Version)
+				return err
+			}
+			if clearTarget {
+				var out control.ClearTargetResult
+				if callErr := api.call(cmd.Context(), "DELETE", path+"/target", nil, &out); callErr != nil {
+					return callErr
+				}
+				if o.json {
+					return printJSON(cmd, out)
+				}
+				for _, l := range out.Retired {
+					if _, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: leg %s (%s/%s) retired; it owned no keys, and its bucket is still on %s (directory version %d)\n",
+						shown(out.Key), l.ID, l.Cluster, l.Bucket, l.Cluster, out.Version); err != nil {
+						return err
+					}
+				}
+				if out.Target == "" {
+					return nil
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s cleared; the bucket is still on %s (directory version %d)\n",
+					shown(out.Key), out.Target, out.Name, out.Target, out.Version)
 				return err
 			}
 			var out control.ExpandResult
@@ -440,15 +522,20 @@ func newExpand() *cobra.Command {
 	f.StringVar(&req.To, "to", "", "the cluster the bucket will move to")
 	f.StringVar(&req.Name, "name", "", "the bucket's name there (default: <name>-001, the lowest unused)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket there if it does not exist")
+	f.BoolVar(&req.AcceptObjects, "accept-existing-objects", false, "take a target bucket that holds objects: they are this bucket's, copied ahead")
+	f.StringVar(&carve, "carve", "", "give the keys under this `prefix` a scope of their own, owned as they are now (ADR-0020)")
+	f.StringVar(&merge, "merge", "", "remove the scope of this `prefix`, once it is owned as its parent scope is")
+	f.BoolVar(&clearTarget, "clear", false, "forget the target expand recorded, before the first step; for a spread bucket, retire its legs that own no keys")
 	return cmd
 }
 
 func newRamp() *cobra.Command {
 	var (
-		o    apiOptions
-		req  control.RampRequest
-		from string
-		wait time.Duration
+		o         apiOptions
+		req       control.RampRequest
+		from      string
+		rangeText string
+		wait      time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "ramp <bucket>",
@@ -465,7 +552,11 @@ func newRamp() *cobra.Command {
 			if req.Ratio < 0 || req.Ratio > 1 {
 				return fmt.Errorf("--ratio %v is outside 0..1", req.Ratio)
 			}
-			req.Wait = wait.String()
+			rg, err := parseRange(rangeText)
+			if err != nil {
+				return err
+			}
+			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpRamp, req, time.Minute+3*wait)
 			})
@@ -480,7 +571,32 @@ func newRamp() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
+}
+
+// addMoveFlags adds the flags that make a first step move part of a bucket (ADR-0018 N3).
+func addMoveFlags(cmd *cobra.Command, rangeText, leg, scope *string) {
+	f := cmd.Flags()
+	f.StringVar(scope, "scope", "", "move keys of this prefix rule (shunt expand --carve made it); --range and --leg are read in its table, and a rule one leg owns moves whole (ADR-0020)")
+	f.StringVar(rangeText, "range", "", "move only the keys whose hash is in `from-to` (16 hex digits each, inclusive), out of the one leg that owns them")
+	f.StringVar(leg, "leg", "", "move the keys of this leg of a spread bucket (its first range; repeat per range); consolidating a bucket is this, once per other leg")
+}
+
+// parseRange reads --range: two 16-hex-digit hash bounds joined by '-', or nothing.
+func parseRange(s string) (*directory.HashRange, error) {
+	if s == "" {
+		return nil, nil //nolint:nilnil // no range asked for
+	}
+	from, to, ok := strings.Cut(s, "-")
+	var rg directory.HashRange
+	if !ok || rg.From.UnmarshalText([]byte(from)) != nil || rg.To.UnmarshalText([]byte(to)) != nil {
+		return nil, fmt.Errorf("--range %q: want <from>-<to>, 16 hex digits each, such as 0000000000000000-7fffffffffffffff", s)
+	}
+	if rg.From > rg.To {
+		return nil, fmt.Errorf("--range %q: the start is after the end", s)
+	}
+	return &rg, nil
 }
 
 func newMigrate() *cobra.Command {
@@ -494,10 +610,11 @@ func newMigrate() *cobra.Command {
 
 func newMigrateStart() *cobra.Command {
 	var (
-		o    apiOptions
-		req  control.MigrateRequest
-		from string
-		wait time.Duration
+		o         apiOptions
+		req       control.MigrateRequest
+		from      string
+		rangeText string
+		wait      time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "start <bucket>",
@@ -507,7 +624,11 @@ func newMigrateStart() *cobra.Command {
 			"are merged. That is the state the mover copies in: `shunt migrate run`.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			req.Wait = wait.String()
+			rg, err := parseRange(rangeText)
+			if err != nil {
+				return err
+			}
+			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpMigrate, req, time.Minute+3*wait)
 			})
@@ -522,6 +643,7 @@ func newMigrateStart() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
 }
 
@@ -596,8 +718,12 @@ func newPurgeSource() *cobra.Command {
 			case o.json && dryRun:
 				return printJSON(cmd, plan)
 			case !o.json:
-				_, _ = fmt.Fprintf(out, "%s: would delete %d objects (%s) and abort %d in-flight uploads from %s/%s, then forget the source\n",
-					shown(plan.Key), plan.Objects, humanBytes(plan.Bytes), plan.UploadsInFlight, plan.Source, plan.Bucket)
+				then := "then forget the source"
+				if plan.KeepsBucket {
+					then = "and keep the bucket, which holds the rest of the bucket's keys"
+				}
+				_, _ = fmt.Fprintf(out, "%s: would delete %d objects (%s) and abort %d in-flight uploads from %s/%s, %s\n",
+					shown(plan.Key), plan.Objects, humanBytes(plan.Bytes), plan.UploadsInFlight, plan.Source, plan.Bucket, then)
 			}
 			if dryRun {
 				return nil
@@ -610,8 +736,12 @@ func newPurgeSource() *cobra.Command {
 			if o.json {
 				return printJSON(cmd, res)
 			}
-			_, err = fmt.Fprintf(out, "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
-				shown(res.Key), res.ObjectsDeleted, res.UploadsAborted, res.Source, res.Bucket, res.Version)
+			bucket := "deleted the bucket; ACTIVE on its primary"
+			if !res.BucketDeleted {
+				bucket = "kept the bucket, which holds the rest of the bucket's keys; ACTIVE"
+			}
+			_, err = fmt.Fprintf(out, "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, %s (directory version %d)\n",
+				shown(res.Key), res.ObjectsDeleted, res.UploadsAborted, res.Source, res.Bucket, bucket, res.Version)
 			return err
 		},
 	}
@@ -646,11 +776,17 @@ func newMigrateFinish() *cobra.Command {
 }
 
 func newStatus() *cobra.Command {
-	var o apiOptions
+	var (
+		o   apiOptions
+		all bool
+	)
 	cmd := &cobra.Command{
 		Use:   "status [bucket]",
 		Short: "Show clusters, moving buckets, the write split, fallback reads, and mover progress",
-		Args:  cobra.MaximumNArgs(1),
+		Long: "Lists the clusters and every bucket that is moving or has a target recorded; --all lists every\n" +
+			"bucket. A bucket spread over several backend buckets (ADR-0018) also gets a table of its legs:\n" +
+			"each one's bucket, its share of the key space, the hash ranges it owns, and the part moving.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			api, err := o.client()
 			if err != nil {
@@ -663,6 +799,8 @@ func newStatus() *cobra.Command {
 					return kerr
 				}
 				q = "?bucket=" + url.QueryEscape(key)
+			} else if all {
+				q = "?all=1"
 			}
 			var st control.Status
 			if err := api.call(cmd.Context(), "GET", "/v1/status"+q, nil, &st); err != nil {
@@ -675,6 +813,7 @@ func newStatus() *cobra.Command {
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&all, "all", false, "every bucket, not only those moving or expanded")
 	return cmd
 }
 
@@ -697,7 +836,7 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 	}
 	_, _ = fmt.Fprintln(out)
 	if len(st.Placements) == 0 {
-		_, err := fmt.Fprintln(out, "no bucket is moving")
+		_, err := fmt.Fprintln(out, "no bucket is moving (--all lists every bucket)")
 		return err
 	}
 	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -712,9 +851,13 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 			// A step written but not on every proxy yet: its keys' writes answer 503 (ADR-0016).
 			ratio += " held→" + strconv.FormatFloat(p.Hold.Ratio, 'f', 2, 64)
 		}
+		primary := p.Primary + "/" + bucketOf(p.PrimaryBucket, p.Names[p.Primary])
+		if p.Primary == "" {
+			primary = fmt.Sprintf("spread over %d", len(p.Legs))
+		}
 		source := "-"
 		if p.Source != "" {
-			source = p.Source + "/" + p.Names[p.Source]
+			source = p.Source + "/" + bucketOf(p.SourceBucket, p.Names[p.Source])
 		} else if p.Target != "" {
 			source = "(target " + p.Target + "/" + p.Names[p.Target] + ")"
 		}
@@ -729,9 +872,85 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 				mover += ", converged"
 			}
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", shown(p.Key), p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", shown(p.Key), p.State, ratio, primary, source, writes, p.FallbackReads, mover)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	for i := range st.Placements {
+		if err := printLegs(out, &st.Placements[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func bucketOf(named, byCluster string) string {
+	if named != "" {
+		return named
+	}
+	return byCluster
+}
+
+// printLegs is a spread bucket's legs (ADR-0018): bucket, share of the key space, the hash ranges
+// it owns, and which part is moving where.
+func printLegs(out io.Writer, p *control.PlacementStatus) error {
+	if len(p.Legs) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "\n%s is spread over %d backend buckets:\n", shown(p.Key), len(p.Legs)); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	scope := ""
+	if len(p.Scopes) > 0 {
+		scope = "SCOPE\t"
+	}
+	_, _ = fmt.Fprintln(tw, "  "+scope+"LEG\tCLUSTER\tBUCKET\tSHARE\tHASH RANGES\tMOVING")
+	legRows(tw, p, "", p.Legs)
+	// Each prefix rule's keys, owned by its own table (ADR-0020); the rows above are every other key.
+	for _, sc := range p.Scopes {
+		legRows(tw, p, sc.Prefix, sc.Legs)
 	}
 	return tw.Flush()
+}
+
+func legRows(tw io.Writer, p *control.PlacementStatus, prefix string, legs []control.LegStatus) {
+	scope := ""
+	if len(p.Scopes) > 0 {
+		scope = "(other keys)\t"
+		if prefix != "" {
+			scope = prefix + "\t"
+		}
+	}
+	for _, l := range legs {
+		ranges := make([]string, 0, len(l.Ranges))
+		for _, rg := range l.Ranges {
+			ranges = append(ranges, fmt.Sprintf("%016x-%016x", uint64(rg.From), uint64(rg.To)))
+		}
+		switch {
+		case len(ranges) > 0:
+		case l.Idle:
+			ranges = append(ranges, "none (idle: expand --clear retires it)")
+		default:
+			ranges = append(ranges, "none here")
+		}
+		moving := "-"
+		if m := p.Move; m != nil && prefix == m.Scope {
+			of := "keys"
+			if m.Scope != "" {
+				of = "its keys"
+			}
+			rg := fmt.Sprintf("%016x-%016x (%.1f%% of %s)", uint64(m.Range.From), uint64(m.Range.To), 100*m.Share, of)
+			switch l.ID {
+			case m.From:
+				moving = "out to " + m.To + ": " + rg
+			case m.To:
+				moving = "in from " + m.From + ": " + rg
+			}
+		}
+		_, _ = fmt.Fprintf(tw, "  %s%s\t%s\t%s\t%.1f%%\t%s\t%s\n", scope, l.ID, l.Cluster, l.Bucket, 100*l.Share, strings.Join(ranges, " "), moving)
+	}
 }
 
 // transition runs one state change as an operation record, polls it, and prints what it did.
@@ -754,6 +973,13 @@ func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, kind stri
 		_, _ = fmt.Fprintf(out, "created %s on %s\n", res.CreatedBucket, res.Primary)
 	}
 	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", shown(res.Key), res.From, res.To, res.Version)
+	if rg := res.Range; rg != nil {
+		under := ""
+		if res.Scope != "" {
+			under = fmt.Sprintf(" under %q (no longer prefix rule claims them)", res.Scope)
+		}
+		_, _ = fmt.Fprintf(out, "only keys%s whose hash is in %016x-%016x move; the ratio is a share of that range\n", under, uint64(rg.From), uint64(rg.To))
+	}
 	switch res.To {
 	case directory.StateRamping:
 		_, _ = fmt.Fprintf(out, "writes for %.0f%% of keys now land on %s; reads fall back to %s\n", 100*res.Ratio, res.Primary, res.Source)

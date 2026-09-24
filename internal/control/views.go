@@ -131,9 +131,9 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 	}
 	view := PlacementView{PlacementStatus: s.placementStatus(key, p), Operations: []string{}, Clusters: map[string]ClusterStatus{}}
 	view.Fence = s.fenceStatus(r.Context(), p)
-	if p.Source != "" {
+	if pv := moving(p); pv.Source != "" {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		n, err := s.uploadsInProgress(ctx, p.Source, p.Names[p.Source])
+		n, err := s.uploadsInProgress(ctx, pv.ClusterOf(pv.Source), pv.Names[pv.Source], moveScope(p))
 		cancel()
 		if err != nil {
 			view.SourceUploadsError = err.Error()
@@ -144,7 +144,7 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 	if ids := s.runningOperations(r.Context(), key); ids != nil {
 		view.Operations = ids
 	}
-	for _, name := range []string{p.Primary, p.Source, p.Target} {
+	for _, name := range placementClusters(p) {
 		if c, found := f.Clusters[name]; found {
 			view.Clusters[name] = clusterStatus(f, name, c)
 		}

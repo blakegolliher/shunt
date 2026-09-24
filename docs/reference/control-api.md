@@ -65,6 +65,8 @@ Returns every cluster, plus every placement that is not plain `ACTIVE` (moving, 
 }
 ```
 
+A bucket spread over legs (ADR-0018 N2) has empty `primary` and `names` and a `legs` list instead: `{"id", "cluster", "bucket", "share", "ranges"}` per leg in key-space order, `share` being its fraction of the key hash space and `ranges` the hash ranges it owns (a new leg of a move owns none yet). While part of it moves (N3), `primary` and `source` are the move's two clusters and `move` says which part.
+
 `client_keys` counts the tenant's client keys whose bucket allowlist admits the bucket. At 0, shunt refuses every request for the bucket until a key is imported; the field is absent when this shunt holds no client keys at all.
 
 `fallback_reads` counts read requests (GET and HEAD) that the source served after the primary answered 404, not distinct objects: `aws s3 cp` of one object sends a HEAD then a GET, so it counts two; a recursive copy sends only GETs. `ramp_writes`, `fallback_reads` and `dual_deletes` are this proxy's counters (`shunt_ramp_writes_total`, `shunt_migration_fallback_reads_total`, `shunt_migration_dual_delete_total`), read without creating series. `mover` is the last progress report, held in memory: it is lost when shunt restarts, and the next mover pass reports again.
@@ -136,7 +138,7 @@ Takes over a bucket that already exists: a signed HEAD checks it is there, then 
 Refused if:
 - the bucket is missing;
 - it has ever been versioned;
-- the placement already exists (`conflict`).
+- the placement already exists (`conflict`), checked before anything else: the message names the bucket's state, cluster and backend name, and points at `expand` for adding a cluster to it.
 
 ### `POST /v1/placements/{tenant}/{bucket}/create-backend`
 
@@ -145,21 +147,50 @@ bucket, then records it as an `ACTIVE` placement (creating the tenant when neede
 to the client bucket name. If the directory write fails, the newly created backend bucket is
 removed. An optional `"keys": [{"access_key": "…", "secret": "…", "buckets": ["data01"]}]` imports
 client keys as adopt's `keys` does: each is checked against the cluster before the bucket is
-created, and a refused key creates nothing. The member-only `/create` route remains the first half of a proxy's signed S3
+created, and a refused key creates nothing. With `"legs": [{"cluster": "minio01", "name": "data02"}, {"cluster": "minio02"}]`
+(two to 32, one per cluster, `name` defaulting to the client bucket name) it creates a bucket spread over
+those legs instead (ADR-0018 N2): every leg's bucket must not exist yet, keys are checked against the
+first leg's cluster, the buckets are created, and the placement records the legs owning equal shares
+of the key hash space. `cluster` and `name` are then unused. A client bucket name the tenant already uses answers
+`conflict` as adopt does, before any backend request or key import; a backend bucket that already
+exists is refused (adopt takes over an existing bucket), and the cleanup after a failed directory
+write deletes only a bucket this call created. The member-only `/create` route remains the first half of a proxy's signed S3
 CreateBucket flow and does not duplicate the backend request.
 
 ### `POST /v1/placements/{tenant}/{bucket}/expand`
 
-`{"to": "vast02", "name": "data01-001", "create": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
+`{"to": "vast02", "name": "data01-001", "create": false, "accept_existing_objects": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
 
 Prepares the target while the placement stays `ACTIVE`, in this order:
 1. Refuses if either bucket was ever versioned.
-2. Verifies the target bucket exists, or creates it with `create`.
+2. Verifies the target bucket exists, or creates it with `create`. An existing bucket must be empty: a one-key listing that finds an object refuses, naming the key, because the bucket's objects would join the moving bucket (in its listings, in target-first reads of a shared key, and ahead of the mover's `If-None-Match` copy, so a stale object would win at cutover). `accept_existing_objects` states they are this bucket's objects, copied ahead (by backend replication, for instance), and skips the check. A first `ramp` or `migrate` step that names its own target with `to` is checked the same way.
 3. Runs a canary PUT, GET and DELETE of `.shunt-canary-<hex>`.
 4. If the target cluster's `conditional_write` or `conditional_delete` is unset, measures it on a scratch object: a PUT with `If-None-Match: *` over it must get 412, and a DELETE with a wrong `If-Match` must get 412. It records the results on the cluster (`measured: true` in the answer). A capability set explicitly is left alone.
 5. Records `target` and its name on the placement.
 
 Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_write", "conditional_delete", "measured", "version"}`. Later `ramp` and `migrate` calls use the recorded target.
+
+### `DELETE /v1/placements/{tenant}/{bucket}/target`
+
+Forgets the target `expand` recorded, while the placement is still `ACTIVE`, so it can be expanded somewhere else. A recorded target routes nothing, so this needs no fence round. The target's bucket stays on its cluster, since shunt may not have created it. Returns `{"key", "target", "name", "version"}`. Refused once a step has used the target (`… is RAMPING, moving to …`) and when there is none. For a spread bucket (ADR-0018 N3c) it retires the legs that own no keys, such as the destination of a first step released before it routed anything, and returns them as `retired` (`[{"id", "cluster", "bucket", …}]`); their buckets stay where they are, and a bucket one leg owns afterwards returns to its plain form. Refused when every leg owns keys. `shunt expand <bucket> --clear` calls it.
+
+### `POST /v1/placements/{tenant}/{bucket}/prefixes` and `DELETE …/prefixes?prefix=<prefix>`
+
+Prefix rules (ADR-0020). `POST` with `{"prefix": "archive/"}` **carves** a rule: the keys under the
+prefix get a scope of their own whose owners table is a copy of the table they fall in now, so no
+key changes owner, no data moves and no fence round is needed. A plain bucket becomes a v2 one with
+its single leg. `DELETE ?prefix=` **merges** a rule back, only when its table equals its parent
+scope's; merging the last rule of a bucket one leg owns makes it plain again. Both return
+`{"key", "prefix", "rules", "version"}` and are refused (409 `refused`) unless the placement is
+`ACTIVE` with no move; carve also refuses a bucket with a target, cold tier or lifecycle recorded,
+a prefix already carved, and more than 64 rules or 1024-byte prefixes. Status reports the rules as `scopes`, each with its legs.
+
+A move of a rule's keys is a first step with `"scope": "archive/"` (ADR-0020 P2): `range` and `leg`
+are then read in that rule's table, and a rule one leg owns moves whole with neither. The mover,
+purge's diff and its deletes list only the prefix, and leave keys of nested rules alone; status's
+`move` names its `scope`. A scoped move ramps by ratio only; carve and merge are refused while any
+move is in progress.
+`shunt expand <bucket> --carve <prefix>` and `--merge <prefix>` call them.
 
 ### `POST /v1/placements/{tenant}/{bucket}/read-only`
 
@@ -172,6 +203,8 @@ and deletes answer 503 plus `Retry-After: 1` by default, or 403 with `reject: tr
 `{"ratio": 0.5, "prefixes": ["runs/2026-09/"], "to": "", "name": "", "create": false, "wait": "30s"}`
 
 A fenced change (see [The fleet](#the-fleet)). Enters or raises `RAMPING`. A key's writes go to the new primary when its hash is below `ratio` or it starts with one of the `prefixes`. The ratio and prefix set only grow (ADR-0004 race 5). Entering `RAMPING` records the hash as `ramp.hash` (`fnv1a-fmix64-v1`). Raising a ramp whose recorded hash this build does not implement is refused, because it would re-split keys. `to`, `name` and `create` are only needed when `expand` has not recorded a target. Returns a transition result (below).
+
+**Moving part of a bucket (ADR-0018 N3).** A first step (from `ACTIVE`, here or on `migrate`) with `"range": {"from": "0000000000000000", "to": "7fffffffffffffff"}` moves only the keys whose hash falls in the range, from the leg that owns all of them to `to`: the leg already on that cluster, or a new leg named `name` there (a plain bucket's primary becomes its first leg). The ratio is then a share of the range. Every later step, `migrate`, the mover, `cutover` and `purge-source` act on that move, and status reports its two clusters as `source` and `primary` with a `move` entry (`from`, `to`, `range`, `share`). `purge-source` compares and deletes only the range's keys, and deletes the source bucket only if its leg owns nothing else; `finish` is refused while the source leg keeps other keys, since the range's copies there would be strays. When the move ends the destination owns the range, and a bucket one leg owns again returns to its plain form. One move at a time per bucket. A cluster may hold several legs (N3b): a first step naming `to` and a new `name` makes a new leg there, and a plain bucket asked to move to another bucket on its own cluster moves every key that way; status then adds `primary_bucket` and `source_bucket`, since `names` holds one bucket per cluster, and upload ids issued during such a move carry a tag of their bucket (`<clusterID>.<tag>~…`). A first step may name `"leg": "<leg id>"` instead of a range (N3c): the move takes the first range that leg owns. **Consolidating** a spread bucket is that step once per other leg, with `to` and `name` naming the leg kept; when the last move is purged the bucket is plain again and `step-out` can take shunt out of its path (step-out reports a spread bucket as a blocker until then). A later step may repeat the same `leg` or leave it out. `shunt ramp` and `shunt migrate start` take `--leg` and `--range <from>-<to>`.
 
 ### `POST /v1/placements/{tenant}/{bucket}/migrate`
 

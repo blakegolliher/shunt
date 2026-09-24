@@ -168,3 +168,28 @@ func TestCheckSideNamesTheSecretSource(t *testing.T) {
 		t.Fatalf("a key that may not list is left to the copy: %v", err)
 	}
 }
+
+// A move within a prefix rule (ADR-0020) lists only the rule's prefix, and copies only its own
+// keys: not those of a nested rule, which the listing under the prefix also returns.
+func TestScopedMoveListsOnlyItsPrefix(t *testing.T) {
+	yes := true
+	dir := moverFixture(t, directory.StateMigrating, 0, &yes)
+	legs := map[string]directory.Leg{"minio": {Cluster: "minio", Bucket: "data"}, "garage": {Cluster: "garage", Bucket: "acme-1111-data"}}
+	whole := []directory.Owner{{From: 0, To: directory.FullRange.To, Leg: "minio"}}
+	dir.Placements["acme/data"] = directory.Placement{State: directory.StateMigrating, KeyHash: directory.RampHash, Legs: legs, Owners: whole,
+		Prefixes: []directory.PrefixRule{{Prefix: "archive/", Owners: whole}, {Prefix: "archive/keep/", Owners: whole}},
+		Move:     &directory.Move{Scope: "archive/", Range: directory.FullRange, From: "minio", To: "garage"}}
+	jobs, err := selectPlacements(dir, nil, "acme/data", "", false)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("jobs: %v %+v", err, jobs)
+	}
+	j := jobs[0]
+	if j.prefix != "archive/" || j.src.bucket != "data" || j.dst.bucket != "acme-1111-data" {
+		t.Fatalf("job: prefix %q, %s -> %s", j.prefix, j.src.bucket, j.dst.bucket)
+	}
+	for key, want := range map[string]bool{"archive/a": true, "archive/keep/a": false, "data/a": false} {
+		if got := j.keep(key); got != want {
+			t.Errorf("copies %s: %v, want %v", key, got, want)
+		}
+	}
+}

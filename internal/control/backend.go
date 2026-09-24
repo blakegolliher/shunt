@@ -127,14 +127,19 @@ func (b backend) bucketExists(ctx context.Context, bucket string) (bool, error) 
 	return false, fmt.Errorf("%s: HEAD bucket %s answered HTTP %d", b.cl.Name, bucket, r.status)
 }
 
-// createBucket creates bucket; a bucket this account already owns counts as created.
-func (b backend) createBucket(ctx context.Context, bucket string) error {
+// createBucket creates bucket; a bucket this account already owns counts as created. created
+// says whether this call made it, so a caller that undoes its work never deletes a bucket it
+// found. AWS in us-east-1 answers 200 to re-creating a bucket the account owns, so created can be
+// true for a bucket that was already there: a caller that may delete checks existence first.
+func (b backend) createBucket(ctx context.Context, bucket string) (created bool, err error) {
 	r, err := b.do(ctx, http.MethodPut, bucket, "", nil, nil, nil)
 	switch {
 	case err != nil:
-		return err
-	case r.status == http.StatusOK, r.status == http.StatusNoContent, r.code == "BucketAlreadyOwnedByYou":
-		return nil
+		return false, err
+	case r.status == http.StatusOK, r.status == http.StatusNoContent:
+		return true, nil
+	case r.code == "BucketAlreadyOwnedByYou":
+		return false, nil
 	}
 	err = fmt.Errorf("%s: creating bucket %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
 	if r.msg != "" {
@@ -145,7 +150,30 @@ func (b backend) createBucket(ctx context.Context, bucket string) error {
 		// (docs/reference/backend-compat.md); a wrong key was already refused when the cluster was added.
 		err = fmt.Errorf("%w: access key %s may not create buckets on %s; grant it that, or create %s there with a key that may and use that name", err, b.cl.Creds.AccessKey, b.cl.Name, bucket)
 	}
-	return err
+	return false, err
+}
+
+// targetEmpty refuses a move into a bucket that already holds an object. Its objects would join
+// the moving bucket: in its listings, in target-first reads of any key they share with it, and
+// ahead of the mover, whose If-None-Match copy skips a key the target already has, so the stale
+// object would win at cutover. override names how to say the objects are the bucket's own.
+func targetEmpty(ctx context.Context, b backend, cluster, bucket, override string) error {
+	r, err := b.do(ctx, http.MethodGet, bucket, "", url.Values{"list-type": {"2"}, "max-keys": {"1"}, "encoding-type": {"url"}}, nil, nil)
+	if err != nil {
+		return err
+	}
+	if r.status != http.StatusOK {
+		return fmt.Errorf("%s: listing %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+	}
+	var page s3response.ListObjectsV2Result
+	if err := xml.Unmarshal(r.body, &page); err != nil {
+		return fmt.Errorf("%s: listing %s: %w", b.cl.Name, bucket, err)
+	}
+	if len(page.Contents) == 0 || page.Contents[0].Key == nil {
+		return nil
+	}
+	return refuse("bucket %s on %s already holds objects (the first is %q); a move into it would mix them into this bucket and could let one win over this bucket's own object of the same key: use an empty bucket or a new name, empty it, or, if they are this bucket's objects copied ahead, use %s",
+		bucket, cluster, s3.DecodeListingKey(*page.Contents[0].Key), override)
 }
 
 // versioning returns the bucket's GetBucketVersioning status: "", "Enabled", or "Suspended".
@@ -174,8 +202,13 @@ type listEntry struct {
 	size int64
 }
 
-func (b backend) listPage(ctx context.Context, bucket, token string) (entries []listEntry, next string, err error) {
+// listPage lists one page of bucket, under prefix when it is set: a move within a prefix rule
+// (ADR-0020) reads only its prefix, not the whole bucket.
+func (b backend) listPage(ctx context.Context, bucket, prefix, token string) (entries []listEntry, next string, err error) {
 	q := url.Values{"list-type": {"2"}, "encoding-type": {"url"}}
+	if prefix != "" {
+		q.Set("prefix", prefix)
+	}
 	if token != "" {
 		q.Set("continuation-token", token)
 	}
@@ -210,6 +243,8 @@ func (b backend) listPage(ctx context.Context, bucket, token string) (entries []
 type lister struct {
 	b       backend
 	bucket  string
+	keep    func(key string) bool // nil: every key; a move's range otherwise (ADR-0018 N3)
+	prefix  string                // a move's scope: only keys under it are listed (ADR-0020)
 	page    []listEntry
 	next    string
 	done    bool
@@ -222,7 +257,7 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 		if l.done {
 			return "", false, nil
 		}
-		entries, next, err := l.b.listPage(ctx, l.bucket, l.next)
+		entries, next, err := l.b.listPage(ctx, l.bucket, l.prefix, l.next)
 		if err != nil {
 			return "", false, err
 		}
@@ -230,6 +265,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 	}
 	e := l.page[0]
 	l.page = l.page[1:]
+	if l.keep != nil && !l.keep(e.key) {
+		return l.nextKey(ctx)
+	}
 	l.objects++
 	l.bytes += e.size
 	return e.key, true, nil
@@ -240,9 +278,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 // is confirmed with HEADs before it counts (stillMissing), so a client delete landing between the
 // two listings' pages is not reported. It also returns how many objects and bytes the source
 // listing held, as far as it was walked.
-func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int) (missing []string, objects int, size int64, err error) {
-	src := &lister{b: source, bucket: sourceBucket}
-	dst := &lister{b: primary, bucket: primaryBucket}
+func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int, keep func(string) bool, prefix string) (missing []string, objects int, size int64, err error) {
+	src := &lister{b: source, bucket: sourceBucket, keep: keep, prefix: prefix}
+	dst := &lister{b: primary, bucket: primaryBucket, keep: keep, prefix: prefix}
 	d, dok, err := dst.nextKey(ctx)
 	if err != nil {
 		return nil, 0, 0, err
@@ -347,7 +385,7 @@ func (b backend) empty(ctx context.Context, bucket string, progress func(deleted
 	// Deleting while paging with continuation tokens can skip keys, so every round lists from the
 	// start until a listing comes back empty.
 	for {
-		entries, _, err := b.listPage(ctx, bucket, "")
+		entries, _, err := b.listPage(ctx, bucket, "", "")
 		if err != nil {
 			return objects, uploads, err
 		}
@@ -366,6 +404,96 @@ func (b backend) empty(ctx context.Context, bucket string, progress func(deleted
 			if progress != nil {
 				progress(objects)
 			}
+		}
+	}
+}
+
+// emptyRange deletes the keys keep holds, and aborts the multipart uploads of those keys, leaving
+// every other key: a move's source leg giving up one range and keeping the rest (ADR-0018 N3).
+// Deleting while paging can skip keys, so it walks the bucket until a whole walk deletes nothing.
+func (b backend) emptyRange(ctx context.Context, bucket, prefix string, keep func(string) bool, progress func(deleted int)) (objects, uploads int, err error) {
+	keyMarker, idMarker := "", ""
+	for {
+		q := url.Values{"uploads": {""}}
+		if prefix != "" {
+			q.Set("prefix", prefix)
+		}
+		if keyMarker != "" {
+			q.Set("key-marker", keyMarker)
+			q.Set("upload-id-marker", idMarker)
+		}
+		r, err := b.do(ctx, http.MethodGet, bucket, "", q, nil, nil)
+		if err != nil {
+			return objects, uploads, err
+		}
+		if r.code == "NoSuchUpload" {
+			break
+		}
+		if r.status != http.StatusOK {
+			return objects, uploads, fmt.Errorf("%s: ListMultipartUploads %s: HTTP %d %s", b.cl.Name, bucket, r.status, r.code)
+		}
+		var page struct {
+			Uploads []struct {
+				Key      string `xml:"Key"`
+				UploadID string `xml:"UploadId"`
+			} `xml:"Upload"`
+			Truncated          bool   `xml:"IsTruncated"`
+			NextKeyMarker      string `xml:"NextKeyMarker"`
+			NextUploadIDMarker string `xml:"NextUploadIdMarker"`
+		}
+		if err := xml.Unmarshal(r.body, &page); err != nil {
+			return objects, uploads, fmt.Errorf("%s: ListMultipartUploads %s: %w", b.cl.Name, bucket, err)
+		}
+		for _, u := range page.Uploads {
+			if !keep(u.Key) {
+				continue
+			}
+			ar, err := b.do(ctx, http.MethodDelete, bucket, u.Key, url.Values{"uploadId": {u.UploadID}}, nil, nil)
+			if err != nil {
+				return objects, uploads, err
+			}
+			if ar.status >= 300 && ar.status != http.StatusNotFound {
+				return objects, uploads, fmt.Errorf("%s: aborting upload of %s: HTTP %d %s", b.cl.Name, u.Key, ar.status, ar.code)
+			}
+			uploads++
+		}
+		if !page.Truncated || page.NextKeyMarker == "" {
+			break
+		}
+		keyMarker, idMarker = page.NextKeyMarker, page.NextUploadIDMarker
+	}
+	for {
+		deleted := 0
+		token := ""
+		for {
+			entries, next, err := b.listPage(ctx, bucket, prefix, token)
+			if err != nil {
+				return objects, uploads, err
+			}
+			for _, e := range entries {
+				if !keep(e.key) {
+					continue
+				}
+				dr, err := b.do(ctx, http.MethodDelete, bucket, e.key, nil, nil, nil)
+				if err != nil {
+					return objects, uploads, err
+				}
+				if dr.status >= 300 && dr.status != http.StatusNotFound {
+					return objects, uploads, fmt.Errorf("%s: deleting %s: HTTP %d %s: %w", b.cl.Name, e.key, dr.status, dr.code, errNotEmpty)
+				}
+				objects++
+				deleted++
+				if progress != nil {
+					progress(objects)
+				}
+			}
+			if next == "" {
+				break
+			}
+			token = next
+		}
+		if deleted == 0 {
+			return objects, uploads, nil
 		}
 	}
 }

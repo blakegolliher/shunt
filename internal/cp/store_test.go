@@ -2,8 +2,10 @@ package cp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -232,5 +234,33 @@ func TestStoreSurvivesRestartAndReload(t *testing.T) {
 	}
 	if _, ok := c.Snapshot().Cluster("vast04"); ok {
 		t.Error("a refused write was installed")
+	}
+}
+
+// A placement stored in schema v2 (ADR-0018) loads as the same placement: build N1 reads what a
+// later build writes, before any build writes it.
+func TestStoreReadsPlacementSchemaV2(t *testing.T) {
+	tc := startCluster(t, 1)
+	key := make([]byte, 32)
+	a := openStore(t, tc, 0, key)
+	ctx := context.Background()
+	if err := a.PutCluster(ctx, "vast01", cluster("control:vast01"), "s", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Adopt(ctx, "acme", "data", "vast01", "data", "test"); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := a.Snapshot().Lookup("acme", "data")
+	a.Close()
+	raw, err := json.Marshal(want.ToV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.nodes[0].Client().Put(ctx, kPlacements+"acme/data", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	b := openStore(t, tc, 0, key)
+	if got, ok := b.Snapshot().Lookup("acme", "data"); !ok || !reflect.DeepEqual(*got, *want) {
+		t.Fatalf("v2 placement loaded as %+v, want %+v (stored %s)", got, want, raw)
 	}
 }

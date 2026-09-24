@@ -22,7 +22,7 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 A review of `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03` identified gaps in snapshot
 installation, in-flight request fencing, lease grants, restore lineage, secret
 rotation, interrupted joins and UI state. The historical acceptance results below
-do not cover those failures. [ADR-0018](adr/0018-distributed-correctness.md) proposes
+do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) proposes
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
@@ -122,6 +122,115 @@ filesystem:
   loss, cache restart, mover convergence, cutover and purge; telemetry p99 differed by 3.24%. At the
   operator's request Playwright is not added: the visual flow and UI-5 screenshot are the remaining
   manual acceptance pass, not an automated browser gate.
+- **UI-7 (2026-09-23):** fixes from the first hands-on browser demo (commit 74bddd4); `distributed`
+  was then fast-forwarded into `master`.
+
+## The `1-to-n-bucket-support` branch (ADR-0018, proposed)
+
+One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1–N4.
+
+- **N1 done (2026-09-23): placement schema v2 is read everywhere, written nowhere.** A placement may
+  be written as `legs`, `owners` (hash ranges that partition the key space, 16-hex-digit bounds)
+  and one `move`; every reader converts it into the v1 fields on decode (`internal/directory/legs.go`):
+  the directory file, the control plane's etcd store, `GET /v1/directory`, the member cache and the
+  change records. A v2 placement this build cannot route (several owners, two legs on one cluster,
+  a partial move, more than 32 legs) is refused with the reason, never guessed at. The writer is
+  unchanged, so no byte on disk, in etcd or on the wire moved. Gate: `mixed-v2.yaml` loads to
+  exactly `mixed.yaml`'s placements; every v1 shape round-trips v1 → v2 → v1 through YAML and JSON;
+  17 invalid v2 samples name their key; the etcd store and a member (long poll and cache) read v2,
+  and both tests fail with the conversion removed; `FuzzParse` and `FuzzParseV2` clean for 30 s
+  each (about 2 M inputs); race suite and lint green; `make walkthrough` (62,441 operations, 0
+  errors) and `make readme-demo` green. `make fleet` was not run: its ports are held by the running
+  UI demo.
+- **N2 done (2026-09-23): buckets spread over legs, at rest.** `create-backend` with `legs` (and
+  Create → Spread across clusters in the UI) makes a bucket whose keys are split by hash over one new
+  bucket per cluster. The proxy narrows every object request to the leg that owns its key and merges
+  listings across legs (v2 and v1) with a fixed-size token (ADR-0019); other bucket-level requests
+  answer `NotImplemented`. Nothing moves a spread bucket yet (N3). Gate: proxy tests route 60 keys
+  and multipart uploads to their owners and nowhere else, page merged listings with and without a
+  delimiter and hide a stray on the wrong leg (fails with the filter removed), fail a listing with a
+  leg missing, and copy both ways; control tests cover the create's refusals and the guards;
+  `FuzzSpreadToken` clean; `BenchmarkSpreadListingPage` about 2× a plain bucket, flat from 2 to 32
+  legs; race suite, lint and 26 UI tests green. **Live on two MinIO clusters (2026-09-23):** a bucket
+  spread over them took two concurrent `shunt verify` runs, one through each proxy, at 0 errors in
+  119,177 operations, and a 12 MiB three-part upload read back identical through the other proxy.
+  Listed directly, the legs held 204 and 209 keys with none on both; through either proxy, paged by
+  1000 or 37, v2 or v1, the listing was exactly their 413; the delimited listing gave each of 4
+  prefixes once; GetBucketVersioning answered `NotImplemented`.
+- **N3a done (2026-09-23): moving part of a bucket between clusters.** A first ramp or migrate step
+  with a `range` moves only those keys to another leg (a plain bucket becomes spread this way); the
+  move runs through ramp, migrate, the mover, cutover and purge as a migration of its range, and
+  ends with the destination owning it. Purge deletes only the range; finish is refused while the
+  source leg keeps other keys. Gate: fleet property test on a half-bucket move, 6 runs, 0 violations
+  in 54,855 operations, negative control failing every run; proxy and control tests with negative
+  controls; race suite, lint, 29 UI tests. **Live (2026-09-23):** a plain bucket on minio01 moved the
+  lower half of its key space to a new leg on minio02 (ramp 25/60/100% held, migrate, mover converged
+  on pass 2, 5 s cutover, purge of the range's 83 objects) under two concurrent `shunt verify` runs,
+  one per proxy: 231,172 operations, and the only errors were the 311 hold 503s of ADR-0016, which
+  the proxies counted exactly (163 and 148; verify does not retry them). Afterwards minio01 held
+  only upper-half keys (266) and minio02 only lower-half keys (271), none on both, the listing was
+  their union, and every seeded object read back.
+- **N3b done (2026-09-23): two legs on one cluster.** A move's roles are legs, resolved to clusters
+  by `ClusterOf`, so a bucket can move to another bucket on its own cluster (the rename) and a
+  spread bucket can hold two legs on one cluster; upload ids issued during such a move carry a tag
+  of their bucket. Gate: fleet property test on a move within garage, 3 runs, 0 violations in 25,287
+  operations, negative control failing every run; proxy test (fails with the bucket looked up by
+  cluster, and untagged), control test through purge, 30 UI tests. **Live (2026-09-23):** a bucket on
+  minio02 moved to a new bucket on minio02 (ramp 25/60/100% held, migrate, mover converged, cutover,
+  purge of the old bucket's 151 objects) under two concurrent `shunt verify` runs: 234,420
+  operations, the only errors the 695 hold 503s the proxies counted exactly; three 12 MiB uploads
+  begun mid-ramp read back identical through the other proxy; the old bucket was deleted and the
+  new one held every key.
+- **verify retries hold 503s (2026-09-23).** `shunt verify` now retries a 503 that carries
+  `Retry-After` (the ADR-0016 hold), up to 10 times with backoff from 50 ms capped at the header,
+  as an S3 SDK does; the report counts them as `retried`, not errors. `--no-retry` restores the old
+  count.
+- **ADR-0018 N3c built (2026-09-23): consolidation, retire, step-out of a spread bucket.** A move
+  may name a leg (`--leg`) instead of a range; consolidating is that move once per other leg, and
+  the bucket settles to plain, where step-out handles it as before. `expand --clear` retires legs
+  that own nothing. CLI `--range`/`--leg` on ramp and migrate start; UI Consolidate and Retire idle
+  leg. Gate: directory, control (consolidation through purge, step-out before and after) and UI
+  tests; lint and race suite green. **Live (2026-09-23), demo fleet (3 control nodes, 2 proxies, two
+  MinIOs), steps through the CLI:** `n3-live`, spread over minio01/n3-live and minio02/n3-live-b,
+  consolidated into minio01/n3-live (`ramp --leg minio02` 25/60/100%, migrate, mover converged,
+  cutover, purge of 343 objects and the minio02 bucket) under two `shunt verify` runs, one per
+  proxy: 215,942 operations, **0 errors**, 141 hold 503s retried, exactly the 72 + 69 the proxies
+  counted. It ended a plain bucket on minio01, all 150 seed objects read back identical, and
+  step-out reports no problem for it. The first attempt, on `n2-live`, stalled at the mover:
+  minio01's conditional-write profile had never been measured, since only expand measured one.
+  A first step now measures its destination (ADR-0018 N3c). minio01 was measured by hand for the
+  move already in flight, which then finished under two more verify runs (138,765 operations,
+  0 errors) and left `n2-live` plain on minio01, ready for step-out.
+- **ADR-0018 N4 built (2026-09-23): UI and CLI.** `adopt --create` and `--spread` create buckets
+  from the CLI; `status --all` and a legs table for spread buckets; an ownership bar in Buckets,
+  bucket detail and Migrations; docs/spread-buckets.md. Every ADR-0018 phase is now built; its
+  open questions (prefix ownership, concurrent moves, the listing target for raising the cap,
+  rebalancing policy) remain.
+- **ADR-0020 (prefix ownership) P1 built (2026-09-23).** Decided: rebalancing is never proposed by
+  shunt; the listing target and concurrent moves stay deferred; prefix ownership is wanted. P1:
+  prefix rules as scopes with their own tables, carve and merge (API and `expand --carve/--merge`)
+  that change no key's owner, one ownership path (`Scope`, `OwnerOf`, `InMove`) for the proxy,
+  listing, mover and purge, listings reading only the legs a prefix can use, status per scope.
+  Gate: carve/merge property test with its negative control, `FuzzOwnerOf`, proxy test with two
+  negative controls, control and CLI tests; lint and race suite green (internal/cp's etcd join
+  flake, "incompatible with current running cluster", recurred in two runs and passed on rerun).
+  Next: P2, moves within a scope.
+- **ADR-0020 P2 built (2026-09-23): moves within a prefix rule.** `--scope` on ramp and migrate
+  start; move membership is scope and range; the mover and purge list only the prefix. Gate: fleet
+  property test's scoped run with nested rules, 5 runs, 158,095 client operations, 0 violations,
+  negative control failing every run, and a stray check that catches a move ignoring scope;
+  directory, control (purge lists only the prefix), proxy, mover and CLI tests. **Live:** `archive/`
+  carved in `n4-live` under load and half of it moved minio01 → minio02 under three verify runs:
+  309,059 operations, 0 errors, holds retried equal to the proxies' 59 + 72. Fixed on the way:
+  purge-source reported "deleted the bucket" for a purge of part of a bucket, which keeps it.
+  Next: P3 (UI; the CLI landed in P1 and P2).
+- **Fixed (2026-09-23): the control plane's etcd join flake.** A joining control node was added as
+  a voting member before it started, which left the first node short of quorum until the joiner
+  was up; the joiner's own startup checks against it then stalled ~7 s (ReadIndex timeouts, the
+  leader stepping down) and sometimes failed ("incompatible with current running cluster"), which
+  internal/cp's tests hit intermittently. A member now joins as a learner and promotes itself once
+  caught up. Same four multi-node tests ×4: 4m17s with 20 stalls before, 1m31s with none after;
+  the package ×3 under -race green.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

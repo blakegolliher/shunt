@@ -65,6 +65,11 @@ type job struct {
 	src, dst    side
 	conditional bool // the target honors If-None-Match: * on PUT
 	condDelete  bool // the target honors If-Match on DELETE
+	// keep, for a move of part of a bucket (ADR-0018 N3), is the moving range: the source leg also
+	// holds keys it keeps, which are never copied. Nil copies every key.
+	keep func(key string) bool
+	// prefix, for a move within a prefix rule (ADR-0020), is the only part of the source listed.
+	prefix string
 }
 
 // LedgerEntry is one row of a run's append-only record, in the order the mover wrote it.
@@ -148,11 +153,20 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 	var jobs []job
 	for _, key := range keys {
 		p := dir.Placements[key]
+		var keep func(string) bool
+		prefix := ""
+		if m := p.Move; m != nil {
+			// Part of a bucket moves: the move's two legs, and only the keys in its range (ADR-0018 N3).
+			spread := p
+			keep = func(k string) bool { return migrate.InMove(&spread, k) }
+			prefix = m.Scope
+			p = p.MoveView()
+		}
 		tenant, name, _ := strings.Cut(key, "/")
 		switch {
 		case one != "" && key != one:
 			continue
-		case one == "" && from != "" && p.Source != from:
+		case one == "" && from != "" && p.ClusterOf(p.Source) != from:
 			continue
 		case one == "" && from == "":
 			continue
@@ -168,24 +182,28 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 			}
 			continue
 		}
-		srcCl, err := client(p.Source)
+		// Roles name buckets; ClusterOf names the cluster each is on (a move's two legs may share one).
+		srcName, dstName := p.ClusterOf(p.Source), p.ClusterOf(p.Primary)
+		srcCl, err := client(srcName)
 		if err != nil {
 			return nil, err
 		}
-		dstCl, err := client(p.Primary)
+		dstCl, err := client(dstName)
 		if err != nil {
 			return nil, err
 		}
-		if !dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
-			return nil, migrate.RefuseLostWriteWindow(key, p.Primary)
+		if !dir.Clusters[dstName].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+			return nil, migrate.RefuseLostWriteWindow(key, dstName)
 		}
 		jobs = append(jobs, job{
 			tenant: tenant, client: name,
-			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl, accessKey: dir.Clusters[p.Source].Credentials.AccessKey, secretRef: dir.Clusters[p.Source].Credentials.SecretRef},
-			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl, accessKey: dir.Clusters[p.Primary].Credentials.AccessKey, secretRef: dir.Clusters[p.Primary].Credentials.SecretRef},
-			conditional: dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
+			src:         side{name: srcName, bucket: p.Names[p.Source], cl: srcCl, accessKey: dir.Clusters[srcName].Credentials.AccessKey, secretRef: dir.Clusters[srcName].Credentials.SecretRef},
+			dst:         side{name: dstName, bucket: p.Names[p.Primary], cl: dstCl, accessKey: dir.Clusters[dstName].Credentials.AccessKey, secretRef: dir.Clusters[dstName].Credentials.SecretRef},
+			conditional: dir.Clusters[dstName].Capabilities.ConditionalWriteOr(true),
 			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
-			condDelete: dir.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
+			condDelete: dir.Clusters[dstName].Capabilities.ConditionalDeleteOr(false),
+			keep:       keep,
+			prefix:     prefix,
 		})
 	}
 	return jobs, nil
@@ -211,13 +229,16 @@ func move(ctx context.Context, j job, paths Paths, dryRun bool, out, errOut io.W
 	var token *string
 	for {
 		page, err := j.src.cl.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket: &j.src.bucket, ContinuationToken: token, StartAfter: optional(after),
+			Bucket: &j.src.bucket, ContinuationToken: token, StartAfter: optional(after), Prefix: optional(j.prefix),
 		})
 		if err != nil {
 			return s, fmt.Errorf("list %s: %w", j.src.bucket, err)
 		}
 		for i := range page.Contents {
 			key := aws.ToString(page.Contents[i].Key)
+			if j.keep != nil && !j.keep(key) {
+				continue // a key the source leg keeps
+			}
 			if dryRun {
 				_, _ = fmt.Fprintf(out, "   would copy %s (%d bytes)\n", key, aws.ToInt64(page.Contents[i].Size))
 				s.copied++

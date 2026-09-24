@@ -39,6 +39,9 @@ type Ramp struct {
 	Hash     string   `yaml:"hash" json:"hash"`
 	Ratio    float64  `yaml:"ratio,omitempty" json:"ratio,omitempty"`
 	Prefixes []string `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
+	// Range limits the ramp to the keys whose hash it holds, and makes Ratio a share of it: the
+	// ramp of a move of part of a bucket (ADR-0018 N3). Nil is every key, as before N3.
+	Range *HashRange `yaml:"range,omitempty" json:"range,omitempty"`
 	// Hold is a ramp step that has been written but is not in force yet (ADR-0016). A key inside
 	// Hold but outside the ramp is held: its writes are refused with 503 until the step reaches
 	// every proxy, so no proxy writes it to the target while another still writes it to the source.
@@ -68,38 +71,62 @@ type CutoverEvidence struct {
 // Placement maps one (tenant, bucket) to clusters and a state.
 type Placement struct {
 	State   string `yaml:"state" json:"state"`
-	Primary string `yaml:"primary" json:"primary"`
+	Primary string `yaml:"primary,omitempty" json:"primary,omitempty"` // always set in v1; empty in v2
 	Source  string `yaml:"source,omitempty" json:"source,omitempty"`
 	// Target is the cluster `shunt expand` prepared for the move, recorded while ACTIVE so the
 	// first ramp or migrate step needs no --to. Its backend name is in Names.
 	Target       string            `yaml:"target,omitempty" json:"target,omitempty"`
 	Cutover      *CutoverEvidence  `yaml:"cutover,omitempty" json:"cutover,omitempty"`
 	Ramp         *Ramp             `yaml:"ramp,omitempty" json:"ramp,omitempty"`
-	Names        map[string]string `yaml:"names" json:"names"` // cluster → backend bucket name
+	Names        map[string]string `yaml:"names,omitempty" json:"names,omitempty"` // cluster → backend bucket name; v1 only
 	Cold         string            `yaml:"cold,omitempty" json:"cold,omitempty"`
 	Tier         string            `yaml:"tier,omitempty" json:"tier,omitempty"` // native | emulated
 	Lifecycle    string            `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
 	Created      time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
 	ReadOnly     bool              `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	RejectWrites bool              `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
+
+	// Schema v2 (ADR-0018, legs.go). Only a decoder sets these, and it converts them into the v1
+	// fields above before anything else sees the placement, so outside legs.go they are always
+	// empty. In v2, Target and Cold name legs instead of clusters.
+	Legs    map[string]Leg `yaml:"legs,omitempty" json:"legs,omitempty"`
+	Owners  []Owner        `yaml:"owners,omitempty" json:"owners,omitempty"`
+	KeyHash string         `yaml:"hash,omitempty" json:"hash,omitempty"` // splits the key space among Owners
+	Move    *Move          `yaml:"move,omitempty" json:"move,omitempty"`
+	// Prefixes are prefix rules (ADR-0020, scopes.go): scopes of keys owned by their own table.
+	Prefixes []PrefixRule `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
+
+	// LegClusters is set only on a move's view (MoveView), never stored: its roles (Source, Primary
+	// and the keys of Names) are leg ids there, since two legs may share a cluster (ADR-0018 N3b),
+	// and this maps each to its cluster. ClusterOf reads it.
+	LegClusters map[string]string `yaml:"-" json:"-"`
+}
+
+// ClusterOf is the cluster a role of p is on: a move's view names its roles by leg, and every other
+// placement names them by cluster.
+func (p *Placement) ClusterOf(role string) string {
+	if c, ok := p.LegClusters[role]; ok {
+		return c
+	}
+	return role
 }
 
 func (p Placement) clone() Placement {
 	c := p
 	c.Names = maps.Clone(p.Names)
-	if p.Ramp != nil {
-		r := *p.Ramp
-		r.Prefixes = slices.Clone(p.Ramp.Prefixes)
-		if p.Ramp.Hold != nil {
-			h := *p.Ramp.Hold
-			h.Prefixes = slices.Clone(p.Ramp.Hold.Prefixes)
-			r.Hold = &h
-		}
-		c.Ramp = &r
-	}
+	c.Ramp = v2ramp(p.Ramp)
 	if p.Cutover != nil {
 		ev := *p.Cutover
 		c.Cutover = &ev
+	}
+	c.Legs = maps.Clone(p.Legs)
+	c.LegClusters = maps.Clone(p.LegClusters)
+	c.Owners = slices.Clone(p.Owners)
+	c.Prefixes = clonePrefixes(p.Prefixes)
+	if p.Move != nil {
+		m := *p.Move
+		m.Ramp, m.Cutover = v2ramp(p.Move.Ramp), v2cutover(p.Move.Cutover)
+		c.Move = &m
 	}
 	return c
 }
@@ -141,6 +168,9 @@ func References(f *File, cluster string) []string {
 	for _, k := range sortedKeys(f.Placements) {
 		p := f.Placements[k]
 		_, named := p.Names[cluster]
+		for _, l := range p.Legs {
+			named = named || l.Cluster == cluster
+		}
 		if p.Primary == cluster || p.Source == cluster || p.Target == cluster || p.Cold == cluster || named {
 			refs = append(refs, "placements."+k)
 		}
@@ -175,6 +205,13 @@ func parse(data []byte) (*File, error) {
 			return &File{}, nil
 		}
 		return nil, config.KeyedDecodeError("directory", data, err)
+	}
+	for _, k := range sortedKeys(f.Placements) {
+		p := f.Placements[k]
+		if err := p.fromV2(); err != nil {
+			return nil, &config.Error{Key: "placements." + k, Msg: err.Error()}
+		}
+		f.Placements[k] = p
 	}
 	config.ApplyClusterDefaults(f.Clusters)
 	return f, nil
@@ -219,6 +256,14 @@ type Store interface {
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.
 	SetTarget(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
+	// CreateSpread writes an ACTIVE placement spread over one leg per cluster (ADR-0018 N2).
+	CreateSpread(ctx context.Context, tenant, bucket string, legs []Leg, actor string) error
+	// ClearTarget forgets an ACTIVE placement's prepared target before any step has used it.
+	ClearTarget(ctx context.Context, tenant, bucket, actor string) error
+	// Carve adds a prefix rule owned as its keys are now, and Merge removes one owned as its
+	// parent scope is (ADR-0020): neither changes any key's owner.
+	Carve(ctx context.Context, tenant, bucket, prefix, actor string) error
+	Merge(ctx context.Context, tenant, bucket, prefix, actor string) error
 	// SetTenantDefault changes where a tenant's new buckets are created.
 	SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error
 	// PutCluster adds or replaces a cluster. secret, when not empty, is the cluster's secret key for
@@ -234,10 +279,12 @@ type Store interface {
 
 // Errors returned by Directory implementations.
 var (
-	ErrExists       = errors.New("directory: placement already exists")
-	ErrInUse        = errors.New("directory: cluster is still in use")
-	ErrNotFound     = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
-	ErrConflict     = errors.New("directory: placement changed concurrently")
+	ErrExists   = errors.New("directory: placement already exists")
+	ErrInUse    = errors.New("directory: cluster is still in use")
+	ErrNotFound = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
+	ErrConflict = errors.New("directory: placement changed concurrently")
+	// ErrRefused is a change refused on its merits, whatever else changes concurrently.
+	ErrRefused      = errors.New("directory: refused")
 	ErrReadOnly     = errors.New("directory: directory file is not writable")
 	ErrSecretInline = errors.New("directory: the directory file carries only secret_refs, never a secret")
 	ErrLockTimeout  = errors.New("directory: timed out waiting for the directory lock")

@@ -157,3 +157,179 @@ test('create imports a client key, and a bucket no key reaches is flagged', asyn
   await waitFor(() => expect(screen.queryByText('no client keys')).not.toBeInTheDocument())
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
+
+test('naming an existing client bucket offers Expand instead of adding it twice', async () => {
+  const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', names: { source: 'data' }, read_only: false, reject_writes: false }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let expandBody: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/data/expand') && init?.method === 'POST') {
+      expandBody = JSON.parse(String(init.body))
+      return Response.json({ key: 'acme/data', target: 'target', name: 'data-minio', version: 4 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Create new' }))
+  fireEvent.change(screen.getByLabelText('Tenant'), { target: { value: 'acme' } })
+  expect(document.querySelector('#client-buckets option[value="data"]')).not.toBeNull()
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'data' } })
+  fireEvent.change(screen.getByLabelText('Cluster'), { target: { value: 'target' } })
+  fireEvent.change(screen.getByLabelText(/Backend bucket name/), { target: { value: 'data-minio' } })
+  expect(screen.getByRole('status')).toHaveTextContent('acme/data already exists: ACTIVE on source as data')
+  expect(screen.getByRole('button', { name: 'Create bucket' })).toBeDisabled()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Expand data to target' }))
+  expect(screen.getByRole('dialog')).toHaveTextContent('Expand acme/data')
+  expect(screen.getByLabelText('Target bucket name')).toHaveValue('data-minio')
+  fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
+  await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'data-minio', create: true }))
+})
+
+test('clears an expanded target from the row, and expand can accept existing objects', async () => {
+  const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', target: 'target', names: { source: 'data', target: 'old' }, read_only: false, reject_writes: false }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let cleared = false
+  let expandBody: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/data/target') && init?.method === 'DELETE') {
+      cleared = true
+      directory.placements = [{ ...placement, target: undefined, names: { source: 'data' } }]
+      directory.version++
+      return Response.json({ key: 'acme/data', target: 'target', name: 'old', version: directory.version })
+    }
+    if (url.endsWith('/placements/acme/data/expand') && init?.method === 'POST') {
+      expandBody = JSON.parse(String(init.body))
+      return Response.json({ key: 'acme/data', target: 'target', name: 'old', version: 5 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  expect(screen.queryByRole('button', { name: 'Expand acme/data' })).not.toBeInTheDocument()
+  fireEvent.click(await screen.findByRole('button', { name: 'Clear target of acme/data' }))
+  expect(await screen.findByText('acme/data: target target cleared; its bucket is still there')).toBeInTheDocument()
+  expect(cleared).toBe(true)
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand acme/data' }))
+  fireEvent.change(screen.getByLabelText('Target bucket name'), { target: { value: 'old' } })
+  fireEvent.click(screen.getByLabelText(/already holds this bucket's objects/))
+  fireEvent.click(screen.getByRole('button', { name: 'Create target and continue to Migrations' }))
+  await waitFor(() => expect(expandBody).toEqual({ to: 'target', name: 'old', create: true, accept_existing_objects: true }))
+})
+
+test('creates a bucket spread across clusters and shows its legs', async () => {
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [] }
+  let sent: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/placements/acme/wide/create-backend') && init?.method === 'POST') {
+      sent = JSON.parse(String(init.body))
+      const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+        legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }] }, { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5, ranges: [{ from: '8000000000000000', to: 'ffffffffffffffff' }] }] }
+      directory.placements = [placement]
+      directory.version++
+      return Response.json(placement)
+    }
+    if (url.endsWith('/placements/acme/wide/view')) return Response.json({ ...directory.placements[0], fence: { version: directory.version, held: false, proxies: 0, waiting_on: [], silent: [] }, operations: [], clusters: { source, target } })
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Create new' }))
+  fireEvent.change(screen.getByLabelText('Tenant'), { target: { value: 'acme' } })
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'wide' } })
+  fireEvent.click(screen.getByLabelText('source'))
+  fireEvent.click(screen.getByLabelText('target'))
+  expect(screen.getByText('(not used: spreading)')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Create bucket' }))
+  expect(await screen.findByText('Bucket acme/wide created, spread over 2 clusters')).toBeInTheDocument()
+  expect(sent).toEqual({ cluster: 'source', name: 'wide', legs: [{ cluster: 'source', name: 'wide' }, { cluster: 'target', name: 'wide' }] })
+  expect(await screen.findByText('spread: source + target')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Expand acme/wide' })).not.toBeInTheDocument()
+  fireEvent.click(screen.getByText('spread: source + target'))
+  expect(await screen.findAllByText('wide · 50% of keys', { exact: false })).toHaveLength(2)
+})
+
+test('moves part of a spread bucket leg to another cluster', async () => {
+  const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+    legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.5, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }] },
+      { id: 'target', cluster: 'target', bucket: 'wide', share: 0.5, ranges: [{ from: '8000000000000000', to: 'ffffffffffffffff' }] }] }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let started: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      started = JSON.parse(String(init.body))
+      return Response.json({ id: 'op-1', kind: 'ramp', placement: 'acme/wide', actor: 'token:x', status: 'running', phase: 'queued' })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Move keys of acme/wide' }))
+  fireEvent.change(screen.getByLabelText("Share of the leg's keys"), { target: { value: '0.5' } })
+  expect(screen.getByText('Into its leg\'s bucket', { exact: false })).toHaveTextContent('wide')
+  fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
+  await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
+    args: { to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, ratio: 0.01, create: true, wait: '30s' } }))
+})
+
+test('consolidates a spread bucket one leg at a time and retires an idle leg', async () => {
+  const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+    legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.75, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }, { from: 'c000000000000000', to: 'ffffffffffffffff' }] },
+      { id: 'target', cluster: 'target', bucket: 'wide-t', share: 0.25, ranges: [{ from: '8000000000000000', to: 'bfffffffffffffff' }] },
+      { id: 'target-2', cluster: 'target', bucket: 'wide-idle', share: 0, ranges: [], idle: true }] }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let started: unknown
+  let retired = false
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      started = JSON.parse(String(init.body))
+      return Response.json({ id: 'op-1', kind: 'ramp', placement: 'acme/wide', actor: 'token:x', status: 'running', phase: 'queued' })
+    }
+    if (url.endsWith('/v1/placements/acme/wide/target') && init?.method === 'DELETE') {
+      retired = true
+      return Response.json({ key: 'acme/wide', retired: [{ id: 'target-2', cluster: 'target', bucket: 'wide-idle' }], version: 4 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Retire idle legs of acme/wide' }))
+  expect(await screen.findByText('acme/wide: retired target/wide-idle, which owned no keys; the buckets are still there')).toBeInTheDocument()
+  expect(retired).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Consolidate acme/wide' }))
+  expect(screen.getByLabelText('Keep')).toHaveValue('source')
+  expect(screen.getByText('1 move left')).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Keep'), { target: { value: 'target' } })
+  expect(screen.getByText('2 moves left')).toBeInTheDocument()
+  expect(screen.getByText(', in 2 ranges (a move each)', { exact: false })).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '25%' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Start the next move and continue to Migrations' }))
+  await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
+    args: { to: 'target', name: 'wide-t', leg: 'source', ratio: 0.25, wait: '30s' } }))
+})
+
+test('moves a bucket to another bucket on its own cluster from Expand', async () => {
+  const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', names: { source: 'data' }, read_only: false, reject_writes: false }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let started: unknown
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      started = JSON.parse(String(init.body))
+      return Response.json({ id: 'op-1', kind: 'ramp', placement: 'acme/data', actor: 'token:x', status: 'running', phase: 'queued' })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand acme/data' }))
+  fireEvent.change(screen.getByLabelText('Target cluster'), { target: { value: 'source' } })
+  expect(screen.getByText(/cannot be recorded as a target/)).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Target bucket name'), { target: { value: 'data-final' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
+  await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/data',
+    args: { to: 'source', name: 'data-final', ratio: 0.01, create: true, wait: '30s' } }))
+})

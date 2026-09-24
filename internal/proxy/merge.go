@@ -76,6 +76,7 @@ type listSide struct {
 	started bool
 	missing bool // the cluster answered NoSuchBucket
 	items   []listItem
+	page    int // max-keys asked of the backend; 0 is maxListKeys
 }
 
 // mergeListing answers ListObjectsV2 from both of a migrating bucket's clusters: a sorted merge of
@@ -169,7 +170,11 @@ func (h *Handler) fetchListPage(ctx context.Context, o *outcome, s *listSide, q 
 	// asked for. Backends disagree about what that encoding means — Garage 2.3.0 percent-encodes
 	// "/" in a key, MinIO leaves it — and two spellings of one key would merge as two objects
 	// (docs/backend-compat.md). Decoding normalizes them; writeListing re-encodes on the way out.
-	v := url.Values{"list-type": {"2"}, "max-keys": {strconv.Itoa(maxListKeys)}, "encoding-type": {"url"}}
+	pageSize := maxListKeys
+	if s.page > 0 {
+		pageSize = s.page
+	}
+	v := url.Values{"list-type": {"2"}, "max-keys": {strconv.Itoa(pageSize)}, "encoding-type": {"url"}}
 	for _, k := range []string{"prefix", "delimiter", "fetch-owner"} {
 		if x := q.Get(k); x != "" {
 			v.Set(k, x)
@@ -261,24 +266,37 @@ func (h *Handler) writeListing(w http.ResponseWriter, o *outcome, q url.Values, 
 		_ = xml.EscapeText(&b, []byte(next))
 		b.WriteString(`</NextContinuationToken>`)
 	}
+	writeListEntries(&b, items, name)
+	b.WriteString(`</ListBucketResult>`)
+	hd := w.Header()
+	hd.Set("Content-Type", "application/xml")
+	hd.Set("Content-Length", strconv.Itoa(b.Len()))
+	w.WriteHeader(http.StatusOK)
+	o.status = http.StatusOK
+	n, _ := w.Write(b.Bytes())
+	o.bytesOut = int64(n)
+}
+
+// writeListEntries renders a page's objects, then its common prefixes, as both listing versions do.
+func writeListEntries(b *bytes.Buffer, items []listItem, name func(string) string) {
 	for i := range items {
 		it := &items[i]
 		if it.prefix {
 			continue
 		}
 		b.WriteString(`<Contents><Key>`)
-		_ = xml.EscapeText(&b, []byte(name(it.name)))
+		_ = xml.EscapeText(b, []byte(name(it.name)))
 		b.WriteString(`</Key>`)
 		if lm := it.obj.LastModified; lm != nil {
-			fmt.Fprintf(&b, `<LastModified>%s</LastModified>`, lm.UTC().Format("2006-01-02T15:04:05.000Z"))
+			fmt.Fprintf(b, `<LastModified>%s</LastModified>`, lm.UTC().Format("2006-01-02T15:04:05.000Z"))
 		}
 		if et := it.obj.ETag; et != nil {
 			b.WriteString(`<ETag>`)
-			_ = xml.EscapeText(&b, []byte(*et))
+			_ = xml.EscapeText(b, []byte(*et))
 			b.WriteString(`</ETag>`)
 		}
 		if sz := it.obj.Size; sz != nil {
-			fmt.Fprintf(&b, `<Size>%d</Size>`, *sz)
+			fmt.Fprintf(b, `<Size>%d</Size>`, *sz)
 		}
 		if sc := string(it.obj.StorageClass); sc != "" {
 			b.WriteString(`<StorageClass>` + sc + `</StorageClass>`)
@@ -291,15 +309,7 @@ func (h *Handler) writeListing(w http.ResponseWriter, o *outcome, q url.Values, 
 			continue
 		}
 		b.WriteString(`<CommonPrefixes><Prefix>`)
-		_ = xml.EscapeText(&b, []byte(name(it.name)))
+		_ = xml.EscapeText(b, []byte(name(it.name)))
 		b.WriteString(`</Prefix></CommonPrefixes>`)
 	}
-	b.WriteString(`</ListBucketResult>`)
-	hd := w.Header()
-	hd.Set("Content-Type", "application/xml")
-	hd.Set("Content-Length", strconv.Itoa(b.Len()))
-	w.WriteHeader(http.StatusOK)
-	o.status = http.StatusOK
-	n, _ := w.Write(b.Bytes())
-	o.bytesOut = int64(n)
 }

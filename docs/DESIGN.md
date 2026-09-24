@@ -3,7 +3,7 @@
 Name: **shunt** — to divert traffic onto another track without stopping it. Binary `shunt`, module `github.com/blakegolliher/shunt`, metric prefix `shunt_`.
 
 **Distributed correctness proposal (2026-09-24):**
-[ADR-0018](adr/0018-distributed-correctness.md) and the
+[ADR-0021](adr/0021-distributed-correctness.md) and the
 [implementation plan](prompts/distributed-hardening.md) specify fixes for runtime
 installation, request draining, restore recovery, control membership and operator
 state. They are proposed, not shipped; §12 and ADR-0015 remain the implemented

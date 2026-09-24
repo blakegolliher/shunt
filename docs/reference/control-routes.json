@@ -177,6 +177,30 @@
     "mutation": true
   },
   {
+    "method": "DELETE",
+    "pattern": "/v1/placements/{tenant}/{bucket}/target",
+    "verbs": [
+      "expand"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/prefixes",
+    "verbs": [
+      "expand"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "DELETE",
+    "pattern": "/v1/placements/{tenant}/{bucket}/prefixes",
+    "verbs": [
+      "expand"
+    ],
+    "mutation": true
+  },
+  {
     "method": "POST",
     "pattern": "/v1/placements/{tenant}/{bucket}/read-only",
     "verbs": [

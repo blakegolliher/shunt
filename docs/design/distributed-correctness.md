@@ -2,7 +2,7 @@
 
 **Proposed, not implemented.** 2026-09-24; based on `distributed` commit
 `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`. Read
-[ADR-0018](../adr/0018-distributed-correctness.md), the
+[ADR-0021](../adr/0021-distributed-correctness.md), the
 [API/CLI/GUI contracts](distributed-correctness-contracts.md), and the
 [delivery and test plan](../prompts/distributed-hardening.md) together.
 
@@ -438,6 +438,15 @@ not from the live store before or after the streaming snapshot call.
 ## 6. D4 — recoverable membership and observed health
 
 ### Join and remove
+
+**Landed (2026-09-23, on `1-to-n-bucket-support`):** a joining node is now added
+with `MemberAddAsLearner` and promotes itself with `MemberPromote` once etcd
+reports it caught up, retrying while it is not (`internal/cp/etcd.go`, `promote`);
+a learner that restarts before promotion tries again and runs as a learner with a
+warning if it cannot. This removed the intermittent `internal/cp` test failure
+("incompatible with current running cluster") and a ~7 s stall on every join. What
+remains for D4/T12 is everything durable below: the persisted join intent and its
+phases, reconciling a lost add response, resume and cancel, and removal by ID.
 
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability

@@ -1,0 +1,5 @@
+# expect: placements.acme/data: owners: the ranges stop at 7fffffffffffffff
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, legs: { g: { cluster: garage, bucket: data } }, owners: [ { from: "0000000000000000", to: "7fffffffffffffff", leg: g } ] }

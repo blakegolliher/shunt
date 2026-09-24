@@ -242,7 +242,8 @@ readme-demo: build ## the README demo, steps 1-14, unattended: e2e Garage (as cl
 fleet: build ## P3c: three shunt-control nodes and two proxies sharing nothing: the fence, quorum loss, a cache restart (ADR-0015, ADR-0016); needs make e2e-up
 	$(E2E_DIR)/fleet.sh $(FLEET_ARGS)
 
-demo-ui: e2e-up ## build and leave a three-control/two-proxy UI demo fleet running
+demo-ui: e2e-up ## build and leave a three-control/two-proxy UI demo fleet running, on the two MinIOs
+	cd $(E2E_DIR) && $(COMPOSE) stop garage   # the demo does not use it; make e2e-up starts it again
 	$(MAKE) ui
 	$(MAKE) build
 	$(E2E_DIR)/demo-ui.sh
@@ -256,9 +257,13 @@ run-vast-resign: build ## run shunt in resign mode in front of the VAST cluster 
 	@sed -e "s/VAST_ACCESS_KEY_SET_BY_ENV/$$VAST_ACCESS_KEY_ID/" -e "s|VAST_HOSTPORT_SET_BY_ENV|$(patsubst https://%,%,$(VAST_ENDPOINT))|" -e "s/VAST_BUCKET_SET_BY_ENV/$(VAST_BUCKET)/g" $(E2E_DIR)/directory-vast.yaml > $(E2E_DIR)/data/directory-vast.yaml
 	$(BIN)/shunt serve --config $(E2E_DIR)/data/shunt-vast-resign.yaml
 
+# The backends write their data into bind mounts under $(E2E_DIR)/data. Rootless podman writes it
+# as the invoking user; Docker as root (CI's runner), so there it takes E2E_RM="sudo rm -rf".
+E2E_RM ?= rm -rf
+
 e2e-down: ## tear down the e2e backends and their data
 	cd $(E2E_DIR) && $(COMPOSE) down -v --remove-orphans
-	rm -rf $(E2E_DIR)/data
+	$(E2E_RM) $(E2E_DIR)/data
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-14s %s\n", $$1, $$2}'

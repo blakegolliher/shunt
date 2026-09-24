@@ -1,0 +1,5 @@
+# expect: placements.acme/data: target: unknown leg "x"
+version: 1
+tenants: { acme: { default_cluster: garage } }
+placements:
+  acme/data: { state: ACTIVE, legs: { g: { cluster: garage, bucket: data } }, owners: [ { from: "0000000000000000", to: ffffffffffffffff, leg: g } ], target: x }
