@@ -195,6 +195,7 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		// The runtime bundle follows the directory, the key file and the registry: after an install
 		// the registry has committed that version's clusters, and a key change keeps the directory.
 		rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: store.Table(), Clusters: registry.Load()})
+		rt.Observe = observeBundles(metrics, log)
 		republish := func(s *directory.Snapshot, keys auth.Table) {
 			if perr := rt.Refresh(s, keys, registry.Load()); perr != nil {
 				log.Error("runtime bundle not published", "err", perr.Error())
@@ -393,6 +394,8 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	// Each installed version is published as one bundle: the member has committed its clusters and
 	// swapped its keys before OnInstall, under its install lock, so bundles never go back (ADR-0021).
 	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: m.Snapshot(), Keys: m.Keys().Table(), Clusters: registry.Load()})
+	rt.Observe = observeBundles(metrics, log)
+	m.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }
 	m.OnInstall = func(s *directory.Snapshot) {
 		if err := rt.Refresh(s, m.Keys().Table(), registry.Load()); err != nil {
 			log.Error("runtime bundle not published", "err", err.Error())
@@ -415,6 +418,25 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 			"proxy", mcfg.ProxyID, "err", err.Error())
 	}
 	return m, registry, rt, nil
+}
+
+// observeBundles exports the runtime publisher's state and logs when installs start and stop
+// waiting on the retired-bundle bound. It runs under the publisher's lock, so its state needs none.
+func observeBundles(metrics *telemetry.Metrics, log *slog.Logger) func(runtimecfg.Stats) {
+	waiting := false
+	return func(st runtimecfg.Stats) {
+		metrics.BundlesRetired.Set(float64(st.Retired))
+		switch {
+		case st.Pending != 0 && !waiting:
+			metrics.InstallBackpressure.Set(1)
+			log.Warn("install backpressure: long-running requests hold the maximum number of replaced runtime bundles; new requests keep using the older version until one finishes",
+				"serving", st.Version, "pending", st.Pending, "retired", st.Retired)
+		case st.Pending == 0 && waiting:
+			metrics.InstallBackpressure.Set(0)
+			log.Info("install backpressure cleared", "serving", st.Version)
+		}
+		waiting = st.Pending != 0
+	}
 }
 
 // defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',

@@ -38,6 +38,10 @@ type Metrics struct {
 	FleetStale     prometheus.Gauge     // shunt_fleet_stale
 	FenceWait      prometheus.Histogram // shunt_fleet_fence_wait_seconds
 	TelemetryMerge prometheus.Histogram // shunt_telemetry_merge_seconds
+
+	// The runtime bundle (ADR-0021 D1), resign mode.
+	BundlesRetired      prometheus.Gauge // shunt_runtime_bundles_retired
+	InstallBackpressure prometheus.Gauge // shunt_install_backpressure
 }
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
@@ -135,11 +139,17 @@ func NewMetrics() *Metrics {
 			Name: "shunt_telemetry_merge_seconds", Help: "Control node: time to decode and merge one completed fleet telemetry window.",
 			Buckets: prometheus.ExponentialBuckets(10e-6, 2.15443469, 16),
 		}),
+		BundlesRetired: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_runtime_bundles_retired", Help: "Replaced runtime bundles a request still holds (at most 8).",
+		}),
+		InstallBackpressure: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_install_backpressure", Help: "1 while an installed directory version waits for a retired runtime bundle to drain.",
+		}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
 		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
-		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge,
+		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge, m.BundlesRetired, m.InstallBackpressure,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

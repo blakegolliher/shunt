@@ -14,6 +14,7 @@ import (
 
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -36,11 +37,10 @@ var refusedOps = map[s3.Op]bool{
 
 // prepareResign verifies the client, resolves the placement, and prepares the upstream request
 // for the cluster the placement routes to. It returns false when shunt has already answered.
-func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, inBody *progressReader) (*prepared, bool) {
+// rt is the request's bundle: the keys that verify the client, the placement that routes it and
+// the clusters that sign it come from one published version (ADR-0021 D1).
+func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, inBody *progressReader, rt *runtimecfg.Bundle) (*prepared, bool) {
 	t0 := time.Now()
-	// One bundle for the whole request: the keys that verify the client, the placement that routes
-	// it and the clusters that sign it come from one published version (ADR-0021 D1).
-	rt := h.Runtime.Load()
 	id, aerr := sigv4.Verify(ctx, r, rt.Keys, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
 	if aerr != nil {
 		h.Metrics.AuthFailures.WithLabelValues(string(aerr.Reason)).Inc()

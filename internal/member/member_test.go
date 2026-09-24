@@ -552,6 +552,32 @@ func TestHeartbeatReportsSecretGenerations(t *testing.T) {
 	}
 }
 
+// While installs are backpressured the proxy serves an older bundle than it installed: heartbeats
+// report the served version and its secret generations, so a fence waits for it (ADR-0021 D1).
+func TestHeartbeatReportsTheServedVersion(t *testing.T) {
+	f := newFakeControl(t)
+	f.mu.Lock()
+	f.dir.Generations = map[string]int64{directory.SecretResource("vast01"): 1}
+	f.mu.Unlock()
+	c := newClient(t, f)
+	if err := c.Register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	served := directory.NewSnapshot(&directory.File{Identity: c.Snapshot().File().Identity})
+	c.Serving = func() *directory.Snapshot { return served }
+	if err := c.beat(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if first := f.beats[0]; first.Applied != 1 {
+		t.Fatalf("without Serving the heartbeat reports the installed version: %d", first.Applied)
+	}
+	if last := f.beats[len(f.beats)-1]; last.Applied != 0 || len(last.Secrets) != 0 {
+		t.Fatalf("heartbeat applied %d secrets %v, want the served version 0 and none", last.Applied, last.Secrets)
+	}
+}
+
 // fakeClock is a settable clock for the lease tests.
 type fakeClock struct {
 	mu  sync.Mutex

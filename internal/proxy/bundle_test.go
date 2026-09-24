@@ -84,3 +84,98 @@ func TestRequestKeepsItsBundle(t *testing.T) {
 		t.Fatalf("upstream requests signed with %v; want the first with the secret of the bundle it took, the second with the rotated one", signedWith)
 	}
 }
+
+// T04's flood: while MaxRetired long requests each hold a replaced bundle, rotations keep coming.
+// Installs back up (the proxy keeps serving the version it had, and new requests still succeed),
+// the newest pending bundle is published as soon as one held request ends, and when all have ended
+// nothing is retired or pending. No request is cut short to make room.
+func TestInstallBackpressure(t *testing.T) {
+	arrived := make(chan struct{}, runtimecfg.MaxRetired)
+	release := make(chan struct{})
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/held") {
+			arrived <- struct{}{}
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(be.Close)
+	var once sync.Once
+	letGo := func() { once.Do(func() { close(release) }) }
+	_, dir := resignParts(t, strings.TrimPrefix(be.URL, "http://"), Capabilities{true, true}, "t")
+
+	// Each rotation moves the secret generation: a new signer over the same transport.
+	reg := upstream.NewRegistry(upstream.Options{}, func(string) (string, error) { return "s", nil })
+	t.Cleanup(reg.Close)
+	gen := int64(0)
+	rotate := func() *upstream.Set {
+		gen++
+		c, err := reg.PrepareWith(dir.Snapshot().File().Clusters, nil, func(string) int64 { return gen })
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Commit()
+		return reg.Load()
+	}
+	keys := mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: keys, Clusters: rotate()})
+	r := newRig(t, be.Config.Handler, 30*time.Second)
+	r.h.Mode, r.h.Runtime, r.h.Dir, r.h.Rewrite = ModeResign, rt, dir, true
+	t.Cleanup(letGo) // registered last, so it runs first: the servers' Close waits for held requests
+
+	get := func(key string) int {
+		req, err := http.NewRequest(http.MethodGet, r.front.URL+"/bbb/"+key, nil)
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		clientSign(req, sigv4.UnsignedPayload)
+		resp, err := fresh().Do(req)
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	var held sync.WaitGroup
+	for range runtimecfg.MaxRetired {
+		held.Add(1)
+		go func() {
+			defer held.Done()
+			if code := get("held"); code != http.StatusOK {
+				t.Errorf("a held request answered %d", code)
+			}
+		}()
+		<-arrived // it holds the current bundle; replace it
+		if err := rt.Refresh(dir.Snapshot(), keys, rotate()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	serving := gen
+	for range 20 {
+		if err := rt.Refresh(dir.Snapshot(), keys, rotate()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := rt.Stats()
+	if st.Retired != runtimecfg.MaxRetired || st.Pending == 0 {
+		t.Fatalf("with %d held requests: %+v", runtimecfg.MaxRetired, st)
+	}
+	if cl, _ := rt.Load().Clusters.Get(rt.Load().Clusters.Names()[0]); cl.SecretGeneration != serving {
+		t.Fatalf("serving secret generation %d, want %d until a held request ends", cl.SecretGeneration, serving)
+	}
+	if code := get("k"); code != http.StatusOK {
+		t.Fatalf("a new request under backpressure answered %d", code)
+	}
+
+	letGo()
+	held.Wait()
+	st = rt.Stats()
+	if st.Retired != 0 || st.Pending != 0 {
+		t.Fatalf("after the held requests ended: %+v", st)
+	}
+	if cl, _ := rt.Load().Clusters.Get(rt.Load().Clusters.Names()[0]); cl.SecretGeneration != gen {
+		t.Fatalf("serving secret generation %d, want the last rotation %d", cl.SecretGeneration, gen)
+	}
+}

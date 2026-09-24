@@ -204,8 +204,22 @@ Each member reports `secrets` (cluster → generation it signs with) in its hear
 cluster view answers `secret`: the generation, which live members have installed it, which are
 pending on an older one, and which are silent. Installed is not drained: a request that took the
 old bundle may still sign with the old secret until it finishes (H2 is the drain barrier).
-Remaining for H1: resource lifetimes and the retained-bundle bound, the restart cache,
-rotation API/CLI/GUI and fleet install diagnostics.
+
+**Landed (2026-09-24, H1c):** resource lifetimes and the retained-bundle bound. A request acquires
+its bundle (a counted reference) in `ServeHTTP` and releases it when the handler returns, response
+body included; the publisher lets go of a bundle only after the next one is current, so acquire
+and retirement interlock through the count with no lock on the request path. A committed cluster
+`Set` is counted by the registry and by each bundle on it, and each transport by the sets that use
+it: the last release closes a retired transport's idle connections, so a secret-only rotation, which
+shares the transport, closes nothing, and a request on a replaced set keeps its connections to the
+end. Preparing a candidate takes no reference (its new transports never dialed), so a dropped
+candidate holds nothing. At most `MaxRetired` (8) replaced bundles may be held; past that an install
+becomes the pending bundle (a newer one replaces it) and is published when a held one drains. New
+requests keep the served version meanwhile, the member's heartbeat reports that served version and
+its secret generations as `applied`, so a fence waits, and `shunt_install_backpressure` and
+`shunt_runtime_bundles_retired` show it. Nothing cuts a request short. There are no transport
+health loops yet (P3a), so none needs sharing. Remaining for H1: the restart cache, rotation
+API/CLI/GUI, fleet install diagnostics (which will carry the backpressure state), and benchmarks.
 
 ### Runtime bundle and installation
 

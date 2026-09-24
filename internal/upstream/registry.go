@@ -3,7 +3,6 @@ package upstream
 import (
 	"fmt"
 	"maps"
-	"net/http"
 	"reflect"
 	"slices"
 	"sync"
@@ -28,7 +27,9 @@ type Registry struct {
 // NewRegistry returns a Registry holding no clusters. resolve turns a secret_ref into the secret.
 func NewRegistry(o Options, resolve func(ref string) (string, error)) *Registry {
 	r := &Registry{opts: o, resolve: resolve, defs: map[string]config.Cluster{}}
-	r.cur.Store(&Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: []string{}})
+	empty := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: []string{}}
+	empty.retainPools()
+	r.cur.Store(empty)
 	return r
 }
 
@@ -77,7 +78,8 @@ func (r *Registry) Apply(clusters map[string]config.Cluster) (added, removed []s
 }
 
 // Candidate is a Set that Prepare built and nothing serves from yet. Commit makes it live; a
-// candidate that is never committed is dropped, and the live set is as it was.
+// candidate that is never committed is dropped, and the live set is as it was. Preparing takes no
+// references: a dropped candidate's new transports never dialed, so they hold nothing to close.
 type Candidate struct {
 	r     *Registry
 	next  *Set
@@ -144,30 +146,23 @@ func (r *Registry) PrepareWith(clusters map[string]config.Cluster, resolve func(
 }
 
 // Commit makes the candidate the live set and returns the names added (new or changed) and
-// removed. Clusters that dropped out or were replaced have their idle connections closed, unless
-// the live set still uses their transport. A request that loaded the old set keeps its *Cluster
-// pointers, and so its secrets, to the end.
+// removed. The registry lets go of the old set: a transport only it used has its idle connections
+// closed once no runtime bundle holds that set either, so a request that loaded the old set keeps
+// its *Cluster pointers, secrets and connections to the end.
 func (c *Candidate) Commit() (added, removed []string) {
 	r := c.r
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	old := r.cur.Load()
+	c.next.retainPools()
 	r.cur.Store(c.next)
 	r.defs = c.defs
-	inUse := make(map[*http.Transport]bool, len(c.next.byName))
-	for _, cl := range c.next.byName {
-		inUse[cl.Transport] = true
-	}
-	for name, cl := range old.byName {
-		if now, ok := c.next.byName[name]; !ok || now != cl {
-			if !ok {
-				removed = append(removed, name)
-			}
-			if !inUse[cl.Transport] {
-				cl.Close()
-			}
+	r.mu.Unlock()
+	for name := range old.byName {
+		if _, ok := c.next.byName[name]; !ok {
+			removed = append(removed, name)
 		}
 	}
+	old.Release()
 	slices.Sort(removed)
 	return c.added, removed
 }

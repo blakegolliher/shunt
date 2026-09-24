@@ -62,6 +62,11 @@ type Client struct {
 	Prepare func(f *directory.File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after every installed version.
 	OnInstall func(*directory.Snapshot)
+	// Serving, if set, returns the snapshot new requests use: the published runtime bundle's, which
+	// lags the installed one while installs are backpressured (ADR-0021 D1). Heartbeats report its
+	// version as applied, and its secret generations, so a fence never counts a version no request
+	// routes with yet. Unset: the installed snapshot.
+	Serving   func() *directory.Snapshot
 	Metrics   *telemetry.Metrics
 	Telemetry *telemetry.Collector
 	Now       func() time.Time
@@ -112,6 +117,13 @@ func (c *Client) Keys() *auth.Static { return c.keys }
 
 // Snapshot implements directory.Directory.
 func (c *Client) Snapshot() *directory.Snapshot { return c.snap.Load() }
+
+func (c *Client) serving() *directory.Snapshot {
+	if c.Serving != nil {
+		return c.Serving()
+	}
+	return c.Snapshot()
+}
 
 // Resolve resolves a cluster's secret_ref from the secrets the control plane delivered, or from
 // the environment or a file for env:/file: refs. It is the resolver the proxy's cluster registry
@@ -462,7 +474,7 @@ func (c *Client) Run(ctx context.Context) {
 func (c *Client) beat(ctx context.Context) error {
 	seq := c.seq.Add(1)
 	sent := c.Now()
-	snap := c.Snapshot()
+	snap := c.serving()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
 		Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
 	if c.Telemetry != nil {
@@ -630,7 +642,7 @@ type Status struct {
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
 func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.Snapshot().Version(), Identity: c.Snapshot().File().Identity}
+	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().File().Identity}
 	if why := c.lineage.Load(); why != nil {
 		st.LineageFault = *why
 	}

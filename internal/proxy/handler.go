@@ -192,8 +192,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var p *prepared
 	if h.Mode == ModeResign {
+		// Held to the end of the handler, response body included: its cluster set, and so the
+		// transport this request's connection returns to, stays open until then.
+		rt := h.Runtime.Acquire()
+		defer rt.Release()
 		var ok bool
-		if p, ok = h.prepareResign(ctx, w, r, o, inBody); !ok {
+		if p, ok = h.prepareResign(ctx, w, r, o, inBody, rt); !ok {
 			return // shunt answered: auth failure, synthesized response, or a refusal
 		}
 	} else {

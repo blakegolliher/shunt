@@ -38,7 +38,21 @@ type Cluster struct {
 	UnsignedTrailer  bool // backend accepts STREAMING-UNSIGNED-PAYLOAD-TRAILER
 	ConditionalWrite bool // backend honors If-None-Match: * on PUT (ADR-0004)
 
+	pool *pool // Transport's reference count, shared by the clusters a secret-only rotation makes
 	next atomic.Uint64
+}
+
+// pool counts the committed Sets using one transport. The last Set to let go closes its idle
+// connections; a request still holding that Set keeps it, and so the transport, alive.
+type pool struct {
+	tr   *http.Transport
+	refs atomic.Int64
+}
+
+func (p *pool) release() {
+	if p.refs.Add(-1) == 0 {
+		p.tr.CloseIdleConnections()
+	}
 }
 
 // Options tune the transport. Zero values get the defaults below.
@@ -113,7 +127,7 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 		Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: ClusterID(name), Endpoints: eps, Transport: tr,
 		Creds:          sigv4.Credentials{AccessKey: c.Credentials.AccessKey},
 		EnforcesSHA256: c.Capabilities.EnforcesSHA256Or(true), UnsignedTrailer: c.Capabilities.UnsignedTrailerOr(true),
-		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true),
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), pool: &pool{tr: tr},
 	}, nil
 }
 
@@ -123,7 +137,7 @@ func New(name string, c config.Cluster, o Options) (*Cluster, error) {
 func (c *Cluster) withSecret(secret string, generation int64) *Cluster {
 	n := &Cluster{Name: c.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, ID: c.ID, Endpoints: c.Endpoints, Transport: c.Transport,
 		Creds: c.Creds, EnforcesSHA256: c.EnforcesSHA256, UnsignedTrailer: c.UnsignedTrailer, ConditionalWrite: c.ConditionalWrite,
-		SecretGeneration: generation}
+		SecretGeneration: generation, pool: c.pool}
 	n.Creds.Secret = secret
 	return n
 }
@@ -144,11 +158,53 @@ func IsConnectError(err error) bool {
 	return errors.As(err, &op) && op.Op == "dial"
 }
 
-// Set is every configured cluster, by name and by opaque id.
+// Set is every configured cluster, by name and by opaque id. A committed Set is reference counted:
+// the registry holds it while it is live and each runtime bundle built on it holds it too. When the
+// last reference goes, every transport no other committed Set uses has its idle connections closed.
 type Set struct {
 	byName map[string]*Cluster
 	byID   map[string]*Cluster
 	names  []string
+
+	refs  atomic.Int64
+	pools []*pool // distinct, each counted once for this Set; set at commit
+}
+
+// Retain takes a reference on s, as a runtime bundle does for as long as it may be used. It fails
+// once s has been released for the last time: its transports may be closed, and it must not be
+// published again.
+func (s *Set) Retain() bool {
+	for {
+		n := s.refs.Load()
+		if n <= 0 {
+			return false
+		}
+		if s.refs.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+// Release drops a reference taken by Retain (or the registry's own, on commit of the next Set).
+func (s *Set) Release() {
+	if s.refs.Add(-1) == 0 {
+		for _, p := range s.pools {
+			p.release()
+		}
+	}
+}
+
+// retainPools counts s once on each distinct transport it uses and gives s its first reference.
+func (s *Set) retainPools() {
+	seen := make(map[*pool]bool, len(s.byName))
+	for _, name := range s.names {
+		if p := s.byName[name].pool; p != nil && !seen[p] {
+			seen[p] = true
+			p.refs.Add(1)
+			s.pools = append(s.pools, p)
+		}
+	}
+	s.refs.Store(1)
 }
 
 // Get returns a cluster by name.
