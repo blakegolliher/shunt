@@ -18,6 +18,8 @@ everything from it and share nothing with each other (docs/fleet.md).
   `--plaintext`, which states what is true until TLS for the control channel lands: cluster
   secrets, client keys and the data-encryption key cross the network in the clear. Keep the API
   on a management network.
+- **An operation capacity** (`--operation-capacity`, default 256): how many operator operations
+  may be unfinished at once. Past it a new one answers 429; status and reads stay available.
 
 ## Forming a cluster
 

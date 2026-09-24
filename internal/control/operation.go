@@ -111,6 +111,11 @@ type Operation struct {
 	// Identity is the directory lineage the operation was accepted on; Scope what it reserves.
 	Identity directory.Identity `json:"identity,omitzero"`
 	Scope    *Scope             `json:"scope,omitempty"`
+	// RequestID is the request's Idempotency-Key. IntentDigest is a keyed digest of its canonical
+	// intent (kind, scope, body), which a retry with the same key must match; it is stored for
+	// every control node to compare and never answered (Public).
+	RequestID    string `json:"request_id,omitempty"`
+	IntentDigest string `json:"intent_digest,omitempty"`
 	// Sequence counts the record's writes: an update is accepted only over the sequence it read.
 	Sequence    int64     `json:"sequence"`
 	Created     time.Time `json:"created"`
@@ -176,12 +181,17 @@ type MemOperations struct {
 	Limit int // default 1000
 	// Dir, if set, is the directory Create checks scope generations and identity against.
 	Dir directory.Directory
+	// Capacity is the limit on unfinished operations; default DefaultCapacity.
+	Capacity int
+	// Now dates the idempotency retention; default time.Now.
+	Now func() time.Time
 	// OnChange, if set, is called after every Create and Update with a copy of the record.
 	OnChange func(Operation)
 
 	mu    sync.Mutex
 	order []string
 	byID  map[string]*Operation
+	idem  map[string]string // IdempotencyIndex → id
 }
 
 var _ Operations = (*MemOperations)(nil)
@@ -429,13 +439,22 @@ func (w *operationWriter) Write(p []byte) (int, error) {
 // operation_conflict before the handler runs.
 func (s *Server) recorded(kind string, scope func(*http.Request) (Operation, error), h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		meta, err := readMeta(w, r)
+		if err != nil {
+			fail(w, err)
+			return
+		}
 		op, err := scope(r)
 		if err != nil {
 			fail(w, err)
 			return
 		}
 		op.Kind = kind
+		meta.apply(s, &op, peekBody(r))
 		tr, err := s.begin(actor(r), op, nil, false)
+		if s.replayed(w, r, err) {
+			return
+		}
 		if err != nil {
 			fail(w, err)
 			return
@@ -561,9 +580,10 @@ func (s *Server) placementKey(arg string) (string, error) {
 
 // launch checks an operation request, writes its record and starts it. Every action's route and
 // POST /v1/operations go through here, so the checks and the run are written once.
-func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracker, <-chan outcome, error) {
+func (s *Server) launch(actor string, req OperationRequest, async bool, meta requestMeta) (*tracker, <-chan outcome, error) {
 	start := func(op Operation, args any, fn func(*tracker) (any, error)) (*tracker, <-chan outcome, error) {
 		op.Kind = req.Kind
+		meta.apply(s, &op, req.Args)
 		tr, err := s.begin(actor, op, args, async)
 		if err != nil {
 			return nil, nil, err
@@ -705,13 +725,21 @@ func (s *Server) launch(actor string, req OperationRequest, async bool) (*tracke
 // that leaves, or a CLI killed while it waits, does not stop a fenced step halfway, and the record
 // carries the outcome either way.
 func (s *Server) serveOperation(w http.ResponseWriter, r *http.Request, req OperationRequest, args any) {
+	meta, err := readMeta(w, r)
+	if err != nil {
+		fail(w, err)
+		return
+	}
 	raw, err := json.Marshal(args)
 	if err != nil {
 		fail(w, err)
 		return
 	}
 	req.Args = raw
-	_, ch, err := s.launch(actor(r), req, false)
+	_, ch, err := s.launch(actor(r), req, false, meta)
+	if s.replayed(w, r, err) {
+		return
+	}
 	if err != nil {
 		fail(w, err)
 		return
@@ -729,16 +757,29 @@ func (s *Server) serveOperation(w http.ResponseWriter, r *http.Request, req Oper
 }
 
 func (s *Server) startOperation(w http.ResponseWriter, r *http.Request) {
-	var req OperationRequest
-	if !decode(w, r, &req) {
-		return
-	}
-	tr, _, err := s.launch(actor(r), req, true)
+	meta, err := readMeta(w, r)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, tr.snapshot())
+	var req OperationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	tr, _, err := s.launch(actor(r), req, true, meta)
+	var rp *IdempotentReplay
+	if errors.As(err, &rp) {
+		// A retry of an accepted request: its record as it stands, not a second run.
+		w.Header().Set("Location", "/v1/operations/"+rp.Existing.ID)
+		writeJSON(w, http.StatusOK, rp.Existing.Public())
+		return
+	}
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	w.Header().Set("Location", "/v1/operations/"+tr.id())
+	writeJSON(w, http.StatusAccepted, tr.snapshot().Public())
 }
 
 func (s *Server) getOperation(w http.ResponseWriter, r *http.Request) {
@@ -750,7 +791,7 @@ func (s *Server) getOperation(w http.ResponseWriter, r *http.Request) {
 	case op == nil:
 		fail(w, notFound("no operation %s", id))
 	default:
-		writeJSON(w, http.StatusOK, op)
+		writeJSON(w, http.StatusOK, op.Public())
 	}
 }
 
@@ -772,7 +813,7 @@ func (s *Server) listOperations(w http.ResponseWriter, r *http.Request) {
 	}
 	out := OperationList{Operations: make([]Operation, 0, len(ops))}
 	for _, op := range ops {
-		out.Operations = append(out.Operations, *op)
+		out.Operations = append(out.Operations, op.Public())
 	}
 	writeJSON(w, http.StatusOK, out)
 }

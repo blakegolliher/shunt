@@ -11,7 +11,15 @@ shunt's operator verbs (`shunt cluster`, `tenant`, `adopt`, `expand`, `ramp`, `m
 
 Anyone else gets 401 `unauthorized`.
 
-The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--token-ref` (env `SHUNT_API_TOKEN_REF`).
+The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`), `--token-ref` (env `SHUNT_API_TOKEN_REF`), and `--request-id`: each change a command sends carries `Idempotency-Key: <request-id>-<n>`, numbered in order, with a random request id by default. A command that loses its connection after sending a change prints its request id; repeating the command with `--request-id` sends the same keys, and the control plane answers with what it already did instead of doing it twice.
+
+## Idempotency
+
+Every request that creates an operation record ([Operations](#operations): `POST /v1/operations`, the fenced routes, and the short mutations that run under a record) needs an `Idempotency-Key` header: 1-128 letters, digits, `.`, `_`, `:` or `-`, a new value for each new request and the same one to retry it. Without one it answers 400 `idempotency_key_required`. The key is bound to the directory's epoch, the authenticated actor, and a keyed digest of the request's intent (its kind, scope and body, with JSON object keys in any order). A retry with the same key and intent runs nothing: `POST /v1/operations` answers 200 with the first request's record, and a route answers what it answered the first time, waiting for the operation's outcome if it has not ended. The same key with another intent answers 409 `idempotency_conflict` with `operation_id`. Answers carry `Idempotency-Retention-Seconds` (604800): an ended record keeps its key, and stays past the history limit, for seven days; do not retry with a key after that. A body that carries a secret (`cluster add`, `adopt`) is only digested, never stored.
+
+A request may also send `If-Generation: <n>`, the generation of its placement or cluster (the `generations` map `GET /v1/directory` carries) it was made against; one the resource has moved past answers 409 `generation_conflict` with `current_generation`, before anything runs.
+
+At most `--operation-capacity` operations (default 256; a lab proxy, 256) are unfinished at once; past it a request that would create one answers 429 `operation_capacity`, before anything runs, while every read stays available. On a fleet the count is checked just before each create's transaction, so concurrent creates on several control nodes can pass it by one each.
 
 ## Conventions
 
@@ -22,6 +30,9 @@ The CLI takes `--api` (env `SHUNT_API`, default `http://127.0.0.1:9900`) and `--
 |---|---|---|
 | 400 | `bad_request` | malformed body or argument |
 | 400 | `invalid` | the change would make the directory invalid (message names the field) |
+| 400 | `idempotency_key_required` | a request that creates an operation sent no `Idempotency-Key` ([Idempotency](#idempotency)) |
+| 409 | `idempotency_conflict` | the `Idempotency-Key` was used for another request; `operation_id` names it |
+| 429 | `operation_capacity` | too many unfinished operations; retry once some end |
 | 401 | `unauthorized` | no valid bearer token, or a non-loopback peer without a configured token |
 | 404 | `not_found` | no such placement or cluster |
 | 409 | `refused` | the rules forbid this now; the message says why and what to do. The CLI prints `refused: <message>` |

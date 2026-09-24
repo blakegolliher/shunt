@@ -35,6 +35,7 @@ type nodeOptions struct {
 	plaintext bool
 	leaseTTL  time.Duration
 	logFormat string
+	capacity  int
 }
 
 func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
@@ -48,6 +49,7 @@ func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
 	f.BoolVar(&o.plaintext, "plaintext", false, "serve the API over plain http on a non-loopback address: secrets and client keys then cross the network in the clear (TLS is deferred, ADR-0015); required unless --api is loopback")
 	f.DurationVar(&o.leaseTTL, "lease-ttl", 10*time.Second, "how long a proxy's lease lasts without a heartbeat before it refuses writes on moving buckets")
 	f.StringVar(&o.logFormat, "log-format", "auto", "json | console | auto")
+	f.IntVar(&o.capacity, "operation-capacity", control.DefaultCapacity, "how many operator operations may be unfinished at once; past it a new one answers 429 operation_capacity, while status stays available (ADR-0021)")
 	_ = cmd.MarkFlagRequired("data-dir")
 	_ = cmd.MarkFlagRequired("peer-url")
 }
@@ -55,6 +57,9 @@ func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
 func (o *nodeOptions) check() error {
 	if !config.ValidProxyID(o.name) {
 		return fmt.Errorf("--name %q: want 1-64 letters, digits, '.', '_' or '-'", o.name)
+	}
+	if o.capacity < 1 {
+		return fmt.Errorf("--operation-capacity %d: want at least 1", o.capacity)
 	}
 	host, _, err := net.SplitHostPort(o.api)
 	if err != nil {
@@ -195,6 +200,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	ops := cp.NewOperations(node.Client())
 	ops.OnChange = events.Fence
 	ops.Node = o.name // its liveness key: another node ends this node's operations if it is lost
+	ops.Capacity = o.capacity
 	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
 	telemetryStore := telemetry.NewStore(o.leaseTTL)
 	moverDir := filepath.Join(o.dataDir, "mover")

@@ -240,6 +240,8 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
   const headers = new Headers(init?.headers)
   headers.set('Authorization', `Bearer ${token}`)
   headers.set('Accept', 'application/json')
+  // Every change is a new request with its own key (ADR-0021); the UI never retries one itself.
+  if ((init?.method ?? 'GET') !== 'GET' && !headers.has('Idempotency-Key')) headers.set('Idempotency-Key', crypto.randomUUID())
   const response = await fetch(path, { ...init, headers })
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`

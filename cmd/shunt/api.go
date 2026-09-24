@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,9 +22,10 @@ import (
 
 // apiOptions are the flags every command that talks to a running shunt takes.
 type apiOptions struct {
-	url      string
-	tokenRef string
-	json     bool
+	url       string
+	tokenRef  string
+	json      bool
+	requestID string
 }
 
 func addAPIFlags(cmd *cobra.Command, o *apiOptions) {
@@ -34,6 +37,8 @@ func addAPIFlags(cmd *cobra.Command, o *apiOptions) {
 	f.StringVar(&o.url, "api", def, "the control API: shunt's admin listener (env SHUNT_API)")
 	f.StringVar(&o.tokenRef, "token-ref", os.Getenv("SHUNT_API_TOKEN_REF"), "env:NAME or file:/path holding admin.control_token_ref's token (env SHUNT_API_TOKEN_REF)")
 	f.BoolVar(&o.json, "json", false, "print the API's JSON answer instead of a summary")
+	f.StringVar(&o.requestID, "request-id", "", "this command's request id: its changes are sent with Idempotency-Key <id>-1, <id>-2, …; "+
+		"repeat a command that lost its connection with the id it printed, and the control plane answers with what it already did (default: random)")
 }
 
 // apiClient calls the control API (docs/reference/control-api.md).
@@ -41,10 +46,19 @@ type apiClient struct {
 	base  string
 	token string
 	http  *http.Client
+	// requestID keys this command's changes; mutations counts them, so a repeat with the same
+	// id sends the same keys in the same order.
+	requestID string
+	mutations int
 }
 
 func (o apiOptions) client() (*apiClient, error) {
-	c := &apiClient{base: strings.TrimRight(o.url, "/"), http: &http.Client{}}
+	c := &apiClient{base: strings.TrimRight(o.url, "/"), http: &http.Client{}, requestID: o.requestID}
+	if c.requestID == "" {
+		var b [8]byte
+		_, _ = rand.Read(b[:]) //nolint:errcheck // crypto/rand does not fail short
+		c.requestID = hex.EncodeToString(b[:])
+	}
 	if o.tokenRef != "" {
 		tok, err := config.ResolveSecret(o.tokenRef)
 		if err != nil {
@@ -73,8 +87,15 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	if method != http.MethodGet {
+		c.mutations++
+		req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("%s-%d", c.requestID, c.mutations))
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if method != http.MethodGet {
+			return fmt.Errorf("control API %s: %w; the change may or may not have been made: repeat the command with --request-id %s to find out without making it twice", c.base, err, c.requestID)
+		}
 		return fmt.Errorf("control API %s: %w (is shunt serve running with its admin listener there?)", c.base, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // read below

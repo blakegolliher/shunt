@@ -235,8 +235,17 @@ func errorOf(err error) (int, Error) {
 		le  *lineageError
 		sb  *ScopeBusyError
 		ge  *GenerationError
+		ic  *IdempotencyConflictError
+		ce2 *CapacityError
+		cd  *codedError
 	)
 	switch {
+	case errors.As(err, &cd):
+		return cd.status, Error{Code: cd.code, Message: err.Error()}
+	case errors.As(err, &ic):
+		return http.StatusConflict, Error{Code: CodeIdempotencyConflict, Message: err.Error(), OperationID: ic.Owner}
+	case errors.As(err, &ce2):
+		return http.StatusTooManyRequests, Error{Code: CodeOperationCapacity, Message: err.Error()}
 	case errors.As(err, &sb):
 		return http.StatusConflict, Error{Code: CodeOperationConflict, Message: err.Error(), OperationID: sb.Owner}
 	case errors.As(err, &ge):

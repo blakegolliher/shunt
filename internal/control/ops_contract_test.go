@@ -12,7 +12,7 @@ import (
 
 // The lab's in-memory store passes the operation transaction contract over a directory file.
 func TestMemOperationsContract(t *testing.T) {
-	opstest.Run(t, func(t *testing.T, limit int) opstest.Harness {
+	opstest.Run(t, func(t *testing.T, o opstest.Options) opstest.Harness {
 		path := filepath.Join(t.TempDir(), "directory.yaml")
 		if err := os.WriteFile(path, []byte("version: 0\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -21,6 +21,6 @@ func TestMemOperationsContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return opstest.Harness{Ops: &control.MemOperations{Dir: d, Limit: limit}, Dir: d}
+		return opstest.Harness{Ops: &control.MemOperations{Dir: d, Limit: o.Limit, Capacity: o.Capacity}, Dir: d}
 	})
 }

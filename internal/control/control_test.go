@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -204,14 +205,27 @@ func newRig(t *testing.T) *rig {
 			rg.slept = append(rg.slept, d)
 			return nil
 		},
-		Events: rg.events, Ops: &MemOperations{OnChange: rg.events.Fence}}
+		Events: rg.events, Ops: &MemOperations{Dir: dir, OnChange: rg.events.Fence}}
 	rg.api = httptest.NewServer(rg.ctl.Handler())
 	t.Cleanup(rg.api.Close)
 	return rg
 }
 
 // call sends one API request and decodes the answer into out (if not nil); it returns the status.
+// call sends one request; a change carries a new Idempotency-Key, as a client's new request does.
 func (rg *rig) call(method, path string, body any, out any) (int, string) {
+	rg.t.Helper()
+	var h http.Header
+	if method != http.MethodGet {
+		h = http.Header{HeaderIdempotencyKey: {fmt.Sprintf("test-%d", rigKeys.Add(1))}}
+	}
+	return rg.callWith(method, path, h, body, out)
+}
+
+var rigKeys atomic.Int64
+
+// callWith sends one request with exactly the headers given.
+func (rg *rig) callWith(method, path string, h http.Header, body any, out any) (int, string) {
 	rg.t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -222,6 +236,9 @@ func (rg *rig) call(method, path string, body any, out any) (int, string) {
 	req, err := http.NewRequest(method, rg.api.URL+path, &buf)
 	if err != nil {
 		rg.t.Fatal(err)
+	}
+	for k, v := range h {
+		req.Header[k] = v
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

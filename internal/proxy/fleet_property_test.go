@@ -317,7 +317,13 @@ var fleetRatios = []float64{0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1}
 
 func (fr *fleetRun) post(path string, body any) (int, string) {
 	data, _ := json.Marshal(body)
-	resp, err := http.Post(fr.api.URL+path, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, fr.api.URL+path, bytes.NewReader(data))
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("fleet-%d", fleetKeys.Add(1)))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, err.Error()
 	}
@@ -325,6 +331,8 @@ func (fr *fleetRun) post(path string, body any) (int, string) {
 	out, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(out)
 }
+
+var fleetKeys atomic.Int64
 
 func TestFleetStepsKeepTheClientsView(t *testing.T) { fleetSteps(t, nil, false, false) }
 

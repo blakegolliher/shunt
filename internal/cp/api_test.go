@@ -137,6 +137,9 @@ func (n *node) call(method, path string, body, out any) (int, string) {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req, _ := http.NewRequest(method, n.api.URL+path, &buf)
+	if method != http.MethodGet {
+		req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("test-%d", nodeKeys.Add(1)))
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		n.t.Fatal(err)
@@ -151,6 +154,8 @@ func (n *node) call(method, path string, body, out any) (int, string) {
 	}
 	return resp.StatusCode, raw.String()
 }
+
+var nodeKeys atomic.Int64
 
 func (n *node) must(method, path string, body, out any) {
 	n.t.Helper()

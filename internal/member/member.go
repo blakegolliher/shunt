@@ -8,6 +8,8 @@ package member
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -304,6 +306,13 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) (
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Shunt-Proxy", c.cfg.ProxyID) // who is asking, for the control plane's logs
+	if method != http.MethodGet {
+		// A forwarded bucket create or delete is an operation on the control plane (ADR-0021). The
+		// member never retries one itself; the client's own retry is a new request.
+		var b [12]byte
+		_, _ = rand.Read(b[:]) //nolint:errcheck // crypto/rand does not fail short
+		req.Header.Set(control.HeaderIdempotencyKey, c.cfg.ProxyID+"-"+hex.EncodeToString(b[:]))
+	}
 	if c.cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
 	}

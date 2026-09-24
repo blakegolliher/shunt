@@ -40,8 +40,10 @@ member that outlived a restore. H0b landed next: operation records reserve their
 cluster scope atomically with their creation (checked against generation and identity), are
 written by sequence, and release the scope when they end; every placement and cluster mutation
 route runs under one, so a second step on a bucket is refused with `operation_conflict` rather
-than queued. One contract test runs against both the etcd and the lab store. H0c–H0e are
-pending. New endpoints/commands in those documents are design
+than queued. One contract test runs against both the etcd and the lab store. H0c followed: every
+request that creates an operation needs an `Idempotency-Key`, and a retry runs nothing twice;
+`If-Generation` refuses a request made against a moved placement or cluster; a capacity limit
+answers 429. H0d–H0e are pending. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

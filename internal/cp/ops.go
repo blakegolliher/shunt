@@ -29,6 +29,7 @@ const (
 	opsPrefix   = "/shunt/ops/"
 	scopePrefix = "/shunt/ops-scope/" // <resource> → the id of the unfinished operation that owns it
 	scopeRev    = "/shunt/ops-scope-rev"
+	idemPrefix  = "/shunt/ops-idem/"  // control.IdempotencyIndex → the id of the operation that used the key
 	ownerPrefix = "/shunt/ops-owner/" // <node> on a lease: the node is live and runs its operations
 	opRetention = 1000
 	opTimeout   = 10 * time.Second
@@ -45,6 +46,10 @@ type Operations struct {
 	// Node, if set, is this control node's name: Start keeps its liveness key, and a create
 	// blocked by an operation whose node's key has lapsed ends that operation as orphaned.
 	Node string
+	// Capacity is the limit on unfinished scoped operations; default control.DefaultCapacity.
+	// It is checked just before the create's transaction, so concurrent creates on several nodes
+	// can pass it by at most one each.
+	Capacity int
 	// Now stamps orphaned records; default time.Now.
 	Now func() time.Time
 
@@ -217,17 +222,23 @@ func (o *Operations) Create(ctx context.Context, op *control.Operation) error {
 	}
 	key := opsPrefix + op.ID
 	for attempt := 0; ; attempt++ {
-		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
-		then := []clientv3.Op{clientv3.OpPut(key, string(raw))}
-		var check []clientv3.Op // read back when the transaction fails, to say why
+		var r reservation
+		r.cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
+		r.then = []clientv3.Op{clientv3.OpPut(key, string(raw))}
+		if op.RequestID != "" {
+			ik := idemPrefix + control.IdempotencyIndex(op)
+			r.cmp(clientv3.Compare(clientv3.CreateRevision(ik), "=", 0), ik)
+			r.then = append(r.then, clientv3.OpPut(ik, op.ID))
+		}
 		if sc := op.Scope; sc != nil {
-			more, err := o.reserve(ctx, op, sc)
-			if err != nil {
+			if err := o.capacity(ctx); err != nil {
 				return err
 			}
-			cmps, then, check = append(cmps, more.cmps...), append(then, more.then...), more.check
+			if err := o.reserve(ctx, op, sc, &r); err != nil {
+				return err
+			}
 		}
-		resp, err := o.cli.Txn(ctx).If(cmps...).Then(then...).Else(check...).Commit()
+		resp, err := o.cli.Txn(ctx).If(r.cmps...).Then(r.then...).Else(r.check...).Commit()
 		if err != nil {
 			return fmt.Errorf("%w: writing an operation record: %w", control.ErrUnavailable, err)
 		}
@@ -238,7 +249,7 @@ func (o *Operations) Create(ctx context.Context, op *control.Operation) error {
 			o.trim(ctx)
 			return nil
 		}
-		retry, refusal := o.refusal(ctx, op, resp)
+		retry, refusal := o.refusal(ctx, op, r.keys, resp)
 		if !retry || attempt >= 8 {
 			if refusal == nil {
 				refusal = fmt.Errorf("%w: operation reservations kept changing; retry", control.ErrUnavailable)
@@ -248,94 +259,128 @@ func (o *Operations) Create(ctx context.Context, op *control.Operation) error {
 	}
 }
 
-// reservation is what reserving a scope adds to a create's transaction.
+// reservation is a create's transaction: its compares and writes, and the keys its Else branch
+// reads back, in order, to say why it failed.
 type reservation struct {
 	cmps  []clientv3.Cmp
 	then  []clientv3.Op
 	check []clientv3.Op
+	keys  []string
 }
 
-// reserve builds a scoped create's compares. A cluster operation reads the unfinished placement
+// cmp adds a compare, and reads key back on failure.
+func (r *reservation) cmp(c clientv3.Cmp, key string) {
+	r.cmps = append(r.cmps, c)
+	r.check = append(r.check, clientv3.OpGet(key))
+	r.keys = append(r.keys, key)
+}
+
+// capacity refuses a scoped create at the limit on unfinished operations: every unfinished scoped
+// operation holds exactly one reservation key.
+func (o *Operations) capacity(ctx context.Context) error {
+	limit := o.Capacity
+	if limit <= 0 {
+		limit = control.DefaultCapacity
+	}
+	resp, err := o.cli.Get(ctx, scopePrefix, clientv3.WithPrefix(), clientv3.WithCountOnly())
+	if err != nil {
+		return fmt.Errorf("%w: counting operations: %w", control.ErrUnavailable, err)
+	}
+	if resp.Count >= int64(limit) {
+		return &control.CapacityError{Limit: limit}
+	}
+	return nil
+}
+
+// reserve adds a scoped create's compares to r. A cluster operation reads the unfinished placement
 // reservations first, refuses one touching its cluster, and compares scopeRev so that a placement
 // reservation made after that read fails the transaction.
-func (o *Operations) reserve(ctx context.Context, op *control.Operation, sc *control.Scope) (reservation, error) {
-	var r reservation
+func (o *Operations) reserve(ctx context.Context, op *control.Operation, sc *control.Scope, r *reservation) error {
 	sk := scopePrefix + sc.Resource
-	r.cmps = append(r.cmps, clientv3.Compare(clientv3.CreateRevision(sk), "=", 0))
+	r.cmp(clientv3.Compare(clientv3.CreateRevision(sk), "=", 0), sk)
 	r.then = append(r.then, clientv3.OpPut(sk, op.ID))
-	r.check = append(r.check, clientv3.OpGet(sk), clientv3.OpGet(kIdentity))
 	if !op.Identity.IsZero() {
 		id, _ := json.Marshal(op.Identity)
-		r.cmps = append(r.cmps, clientv3.Compare(clientv3.Value(kIdentity), "=", string(id)))
+		r.cmp(clientv3.Compare(clientv3.Value(kIdentity), "=", string(id)), kIdentity)
 	}
 	gk := kGenerations + sc.Resource
 	if sc.Generation == 0 {
-		r.cmps = append(r.cmps, clientv3.Compare(clientv3.CreateRevision(gk), "=", 0))
+		r.cmp(clientv3.Compare(clientv3.CreateRevision(gk), "=", 0), gk)
 	} else {
-		r.cmps = append(r.cmps, clientv3.Compare(clientv3.Value(gk), "=", strconv.FormatInt(sc.Generation, 10)))
+		r.cmp(clientv3.Compare(clientv3.Value(gk), "=", strconv.FormatInt(sc.Generation, 10)), gk)
 	}
-	r.check = append(r.check, clientv3.OpGet(gk))
 	if cluster, isCluster := strings.CutPrefix(sc.Resource, "cluster:"); isCluster {
 		resp, err := o.cli.Get(ctx, scopePrefix+"placement:", clientv3.WithPrefix())
 		if err != nil {
-			return r, fmt.Errorf("%w: reading operation reservations: %w", control.ErrUnavailable, err)
+			return fmt.Errorf("%w: reading operation reservations: %w", control.ErrUnavailable, err)
 		}
 		for _, kv := range resp.Kvs {
 			owner, err := o.Get(ctx, string(kv.Value))
 			if err != nil {
-				return r, err
+				return err
 			}
 			if owner != nil && !owner.Terminal() && owner.Scope != nil && slices.Contains(owner.Scope.Clusters, cluster) {
 				if o.reap(ctx, owner) {
 					continue
 				}
-				return r, &control.ScopeBusyError{Resource: sc.Resource, Owner: owner.ID, Held: owner.Scope.Resource}
+				return &control.ScopeBusyError{Resource: sc.Resource, Owner: owner.ID, Held: owner.Scope.Resource}
 			}
 		}
-		r.cmps = append(r.cmps, clientv3.Compare(clientv3.ModRevision(scopeRev), "<", resp.Header.Revision+1))
-		return r, nil
+		r.cmp(clientv3.Compare(clientv3.ModRevision(scopeRev), "<", resp.Header.Revision+1), scopeRev)
+		return nil
 	}
 	for _, c := range sc.Clusters {
 		ck := scopePrefix + "cluster:" + c
-		r.cmps = append(r.cmps, clientv3.Compare(clientv3.CreateRevision(ck), "=", 0))
-		r.check = append(r.check, clientv3.OpGet(ck))
+		r.cmp(clientv3.Compare(clientv3.CreateRevision(ck), "=", 0), ck)
 	}
 	r.then = append(r.then, clientv3.OpPut(scopeRev, op.ID))
-	return r, nil
+	return nil
 }
 
-// refusal says why a create's transaction failed, from what its Else branch read, and whether to
-// retry: after a reaped owner, or a placement reservation made during a cluster operation's read.
-func (o *Operations) refusal(ctx context.Context, op *control.Operation, resp *clientv3.TxnResponse) (retry bool, err error) {
-	if len(resp.Responses) == 0 {
-		return false, fmt.Errorf("operation %s already exists", op.ID)
-	}
-	get := func(i int) *mvccpb.KeyValue {
+// refusal says why a create's transaction failed, from what its Else branch read back for keys,
+// and whether to retry: after a reaped owner, or a placement reservation made during a cluster
+// operation's read.
+func (o *Operations) refusal(ctx context.Context, op *control.Operation, keys []string, resp *clientv3.TxnResponse) (retry bool, err error) {
+	read := make(map[string]*mvccpb.KeyValue, len(keys))
+	for i, k := range keys {
 		if kvs := resp.Responses[i].GetResponseRange().Kvs; len(kvs) > 0 {
-			return kvs[0]
+			read[k] = kvs[0]
 		}
-		return nil
+	}
+	if op.RequestID != "" {
+		if kv := read[idemPrefix+control.IdempotencyIndex(op)]; kv != nil {
+			existing, err := o.Get(ctx, string(kv.Value))
+			if err != nil {
+				return false, err
+			}
+			if existing != nil {
+				return false, control.Replay(op, existing)
+			}
+		}
 	}
 	sc := op.Scope
-	if kv := get(0); kv != nil {
+	if sc == nil {
+		return false, fmt.Errorf("operation %s already exists", op.ID)
+	}
+	if kv := read[scopePrefix+sc.Resource]; kv != nil {
 		return o.busy(ctx, sc.Resource, string(kv.Value), "")
 	}
-	if kv := get(1); kv != nil && !op.Identity.IsZero() {
+	if kv := read[kIdentity]; kv != nil && !op.Identity.IsZero() {
 		var cur directory.Identity
 		if json.Unmarshal(kv.Value, &cur) == nil && cur != op.Identity {
 			return false, control.LineageMismatch(cur, op.Identity)
 		}
 	}
 	var cur int64
-	if kv := get(2); kv != nil {
+	if kv := read[kGenerations+sc.Resource]; kv != nil {
 		cur, _ = strconv.ParseInt(string(kv.Value), 10, 64)
 	}
 	if cur != sc.Generation {
 		return false, &control.GenerationError{Resource: sc.Resource, Expected: sc.Generation, Current: cur}
 	}
-	for i := 3; i < len(resp.Responses); i++ {
-		if kv := get(i); kv != nil {
-			return o.busy(ctx, sc.Resource, string(kv.Value), strings.TrimPrefix(string(kv.Key), scopePrefix))
+	for _, c := range sc.Clusters {
+		if kv := read[scopePrefix+"cluster:"+c]; kv != nil {
+			return o.busy(ctx, sc.Resource, string(kv.Value), "cluster:"+c)
 		}
 	}
 	return true, nil // scopeRev moved: a placement reservation raced the cluster operation's read
@@ -442,13 +487,18 @@ func (o *Operations) trim(ctx context.Context) {
 	}
 	slices.Sort(ids)
 	var drop []clientv3.Op
+	dropped := 0
 	for _, id := range ids {
-		if len(ids)-len(drop) <= limit {
+		if len(ids)-dropped <= limit {
 			break
 		}
 		var op control.Operation
-		if json.Unmarshal(o.index[id], &op) == nil && op.Terminal() && op.EffectState != control.EffectUncertain {
+		if json.Unmarshal(o.index[id], &op) == nil && op.Prunable(o.now()) {
 			drop = append(drop, clientv3.OpDelete(opsPrefix+id))
+			dropped++
+			if op.RequestID != "" {
+				drop = append(drop, clientv3.OpDelete(idemPrefix+control.IdempotencyIndex(&op)))
+			}
 		}
 	}
 	o.mu.Unlock()

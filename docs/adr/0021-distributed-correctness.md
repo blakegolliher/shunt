@@ -1,8 +1,9 @@
 # ADR-0021: coherent snapshots, drain barriers and recoverable control operations
 
 Status: **proposed; the first four regressions landed** (T01, T02, T03, T07 on 2026-09-24, see
-"Decisions taken 2026-09-24"), H0a (identity, generations, lineage checks) and H0b (the operation
-transaction contract and scope reservations). The rest of H0 and H1–H5 are pending.
+"Decisions taken 2026-09-24"), H0a (identity, generations, lineage checks), H0b (the operation
+transaction contract and scope reservations) and H0c (idempotency keys, expected generations and
+operation capacity). The rest of H0 and H1–H5 are pending.
 
 Design baseline: `distributed` at `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`.
 This proposal amends [ADR-0015](0015-embedded-etcd.md),

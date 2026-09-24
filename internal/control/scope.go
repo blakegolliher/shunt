@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
 )
@@ -84,6 +87,55 @@ func (e *GenerationError) Error() string {
 	return fmt.Sprintf("%s changed since this request was made (generation %d, now %d); read it again and resubmit", e.Resource, e.Expected, e.Current)
 }
 
+// IdempotentReplay is a create whose idempotency key an earlier request with the same intent
+// already used: Existing is that request's record, and nothing new was written.
+type IdempotentReplay struct{ Existing *Operation }
+
+func (e *IdempotentReplay) Error() string {
+	return fmt.Sprintf("this request was already accepted as operation %s", e.Existing.ID)
+}
+
+// IdempotencyConflictError is a create reusing an idempotency key for another intent.
+type IdempotencyConflictError struct{ Owner string }
+
+func (e *IdempotencyConflictError) Error() string {
+	return fmt.Sprintf("this Idempotency-Key was already used by operation %s for another request; use a new key for a new request", e.Owner)
+}
+
+// CapacityError refuses new work at the active-operation limit, before any effect.
+type CapacityError struct{ Limit int }
+
+func (e *CapacityError) Error() string {
+	return fmt.Sprintf("%d operations are unfinished, the limit; retry once some end (status and recovery stay available)", e.Limit)
+}
+
+// IdempotencyRetention is how long an ended operation keeps its idempotency key, and its record,
+// however many records there are: a retry within it gets the same record, never a second run.
+const IdempotencyRetention = 7 * 24 * time.Hour
+
+// DefaultCapacity is the default limit on unfinished operations.
+const DefaultCapacity = 256
+
+// IdempotencyIndex is the key an operation's idempotency key is indexed under: bound to the
+// directory epoch and the authenticated actor, so one client's key never matches another's, nor a
+// key used before a restore.
+func IdempotencyIndex(op *Operation) string {
+	sum := sha256.Sum256([]byte("shunt-idempotency-v1\x00" + op.Identity.Epoch + "\x00" + op.Actor + "\x00" + op.RequestID))
+	return hex.EncodeToString(sum[:])
+}
+
+// Replay answers a create whose idempotency key already names existing: an *IdempotentReplay for
+// the same intent, an *IdempotencyConflictError for another.
+func Replay(op, existing *Operation) error { return replay(op, existing) }
+
+// replay answers a create whose idempotency key already names existing.
+func replay(op, existing *Operation) error {
+	if existing.IntentDigest != op.IntentDigest {
+		return &IdempotencyConflictError{Owner: existing.ID}
+	}
+	return &IdempotentReplay{Existing: existing}
+}
+
 // ErrStaleSequence is an Update whose record is no longer at the sequence it was read at: another
 // writer (a node that took the operation over from an owner it saw lost) has written it since.
 var ErrStaleSequence = errors.New("operation record changed since it was read")
@@ -100,11 +152,15 @@ func (op *Operation) Terminal() bool {
 	return false
 }
 
-// prunable reports whether a record may be dropped by the history limit: an ended operation whose
-// effect on the directory is known. An unfinished one, or one whose effect is uncertain, is
-// evidence and stays however many records there are.
-func (op *Operation) prunable() bool {
-	return op.Terminal() && op.EffectState != EffectUncertain
+// Prunable reports whether a record may be dropped by the history limit at now: an ended
+// operation whose effect on the directory is known, and which no longer holds an idempotency key.
+// An unfinished one, or one whose effect is uncertain, is evidence and stays however many records
+// there are.
+func (op *Operation) Prunable(now time.Time) bool {
+	if !op.Terminal() || op.EffectState == EffectUncertain {
+		return false
+	}
+	return op.RequestID == "" || now.Sub(op.Updated) >= IdempotencyRetention
 }
 
 // conflict returns the unfinished operation among live whose scope sc conflicts with, if any.
@@ -146,13 +202,33 @@ func checkScope(snap *directory.Snapshot, op *Operation) error {
 func (m *MemOperations) Create(_ context.Context, op *Operation) error {
 	m.mu.Lock()
 	if m.byID == nil {
-		m.byID = map[string]*Operation{}
+		m.byID, m.idem = map[string]*Operation{}, map[string]string{}
 	}
 	if _, dup := m.byID[op.ID]; dup {
 		m.mu.Unlock()
 		return fmt.Errorf("operation %s already exists", op.ID)
 	}
+	if op.RequestID != "" {
+		if id, ok := m.idem[IdempotencyIndex(op)]; ok {
+			existing := m.byID[id].clone()
+			m.mu.Unlock()
+			return replay(op, existing)
+		}
+	}
 	if op.Scope != nil {
+		limit, n := m.Capacity, 0
+		if limit <= 0 {
+			limit = DefaultCapacity
+		}
+		for _, o := range m.byID {
+			if !o.Terminal() {
+				n++
+			}
+		}
+		if n >= limit {
+			m.mu.Unlock()
+			return &CapacityError{Limit: limit}
+		}
 		if m.Dir != nil {
 			if err := checkScope(m.Dir.Snapshot(), op); err != nil {
 				m.mu.Unlock()
@@ -171,6 +247,9 @@ func (m *MemOperations) Create(_ context.Context, op *Operation) error {
 	m.order = append(m.order, op.ID)
 	c := op.clone()
 	m.byID[op.ID] = c
+	if op.RequestID != "" {
+		m.idem[IdempotencyIndex(op)] = op.ID
+	}
 	m.trim()
 	fn := m.OnChange
 	m.mu.Unlock()
@@ -209,8 +288,15 @@ func (m *MemOperations) trim() {
 	if limit <= 0 {
 		limit = defaultOperationLimit
 	}
+	now := time.Now()
+	if m.Now != nil {
+		now = m.Now()
+	}
 	for i := 0; len(m.order) > limit && i < len(m.order); {
-		if op := m.byID[m.order[i]]; op.prunable() {
+		if op := m.byID[m.order[i]]; op.Prunable(now) {
+			if op.RequestID != "" {
+				delete(m.idem, IdempotencyIndex(op))
+			}
 			delete(m.byID, m.order[i])
 			m.order = slices.Delete(m.order, i, i+1)
 			continue

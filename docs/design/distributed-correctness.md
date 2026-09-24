@@ -91,6 +91,16 @@ and its scope released, which is weaker than the reconciliation below: until H2,
 step is what completes a hold it left. Deferred: owner terms, idempotency keys and capacity (H0c),
 multi-scope child operations, and the file-backend durable envelope (dropped, ADR-0021).
 
+**Landed (2026-09-24, H0c):** `Idempotency-Key` is required on every request that creates an
+operation record. The key is indexed by epoch, actor and key (`/shunt/ops-idem/`) in the same
+transaction as the record; the record stores a keyed digest (HMAC under the shared confirmation
+key) of kind, scope and canonical body, which a retry must match, and the API never answers it.
+A retry gets the same record or the route's first answer; another intent gets 409
+`idempotency_conflict`. Ended keyed records stay seven days past the history limit. An optional
+`If-Generation` sets the scope's expected generation; making it required arrives with the draft
+work of H5. `--operation-capacity` (default 256) answers 429 `operation_capacity` before any
+effect. The CLI numbers its keys from a per-command `--request-id`.
+
 Extend the existing Operations seam rather than add a second job framework.
 Each safety-sensitive operation contains:
 

@@ -13,10 +13,12 @@ import (
 
 // The control plane's store on etcd passes the same operation transaction contract as the lab's.
 func TestOperationsContract(t *testing.T) {
-	opstest.Run(t, func(t *testing.T, limit int) opstest.Harness {
+	opstest.Run(t, func(t *testing.T, o opstest.Options) opstest.Harness {
 		tc := startCluster(t, 1)
 		store := openStore(t, tc, 0, make([]byte, 32))
-		return opstest.Harness{Ops: openOps(t, tc, 0, limit), Dir: store}
+		ops := openOps(t, tc, 0, o.Limit)
+		ops.Capacity = o.Capacity
+		return opstest.Harness{Ops: ops, Dir: store}
 	})
 }
 

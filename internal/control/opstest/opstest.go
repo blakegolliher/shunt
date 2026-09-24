@@ -24,15 +24,23 @@ type Harness struct {
 	Dir directory.Store
 }
 
-// Run runs the contract. newHarness returns a fresh store keeping at most limit ended records, over
-// an empty directory.
-func Run(t *testing.T, newHarness func(t *testing.T, limit int) Harness) {
-	t.Run("reservation", func(t *testing.T) { reservation(t, newHarness(t, 100)) })
-	t.Run("sequence", func(t *testing.T) { sequence(t, newHarness(t, 100)) })
-	t.Run("clusters", func(t *testing.T) { clusters(t, newHarness(t, 100)) })
-	t.Run("generation-and-lineage", func(t *testing.T) { generation(t, newHarness(t, 100)) })
-	t.Run("retention", func(t *testing.T) { retention(t, newHarness(t, 3)) })
-	t.Run("race", func(t *testing.T) { race(t, newHarness(t, 100)) })
+// Options size a store under test.
+type Options struct {
+	Limit    int // ended records kept
+	Capacity int // unfinished operations allowed
+}
+
+// Run runs the contract. newHarness returns a fresh store sized by o, over an empty directory.
+func Run(t *testing.T, newHarness func(t *testing.T, o Options) Harness) {
+	std := Options{Limit: 100, Capacity: 100}
+	t.Run("reservation", func(t *testing.T) { reservation(t, newHarness(t, std)) })
+	t.Run("sequence", func(t *testing.T) { sequence(t, newHarness(t, std)) })
+	t.Run("clusters", func(t *testing.T) { clusters(t, newHarness(t, std)) })
+	t.Run("generation-and-lineage", func(t *testing.T) { generation(t, newHarness(t, std)) })
+	t.Run("retention", func(t *testing.T) { retention(t, newHarness(t, Options{Limit: 3, Capacity: 100})) })
+	t.Run("race", func(t *testing.T) { race(t, newHarness(t, std)) })
+	t.Run("idempotency", func(t *testing.T) { idempotency(t, newHarness(t, Options{Limit: 2, Capacity: 100})) })
+	t.Run("capacity", func(t *testing.T) { capacity(t, newHarness(t, Options{Limit: 100, Capacity: 2})) })
 }
 
 var ids atomic.Int64
@@ -83,7 +91,7 @@ func clusterOp(h Harness, name string) *control.Operation {
 // end writes op as ended with status and effect, over its current sequence.
 func end(t *testing.T, h Harness, op *control.Operation, status, effect string) {
 	t.Helper()
-	op.Status, op.EffectState, op.Sequence = status, effect, op.Sequence+1
+	op.Status, op.EffectState, op.Sequence, op.Updated = status, effect, op.Sequence+1, time.Now().UTC()
 	if err := h.Ops.Update(context.Background(), op); err != nil {
 		t.Fatalf("ending %s: %v", op.ID, err)
 	}
@@ -291,6 +299,69 @@ func race(t *testing.T, h Harness) {
 		if owner != winners[0] {
 			t.Errorf("a loser was told %s owns the scope; %s does", owner, winners[0])
 		}
+	}
+}
+
+// keyed is op with an idempotency key and an intent digest.
+func keyed(op *control.Operation, actor, key, digest string) *control.Operation {
+	op.Actor, op.RequestID, op.IntentDigest = actor, key, digest
+	return op
+}
+
+// A retry with the same key and intent gets the first record, never a second one; the same key
+// with another intent is refused naming it; a key is the actor's own; and an ended record keeps
+// its key, and so stays, past the history limit.
+func idempotency(t *testing.T, h Harness) {
+	setup(t, h)
+	ctx := context.Background()
+	first := keyed(placementOp(h, "acme/ppp", "c1"), "alice", "k1", "intent-a")
+	if err := h.Ops.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	var rp *control.IdempotentReplay
+	if err := h.Ops.Create(ctx, keyed(placementOp(h, "acme/ppp", "c1"), "alice", "k1", "intent-a")); !errors.As(err, &rp) || rp.Existing.ID != first.ID {
+		t.Fatalf("a retry of the same request: %v, want a replay of %s", err, first.ID)
+	}
+	var ic *control.IdempotencyConflictError
+	if err := h.Ops.Create(ctx, keyed(placementOp(h, "acme/qqq", "c2"), "alice", "k1", "intent-b")); !errors.As(err, &ic) || ic.Owner != first.ID {
+		t.Fatalf("the same key for another request: %v, want a conflict naming %s", err, first.ID)
+	}
+	bob := keyed(placementOp(h, "acme/qqq", "c2"), "bob", "k1", "intent-b")
+	if err := h.Ops.Create(ctx, bob); err != nil {
+		t.Fatalf("another actor's request with the same key: %v", err)
+	}
+	end(t, h, first, control.StatusSucceeded, control.EffectCommitted)
+	end(t, h, bob, control.StatusSucceeded, control.EffectCommitted)
+	for range 4 { // past the limit of 2
+		op := &control.Operation{ID: newID(), Kind: control.OpRamp, Placement: "acme/r", Status: control.StatusPending, Sequence: 1}
+		if err := h.Ops.Create(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+		end(t, h, op, control.StatusSucceeded, control.EffectNone)
+	}
+	if err := h.Ops.Create(ctx, keyed(placementOp(h, "acme/ppp", "c1"), "alice", "k1", "intent-a")); !errors.As(err, &rp) || rp.Existing.ID != first.ID || rp.Existing.Status != control.StatusSucceeded {
+		t.Fatalf("a retry after the record ended and the limit was passed: %v, want a replay of the ended %s", err, first.ID)
+	}
+}
+
+// At the limit on unfinished operations a new one is refused before it reserves anything; one
+// ending makes room.
+func capacity(t *testing.T, h Harness) {
+	setup(t, h)
+	ctx := context.Background()
+	a, b := placementOp(h, "acme/ppp", "c1"), placementOp(h, "acme/qqq", "c2")
+	for _, op := range []*control.Operation{a, b} {
+		if err := h.Ops.Create(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ce *control.CapacityError
+	if err := h.Ops.Create(ctx, placementOp(h, "acme/rrr")); !errors.As(err, &ce) || ce.Limit != 2 {
+		t.Fatalf("a third operation at capacity 2: %v", err)
+	}
+	end(t, h, a, control.StatusSucceeded, control.EffectNone)
+	if err := h.Ops.Create(ctx, placementOp(h, "acme/rrr")); err != nil {
+		t.Fatalf("after one ended: %v", err)
 	}
 }
 
