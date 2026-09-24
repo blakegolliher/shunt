@@ -41,11 +41,14 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 	if t.Range != nil && *t.Range != m.Range {
 		return fail("a move of range %s is in progress; finish it before moving another", rangeText(m.Range))
 	}
+	if t.Leg != "" && t.Leg != m.From {
+		return fail("a move of leg %s's keys is in progress; finish it before moving another leg's", m.From)
+	}
 	v := p.MoveView()
 	if t.Target != "" && t.Target != v.ClusterOf(v.Primary) {
 		return fail("the move goes to %s; a later step may only repeat that target", v.ClusterOf(v.Primary))
 	}
-	t.Range, t.Target, t.Name = nil, "", ""
+	t.Range, t.Leg, t.Target, t.Name = nil, "", "", ""
 	nv, err := Apply(v, t)
 	if err != nil {
 		return p, err
@@ -85,11 +88,10 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if p.State != StateActive {
 		return fail("a move of part of a bucket starts from ACTIVE")
 	}
-	if t.Range == nil {
-		return fail("name the range of keys to move: the bucket is spread over legs")
+	if t.Range == nil && t.Leg == "" {
+		return fail("name the range of keys to move, or the leg whose keys move: the bucket is spread over legs")
 	}
-	rg := *t.Range
-	if rg.From > rg.To {
+	if t.Range != nil && t.Range.From > t.Range.To {
 		return fail("the range's start is after its end")
 	}
 	np := p.clone()
@@ -116,14 +118,32 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if t.Target == "" {
 		return fail("the target cluster is required")
 	}
+	if t.Range == nil { // the leg's first range; a leg that owns several moves them one at a time
+		if _, ok := np.Legs[t.Leg]; !ok {
+			return fail("the bucket has no leg %s; its legs are %v", t.Leg, slices.Sorted(maps.Keys(np.Legs)))
+		}
+		for _, o := range np.Owners {
+			if o.Leg == t.Leg {
+				t.Range = &HashRange{From: o.From, To: o.To}
+				break
+			}
+		}
+		if t.Range == nil {
+			return fail("leg %s owns no keys; there is nothing of it to move", t.Leg)
+		}
+	}
+	rg := *t.Range
 	src := ""
 	for _, o := range np.Owners {
 		if o.From <= rg.From && rg.To <= o.To {
 			src = o.Leg
 		}
 	}
-	if src == "" {
+	switch {
+	case src == "":
 		return fail("the range %s spans more than one leg; move one leg's keys at a time", rangeText(rg))
+	case t.Leg != "" && src != t.Leg:
+		return fail("the range %s is leg %s's, not leg %s's", rangeText(rg), src, t.Leg)
 	}
 	// The destination: the leg holding the named bucket, or the one leg on the target cluster when
 	// no bucket is named, or a new leg (ADR-0018 N3b: a cluster may hold several).
@@ -156,7 +176,7 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	// named by leg as in MoveView.
 	view := Placement{State: StateActive, Primary: src, Names: map[string]string{src: np.Legs[src].Bucket}}
 	tv := t
-	tv.Range, tv.Target, tv.Name = nil, dst, np.Legs[dst].Bucket
+	tv.Range, tv.Leg, tv.Target, tv.Name = nil, "", dst, np.Legs[dst].Bucket
 	nv, err := Apply(view, tv)
 	if err != nil {
 		return p, err
@@ -237,6 +257,20 @@ func settle(p Placement) Placement {
 		}
 	}
 	return v
+}
+
+// IdleLegs are the legs of p, sorted, that own no keys and take part in no move.
+func IdleLegs(p Placement) []string {
+	var out []string
+	for _, id := range slices.Sorted(maps.Keys(p.Legs)) {
+		if p.Move != nil && (id == p.Move.From || id == p.Move.To) {
+			continue
+		}
+		if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == id }) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func rangeText(rg HashRange) string {

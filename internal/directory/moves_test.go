@@ -177,3 +177,77 @@ func TestMoveToAnotherBucketOnTheSameCluster(t *testing.T) {
 		t.Fatalf("after the move: %+v", p)
 	}
 }
+
+// A move may name a leg instead of a range: it moves that leg's first range, and a consolidation is
+// that move once per leg (ADR-0018 N3c). A held first step released before it routed anything
+// leaves an idle leg, which ClearTarget retires.
+func TestMoveALegAndRetireAnIdleOne(t *testing.T) {
+	f := &File{Clusters: sampleClusters(t), Tenants: map[string]Tenant{}, Placements: map[string]Placement{}}
+	legs := []Leg{{Cluster: "garage", Bucket: "s-g"}, {Cluster: "minio", Bucket: "s-m"}, {Cluster: "cold", Bucket: "s-c"}}
+	if err := f.CreateSpread("acme", "sp1", legs, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p := f.Placements["acme/sp1"]
+	for name, tc := range map[string]struct {
+		tr   Transition
+		want string
+	}{
+		"unknown leg":      {Transition{To: StateMigrating, Target: "minio", Leg: "nope"}, "has no leg nope"},
+		"range of another": {Transition{To: StateMigrating, Target: "minio", Leg: "garage", Range: &HashRange{From: p.Owners[1].From, To: p.Owners[1].To}}, "is leg minio's, not leg garage's"},
+		"leg of plain":     {Transition{To: StateMigrating, Target: "minio", Leg: "x"}, "has no leg x"},
+		"leg onto its own": {Transition{To: StateMigrating, Target: "garage", Leg: "garage"}, "on garage/s-g already"},
+	} {
+		from := p
+		if name == "leg of plain" {
+			from = Placement{State: StateActive, Primary: "garage", Names: map[string]string{"garage": "d"}}
+		}
+		if _, err := Apply(from, tc.tr); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	// Consolidate into garage's leg: minio's keys, then cold's, one move each.
+	ev := &CutoverEvidence{At: time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC), Window: time.Minute}
+	for i, leg := range []string{"minio", "cold"} {
+		p = step(t, p, Transition{To: StateRamping, Target: "garage", Name: "s-g", Leg: leg, Ratio: 0.5})
+		if p.Move.From != leg || p.Move.To != "garage" || p.Move.Range != (HashRange{From: p.Owners[1].From, To: p.Owners[1].To}) {
+			t.Fatalf("move %d: %+v owners %+v", i, p.Move, p.Owners)
+		}
+		if _, err := Apply(p, Transition{To: StateRamping, Ratio: 1, Leg: "garage"}); err == nil || !strings.Contains(err.Error(), "finish it before moving another leg") {
+			t.Fatalf("another leg during a move: %v", err)
+		}
+		p = step(t, p, Transition{To: StateRamping, Ratio: 1, Leg: leg})
+		p = step(t, p, Transition{To: StateMigrating})
+		p = step(t, p, Transition{To: StateCutover, Cutover: ev})
+		p = step(t, p, Transition{To: StateActive})
+		if _, kept := p.Legs[leg]; kept {
+			t.Fatalf("leg %s owns nothing after its move but was kept: %+v", leg, p)
+		}
+	}
+	if p.Spread() || p.Primary != "garage" || len(p.Names) != 1 || p.Names["garage"] != "s-g" {
+		t.Fatalf("after consolidating: %+v", p)
+	}
+
+	// A released first step leaves the destination as a leg that owns nothing; clearing retires it.
+	if err := f.CreateSpread("acme", "sp2", []Leg{{Cluster: "garage", Bucket: "t-g"}, {Cluster: "minio", Bucket: "t-m"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	q := step(t, f.Placements["acme/sp2"], Transition{To: StateRamping, Target: "cold", Name: "s2-c", Leg: "garage", Ratio: 0.5, Hold: true})
+	q = step(t, q, Transition{To: StateRamping, Release: true})
+	if idle := IdleLegs(q); len(idle) != 1 || idle[0] != "cold" || q.State != StateActive || q.Move != nil {
+		t.Fatalf("released: idle %v, %+v", IdleLegs(q), q)
+	}
+	f.Placements["acme/sp2"] = q
+	if err := f.ClearTarget("acme", "sp2"); err != nil {
+		t.Fatal(err)
+	}
+	if q = f.Placements["acme/sp2"]; len(q.Legs) != 2 || !q.Spread() || len(IdleLegs(q)) != 0 {
+		t.Fatalf("after retiring: %+v", q)
+	}
+	if err := f.ClearTarget("acme", "sp2"); err == nil || !strings.Contains(err.Error(), "no idle leg") {
+		t.Fatalf("clearing with no idle leg: %v", err)
+	}
+	if err := validate(f); err != nil {
+		t.Fatalf("the directory after retiring: %v", err)
+	}
+}

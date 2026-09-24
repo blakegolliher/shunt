@@ -276,6 +276,42 @@ test('moves part of a spread bucket leg to another cluster', async () => {
     args: { to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, ratio: 0.01, create: true, wait: '30s' } }))
 })
 
+test('consolidates a spread bucket one leg at a time and retires an idle leg', async () => {
+  const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
+    legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.75, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }, { from: 'c000000000000000', to: 'ffffffffffffffff' }] },
+      { id: 'target', cluster: 'target', bucket: 'wide-t', share: 0.25, ranges: [{ from: '8000000000000000', to: 'bfffffffffffffff' }] },
+      { id: 'target-2', cluster: 'target', bucket: 'wide-idle', share: 0, ranges: [] }] }
+  const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
+  let started: unknown
+  let retired = false
+  baseMock(directory, (url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      started = JSON.parse(String(init.body))
+      return Response.json({ id: 'op-1', kind: 'ramp', placement: 'acme/wide', actor: 'token:x', status: 'running', phase: 'queued' })
+    }
+    if (url.endsWith('/v1/placements/acme/wide/target') && init?.method === 'DELETE') {
+      retired = true
+      return Response.json({ key: 'acme/wide', retired: [{ id: 'target-2', cluster: 'target', bucket: 'wide-idle' }], version: 4 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Retire idle legs of acme/wide' }))
+  expect(await screen.findByText('acme/wide: retired target/wide-idle, which owned no keys; the buckets are still there')).toBeInTheDocument()
+  expect(retired).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Consolidate acme/wide' }))
+  expect(screen.getByLabelText('Keep')).toHaveValue('source')
+  expect(screen.getByText('1 move left')).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Keep'), { target: { value: 'target' } })
+  expect(screen.getByText('2 moves left')).toBeInTheDocument()
+  expect(screen.getByText(', in 2 ranges (a move each)', { exact: false })).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '25%' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Start the next move and continue to Migrations' }))
+  await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
+    args: { to: 'target', name: 'wide-t', leg: 'source', ratio: 0.25, wait: '30s' } }))
+})
+
 test('moves a bucket to another bucket on its own cluster from Expand', async () => {
   const placement: PlacementStatus = { key: 'acme/data', state: 'ACTIVE', primary: 'source', names: { source: 'data' }, read_only: false, reject_writes: false }
   const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }

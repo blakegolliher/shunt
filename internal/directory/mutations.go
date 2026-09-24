@@ -202,7 +202,8 @@ func (f *File) SetTarget(tenant, bucket, cluster, backend string) error {
 }
 
 // ClearTarget forgets the cluster `shunt expand` prepared, while no step has used it: the placement
-// stays ACTIVE where it is. The backend bucket is left as it is; shunt may not have created it.
+// stays ACTIVE where it is. For a spread bucket it retires the legs that own nothing. The backend
+// bucket is left as it is; shunt may not have created it.
 func (f *File) ClearTarget(tenant, bucket string) error {
 	k := Key(tenant, bucket)
 	p, ok := f.Placements[k]
@@ -211,6 +212,20 @@ func (f *File) ClearTarget(tenant, bucket string) error {
 	}
 	if p.State != StateActive {
 		return fmt.Errorf("%w: %s is %s; a target can only be cleared before the first step", ErrConflict, k, p.State)
+	}
+	if p.Spread() {
+		// A spread bucket's prepared destinations are its legs that own nothing (a move released
+		// before it routed anything leaves one): retiring them is directory-only (ADR-0018 N3c).
+		idle := IdleLegs(p)
+		if len(idle) == 0 {
+			return fmt.Errorf("%w: every leg of %s owns keys; there is no idle leg to retire", ErrConflict, k)
+		}
+		np := p.clone()
+		for _, id := range idle {
+			delete(np.Legs, id)
+		}
+		f.Placements[k] = settle(np)
+		return nil
 	}
 	if p.Target == "" {
 		return fmt.Errorf("%w: %s has no target to clear", ErrConflict, k)

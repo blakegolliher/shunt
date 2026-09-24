@@ -442,3 +442,18 @@ func (k *stubKeys) Remove(ak string) error {
 	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
 	return nil
 }
+
+func TestParseRange(t *testing.T) {
+	rg, err := parseRange("0000000000000000-7fffffffffffffff")
+	if err != nil || rg == nil || rg.From != 0 || rg.To != 1<<63-1 {
+		t.Fatalf("a valid range: %+v %v", rg, err)
+	}
+	if rg, err := parseRange(""); rg != nil || err != nil {
+		t.Fatalf("no range: %+v %v", rg, err)
+	}
+	for _, bad := range []string{"0-7f", "7fffffffffffffff-0000000000000000", "0000000000000000", "zzzzzzzzzzzzzzzz-ffffffffffffffff"} {
+		if _, err := parseRange(bad); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
+	}
+}

@@ -169,7 +169,13 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
 - **verify retries hold 503s (2026-09-23).** `shunt verify` now retries a 503 that carries
   `Retry-After` (the ADR-0016 hold), up to 10 times with backoff from 50 ms capped at the header,
   as an S3 SDK does; the report counts them as `retried`, not errors. `--no-retry` restores the old
-  count. Next: N3c (consolidation).
+  count.
+- **ADR-0018 N3c built (2026-09-23): consolidation, retire, step-out of a spread bucket.** A move
+  may name a leg (`--leg`) instead of a range; consolidating is that move once per other leg, and
+  the bucket settles to plain, where step-out handles it as before. `expand --clear` retires legs
+  that own nothing. CLI `--range`/`--leg` on ramp and migrate start; UI Consolidate and Retire idle
+  leg. Gate: directory, control (consolidation through purge, step-out before and after) and UI
+  tests; lint and race suite green. Not yet run live. Next: N4.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

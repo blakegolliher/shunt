@@ -421,6 +421,15 @@ func newExpand() *cobra.Command {
 				if o.json {
 					return printJSON(cmd, out)
 				}
+				for _, l := range out.Retired {
+					if _, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: leg %s (%s/%s) retired; it owned no keys, and its bucket is still on %s (directory version %d)\n",
+						shown(out.Key), l.ID, l.Cluster, l.Bucket, l.Cluster, out.Version); err != nil {
+						return err
+					}
+				}
+				if out.Target == "" {
+					return nil
+				}
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: target %s/%s cleared; the bucket is still on %s (directory version %d)\n",
 					shown(out.Key), out.Target, out.Name, out.Target, out.Version)
 				return err
@@ -458,16 +467,17 @@ func newExpand() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name there (default: <name>-001, the lowest unused)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket there if it does not exist")
 	f.BoolVar(&req.AcceptObjects, "accept-existing-objects", false, "take a target bucket that holds objects: they are this bucket's, copied ahead")
-	f.BoolVar(&clearTarget, "clear", false, "forget the target expand recorded, before the first step")
+	f.BoolVar(&clearTarget, "clear", false, "forget the target expand recorded, before the first step; for a spread bucket, retire its legs that own no keys")
 	return cmd
 }
 
 func newRamp() *cobra.Command {
 	var (
-		o    apiOptions
-		req  control.RampRequest
-		from string
-		wait time.Duration
+		o         apiOptions
+		req       control.RampRequest
+		from      string
+		rangeText string
+		wait      time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "ramp <bucket>",
@@ -484,7 +494,11 @@ func newRamp() *cobra.Command {
 			if req.Ratio < 0 || req.Ratio > 1 {
 				return fmt.Errorf("--ratio %v is outside 0..1", req.Ratio)
 			}
-			req.Wait = wait.String()
+			rg, err := parseRange(rangeText)
+			if err != nil {
+				return err
+			}
+			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpRamp, req, time.Minute+3*wait)
 			})
@@ -499,7 +513,31 @@ func newRamp() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	addMoveFlags(cmd, &rangeText, &req.Leg)
 	return cmd
+}
+
+// addMoveFlags adds the flags that make a first step move part of a bucket (ADR-0018 N3).
+func addMoveFlags(cmd *cobra.Command, rangeText, leg *string) {
+	f := cmd.Flags()
+	f.StringVar(rangeText, "range", "", "move only the keys whose hash is in `from-to` (16 hex digits each, inclusive), out of the one leg that owns them")
+	f.StringVar(leg, "leg", "", "move the keys of this leg of a spread bucket (its first range; repeat per range); consolidating a bucket is this, once per other leg")
+}
+
+// parseRange reads --range: two 16-hex-digit hash bounds joined by '-', or nothing.
+func parseRange(s string) (*directory.HashRange, error) {
+	if s == "" {
+		return nil, nil //nolint:nilnil // no range asked for
+	}
+	from, to, ok := strings.Cut(s, "-")
+	var rg directory.HashRange
+	if !ok || rg.From.UnmarshalText([]byte(from)) != nil || rg.To.UnmarshalText([]byte(to)) != nil {
+		return nil, fmt.Errorf("--range %q: want <from>-<to>, 16 hex digits each, such as 0000000000000000-7fffffffffffffff", s)
+	}
+	if rg.From > rg.To {
+		return nil, fmt.Errorf("--range %q: the start is after the end", s)
+	}
+	return &rg, nil
 }
 
 func newMigrate() *cobra.Command {
@@ -513,10 +551,11 @@ func newMigrate() *cobra.Command {
 
 func newMigrateStart() *cobra.Command {
 	var (
-		o    apiOptions
-		req  control.MigrateRequest
-		from string
-		wait time.Duration
+		o         apiOptions
+		req       control.MigrateRequest
+		from      string
+		rangeText string
+		wait      time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "start <bucket>",
@@ -526,7 +565,11 @@ func newMigrateStart() *cobra.Command {
 			"are merged. That is the state the mover copies in: `shunt migrate run`.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			req.Wait = wait.String()
+			rg, err := parseRange(rangeText)
+			if err != nil {
+				return err
+			}
+			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpMigrate, req, time.Minute+3*wait)
 			})
@@ -541,6 +584,7 @@ func newMigrateStart() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	addMoveFlags(cmd, &rangeText, &req.Leg)
 	return cmd
 }
 
@@ -773,6 +817,9 @@ func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, kind stri
 		_, _ = fmt.Fprintf(out, "created %s on %s\n", res.CreatedBucket, res.Primary)
 	}
 	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", shown(res.Key), res.From, res.To, res.Version)
+	if rg := res.Range; rg != nil {
+		_, _ = fmt.Fprintf(out, "only keys whose hash is in %016x-%016x move; the ratio is a share of that range\n", uint64(rg.From), uint64(rg.To))
+	}
 	switch res.To {
 	case directory.StateRamping:
 		_, _ = fmt.Fprintf(out, "writes for %.0f%% of keys now land on %s; reads fall back to %s\n", 100*res.Ratio, res.Primary, res.Source)

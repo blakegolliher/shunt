@@ -75,7 +75,7 @@ func (s *Server) stepOut(w http.ResponseWriter, r *http.Request) {
 					clusters = append(clusters, l.Cluster)
 				}
 			}
-			b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is spread over %d backend buckets (%s): clients going direct need all its keys in one bucket; move them into one leg first (ADR-0018 N3)",
+			b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is spread over %d backend buckets (%s): clients going direct need all its keys in one bucket; consolidate it first, moving each other leg's keys into the one to keep (shunt ramp or migrate start --leg; ADR-0018 N3c)",
 				key, len(where), strings.Join(where, ", ")))
 			out.Buckets = append(out.Buckets, b)
 			continue

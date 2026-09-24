@@ -1,8 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23); N1, N2, N3a and N3b built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2, N3a and N3b
-are built (below); N3c and N4 are not.
+Status: proposed (2026-09-23); N1, N2 and N3 (a, b, c) built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2, N3a, N3b and
+N3c are built (below); N4 is not.
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -219,6 +219,33 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   uploads begun before the move (untagged, completing on the old bucket) and during it (tagged,
   completing on the new one); it fails with the bucket looked up by cluster, and with no tag. A
   control test moves a bucket to a new bucket on its own cluster from migrate through purge.
+
+## N3c as built (2026-09-23): consolidation, retire, and step-out of a spread bucket
+
+- **A move may name a leg** (`Transition.Leg`, `leg` on ramp and migrate, `--leg` on the CLI) instead
+  of a range: it takes the first range that leg owns, and is then the move N3a built, unchanged. No
+  per-key rule changes, so the fleet property test's range and same-cluster runs cover it; naming a
+  leg is how its range is chosen, not a new kind of move. A leg owning several ranges moves them one
+  move at a time.
+- **Consolidating** a spread bucket is that move once per other leg, into the leg kept (or a new
+  bucket, as any move's destination). Each purge deletes a source leg's bucket once it owns
+  nothing, and the last move settles the bucket to plain. **Step-out** then treats it as any plain
+  bucket; until then its blocker says to consolidate. Concurrent moves stay deferred, so a
+  consolidation of N legs is N−1 moves in sequence.
+- **Retire** is `DELETE …/target` (`shunt expand --clear`) on a spread bucket: it forgets the legs
+  that own nothing and take part in no move (`directory.IdleLegs`), leaving their buckets. A first
+  step released before it routed anything leaves such a leg. A leg can only come to own nothing
+  through a move's end, which drops it, or a release, which never routed anything to it, so it holds
+  no keys.
+- **Split** needs no action of its own: a move may take any range inside one leg's ownership, and
+  the owners table is cut where the move's range ends.
+- **CLI:** `shunt ramp` and `shunt migrate start` take `--range <from>-<to>` and `--leg`; the result
+  says which range moves. **UI:** a spread bucket has **Consolidate** (pick the leg to keep; it
+  lists the moves left and starts the next) and **Retire idle leg**.
+- **Proof:** a directory test consolidates three legs into one and retires a released destination;
+  a control test consolidates a two-leg bucket into a new bucket on one of its clusters through
+  migrate, mover, cutover and purge, checking step-out before and after; a UI test drives both
+  buttons.
 
 ## Open questions
 

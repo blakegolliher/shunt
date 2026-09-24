@@ -1282,6 +1282,89 @@ func TestMoveToAnotherBucketOnTheSameClusterThroughTheAPI(t *testing.T) {
 	}
 }
 
+// A spread bucket consolidates into one new bucket through the API (ADR-0018 N3c): each leg's keys
+// move by naming the leg, one move at a time; each purge deletes a source leg's bucket once it owns
+// nothing; the bucket ends plain under the new name, and step-out no longer reports it spread.
+func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/spd/create-backend",
+		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-b"}}}, nil)
+	p, _ := rg.dir.Snapshot().Lookup("acme", "spd")
+	legs := map[string]struct {
+		cl     *fakeCluster
+		bucket string
+	}{"vast01": {rg.vast01, "sp-a"}, "vast02": {rg.vast02, "sp-b"}}
+	keys := map[string][]string{}
+	for i := range 12 {
+		k := fmt.Sprintf("k%02d", i)
+		owner, err := migrate.OwnerOf(p, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[owner] = append(keys[owner], k)
+		legs[owner].cl.put(t, legs[owner].bucket, k, "v")
+	}
+	if len(keys["vast01"]) == 0 || len(keys["vast02"]) == 0 {
+		t.Fatalf("every leg needs keys: %v", keys)
+	}
+	rg.refused("DELETE", "/v1/placements/acme/spd/target", nil, "no idle leg to retire")
+	rg.refused("POST", "/v1/placements/acme/spd/migrate", MigrateRequest{To: "vast02", Name: "sp-final", Leg: "nope"}, "has no leg nope")
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	moveLeg := func(leg string) {
+		t.Helper()
+		var tr TransitionResult
+		rg.must("POST", "/v1/placements/acme/spd/migrate", MigrateRequest{To: "vast02", Name: "sp-final", Create: true, Leg: leg}, &tr)
+		if tr.To != directory.StateMigrating || tr.Range == nil {
+			t.Fatalf("moving leg %s: %+v", leg, tr)
+		}
+		rg.refused("POST", "/v1/placements/acme/spd/ramp", RampRequest{Ratio: 1, Leg: "other"}, "finish it before moving another leg")
+		for _, k := range keys[leg] {
+			rg.vast02.put(t, "sp-final", k, "v") // the mover's work
+		}
+		rg.must("POST", "/v1/placements/acme/spd/mover-progress", Progress{Source: leg, Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+		rg.must("POST", "/v1/placements/acme/spd/cutover", CutoverRequest{Window: "1s"}, &tr)
+		var dry PurgeDryRun
+		rg.must("POST", "/v1/placements/acme/spd/purge-source", PurgeRequest{DryRun: true}, &dry)
+		if !dry.Allowed || dry.Bucket != legs[leg].bucket || dry.Objects != len(keys[leg]) {
+			t.Fatalf("dry run for leg %s: %+v", leg, dry)
+		}
+		var pg PurgeResult
+		rg.must("POST", "/v1/placements/acme/spd/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+		if ok, _ := legs[leg].cl.be.BucketExists(legs[leg].bucket); ok {
+			t.Fatalf("leg %s owns nothing, but its bucket %s was kept", leg, legs[leg].bucket)
+		}
+	}
+	moveLeg("vast01")
+	p, _ = rg.dir.Snapshot().Lookup("acme", "spd")
+	if !p.Spread() || len(p.Legs) != 2 || p.Legs["vast02-2"].Bucket != "sp-final" {
+		t.Fatalf("after the first leg: %+v", p)
+	}
+	var so StepOut
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	if so.Ready || len(so.Buckets) != 1 || !strings.Contains(strings.Join(so.Buckets[0].Problems, " "), "consolidate it first") {
+		t.Fatalf("step-out of a spread bucket: %+v", so)
+	}
+	moveLeg("vast02")
+	p, _ = rg.dir.Snapshot().Lookup("acme", "spd")
+	if p.Spread() || p.Primary != "vast02" || len(p.Names) != 1 || p.Names["vast02"] != "sp-final" {
+		t.Fatalf("after consolidating: %+v", p)
+	}
+	for _, k := range append(keys["vast01"], keys["vast02"]...) {
+		if !rg.vast02.has("sp-final", k) {
+			t.Fatalf("%s is not in the consolidated bucket", k)
+		}
+	}
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	for _, b := range so.Buckets {
+		if strings.Contains(strings.Join(b.Problems, " "), "spread over") {
+			t.Fatalf("a consolidated bucket is still reported spread: %+v", b)
+		}
+	}
+}
+
 // stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
 type stubKeys struct {
 	stored   []sigv4.Credential

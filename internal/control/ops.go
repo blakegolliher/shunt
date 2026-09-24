@@ -156,7 +156,7 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 
 	tenant, bucket, _ := directory.SplitKey(key)
 	complete := t // the step as written once every member holds it: never with a target
-	complete.Target, complete.Name, complete.Complete, complete.Range = "", "", true, nil
+	complete.Target, complete.Name, complete.Complete, complete.Range, complete.Leg = "", "", true, nil, ""
 	var heldAt int64
 	var created string
 	if p.Held() {
@@ -585,10 +585,13 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 
 // ClearTargetResult is what DELETE /v1/placements/{tenant}/{bucket}/target forgot.
 type ClearTargetResult struct {
-	Key     string `json:"key"`
-	Target  string `json:"target"` // the cluster expand had prepared
-	Name    string `json:"name"`   // its bucket there, left as it is
-	Version int64  `json:"version"`
+	Key    string `json:"key"`
+	Target string `json:"target,omitempty"` // the cluster expand had prepared
+	Name   string `json:"name,omitempty"`   // its bucket there, left as it is
+	// Retired, for a spread bucket, are the legs that owned nothing and are forgotten; their buckets
+	// are left as they are (ADR-0018 N3c).
+	Retired []LegStatus `json:"retired,omitempty"`
+	Version int64       `json:"version"`
 }
 
 // clearTarget undoes expand before the first step: the target is recorded while ACTIVE and routes
@@ -600,21 +603,29 @@ func (s *Server) clearTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant, bucket, _ := directory.SplitKey(key)
+	pv := moving(p)
 	switch {
 	case p.State != directory.StateActive:
-		fail(w, refuse("%s is %s, moving to %s; a target can only be cleared before the first step", key, p.State, p.Primary))
+		fail(w, refuse("%s is %s, moving to %s; a target can only be cleared before the first step", key, p.State, pv.ClusterOf(pv.Primary)))
 		return
-	case p.Target == "":
+	case p.Spread() && len(directory.IdleLegs(p)) == 0:
+		fail(w, refuse("every leg of %s owns keys; there is no idle leg to retire (move a leg's keys to another leg first)", key))
+		return
+	case !p.Spread() && p.Target == "":
 		fail(w, refuse("%s has no target to clear", key))
 		return
 	}
 	res := ClearTargetResult{Key: key, Target: p.Target, Name: p.Names[p.Target]}
+	for _, id := range directory.IdleLegs(p) {
+		l := p.Legs[id]
+		res.Retired = append(res.Retired, LegStatus{ID: id, Cluster: l.Cluster, Bucket: l.Bucket})
+	}
 	if err := s.Dir.ClearTarget(r.Context(), tenant, bucket, actor(r)); err != nil {
 		fail(w, err)
 		return
 	}
 	res.Version = s.Dir.Snapshot().Version()
-	s.info(actor(r), "target cleared", "placement", key, "target", res.Target, "bucket", res.Name, "version", res.Version)
+	s.info(actor(r), "target cleared", "placement", key, "target", res.Target, "bucket", res.Name, "retired", len(res.Retired), "version", res.Version)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -704,9 +715,11 @@ type RampRequest struct {
 	To       string   `json:"to,omitempty"`   // leaving ACTIVE without expand: the target cluster
 	Name     string   `json:"name,omitempty"` // and its backend bucket
 	// Range, leaving ACTIVE, moves only the keys whose hash it holds, to the target's leg (ADR-0018 N3).
-	Range  *directory.HashRange `json:"range,omitempty"`
-	Create bool                 `json:"create,omitempty"`
-	Wait   string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
+	Range *directory.HashRange `json:"range,omitempty"`
+	// Leg, leaving ACTIVE, moves the first range that leg owns instead of a named range (ADR-0018 N3c).
+	Leg    string `json:"leg,omitempty"`
+	Create bool   `json:"create,omitempty"`
+	Wait   string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
@@ -722,7 +735,7 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range}, req.Create, false, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg}, req.Create, false, wait)
 	if err != nil {
 		return res, err
 	}
@@ -736,6 +749,7 @@ type MigrateRequest struct {
 	To                    string               `json:"to,omitempty"`
 	Name                  string               `json:"name,omitempty"`
 	Range                 *directory.HashRange `json:"range,omitempty"` // leaving ACTIVE: move only these keys (ADR-0018 N3)
+	Leg                   string               `json:"leg,omitempty"`   // leaving ACTIVE: move this leg's first range (N3c)
 	Create                bool                 `json:"create,omitempty"`
 	AcceptLostWriteWindow bool                 `json:"accept_lost_write_window,omitempty"`
 	Wait                  string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
@@ -754,7 +768,7 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		return res, err
 	}
