@@ -139,9 +139,11 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.refuseWrite(w, r, o, info.Bucket, "stale", "This proxy has lost contact with its control node and does not write to a bucket that is moving. Retry shortly.")
 		return nil, false
 	}
-	clusterName := p.Primary
+	// The route names a role; the role names a bucket, on a cluster (ClusterOf): in a move between
+	// two legs of one cluster the two roles share it (ADR-0018 N3b).
+	role := p.Primary
 	if route.Cluster == migrate.Source {
-		clusterName = p.Source
+		role = p.Source
 	}
 	rawQuery, prefix, conflict := rewriteUploadIDs(rawQuery)
 	if conflict {
@@ -149,18 +151,19 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		return nil, false
 	}
 	if prefix != "" {
-		pcl, found := clusters.ByID(prefix)
-		if !found || p.Names[pcl.Name] == "" {
+		pinned, found := uploadRole(p, clusters, prefix)
+		if !found {
 			h.answer(w, r, o, s3.NoSuchUpload, "")
 			return nil, false
 		}
-		clusterName = pcl.Name
+		role = pinned
 		route = migrate.Route{Cluster: migrate.Primary} // pinned: no fallback, no dual, no merge
 	}
+	clusterName := p.ClusterOf(role)
 	if mutating {
 		check := []string{clusterName}
 		if route.Both {
-			check = append(check, p.Source)
+			check = append(check, p.ClusterOf(p.Source))
 		}
 		for _, name := range check {
 			if c, found := snap.Cluster(name); found && c.ReadOnly {
@@ -177,8 +180,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.InternalError, "")
 		return nil, false
 	}
-	backend := p.Names[cl.Name]
+	backend := p.Names[role]
 	o.cluster, o.clusterType, o.backend = cl.Name, cl.Type, backend
+	o.fromSource = p.Source != "" && role == p.Source
 	if p.State == directory.StateRamping && class == migrate.ClassWrite {
 		bucketKey := directory.Key(o.tenant, info.Bucket)
 		h.Metrics.RampWrites.WithLabelValues(bucketKey, route.Cluster.String()).Inc()
@@ -189,7 +193,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 
 	// A conditional write while the bucket's objects are split across two clusters is judged
 	// against both, not only the cluster this write lands on (ADR-0013).
-	act, code, msg := h.conditionalWrite(ctx, r, o, info, p, clusters, cl, backend, class)
+	act, code, msg := h.conditionalWrite(ctx, r, o, info, p, clusters, role, cl, backend, class)
 	if code != "" {
 		h.answer(w, r, o, code, msg)
 		return nil, false
@@ -202,10 +206,10 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	otherBackend := ""
 	if p.Source != "" && (route.Fallback || route.Both || route.Merge) {
 		name := p.Source
-		if route.Cluster == migrate.Source {
+		if role == p.Source {
 			name = p.Primary
 		}
-		if oc, found := clusters.Get(name); found && p.Names[name] != "" {
+		if oc, found := clusters.Get(p.ClusterOf(name)); found && p.Names[name] != "" {
 			other, otherBackend = oc, p.Names[name]
 		}
 	}
@@ -252,6 +256,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	var ed *editor
 	if h.Rewrite {
 		ed = newEditor(r, info, cl, backend)
+		ed.clusterID = uploadPrefix(p, cl, backend)
 	}
 	build := func(ctx context.Context, cl *upstream.Cluster, backend, endpoint string) (*http.Request, error) {
 		target := upstreamPath(r, info, backend)
@@ -336,6 +341,46 @@ func upstreamPath(r *http.Request, info s3.RequestInfo, backend string) string {
 		return "/" + backend + rest[i:]
 	}
 	return "/" + backend
+}
+
+// uploadRole is the role an upload id's prefix names in p: the one role on that cluster, or, when
+// a move's two legs share it, the one whose bucket the id's tag names (BucketTag); an untagged id
+// there was issued before the move, by its source (ADR-0018 N3b).
+func uploadRole(p *directory.Placement, clusters *upstream.Set, prefix string) (string, bool) {
+	id, tag := migrate.SplitUploadPrefix(prefix)
+	cl, found := clusters.ByID(id)
+	if !found {
+		return "", false
+	}
+	var roles []string
+	for _, role := range []string{p.Primary, p.Source} {
+		if role != "" && p.ClusterOf(role) == cl.Name && p.Names[role] != "" {
+			roles = append(roles, role)
+		}
+	}
+	switch {
+	case len(roles) == 0:
+		return "", false
+	case tag != "":
+		for _, role := range roles {
+			if migrate.BucketTag(p.Names[role]) == tag {
+				return role, true
+			}
+		}
+		return "", false
+	case len(roles) == 1:
+		return roles[0], true
+	}
+	return p.Source, true
+}
+
+// uploadPrefix is what the upload ids of a response get before '~': the cluster id, and a tag of
+// the bucket when the request's two buckets share the cluster (ADR-0018 N3b).
+func uploadPrefix(p *directory.Placement, cl *upstream.Cluster, backend string) string {
+	if p.Source != "" && p.ClusterOf(p.Source) == p.ClusterOf(p.Primary) {
+		return cl.ID + "." + migrate.BucketTag(backend)
+	}
+	return cl.ID
 }
 
 // rewriteUploadIDs strips the cluster prefix from uploadId and upload-id-marker in a raw query

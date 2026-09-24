@@ -175,8 +175,11 @@ func TestTransitionDetails(t *testing.T) {
 	if _, err := Apply(p, Transition{To: StateMigrating}); err == nil {
 		t.Error("leaving ACTIVE without a target accepted")
 	}
-	if _, err := Apply(p, Transition{To: StateMigrating, Target: "garage", Name: "x"}); err == nil {
-		t.Error("target equal to primary accepted")
+	if _, err := Apply(p, Transition{To: StateMigrating, Target: "garage", Name: "data"}); err == nil {
+		t.Error("the primary's own bucket accepted as the target")
+	}
+	if _, err := Apply(p, Transition{To: StateMigrating, Target: "garage"}); err == nil {
+		t.Error("the primary's cluster accepted as the target with no other bucket named")
 	}
 	if _, err := Apply(p, Transition{To: StateRamping, Target: "minio", Name: "x"}); err == nil {
 		t.Error("RAMPING without ratio or prefix accepted")

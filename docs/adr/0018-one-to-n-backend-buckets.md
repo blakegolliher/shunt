@@ -1,8 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23); N1, N2 and N3a built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2 and N3a are
-built (below); N3b, N3c and N4 are not.
+Status: proposed (2026-09-23); N1, N2, N3a and N3b built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2, N3a and N3b
+are built (below); N3c and N4 are not.
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -188,6 +188,37 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
 - **UI:** the first step of an expanded bucket can move a share of its key space; a spread bucket
   has **Move keys** (a share of one leg's range to another cluster); the Migrations screen shows a
   move as the migration it is, with which part moves.
+
+## N3b as built (2026-09-23): two legs on one cluster
+
+- **A move's roles are legs.** `MoveView` names its source and primary by leg id, keys `Names` by
+  them, and maps each to its cluster (`LegClusters`, never stored); `Placement.ClusterOf(role)` is
+  the cluster, which is the role itself for every stored placement. Everything that picks a bucket
+  (the proxy's route, fallback, conditional check and copy source; the mover; the control plane's
+  steps, cutover and purge) picks it by role and asks `ClusterOf` for the cluster. The side a proxy
+  answered from is recorded as a role (`outcome.fromSource`), since the cluster no longer tells.
+- **A new leg on a cluster that has one** gets its own id (`<cluster>-2`, `-3`, ...). A first step
+  names the destination bucket; with no name it is the one leg on that cluster. A plain bucket asked
+  to move to another bucket on its own cluster moves every key as a move (the rename), since a plain
+  migration's two buckets are on two clusters; it settles back to a plain bucket under the new name.
+  CreateSpread still spreads a new bucket over different clusters, since one cluster's keys over two
+  of its buckets gains nothing.
+- **Upload ids.** `<clusterID>~<backendID>` (docs/DESIGN.md §2.4) gains a form for two buckets on one
+  cluster: `<clusterID>.<tag>~<backendID>`, the tag being six hex of the bucket name's SHA-256
+  (`migrate.BucketTag`). A proxy issues it only while a request's two buckets share a cluster; every
+  other id keeps the old form. An incoming id resolves to the role on its cluster whose bucket the
+  tag names; untagged, to the one role on that cluster, or, when a move's two legs share it, to the
+  source: an untagged id there was issued before the move.
+- **Status** reports clusters in `primary` and `source` as before and adds `primary_bucket` and
+  `source_bucket`, since `names` cannot hold two buckets of one cluster. The UI's Expand offers the
+  bucket's own cluster ("another bucket here"), which starts the move at once, and Move keys offers a
+  new bucket beside the source.
+- **Proof:** the fleet property test and its negative control run a move to another bucket on
+  garage: 3 runs each, 0 violations in 25,287 client operations with the fence, violations in every
+  run without it. A proxy test covers writes, fallback reads, the merged listing, dual deletes, and
+  uploads begun before the move (untagged, completing on the old bucket) and during it (tagged,
+  completing on the new one); it fails with the bucket looked up by cluster, and with no tag. A
+  control test moves a bucket to a new bucket on its own cluster from migrate through purge.
 
 ## Open questions
 

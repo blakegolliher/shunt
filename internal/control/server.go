@@ -314,8 +314,11 @@ type PlacementStatus struct {
 	// Primary and Names are empty then.
 	Legs []LegStatus `json:"legs,omitempty"`
 	// Move is the part of a spread bucket moving between legs; Primary and Source are its two
-	// clusters then (ADR-0018 N3).
-	Move *MoveStatus `json:"move,omitempty"`
+	// clusters then (ADR-0018 N3), and PrimaryBucket and SourceBucket its two buckets, which names
+	// cannot both hold when the legs share a cluster (N3b).
+	Move          *MoveStatus `json:"move,omitempty"`
+	PrimaryBucket string      `json:"primary_bucket,omitempty"`
+	SourceBucket  string      `json:"source_bucket,omitempty"`
 	// ClientKeys counts the tenant's client keys whose bucket allowlist admits this bucket: 0 means
 	// no request through shunt can reach it yet. Absent when this shunt holds no client keys.
 	ClientKeys *int `json:"client_keys,omitempty"`
@@ -432,9 +435,18 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 	// A bucket part of which is moving reads as the move's two clusters, so everything that shows a
 	// migration shows the move as one; Legs and Move say which part (ADR-0018 N3).
 	p := moving(pl)
-	ps := PlacementStatus{Key: key, State: p.State, Primary: p.Primary, Source: p.Source, Target: p.Target, Names: p.Names,
+	ps := PlacementStatus{Key: key, State: p.State, Primary: p.ClusterOf(p.Primary), Target: p.Target, Names: p.Names,
 		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites,
 		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
+	if p.Source != "" {
+		ps.Source = p.ClusterOf(p.Source)
+	}
+	if p.LegClusters != nil {
+		// A move's roles are legs; names reads by cluster, and PrimaryBucket and SourceBucket keep the
+		// two buckets apart when the legs share a cluster (ADR-0018 N3b).
+		ps.Names = map[string]string{ps.Source: p.Names[p.Source], ps.Primary: p.Names[p.Primary]}
+		ps.PrimaryBucket, ps.SourceBucket = p.Names[p.Primary], p.Names[p.Source]
+	}
 	if p.Ramp != nil {
 		ps.Ratio, ps.Prefixes, ps.Hold = p.Ramp.Ratio, p.Ramp.Prefixes, p.Ramp.Hold
 	}

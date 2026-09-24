@@ -161,7 +161,7 @@ func (f *File) CreateSpread(tenant, bucket string, legs []Leg, now time.Time) er
 	ids := make([]string, 0, len(legs))
 	for _, l := range legs {
 		if _, dup := byID[l.Cluster]; dup {
-			return fmt.Errorf("%w: cluster %s is named twice; this build puts one leg on each cluster (ADR-0018 N3)", ErrConflict, l.Cluster)
+			return fmt.Errorf("%w: cluster %s is named twice; a new bucket spreads over different clusters, since splitting one cluster's keys over two of its buckets gains nothing", ErrConflict, l.Cluster)
 		}
 		byID[l.Cluster] = l
 		ids = append(ids, l.Cluster)

@@ -162,7 +162,7 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 		switch {
 		case one != "" && key != one:
 			continue
-		case one == "" && from != "" && p.Source != from:
+		case one == "" && from != "" && p.ClusterOf(p.Source) != from:
 			continue
 		case one == "" && from == "":
 			continue
@@ -178,24 +178,26 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 			}
 			continue
 		}
-		srcCl, err := client(p.Source)
+		// Roles name buckets; ClusterOf names the cluster each is on (a move's two legs may share one).
+		srcName, dstName := p.ClusterOf(p.Source), p.ClusterOf(p.Primary)
+		srcCl, err := client(srcName)
 		if err != nil {
 			return nil, err
 		}
-		dstCl, err := client(p.Primary)
+		dstCl, err := client(dstName)
 		if err != nil {
 			return nil, err
 		}
-		if !dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
-			return nil, migrate.RefuseLostWriteWindow(key, p.Primary)
+		if !dir.Clusters[dstName].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+			return nil, migrate.RefuseLostWriteWindow(key, dstName)
 		}
 		jobs = append(jobs, job{
 			tenant: tenant, client: name,
-			src:         side{name: p.Source, bucket: p.Names[p.Source], cl: srcCl, accessKey: dir.Clusters[p.Source].Credentials.AccessKey, secretRef: dir.Clusters[p.Source].Credentials.SecretRef},
-			dst:         side{name: p.Primary, bucket: p.Names[p.Primary], cl: dstCl, accessKey: dir.Clusters[p.Primary].Credentials.AccessKey, secretRef: dir.Clusters[p.Primary].Credentials.SecretRef},
-			conditional: dir.Clusters[p.Primary].Capabilities.ConditionalWriteOr(true),
+			src:         side{name: srcName, bucket: p.Names[p.Source], cl: srcCl, accessKey: dir.Clusters[srcName].Credentials.AccessKey, secretRef: dir.Clusters[srcName].Credentials.SecretRef},
+			dst:         side{name: dstName, bucket: p.Names[p.Primary], cl: dstCl, accessKey: dir.Clusters[dstName].Credentials.AccessKey, secretRef: dir.Clusters[dstName].Credentials.SecretRef},
+			conditional: dir.Clusters[dstName].Capabilities.ConditionalWriteOr(true),
 			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
-			condDelete: dir.Clusters[p.Primary].Capabilities.ConditionalDeleteOr(false),
+			condDelete: dir.Clusters[dstName].Capabilities.ConditionalDeleteOr(false),
 			keep:       keep,
 		})
 	}

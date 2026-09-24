@@ -133,7 +133,7 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 	view.Fence = s.fenceStatus(r.Context(), p)
 	if pv := moving(p); pv.Source != "" {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		n, err := s.uploadsInProgress(ctx, pv.Source, pv.Names[pv.Source])
+		n, err := s.uploadsInProgress(ctx, pv.ClusterOf(pv.Source), pv.Names[pv.Source])
 		cancel()
 		if err != nil {
 			view.SourceUploadsError = err.Error()

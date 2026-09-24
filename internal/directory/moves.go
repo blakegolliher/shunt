@@ -18,9 +18,10 @@ import (
 func (p *Placement) MoveView() Placement {
 	m := p.Move
 	from, to := p.Legs[m.From], p.Legs[m.To]
-	v := Placement{State: p.State, Source: from.Cluster, Primary: to.Cluster,
-		Names: map[string]string{from.Cluster: from.Bucket, to.Cluster: to.Bucket},
-		Ramp:  v2ramp(m.Ramp), Cutover: v2cutover(m.Cutover), Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
+	v := Placement{State: p.State, Source: m.From, Primary: m.To,
+		Names:       map[string]string{m.From: from.Bucket, m.To: to.Bucket},
+		LegClusters: map[string]string{m.From: from.Cluster, m.To: to.Cluster},
+		Ramp:        v2ramp(m.Ramp), Cutover: v2cutover(m.Cutover), Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
 	if v.Ramp != nil {
 		rg := m.Range
 		v.Ramp.Range = &rg
@@ -41,8 +42,8 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 		return fail("a move of range %s is in progress; finish it before moving another", rangeText(m.Range))
 	}
 	v := p.MoveView()
-	if t.Target != "" && t.Target != v.Primary {
-		return fail("the move goes to %s; a later step may only repeat that target", v.Primary)
+	if t.Target != "" && t.Target != v.ClusterOf(v.Primary) {
+		return fail("the move goes to %s; a later step may only repeat that target", v.ClusterOf(v.Primary))
 	}
 	t.Range, t.Target, t.Name = nil, "", ""
 	nv, err := Apply(v, t)
@@ -124,33 +125,38 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if src == "" {
 		return fail("the range %s spans more than one leg; move one leg's keys at a time", rangeText(rg))
 	}
-	dst := ""
-	for id, l := range np.Legs {
+	// The destination: the leg holding the named bucket, or the one leg on the target cluster when
+	// no bucket is named, or a new leg (ADR-0018 N3b: a cluster may hold several).
+	dst, onTarget := "", 0
+	for _, id := range slices.Sorted(maps.Keys(np.Legs)) {
+		l := np.Legs[id]
 		if l.Cluster != t.Target {
 			continue
 		}
-		if t.Name != "" && t.Name != l.Bucket {
-			return fail("cluster %s already holds leg %s (bucket %s); this build puts one leg on each cluster (ADR-0018 N3b)", t.Target, id, l.Bucket)
+		onTarget++
+		if t.Name == "" || t.Name == l.Bucket {
+			dst = id
 		}
-		dst = id
 	}
 	switch {
+	case t.Name == "" && onTarget > 1:
+		return fail("cluster %s holds %d legs of the bucket; name the bucket the range moves to", t.Target, onTarget)
 	case dst == src:
-		return fail("the range is on %s already", t.Target)
+		return fail("the range is on %s/%s already", t.Target, np.Legs[src].Bucket)
 	case dst == "" && t.Name == "":
 		return fail("name the bucket on %s that the range moves to", t.Target)
 	case dst == "":
-		dst = t.Target
+		dst = newLegID(np.Legs, t.Target)
 		np.Legs[dst] = Leg{Cluster: t.Target, Bucket: t.Name}
 	}
 	if len(np.Legs) > MaxLegs {
 		return fail("a placement has at most %d legs", MaxLegs)
 	}
-	// The move is the two-cluster migration of its range: Apply decides its first step.
-	from := np.Legs[src]
-	view := Placement{State: StateActive, Primary: from.Cluster, Names: map[string]string{from.Cluster: from.Bucket}}
+	// The move is the two-bucket migration of its range: Apply decides its first step, on roles
+	// named by leg as in MoveView.
+	view := Placement{State: StateActive, Primary: src, Names: map[string]string{src: np.Legs[src].Bucket}}
 	tv := t
-	tv.Range, tv.Target, tv.Name = nil, np.Legs[dst].Cluster, np.Legs[dst].Bucket
+	tv.Range, tv.Target, tv.Name = nil, dst, np.Legs[dst].Bucket
 	nv, err := Apply(view, tv)
 	if err != nil {
 		return p, err
@@ -162,6 +168,20 @@ func startMove(p Placement, t Transition) (Placement, error) {
 		np.Move.Ramp.Range = &r
 	}
 	return np, nil
+}
+
+// newLegID names a new leg on cluster: the cluster's name, or with -2, -3, ... when a leg has it.
+func newLegID(legs map[string]Leg, cluster string) string {
+	id := cluster
+	for n := 2; ; n++ {
+		if _, taken := legs[id]; !taken && legID.MatchString(id) {
+			return id
+		}
+		id = fmt.Sprintf("%s-%d", cluster, n)
+		if len(id) > 63 {
+			id = fmt.Sprintf("%s-%d", cluster[:63-len(fmt.Sprint(n))-1], n)
+		}
+	}
 }
 
 // reassign gives rg to leg: the owner ranges it cuts are split around it, and neighbors owned by
@@ -205,11 +225,14 @@ func settle(p Placement) Placement {
 	v := p
 	v.Legs, v.Owners, v.KeyHash = nil, nil, ""
 	v.Primary = p.Legs[owner].Cluster
-	v.Names = map[string]string{}
+	v.Names = map[string]string{v.Primary: p.Legs[owner].Bucket}
 	for _, id := range slices.Sorted(maps.Keys(p.Legs)) {
 		l := p.Legs[id]
+		if _, taken := v.Names[l.Cluster]; taken {
+			continue // a leg that owns nothing on the owner's cluster: not a target a plain bucket can name
+		}
 		v.Names[l.Cluster] = l.Bucket
-		if id != owner && v.Target == "" {
+		if v.Target == "" {
 			v.Target = l.Cluster
 		}
 	}

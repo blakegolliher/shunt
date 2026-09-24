@@ -92,17 +92,17 @@ func (p *Placement) fromV2() error {
 	if err := checkV2(p); err != nil {
 		return err
 	}
+	if len(p.Owners) > 1 || (p.Move != nil && (p.Move.Range != FullRange || sameClusterMove(p))) {
+		return checkSpread(p)
+	}
 	cluster := func(leg string) string { return p.Legs[leg].Cluster }
 	names := make(map[string]string, len(p.Legs))
 	for _, id := range sortedKeys(p.Legs) {
 		l := p.Legs[id]
 		if _, dup := names[l.Cluster]; dup {
-			return fmt.Errorf("legs: two legs on cluster %q; this build routes one leg per cluster (ADR-0018 N3)", l.Cluster)
+			return fmt.Errorf("legs: two legs on cluster %q, but one leg owns every key and nothing moves: a plain placement names one bucket per cluster", l.Cluster)
 		}
 		names[l.Cluster] = l.Bucket
-	}
-	if len(p.Owners) > 1 || (p.Move != nil && p.Move.Range != FullRange) {
-		return checkSpread(p)
 	}
 	owner := p.Owners[0].Leg
 	v1 := *p
@@ -155,9 +155,6 @@ func checkSpread(p *Placement) error {
 	if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To }) {
 		return fmt.Errorf("move.range: leg %q does not own all of %s", m.From, rangeText(m.Range))
 	}
-	if p.Legs[m.From].Cluster == p.Legs[m.To].Cluster {
-		return fmt.Errorf("move: legs %s and %s are on one cluster; this build moves between clusters (ADR-0018 N3b)", m.From, m.To)
-	}
 	switch {
 	case p.State == StateRamping && m.Ramp == nil:
 		return fmt.Errorf("move.ramp: required in state RAMPING")
@@ -167,6 +164,14 @@ func checkSpread(p *Placement) error {
 		return fmt.Errorf("move.cutover: only allowed in state CUTOVER")
 	}
 	return nil
+}
+
+// sameClusterMove reports whether a move's two legs share a cluster: such a move stays in v2 form,
+// since a plain placement names one bucket per cluster.
+func sameClusterMove(p *Placement) bool {
+	from, okF := p.Legs[p.Move.From]
+	to, okT := p.Legs[p.Move.To]
+	return okF && okT && from.Cluster == to.Cluster
 }
 
 // EvenOwners splits the key hash space into len(legs) ranges of equal width, in the order given.

@@ -226,16 +226,11 @@ func validateSpread(e *errs, clusters map[string]config.Cluster, k, pk string, p
 	if p.Primary != "" || p.Source != "" || p.Names != nil || p.Ramp != nil || p.Cutover != nil {
 		e.add(k, "a placement spread over legs names its buckets in legs, not in primary, source, names, ramp or cutover")
 	}
-	onCluster := map[string]string{}
 	for _, id := range sortedKeys(p.Legs) {
 		l, lk := p.Legs[id], k+".legs."+id
 		if !e.ref(clusters, lk+".cluster", l.Cluster) {
 			continue
 		}
-		if other, dup := onCluster[l.Cluster]; dup {
-			e.add(lk+".cluster", "legs %s and %s are both on cluster %q; this build routes one leg per cluster (ADR-0018 N3)", other, id, l.Cluster)
-		}
-		onCluster[l.Cluster] = id
 		switch {
 		case !s3.ValidBucketName(l.Bucket):
 			e.add(lk+".bucket", "%q is not a valid S3 bucket name", l.Bucket)

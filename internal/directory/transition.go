@@ -70,8 +70,14 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
 	}
-	if t.Range != nil && *t.Range == FullRange && !p.Spread() {
-		t.Range = nil // the whole bucket: a migration as before
+	if !p.Spread() && p.State == StateActive && t.Target != "" && t.Target == p.Primary && t.Name != "" && t.Name != p.Names[p.Primary] {
+		// Another bucket on the same cluster: a move of every key, since a plain migration's two
+		// buckets are on two clusters (ADR-0018 N3b).
+		all := FullRange
+		t.Range = &all
+	}
+	if t.Range != nil && *t.Range == FullRange && !p.Spread() && t.Target != p.Primary {
+		t.Range = nil // the whole bucket to another cluster: a migration as before
 	}
 	if p.Spread() || t.Range != nil {
 		return applyMove(p, t)

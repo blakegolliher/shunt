@@ -362,8 +362,12 @@ func (h *Handler) fallbackRead(ctx context.Context, r *http.Request, o *outcome,
 	_ = primary.Body.Close()
 	h.Metrics.FallbackReads.WithLabelValues(p.bucketKey).Inc()
 	o.cluster, o.clusterType, o.backend, o.upstream = p.other.Name, p.other.Type, p.otherBackend, side.upstream
+	o.fromSource = !o.fromSource // the other role answered
 	if h.Rewrite {
 		p.ed = newEditor(r, o.info, p.other, p.otherBackend) // echoes now come from the source
+		if p.placement != nil {
+			p.ed.clusterID = uploadPrefix(p.placement, p.other, p.otherBackend)
+		}
 	}
 	return alt
 }

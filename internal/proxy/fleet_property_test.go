@@ -317,17 +317,35 @@ func (fr *fleetRun) post(path string, body any) (int, string) {
 	return resp.StatusCode, string(out)
 }
 
-func TestFleetStepsKeepTheClientsView(t *testing.T) { fleetSteps(t, nil) }
+func TestFleetStepsKeepTheClientsView(t *testing.T) { fleetSteps(t, nil, false) }
 
 // TestFleetRangeMoveKeepsTheClientsView is the same run for a move of part of the bucket (ADR-0018
 // N3): only the lower half of the key space moves, so clients' keys in the other half stay on the
 // source throughout, and the property holds for both.
 func TestFleetRangeMoveKeepsTheClientsView(t *testing.T) {
-	fleetSteps(t, &directory.HashRange{From: 0, To: 1<<63 - 1})
+	fleetSteps(t, &directory.HashRange{From: 0, To: 1<<63 - 1}, false)
 }
 
-func fleetSteps(t *testing.T, rg *directory.HashRange) {
+// TestFleetSameClusterMoveKeepsTheClientsView moves the bucket to another bucket on its own
+// cluster (ADR-0018 N3b): the two buckets share garage, so only the roles tell them apart.
+func TestFleetSameClusterMoveKeepsTheClientsView(t *testing.T) { fleetSteps(t, nil, true) }
+
+// sameClusterTarget turns the run's move into one within garage: the recorded target is cleared
+// and the first step names a new bucket there.
+func (fr *fleetRun) sameClusterTarget(t *testing.T) {
+	t.Helper()
+	fr.m.garage.addBucket("acme-data-new")
+	fr.m.backendNames = append(fr.m.backendNames, "acme-data-new")
+	if err := fr.tc.ClearTarget(context.Background(), "acme", "data", "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fleetSteps(t *testing.T, rg *directory.HashRange, sameCluster bool) {
 	fr := newFleetRun(t, 60*time.Millisecond)
+	if sameCluster {
+		fr.sameClusterTarget(t)
+	}
 	b := fr.proxies[1]
 	cut := &fr.cut // set: B is severed from the control plane, its heartbeats and polls fail
 
@@ -360,6 +378,9 @@ func fleetSteps(t *testing.T, rg *directory.HashRange) {
 			req := control.RampRequest{Ratio: ratio, Wait: "5s"}
 			if i == 0 {
 				req.Range = rg // the first step starts the move: of every key, or of the range
+				if sameCluster {
+					req.To, req.Name = "garage", "acme-data-new"
+				}
 			}
 			code, body := fr.post("/v1/placements/acme/data/ramp", req)
 			if code != http.StatusOK {
@@ -394,6 +415,9 @@ func fleetSteps(t *testing.T, rg *directory.HashRange) {
 	if rg != nil && (p.Move == nil || p.Move.Range != *rg) {
 		t.Errorf("the run was to move part of the bucket, and ended with move %+v", p.Move)
 	}
+	if sameCluster && (p.Move == nil || p.Legs[p.Move.To].Cluster != "garage" || p.Legs[p.Move.To].Bucket != "acme-data-new") {
+		t.Errorf("the run was to move within garage, and ended with %+v legs %+v", p.Move, p.Legs)
+	}
 	if held < len(fleetRatios)-2 {
 		t.Errorf("only %d steps were held: B was a member for all but one of them", held)
 	}
@@ -404,16 +428,22 @@ func fleetSteps(t *testing.T, rg *directory.HashRange) {
 
 // The negative control: the same run with the steps written straight into the store, no fence
 // and no hold. B's lag must show up as a lost write or a stale read.
-func TestFleetWithoutTheFence(t *testing.T) { fleetWithoutTheFence(t, nil) }
+func TestFleetWithoutTheFence(t *testing.T) { fleetWithoutTheFence(t, nil, false) }
+
+// TestFleetSameClusterMoveWithoutTheFence is the negative control of the move within one cluster.
+func TestFleetSameClusterMoveWithoutTheFence(t *testing.T) { fleetWithoutTheFence(t, nil, true) }
 
 // TestFleetRangeMoveWithoutTheFence is the negative control of the move of part of the bucket: it
 // must find a violation too, or the positive run proves nothing for moves.
 func TestFleetRangeMoveWithoutTheFence(t *testing.T) {
-	fleetWithoutTheFence(t, &directory.HashRange{From: 0, To: 1<<63 - 1})
+	fleetWithoutTheFence(t, &directory.HashRange{From: 0, To: 1<<63 - 1}, false)
 }
 
-func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange) {
+func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange, sameCluster bool) {
 	fr := newFleetRun(t, 60*time.Millisecond)
+	if sameCluster {
+		fr.sameClusterTarget(t)
+	}
 	ctx := context.Background()
 	fr.run(t, 8*time.Second, func(stop <-chan struct{}) {
 		from := directory.StateActive
@@ -426,6 +456,9 @@ func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange) {
 			tr := directory.Transition{To: directory.StateRamping, Ratio: ratio}
 			if i == 0 {
 				tr.Range = rg
+				if sameCluster {
+					tr.Target, tr.Name = "garage", "acme-data-new"
+				}
 			}
 			if err := fr.tc.SetState(ctx, "acme", "data", from, tr, "test"); err != nil {
 				t.Errorf("ramp %v: %v", ratio, err)

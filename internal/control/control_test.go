@@ -1236,6 +1236,52 @@ func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
 	}
 }
 
+// A bucket moves to a new bucket on its own cluster through the API (ADR-0018 N3b): migrate names
+// the same cluster and another bucket, status keeps the two buckets apart, and purge deletes the
+// old bucket once its leg owns nothing, leaving a plain bucket under the new name.
+func TestMoveToAnotherBucketOnTheSameClusterThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{To: "vast01", Name: "data01-final", Create: true}, &tr)
+	if tr.To != directory.StateMigrating || tr.Primary != "vast01" || tr.Source != "vast01" || tr.CreatedBucket != "data01-final" {
+		t.Fatalf("migrate within vast01: %+v", tr)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?all=1", nil, &st)
+	if ps := st.Placements[0]; ps.PrimaryBucket != "data01-final" || ps.SourceBucket != "data01" || ps.Names["vast01"] != "data01-final" {
+		t.Fatalf("status of a move within one cluster: %+v", ps)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		rg.vast01.put(t, "data01-final", k, "v") // the mover's work
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast01", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Bucket != "data01" || dry.Objects != 3 {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok || pg.Bucket != "data01" || pg.ObjectsDeleted != 3 {
+		t.Fatalf("purge of the old bucket: %+v, still there %v", pg, ok)
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.Spread() || p.Primary != "vast01" || len(p.Names) != 1 || p.Names["vast01"] != "data01-final" {
+		t.Fatalf("after the move: %+v", p)
+	}
+}
+
 // stubKeys is a Keys for tests: an in-memory list, with an Add that can be made to fail.
 type stubKeys struct {
 	stored   []sigv4.Credential

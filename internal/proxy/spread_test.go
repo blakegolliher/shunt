@@ -461,3 +461,98 @@ func TestMovePartOfABucketThroughTheProxy(t *testing.T) {
 	}
 	m.noLeak(t, "moved bucket", m.acme(t, "GET", "/data/"+in[1], nil))
 }
+
+// A bucket moves to another bucket on its own cluster (ADR-0018 N3b): the move's two roles share
+// garage, so everything that picks a bucket picks it by role. Writes follow the ramp, reads fall
+// back, the listing merges both buckets, deletes reach both; an upload begun before the move ends
+// on the old bucket, and one begun during it, whose id is tagged, ends on the new one.
+func TestMoveToAnotherBucketOnTheSameCluster(t *testing.T) {
+	m := newMixedRig(t, nil)
+	m.garage.addBucket("acme-data-new")
+	m.backendNames = append(m.backendNames, "acme-data-new")
+	for i := range 10 {
+		m.acme(t, "PUT", fmt.Sprintf("/data/old/%02d", i), []byte("old"))
+	}
+	// An upload begun before the move: its id has no tag.
+	before := between(m.acme(t, "POST", "/data/mpu/before?uploads", nil).body, "<UploadId>", "</UploadId>")
+	if strings.Count(before, ".") != 0 {
+		t.Fatalf("an id tagged outside a same-cluster move: %s", before)
+	}
+	if err := m.dir.SetState(context.Background(), "acme", "data", directory.StateActive,
+		directory.Transition{To: directory.StateRamping, Target: "garage", Name: "acme-data-new", Ratio: 0.5}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := m.dir.Snapshot().Lookup("acme", "data")
+	if p.Move == nil || p.Legs[p.Move.From].Cluster != "garage" || p.Legs[p.Move.To].Cluster != "garage" {
+		t.Fatalf("a move within garage: %+v", p)
+	}
+	ramp := p.MoveView().Ramp
+	moved, stayed := "", ""
+	for i := 0; moved == "" || stayed == ""; i++ {
+		k := fmt.Sprintf("new/%03d", i)
+		if in, _ := migrate.InRange(ramp, k); in {
+			moved = k
+		} else {
+			stayed = k
+		}
+	}
+	m.acme(t, "PUT", "/data/"+moved, []byte("to the new bucket"))
+	m.acme(t, "PUT", "/data/"+stayed, []byte("on the old bucket"))
+	if b, ok := m.garage.object("acme-data-new", moved); !ok || string(b) != "to the new bucket" {
+		t.Fatalf("a write in the ramp missed the new bucket: %q %v", b, ok)
+	}
+	if b, ok := m.garage.object("acme-1111-data", stayed); !ok || string(b) != "on the old bucket" {
+		t.Fatalf("a write outside the ramp left the old bucket: %q %v", b, ok)
+	}
+	if _, ok := m.garage.object("acme-1111-data", moved); ok {
+		t.Fatal("a key in the ramp was written to both buckets")
+	}
+	if r := m.acme(t, "GET", "/data/old/03", nil); string(r.body) != "old" {
+		t.Fatalf("a read falling back to the old bucket: %d %q", r.StatusCode, r.body)
+	}
+	if got := listKeys(t, m.acme(t, "GET", "/data?list-type=2", nil).body, "Key"); len(got) != 12 || !slices.IsSorted(got) {
+		t.Fatalf("listing across the two buckets: %v", got)
+	}
+
+	// An upload of a moved key begun now is tagged with its bucket and completes there.
+	mpu := ""
+	for i := 0; mpu == ""; i++ {
+		if k := fmt.Sprintf("mpu/%03d", i); func() bool { in, _ := migrate.InRange(ramp, k); return in }() {
+			mpu = k
+		}
+	}
+	id := between(m.acme(t, "POST", "/data/"+mpu+"?uploads", nil).body, "<UploadId>", "</UploadId>")
+	if prefix, _, _ := migrate.DecodeUploadID(id); !strings.Contains(prefix, "."+migrate.BucketTag("acme-data-new")) {
+		t.Fatalf("an upload during a same-cluster move is untagged: %s", id)
+	}
+	complete := func(key, id string) {
+		t.Helper()
+		part := m.acme(t, "PUT", "/data/"+key+"?partNumber=1&uploadId="+id, []byte("part"))
+		if part.StatusCode != 200 {
+			t.Fatalf("part of %s: %d %s", key, part.StatusCode, part.body)
+		}
+		done := m.acme(t, "POST", "/data/"+key+"?uploadId="+id,
+			[]byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>`+part.Header.Get("ETag")+`</ETag></Part></CompleteMultipartUpload>`))
+		if done.StatusCode != 200 {
+			t.Fatalf("complete %s: %d %s", key, done.StatusCode, done.body)
+		}
+	}
+	complete(mpu, id)
+	if _, ok := m.garage.object("acme-data-new", mpu); !ok {
+		t.Fatal("a tagged upload did not complete on the new bucket")
+	}
+	// The upload begun before the move completes where it began.
+	complete("mpu/before", before)
+	if _, ok := m.garage.object("acme-1111-data", "mpu/before"); !ok {
+		t.Fatal("an upload begun before the move did not complete on the old bucket")
+	}
+
+	if err := m.dir.SetState(context.Background(), "acme", "data", directory.StateRamping, directory.Transition{To: directory.StateMigrating}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	m.acme(t, "DELETE", "/data/old/05", nil)
+	if _, ok := m.garage.object("acme-1111-data", "old/05"); ok {
+		t.Fatal("a delete during the move missed the old bucket")
+	}
+	m.noLeak(t, "same-cluster move", m.acme(t, "GET", "/data/old/03", nil))
+}

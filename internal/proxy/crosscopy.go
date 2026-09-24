@@ -102,8 +102,8 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 	// The backend can copy for itself only when the object is certainly on the cluster doing the
 	// copy: one cluster, and that cluster is the destination's.
 	settled := sp.State == directory.StateActive || sp.State == directory.StateCutover
-	if settled && sp.Primary == dst.Name && sp.Names[dst.Name] != "" {
-		return lead + sp.Names[dst.Name] + sep + rest, nil, "", ""
+	if settled && sp.ClusterOf(sp.Primary) == dst.Name && sp.Names[sp.Primary] != "" {
+		return lead + sp.Names[sp.Primary] + sep + rest, nil, "", ""
 	}
 
 	key, err := url.PathUnescape(rawKey)
@@ -115,11 +115,11 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 		return "", nil, s3.ServiceUnavailable, "The source bucket's migration ramp cannot be routed by this proxy version."
 	}
 	route = staleRead(h.staleFor(sp), migrate.ClassRead, route)
-	readFrom := sp.Primary
+	readFrom := sp.Primary // a role: its bucket is on sp.ClusterOf(readFrom) (ADR-0018 N3b)
 	if route.Cluster == migrate.Source {
 		readFrom = sp.Source
 	}
-	cl, found := clusters.Get(readFrom)
+	cl, found := clusters.Get(sp.ClusterOf(readFrom))
 	if !found || sp.Names[readFrom] == "" {
 		return "", nil, s3.NoSuchKey, "The source object's cluster is not available."
 	}
@@ -129,7 +129,7 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 		if readFrom == sp.Source {
 			other = sp.Primary
 		}
-		if oc, ok2 := clusters.Get(other); ok2 && sp.Names[other] != "" {
+		if oc, ok2 := clusters.Get(sp.ClusterOf(other)); ok2 && sp.Names[other] != "" {
 			p.srcFallback, p.fallbackName = oc, sp.Names[other]
 		}
 	}

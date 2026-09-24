@@ -93,6 +93,7 @@ type outcome struct {
 	cluster     string // "none" until a cluster is chosen
 	clusterType string
 	backend     string // backend bucket name (resign mode)
+	fromSource  bool   // the answer came from a migration's source role, not its primary
 }
 
 // prepared is a request ready to send: the cluster, a builder that produces the upstream request
@@ -350,7 +351,7 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 			switch {
 			case resp.StatusCode == http.StatusNotFound:
 				outcome = "miss"
-			case resp.StatusCode < http.StatusBadRequest && p.placement != nil && o.cluster == p.placement.Source:
+			case resp.StatusCode < http.StatusBadRequest && p.placement != nil && o.fromSource:
 				outcome = "fallback_source"
 			case resp.StatusCode < http.StatusBadRequest:
 				outcome = "target_hit"
@@ -365,7 +366,7 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	appendVia(w.Header(), h.Via)
 	if p.placement != nil && h.wantsRoute(r) {
 		side := migrate.Primary.String()
-		if p.placement.Source != "" && o.cluster == p.placement.Source {
+		if p.placement.Source != "" && o.fromSource {
 			side = migrate.Source.String()
 		}
 		w.Header().Set(headerRoute, side+" "+o.cluster)

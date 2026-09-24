@@ -126,12 +126,13 @@ func (s *Server) checkMover(key string, req MoverRequest) error {
 	if p.State != directory.StateMigrating && !(p.State == directory.StateRamping && p.Ramp != nil && p.Ramp.Ratio >= 1) {
 		return refuse("%s is %s: the mover runs on a MIGRATING placement, or a RAMPING one at ratio 1", key, p.State)
 	}
-	caps := f.Clusters[p.Primary].Capabilities
+	dst := p.ClusterOf(p.Primary)
+	caps := f.Clusters[dst].Capabilities
 	if caps.ConditionalWrite == nil && !req.AcceptLostWriteWindow {
-		return refuse("%s: target cluster %s has an assumed conditional-write profile; measure it with expand before copying, or explicitly accept the ADR-0004 lost-write window", key, p.Primary)
+		return refuse("%s: target cluster %s has an assumed conditional-write profile; measure it with expand before copying, or explicitly accept the ADR-0004 lost-write window", key, dst)
 	}
 	if !caps.ConditionalWriteOr(true) && !req.AcceptLostWriteWindow {
-		return refuse("%s", migrate.RefuseLostWriteWindow(key, p.Primary))
+		return refuse("%s", migrate.RefuseLostWriteWindow(key, dst))
 	}
 	if s.Mover == nil {
 		return fmt.Errorf("%w: this control node has no mover worker", ErrUnavailable)

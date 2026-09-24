@@ -81,14 +81,18 @@ func TestMoveReleaseAndRefusals(t *testing.T) {
 		Owners: []Owner{{From: 0, To: 1<<63 - 1, Leg: "g"}, {From: 1 << 63, To: FullRange.To, Leg: "m"}}}
 	across := HashRange{From: 1 << 62, To: 1<<63 + 5}
 	for name, tr := range map[string]Transition{
-		"no range":                     {To: StateMigrating, Target: "cold", Name: "c"},
-		"two legs' keys":               {To: StateMigrating, Target: "cold", Name: "c", Range: &across},
-		"onto its own leg":             {To: StateMigrating, Target: "garage", Range: &lowerHalf},
-		"a second bucket on a cluster": {To: StateMigrating, Target: "minio", Name: "other", Range: &lowerHalf},
+		"no range":         {To: StateMigrating, Target: "cold", Name: "c"},
+		"two legs' keys":   {To: StateMigrating, Target: "cold", Name: "c", Range: &across},
+		"onto its own leg": {To: StateMigrating, Target: "garage", Range: &lowerHalf},
 	} {
 		if _, err := Apply(spread, tr); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	// A second bucket on a cluster that already has a leg is a new leg there (ADR-0018 N3b).
+	second := step(t, spread, Transition{To: StateMigrating, Target: "minio", Name: "other", Range: &lowerHalf})
+	if second.Move.To != "minio" || second.Legs["minio"] != (Leg{Cluster: "minio", Bucket: "other"}) || second.Legs["m"].Bucket != "b" {
+		t.Errorf("a second leg on minio: %+v %+v", second.Move, second.Legs)
 	}
 	moving := step(t, spread, Transition{To: StateMigrating, Target: "minio", Range: &lowerHalf})
 	other := HashRange{From: 1 << 63, To: FullRange.To}
@@ -134,5 +138,42 @@ func TestReassign(t *testing.T) {
 	got = reassign(owners, HashRange{From: 0, To: 99}, "b")
 	if want := []Owner{{From: 0, To: FullRange.To, Leg: "b"}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("a whole range joins its neighbor: %+v", got)
+	}
+}
+
+// A bucket moves to another bucket on its own cluster (ADR-0018 N3b): every key, named by the new
+// bucket alone, through a move whose view names its two roles by leg, and settles back to a plain
+// bucket on the same cluster under the new name.
+func TestMoveToAnotherBucketOnTheSameCluster(t *testing.T) {
+	p := Placement{State: StateActive, Primary: "garage", Names: map[string]string{"garage": "mimir-dest"}}
+	p = step(t, p, Transition{To: StateRamping, Target: "garage", Name: "mimir-final", Ratio: 0.5})
+	if !p.Spread() || p.Move == nil || p.Move.Range != FullRange || p.Move.From != "garage" || p.Move.To != "garage-2" {
+		t.Fatalf("a move to a bucket on the same cluster: %+v move %+v", p, p.Move)
+	}
+	v := p.MoveView()
+	if v.Source == v.Primary || v.ClusterOf(v.Source) != "garage" || v.ClusterOf(v.Primary) != "garage" ||
+		v.Names[v.Source] != "mimir-dest" || v.Names[v.Primary] != "mimir-final" {
+		t.Fatalf("the view keeps the two buckets apart: %+v", v)
+	}
+	// It is written and read back as v2 (a plain placement cannot name two buckets on one cluster).
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Placement
+	if err := json.Unmarshal(raw, &back); err != nil || !reflect.DeepEqual(back, p) {
+		t.Fatalf("round trip: %v\n%s", err, raw)
+	}
+	f := &File{Version: 1, Clusters: sampleClusters(t), Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}},
+		Placements: map[string]Placement{"acme/data": p}}
+	if err := validate(f); err != nil {
+		t.Fatalf("a same-cluster move is invalid: %v", err)
+	}
+	p = step(t, p, Transition{To: StateRamping, Ratio: 1, Target: "garage"}) // repeating the target is allowed
+	p = step(t, p, Transition{To: StateMigrating})
+	p = step(t, p, Transition{To: StateCutover, Cutover: &CutoverEvidence{Window: time.Second}})
+	p = step(t, p, Transition{To: StateActive})
+	if p.Spread() || p.Primary != "garage" || len(p.Names) != 1 || p.Names["garage"] != "mimir-final" {
+		t.Fatalf("after the move: %+v", p)
 	}
 }

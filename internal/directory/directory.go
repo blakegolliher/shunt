@@ -93,6 +93,20 @@ type Placement struct {
 	Owners  []Owner        `yaml:"owners,omitempty" json:"owners,omitempty"`
 	KeyHash string         `yaml:"hash,omitempty" json:"hash,omitempty"` // splits the key space among Owners
 	Move    *Move          `yaml:"move,omitempty" json:"move,omitempty"`
+
+	// LegClusters is set only on a move's view (MoveView), never stored: its roles (Source, Primary
+	// and the keys of Names) are leg ids there, since two legs may share a cluster (ADR-0018 N3b),
+	// and this maps each to its cluster. ClusterOf reads it.
+	LegClusters map[string]string `yaml:"-" json:"-"`
+}
+
+// ClusterOf is the cluster a role of p is on: a move's view names its roles by leg, and every other
+// placement names them by cluster.
+func (p *Placement) ClusterOf(role string) string {
+	if c, ok := p.LegClusters[role]; ok {
+		return c
+	}
+	return role
 }
 
 func (p Placement) clone() Placement {
@@ -104,6 +118,7 @@ func (p Placement) clone() Placement {
 		c.Cutover = &ev
 	}
 	c.Legs = maps.Clone(p.Legs)
+	c.LegClusters = maps.Clone(p.LegClusters)
 	c.Owners = slices.Clone(p.Owners)
 	if p.Move != nil {
 		m := *p.Move

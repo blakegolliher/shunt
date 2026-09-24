@@ -154,8 +154,14 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   one per proxy: 231,172 operations, and the only errors were the 311 hold 503s of ADR-0016, which
   the proxies counted exactly (163 and 148; verify does not retry them). Afterwards minio01 held
   only upper-half keys (266) and minio02 only lower-half keys (271), none on both, the listing was
-  their union, and every seeded object read back. Next: N3b (two legs on one cluster), N3c
-  (consolidation).
+  their union, and every seeded object read back.
+- **N3b done (2026-09-23): two legs on one cluster.** A move's roles are legs, resolved to clusters
+  by `ClusterOf`, so a bucket can move to another bucket on its own cluster (the rename) and a
+  spread bucket can hold two legs on one cluster; upload ids issued during such a move carry a tag
+  of their bucket. Gate: fleet property test on a move within garage, 3 runs, 0 violations in 25,287
+  operations, negative control failing every run; proxy test (fails with the bucket looked up by
+  cluster, and untagged), control test through purge, 30 UI tests. Next: verify retrying the
+  ADR-0016 hold 503s, then N3c (consolidation).
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
