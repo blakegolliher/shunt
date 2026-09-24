@@ -32,7 +32,13 @@ const (
 	SeriesErrors0PerSecond   = "errors_0_per_second"   // SeriesErrors0PerSecond counts requests with no response status.
 	SeriesErrors4xxPerSecond = "errors_4xx_per_second" // SeriesErrors4xxPerSecond counts client-error responses.
 	SeriesErrors5xxPerSecond = "errors_5xx_per_second" // SeriesErrors5xxPerSecond counts server-error responses.
+	// SeriesNotFoundPerSecond counts reads answered 404: a HEAD or GET of a key or bucket that is
+	// not there is an answer, not a failure, so it is kept out of errors_4xx_per_second.
+	SeriesNotFoundPerSecond = "not_found_per_second"
 )
+
+// notFound is the Errors key of a read answered 404 (SeriesNotFoundPerSecond).
+const notFound = "not_found"
 
 // OpClass is the bounded operation dimension carried in window telemetry.
 type OpClass string
@@ -281,7 +287,11 @@ func (c *Collector) Observe(o Observation) {
 		if count.Errors == nil {
 			count.Errors = map[string]int64{}
 		}
-		count.Errors[StatusClass(o.Status)]++
+		class := StatusClass(o.Status)
+		if o.Status == 404 && (op == OpRead || op == OpList) {
+			class = notFound
+		}
+		count.Errors[class]++
 	}
 }
 
@@ -699,6 +709,8 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 				total = c.Errors["4xx"]
 			case SeriesErrors5xxPerSecond:
 				total = c.Errors["5xx"]
+			case SeriesNotFoundPerSecond:
+				total = c.Errors[notFound]
 			default:
 				continue
 			}

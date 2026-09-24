@@ -234,3 +234,45 @@ func BenchmarkWindowObserve(b *testing.B) {
 			ClientTotal: 2 * time.Millisecond, UpstreamTTFB: time.Millisecond, UpstreamTotal: 1500 * time.Microsecond})
 	}
 }
+
+// A read answered 404 is counted as not found, not as a 4xx error: a HEAD or GET of a missing key
+// is an answer. A 404 on a write, and any other 4xx, stay errors.
+func TestReadNotFoundIsNotAnError(t *testing.T) {
+	c := NewCollector()
+	at := windowBase.Add(time.Second)
+	for _, o := range []Observation{
+		{At: at, Operation: "HeadObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+		{At: at, Operation: "GetObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+		{At: at, Operation: "GetObject", Cluster: "a", Status: 403, ClientTotal: time.Millisecond},
+		{At: at, Operation: "PutObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+	} {
+		c.Observe(o)
+	}
+	w := c.Completed(windowBase.Add(WindowDuration))
+	if w == nil {
+		t.Fatal("no window")
+	}
+	var read, write WindowCounter
+	for _, ct := range w.Counters {
+		switch ct.Op {
+		case OpRead:
+			read = ct
+		case OpWrite:
+			write = ct
+		}
+	}
+	if read.Errors[notFound] != 2 || read.Errors["4xx"] != 1 {
+		t.Fatalf("read counters %v: want 2 not found and 1 4xx", read.Errors)
+	}
+	if write.Errors["4xx"] != 1 || write.Errors[notFound] != 0 {
+		t.Fatalf("write counters %v: a write's 404 is an error", write.Errors)
+	}
+	s := NewStore(time.Hour)
+	if _, err := s.Ingest([]MemberWindow{{ID: "p", Live: true, Telemetry: w}}); err != nil {
+		t.Fatal(err)
+	}
+	pts := s.CounterSeries("fleet", SeriesNotFoundPerSecond, OpRead, windowBase.Add(-time.Minute), windowBase.Add(time.Hour))
+	if len(pts) != 1 || pts[0].Value != 2/WindowDuration.Seconds() {
+		t.Fatalf("not_found_per_second: %+v", pts)
+	}
+}

@@ -21,3 +21,37 @@ test('passes control-node counter rates to chart data unchanged', () => {
     end, requests_per_second: 12.75, bytes_out_per_second: 4096.5,
   }])
 })
+
+test('shows each backend cluster share of requests, and says when a compared cluster has no traffic', async () => {
+  const { render, screen, fireEvent } = await import('@testing-library/react')
+  const { App } = await import('./App')
+  const { StoreProvider } = await import('./store')
+  const cluster = (name: string) => ({ name, type: 'minio', scheme: 'http', region: 'us-east-1', endpoints: [`${name}:9000`], access_key: 'AK', secret_ref: `control:${name}`, conditional_write: true, conditional_delete: false, references: [], read_only: false, reject_writes: false })
+  const control = { node: 'c1', version: 't', directory: 3, directory_loaded: true, last_compaction: null, join: '', fleet: [],
+    cluster: { members: [{ name: 'c1', id: '1', peer_urls: [], leader: true, started: true }], quorum: 1, started: 1, has_quorum: true, revision: 3, db_bytes: 1, db_in_use_bytes: 1, quota_bytes: 2, leader: 'c1' } }
+  const end = new Date().toISOString()
+  sessionStorage.setItem('shunt.control.token', 'actor-token')
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input)
+    if (url.endsWith('/v1/control')) return Response.json(control)
+    if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 3, clusters: [cluster('minio-a'), cluster('minio-b')], placements: [] })
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    if (url.includes('/v1/telemetry/series')) {
+      const q = new URL(url, 'http://x').searchParams
+      const value = q.get('series') !== 'requests_per_second' ? 0 : q.get('scope') === 'cluster:minio-a' ? 30 : q.get('scope') === 'cluster:minio-b' ? 10 : 40
+      if (q.get('scope') === 'cluster:minio-b' && q.get('series') === 'client_total') return Response.json({ points: [] })
+      return Response.json({ points: [{ start: end, end, series: q.get('series'), op: 'all', value, count: 1, p99_us: 100 }] })
+    }
+    return Response.json({ message: `unhandled ${url}` }, { status: 404 })
+  })
+  try {
+    render(<StoreProvider><App /></StoreProvider>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Telemetry' }))
+    expect(await screen.findByText('minio-a 75% · minio-b 25%')).toBeInTheDocument()
+    expect(await screen.findByText(/No traffic reached minio-b in this window/)).toBeInTheDocument()
+  } finally {
+    sessionStorage.clear()
+    vi.restoreAllMocks()
+  }
+})
