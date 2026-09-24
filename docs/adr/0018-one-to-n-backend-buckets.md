@@ -1,8 +1,8 @@
 # ADR-0018: one client bucket over 1 to N backend buckets
 
-Status: proposed (2026-09-23); N1, N2 and N3 (a, b, c) built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
-across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. N1, N2, N3a, N3b and
-N3c are built (below); N4 is not.
+Status: proposed (2026-09-23); N1 to N4 built (2026-09-23). Would amend ADR-0004 (migration races), ADR-0013 (conditional writes
+across a migration), ADR-0016 (version fence) and docs/DESIGN.md §2.3–§2.5. Every phase, N1 to N4,
+is built (below).
 Branch: `1-to-n-bucket-support`.
 
 ## Context
@@ -251,6 +251,23 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   a control test consolidates a two-leg bucket into a new bucket on one of its clusters through
   migrate, mover, cutover and purge, checking step-out before and after; a UI test drives both
   buttons.
+
+## N4 as built (2026-09-23): UI and CLI
+
+- **CLI.** `shunt adopt <cluster> <bucket> --create` makes a new bucket and `--spread
+  <cluster>[:<name>]` (repeatable) a spread one, so neither needs the UI. `shunt status --all` lists
+  every bucket, not only moving ones; every spread bucket shown gets a table of its legs (bucket,
+  share, hash ranges, and which range moves where), and the primary and source columns name the
+  move's buckets, so a move between two buckets on one cluster reads right. `--range` and `--leg`
+  on ramp and migrate start came with N3c. No new verb: the list in CLAUDE.md is unchanged.
+- **UI.** An ownership bar (the key space, one color per leg, the moving range striped) in the
+  Buckets table, the bucket detail (with each leg's hash ranges, and idle legs marked), and the
+  Migrations screen for a move. Create, Move keys, Consolidate, Retire idle leg and Expand onto the
+  bucket's own cluster came with N2 and N3.
+- **Docs.** docs/spread-buckets.md is the operator guide: create, see, move part of a bucket,
+  consolidate, retire, step out, from the CLI and the UI.
+- **Proof:** a CLI test drives a spread bucket through adopt --spread, status --all, a move by
+  leg and status during it; UI tests for the bar's geometry and the hash-range positions.
 
 ## Open questions
 

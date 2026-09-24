@@ -345,6 +345,7 @@ A signing region other than `us-east-1` (AWS outside it, Garage) takes `--region
 
 - [docs/walkthrough.md](docs/walkthrough.md): the same migration, scripted, with a workload generator (`shunt verify`) that checks every read and write. `make walkthrough` runs it against local Garage and MinIO.
 - [docs/migrating.md](docs/migrating.md): the operator how-to, and what each state does.
+- [docs/spread-buckets.md](docs/spread-buckets.md): one client bucket over several backend buckets: create, move part of a bucket, consolidate, step out (ADR-0018).
 - [docs/reference/control-api.md](docs/reference/control-api.md): the control API behind the `shunt` commands.
 - [docs/reference/config.md](docs/reference/config.md): every config key.
 - [docs/adr/](docs/adr/): the design decisions, including the migration races and their windows (ADR-0004).

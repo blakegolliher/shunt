@@ -17,3 +17,15 @@ export function leadingShare(range: HashRange, share: number): HashRange {
   if (end < from) end = from
   return { from: range.from, to: hex(end) }
 }
+
+const space = 1n << 64n
+
+// position is where a range sits in the key space, as fractions (0..1) for drawing: its start and
+// its width. Four decimal digits of a fraction are exact enough for a bar, and BigInt keeps the
+// arithmetic exact before that.
+export function position(range: HashRange): { start: number; width: number } {
+  const from = BigInt('0x' + range.from)
+  const to = BigInt('0x' + range.to)
+  const scale = 1_000_000n
+  return { start: Number((from * scale) / space) / 1e6, width: Number(((to - from + 1n) * scale) / space) / 1e6 }
+}

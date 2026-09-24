@@ -457,3 +457,49 @@ func TestParseRange(t *testing.T) {
 		}
 	}
 }
+
+// A spread bucket through the CLI (ADR-0018 N4): adopt --create --spread makes it, status --all
+// lists its legs with their shares and ranges, and a move started by leg shows on both legs.
+func TestSpreadBucketThroughTheCLI(t *testing.T) {
+	rg := newAPIRig(t)
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.addCluster(t, "vast02", rg.ep02)
+	if out, err := rg.cli(t, "adopt", "vast01", "acme/wide", "--spread", ":x"); err == nil || !strings.Contains(out, "want <cluster>[:<bucket name>]") {
+		t.Fatalf("a --spread without a cluster: %v %s", err, out)
+	}
+	out := rg.must(t, "adopt", "vast01", "acme/wide", "--spread", "vast02:wide-b")
+	if !strings.Contains(out, "acme/wide: ACTIVE, spread over vast01/wide (50%), vast02/wide-b (50%)") {
+		t.Fatalf("adopt --spread: %s", out)
+	}
+	for _, b := range []struct {
+		be   *s3mem.Backend
+		name string
+	}{{rg.vast01, "wide"}, {rg.vast02, "wide-b"}} {
+		if ok, _ := b.be.BucketExists(b.name); !ok {
+			t.Fatalf("leg bucket %s was not created", b.name)
+		}
+	}
+	if out := rg.must(t, "status"); strings.Contains(out, "is spread over") || !strings.Contains(out, "no bucket is moving (--all lists every bucket)") {
+		t.Fatalf("status without --all lists a spread bucket at rest: %s", out)
+	}
+	out = rg.must(t, "status", "--all")
+	for _, want := range []string{"spread over 2", "acme/wide is spread over 2 backend buckets:", "vast01  vast01   wide    50.0%  0000000000000000-7ffffffffffffffe",
+		"vast02  vast02   wide-b  50.0%  7fffffffffffffff-ffffffffffffffff"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status --all lacks %q:\n%s", want, out)
+		}
+	}
+	rg.must(t, "ramp", "acme/wide", "--leg", "vast02", "--to", "vast01", "--name", "wide", "--ratio", "0.5")
+	out = rg.must(t, "status", "acme/wide")
+	for _, want := range []string{"vast01/wide", "vast02/wide-b", "in from vast02: 7fffffffffffffff-ffffffffffffffff (50.0% of keys)", "out to vast01: 7fffffffffffffff-ffffffffffffffff"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status during the move lacks %q:\n%s", want, out)
+		}
+	}
+	if out := rg.must(t, "adopt", "vast02", "acme/fresh", "--create"); !strings.Contains(out, "acme/fresh: ACTIVE on vast02/fresh") {
+		t.Fatalf("adopt --create: %s", out)
+	}
+	if ok, _ := rg.vast02.BucketExists("fresh"); !ok {
+		t.Fatal("adopt --create made no bucket")
+	}
+}

@@ -185,7 +185,12 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   minio01's conditional-write profile had never been measured, since only expand measured one.
   A first step now measures its destination (ADR-0018 N3c). minio01 was measured by hand for the
   move already in flight, which then finished under two more verify runs (138,765 operations,
-  0 errors) and left `n2-live` plain on minio01, ready for step-out. Next: N4.
+  0 errors) and left `n2-live` plain on minio01, ready for step-out.
+- **ADR-0018 N4 built (2026-09-23): UI and CLI.** `adopt --create` and `--spread` create buckets
+  from the CLI; `status --all` and a legs table for spread buckets; an ownership bar in Buckets,
+  bucket detail and Migrations; docs/spread-buckets.md. Every ADR-0018 phase is now built; its
+  open questions (prefix ownership, concurrent moves, the listing target for raising the cap,
+  rebalancing policy) remain.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

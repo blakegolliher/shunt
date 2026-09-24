@@ -316,11 +316,16 @@ func newAdopt() *cobra.Command {
 		o        apiOptions
 		name     string
 		keysFile string
+		create   bool
+		spread   []string
 	)
 	cmd := &cobra.Command{
 		Use:   "adopt <cluster> <bucket>",
-		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11)",
+		Short: "Serve an existing bucket through shunt under the same name (docs/DESIGN.md §11), or create one",
 		Long: "Takes over a bucket that already exists on a cluster, keeping its name.\n\n" +
+			"--create makes a new, empty bucket on the cluster instead. --spread <cluster>[:<name>], once per\n" +
+			"further cluster, creates a bucket spread over one new bucket on each (ADR-0018): every key lives\n" +
+			"in exactly one of them, chosen by its hash, and listings merge them all. It implies --create.\n\n" +
 			"--keys imports the client keys that cluster already issued, in the credentials-file schema\n" +
 			"(access_key and secret per entry). shunt checks each against the cluster and then verifies\n" +
 			"client signatures with them, so clients keep the credentials they have today and keep them\n" +
@@ -340,8 +345,26 @@ func newAdopt() *cobra.Command {
 				return err
 			}
 			var out control.PlacementStatus
-			if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name, Keys: keys}, &out); callErr != nil {
-				return callErr
+			switch {
+			case create || len(spread) > 0:
+				req := control.CreateBackendRequest{Cluster: args[0], Name: name, Keys: keys}
+				if len(spread) > 0 {
+					req.Legs = []control.LegRequest{{Cluster: args[0], Name: name}}
+					for _, l := range spread {
+						c, n, _ := strings.Cut(l, ":")
+						if c == "" {
+							return fmt.Errorf("--spread %q: want <cluster>[:<bucket name>]", l)
+						}
+						req.Legs = append(req.Legs, control.LegRequest{Cluster: c, Name: n})
+					}
+				}
+				if callErr := api.call(cmd.Context(), "POST", path+"/create-backend", req, &out); callErr != nil {
+					return callErr
+				}
+			default:
+				if callErr := api.call(cmd.Context(), "POST", path+"/adopt", control.AdoptRequest{Cluster: args[0], Name: name, Keys: keys}, &out); callErr != nil {
+					return callErr
+				}
 			}
 			if o.json {
 				return printJSON(cmd, out)
@@ -351,11 +374,21 @@ func newAdopt() *cobra.Command {
 					return perr
 				}
 			}
+			if len(out.Legs) > 0 {
+				where := make([]string, 0, len(out.Legs))
+				for _, l := range out.Legs {
+					where = append(where, fmt.Sprintf("%s/%s (%.0f%%)", l.Cluster, l.Bucket, 100*l.Share))
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE, spread over %s\n", shown(out.Key), strings.Join(where, ", "))
+				return err
+			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: ACTIVE on %s/%s\n", shown(out.Key), out.Primary, out.Names[out.Primary])
 			return err
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&create, "create", false, "create a new, empty bucket on the cluster instead of adopting one")
+	cmd.Flags().StringArrayVar(&spread, "spread", nil, "also spread the new bucket over this `cluster[:name]` (repeatable; implies --create)")
 	cmd.Flags().StringVar(&name, "name", "", "the bucket's name on the cluster (default: the same name)")
 	cmd.Flags().StringVar(&keysFile, "keys", "", "a credentials-file `path` of client keys the cluster already issued, to import")
 	return cmd
@@ -709,11 +742,17 @@ func newMigrateFinish() *cobra.Command {
 }
 
 func newStatus() *cobra.Command {
-	var o apiOptions
+	var (
+		o   apiOptions
+		all bool
+	)
 	cmd := &cobra.Command{
 		Use:   "status [bucket]",
 		Short: "Show clusters, moving buckets, the write split, fallback reads, and mover progress",
-		Args:  cobra.MaximumNArgs(1),
+		Long: "Lists the clusters and every bucket that is moving or has a target recorded; --all lists every\n" +
+			"bucket. A bucket spread over several backend buckets (ADR-0018) also gets a table of its legs:\n" +
+			"each one's bucket, its share of the key space, the hash ranges it owns, and the part moving.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			api, err := o.client()
 			if err != nil {
@@ -726,6 +765,8 @@ func newStatus() *cobra.Command {
 					return kerr
 				}
 				q = "?bucket=" + url.QueryEscape(key)
+			} else if all {
+				q = "?all=1"
 			}
 			var st control.Status
 			if err := api.call(cmd.Context(), "GET", "/v1/status"+q, nil, &st); err != nil {
@@ -738,6 +779,7 @@ func newStatus() *cobra.Command {
 		},
 	}
 	addAPIFlags(cmd, &o)
+	cmd.Flags().BoolVar(&all, "all", false, "every bucket, not only those moving or expanded")
 	return cmd
 }
 
@@ -760,7 +802,7 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 	}
 	_, _ = fmt.Fprintln(out)
 	if len(st.Placements) == 0 {
-		_, err := fmt.Fprintln(out, "no bucket is moving")
+		_, err := fmt.Fprintln(out, "no bucket is moving (--all lists every bucket)")
 		return err
 	}
 	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -775,9 +817,13 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 			// A step written but not on every proxy yet: its keys' writes answer 503 (ADR-0016).
 			ratio += " held→" + strconv.FormatFloat(p.Hold.Ratio, 'f', 2, 64)
 		}
+		primary := p.Primary + "/" + bucketOf(p.PrimaryBucket, p.Names[p.Primary])
+		if p.Primary == "" {
+			primary = fmt.Sprintf("spread over %d", len(p.Legs))
+		}
 		source := "-"
 		if p.Source != "" {
-			source = p.Source + "/" + p.Names[p.Source]
+			source = p.Source + "/" + bucketOf(p.SourceBucket, p.Names[p.Source])
 		} else if p.Target != "" {
 			source = "(target " + p.Target + "/" + p.Names[p.Target] + ")"
 		}
@@ -792,7 +838,56 @@ func printStatus(cmd *cobra.Command, st control.Status) error {
 				mover += ", converged"
 			}
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", shown(p.Key), p.State, ratio, p.Primary+"/"+p.Names[p.Primary], source, writes, p.FallbackReads, mover)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%s\n", shown(p.Key), p.State, ratio, primary, source, writes, p.FallbackReads, mover)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	for i := range st.Placements {
+		if err := printLegs(out, &st.Placements[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func bucketOf(named, byCluster string) string {
+	if named != "" {
+		return named
+	}
+	return byCluster
+}
+
+// printLegs is a spread bucket's legs (ADR-0018): bucket, share of the key space, the hash ranges
+// it owns, and which part is moving where.
+func printLegs(out io.Writer, p *control.PlacementStatus) error {
+	if len(p.Legs) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "\n%s is spread over %d backend buckets:\n", shown(p.Key), len(p.Legs)); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "  LEG\tCLUSTER\tBUCKET\tSHARE\tHASH RANGES\tMOVING")
+	for _, l := range p.Legs {
+		ranges := make([]string, 0, len(l.Ranges))
+		for _, rg := range l.Ranges {
+			ranges = append(ranges, fmt.Sprintf("%016x-%016x", uint64(rg.From), uint64(rg.To)))
+		}
+		if len(ranges) == 0 {
+			ranges = append(ranges, "none (idle: expand --clear retires it)")
+		}
+		moving := "-"
+		if m := p.Move; m != nil {
+			rg := fmt.Sprintf("%016x-%016x (%.1f%% of keys)", uint64(m.Range.From), uint64(m.Range.To), 100*m.Share)
+			switch l.ID {
+			case m.From:
+				moving = "out to " + m.To + ": " + rg
+			case m.To:
+				moving = "in from " + m.From + ": " + rg
+			}
+		}
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%.1f%%\t%s\t%s\n", l.ID, l.Cluster, l.Bucket, 100*l.Share, strings.Join(ranges, " "), moving)
 	}
 	return tw.Flush()
 }

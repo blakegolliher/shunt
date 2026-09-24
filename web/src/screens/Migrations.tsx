@@ -16,6 +16,7 @@ import { ConfirmDrawer } from '../components/ConfirmDrawer'
 import { FenceStatus } from '../components/FenceStatus'
 import { Sparkline } from '../components/Sparkline'
 import { StateBadge } from '../components/StateBadge'
+import { OwnershipBar } from '../components/OwnershipBar'
 import { useStore } from '../store'
 
 const inputClass = 'mt-2 w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-paper'
@@ -208,7 +209,7 @@ export function Migrations({ selected, onSelect }: { selected: string; onSelect:
 
     <Card eyebrow="Migration" title={`${source || 'source'} → ${target || 'target'}`} action={<StateBadge state={detail.state} />}>
       <label className="mb-4 block text-sm text-muted">Bucket<select value={key} onChange={(event) => onSelect(event.target.value)} className={inputClass}>{candidates.map((item) => <option key={item.key} value={item.key}>{item.key}</option>)}</select></label>
-      {detail.move && <p className="mb-3 rounded-lg bg-ink-950 p-3 text-sm">Moving <span className="font-semibold text-ember-300">{Math.round(detail.move.share * 1000) / 10}%</span> of the bucket's keys, leg {detail.move.from} → leg {detail.move.to}; the rest of the bucket stays where it is.</p>}
+      {detail.move && <div className="mb-3 rounded-lg bg-ink-950 p-3 text-sm"><p>Moving <span className="font-semibold text-ember-300">{Math.round(detail.move.share * 1000) / 10}%</span> of the bucket's keys, leg {detail.move.from} → leg {detail.move.to}; the rest of the bucket stays where it is.</p>{detail.legs?.length ? <div className="mt-3"><OwnershipBar legs={detail.legs} move={detail.move} /></div> : null}</div>}
       <FenceStatus held={detail.fence.held || operation?.phase === 'hold'} version={operation?.version ?? detail.fence.version} waitingOn={opWaiting} phase={operation?.status === 'running' ? operation.phase : undefined} />
       {operation && <div className="mt-3 rounded-lg bg-ink-950 p-3 text-xs"><span className="font-mono text-ember-300">{operation.id}</span><span className="ml-2 text-muted">{operation.kind} · {operation.status} · {operation.phase ?? 'done'}</span>{operation.error && <p className="mt-2 text-red-200">{operation.error.message}</p>}</div>}
     </Card>
