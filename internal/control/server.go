@@ -181,6 +181,10 @@ type Error struct {
 	OperationID string `json:"operation_id,omitempty"`
 	// CurrentGeneration is the resource's generation now, on generation_conflict: a decimal string.
 	CurrentGeneration string `json:"current_generation,omitempty"`
+	// Retryable says whether the same request may succeed later unchanged: the control plane was
+	// unavailable, at capacity, or another operation held the scope. Retry with the same
+	// Idempotency-Key.
+	Retryable bool `json:"retryable"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -192,7 +196,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, Error{Code: code, Message: msg})
+	writeJSON(w, status, Error{Code: code, Message: msg, Retryable: retryable(code)})
 }
 
 // badRequest is a malformed body or argument; it answers 400.
@@ -282,7 +286,17 @@ func ErrorCode(err error) string {
 // fail maps an error to its HTTP answer.
 func fail(w http.ResponseWriter, err error) {
 	status, e := errorOf(err)
+	e.Retryable = retryable(e.Code)
 	writeJSON(w, status, e)
+}
+
+// retryable reports whether a refusal with this code may pass later unchanged.
+func retryable(code string) bool {
+	switch code {
+	case "unavailable", CodeOperationCapacity, CodeOperationConflict, CodeResyncRequired:
+		return true
+	}
+	return false
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {

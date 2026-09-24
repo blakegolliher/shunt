@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -24,6 +25,10 @@ var (
 func main() {
 	if err := newRoot().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "shunt:", err)
+		var ee *exitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.code)
+		}
 		os.Exit(1)
 	}
 }
@@ -38,7 +43,7 @@ func newRoot() *cobra.Command {
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
 	root.AddCommand(newVersion(), newCheckConfig(), newServe(), newProbe(), newDirectory(),
-		newCluster(), newTenant(), newAdopt(), newExpand(), newBucketReadOnly(), newRamp(), newMigrate(), newCutover(), newPurgeSource(), newStatus(), newStepOut(), newVerify(), newClient(), newProxy())
+		newCluster(), newTenant(), newAdopt(), newExpand(), newBucketReadOnly(), newRamp(), newMigrate(), newCutover(), newPurgeSource(), newStatus(), newStepOut(), newVerify(), newClient(), newProxy(), newOperation())
 	return root
 }
 

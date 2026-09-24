@@ -22,11 +22,7 @@
     "pattern":"/v1/audit",
     "readOnlyException":"The audit tail is a browser read model over records the mutating CLI verbs already create."
   },
-  {
-    "method":"GET",
-    "pattern":"/v1/operations",
-    "readOnlyException":"The browser lists operation records; CLI verbs expose and poll their own record rather than offering a general list verb."
-  },
+  {"method":"GET","pattern":"/v1/operations"},
   {"method":"GET","pattern":"/v1/operations/{id}"},
   {"method":"POST","pattern":"/v1/clusters/probe"},
   {"method":"POST","pattern":"/v1/clusters"},

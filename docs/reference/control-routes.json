@@ -43,6 +43,9 @@
   {
     "method": "GET",
     "pattern": "/v1/operations",
+    "verbs": [
+      "operation list"
+    ],
     "mutation": false
   },
   {
@@ -54,7 +57,9 @@
       "cutover",
       "purge-source",
       "migrate finish",
-      "cluster remove"
+      "cluster remove",
+      "operation show",
+      "operation wait"
     ],
     "mutation": false
   },

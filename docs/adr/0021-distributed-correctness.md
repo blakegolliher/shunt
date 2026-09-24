@@ -2,8 +2,9 @@
 
 Status: **proposed; the first four regressions landed** (T01, T02, T03, T07 on 2026-09-24, see
 "Decisions taken 2026-09-24"), H0a (identity, generations, lineage checks), H0b (the operation
-transaction contract and scope reservations) and H0c (idempotency keys, expected generations and
-operation capacity). The rest of H0 and H1–H5 are pending.
+transaction contract and scope reservations), H0c (idempotency keys, expected generations and
+operation capacity) and H0d (typed refusals, `shunt operation`, the Operations screen, and the
+direct-write audit). H0e and H1–H5 are pending.
 
 Design baseline: `distributed` at `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`.
 This proposal amends [ADR-0015](0015-embedded-etcd.md),

@@ -101,6 +101,12 @@ A retry gets the same record or the route's first answer; another intent gets 40
 work of H5. `--operation-capacity` (default 256) answers 429 `operation_capacity` before any
 effect. The CLI numbers its keys from a per-command `--request-id`.
 
+**Landed (2026-09-24, H0d):** refusals carry `retryable`; `shunt operation list|show|wait`
+(wait exits 3 at its timeout with the operation unfinished) and the web UI's Operations screen
+read the same records; `resume` and `cancel` arrive with the barriers (H2). The direct file writes
+`shunt directory set-state` and `set-default` now need `--offline`, since they go around the
+records, reservations and fence.
+
 Extend the existing Operations seam rather than add a second job framework.
 Each safety-sensitive operation contains:
 

@@ -87,8 +87,19 @@ func newDirectoryGet(cfgPath *string) *cobra.Command {
 	return cmd
 }
 
+// errOnline refuses a direct write of the directory file without --offline. It goes around the
+// control API's operation records, scope reservations and fence (ADR-0021): a shunt serving the
+// file would not know a step was taken.
+func errOnline(verb, instead string) error {
+	return fmt.Errorf("refused: shunt directory %s writes the directory file directly, around the control API's operation records and fence (ADR-0021); "+
+		"against a running shunt use %s, or pass --offline when no shunt serves this file", verb, instead)
+}
+
 func newDirectorySetDefault(cfgPath *string) *cobra.Command {
-	var actor string
+	var (
+		actor   string
+		offline bool
+	)
 	cmd := &cobra.Command{
 		Use:   "set-default <tenant> <cluster>",
 		Short: "Choose the cluster a tenant's new buckets are created on",
@@ -96,6 +107,9 @@ func newDirectorySetDefault(cfgPath *string) *cobra.Command {
 			"Repoint every tenant that still defaults to a cluster before retiring it.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !offline {
+				return errOnline("set-default", "shunt tenant set-default")
+			}
 			cfg, err := loadForDirectory(*cfgPath)
 			if err != nil {
 				return err
@@ -116,6 +130,7 @@ func newDirectorySetDefault(cfgPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
+	cmd.Flags().BoolVar(&offline, "offline", false, "state that no shunt serves this directory file: the write goes around the control API")
 	return cmd
 }
 
@@ -151,8 +166,9 @@ func newDirectoryValidate(cfgPath *string) *cobra.Command {
 
 func newDirectorySetState(cfgPath *string) *cobra.Command {
 	var (
-		t     directory.Transition
-		actor string
+		t       directory.Transition
+		actor   string
+		offline bool
 	)
 	cmd := &cobra.Command{
 		Use:   "set-state <tenant/bucket> <ACTIVE|RAMPING|MIGRATING|CUTOVER>",
@@ -163,6 +179,9 @@ func newDirectorySetState(cfgPath *string) *cobra.Command {
 			"both the source and the primary bucket (docs/DESIGN.md decision 12).",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !offline {
+				return errOnline("set-state", "shunt ramp, migrate start, cutover or migrate finish")
+			}
 			tenant, bucket, ok := directory.SplitKey(args[0])
 			if !ok {
 				return fmt.Errorf("%q: want <tenant>/<bucket>", args[0])
@@ -208,6 +227,7 @@ func newDirectorySetState(cfgPath *string) *cobra.Command {
 	cmd.Flags().Float64Var(&t.Ratio, "ratio", 0, "RAMPING: fraction of keys (by hash) whose writes go to the new primary; only grows")
 	cmd.Flags().StringArrayVar(&t.Prefixes, "prefix", nil, "RAMPING: key prefix whose writes go to the new primary (repeatable); only grows")
 	cmd.Flags().StringVar(&actor, "actor", "", "who is making the change, for the change log (default cli:$USER)")
+	cmd.Flags().BoolVar(&offline, "offline", false, "state that no shunt serves this directory file: the write goes around the control API")
 	return cmd
 }
 

@@ -154,7 +154,12 @@ export interface Operation {
   // with error.code 'refused' (ADR-0021).
   status: 'pending' | 'running' | 'blocked' | 'succeeded' | 'failed' | 'cancelled'
   effect_state?: 'none' | 'committed' | 'uncertain'
+  identity?: { cluster_id: string; epoch: string }
   scope?: { resource: string; generation: number; clusters?: string[] }
+  node?: string
+  request_id?: string
+  created?: string
+  updated?: string
   sequence?: number
   allowed_actions?: string[]
   blockers?: { code: string; proxy_id?: string; message?: string }[]
@@ -284,6 +289,7 @@ export const removeClusterDryRun = (token: string, name: string) => request<Remo
 export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
 export const startOperation = (token: string, kind: string, placement: string, args?: unknown) => request<Operation>(`${apiRoot}/operations`, token, json({ kind, placement, args }))
 export const getOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}`, token)
+export const listOperations = (token: string, limit = 50) => request<{ operations: Operation[] }>(`${apiRoot}/operations?limit=${limit}`, token)
 export const purgeSourceDryRun = (token: string, tenant: string, bucket: string) => request<PurgeDryRun>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/purge-source`, token, json({ dry_run: true, wait: '30s' }))
 export const getMoverLedger = (token: string, tenant: string, bucket: string) => request<{ entries: LedgerEntry[] }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/mover-ledger?limit=20`, token)
 export interface ClientKeyResult { access_key: string; tenant: string; checked?: string }

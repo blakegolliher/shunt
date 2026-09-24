@@ -154,6 +154,7 @@ func (s *Server) replayed(w http.ResponseWriter, r *http.Request, err error) boo
 	if op.Error != nil {
 		e = *op.Error
 	}
+	e.Retryable = retryable(e.Code)
 	writeJSON(w, statusOf(e.Code), e)
 	return true
 }

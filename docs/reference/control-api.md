@@ -24,7 +24,7 @@ At most `--operation-capacity` operations (default 256; a lab proxy, 256) are un
 ## Conventions
 
 - Bodies are JSON, and unknown request fields are rejected. That includes a cluster's inline `secret`: clusters carry only a `secret_ref`.
-- Errors come back as `{"code": "...", "message": "..."}`:
+- Errors come back as `{"code": "...", "message": "...", "retryable": false}`, plus `operation_id`, `current_generation` or `current_identity` where the code below names them. `retryable` is true when the same request may pass later unchanged (`unavailable`, `operation_capacity`, `operation_conflict`, `resync_required`): retry it with the same `Idempotency-Key`.
 
 | HTTP | code | Meaning |
 |---|---|---|
@@ -368,6 +368,8 @@ The record; 404 `not_found` for an id this control plane does not have (a lab pr
 ### `GET /v1/operations[?placement=t/b][&cluster=name][&limit=50]`
 
 `{"operations": [...]}`, newest first, filtered by placement or cluster when given; `limit` defaults to 50 and is capped at 500.
+
+The CLI reads records with `shunt operation list [--placement t/b] [--cluster name] [--limit n]`, `shunt operation show <id>` and `shunt operation wait <id> [--timeout 5m]`. `wait` exits 0 when the operation succeeded, 1 when it ended otherwise, and 3 when its timeout passes with the operation still unfinished; the operation keeps running either way. The web UI's Operations screen lists the same records with their scope, status and effect.
 
 ## Events
 

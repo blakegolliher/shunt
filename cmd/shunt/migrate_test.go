@@ -59,7 +59,7 @@ func newAPIRig(t *testing.T) *apiRig {
 		}
 		return func() { cand.Commit() }, nil
 	}
-	rg.ctl = &control.Server{Dir: rg.dir, Clusters: reg, Metrics: telemetry.NewMetrics()}
+	rg.ctl = &control.Server{Dir: rg.dir, Clusters: reg, Metrics: telemetry.NewMetrics(), Ops: &control.MemOperations{Dir: rg.dir}}
 	api := httptest.NewServer(rg.ctl.Handler())
 	t.Cleanup(api.Close)
 	rg.url = api.URL

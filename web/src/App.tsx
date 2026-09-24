@@ -6,9 +6,10 @@ import { ControlPlane } from './screens/ControlPlane'
 import { Migrations } from './screens/Migrations'
 import { Telemetry } from './screens/Telemetry'
 import { Audit } from './screens/Audit'
+import { Operations } from './screens/Operations'
 import { useStore } from './store'
 
-const pages = ['Control plane', 'Clusters', 'Buckets', 'Migrations', 'Telemetry', 'Audit'] as const
+const pages = ['Control plane', 'Clusters', 'Buckets', 'Migrations', 'Operations', 'Telemetry', 'Audit'] as const
 type Page = (typeof pages)[number]
 
 function TokenPrompt() {
@@ -37,6 +38,7 @@ export function App() {
     : page === 'Clusters' ? <Clusters />
       : page === 'Buckets' ? <Buckets onMigrate={(key) => { setMigration(key); setPage('Migrations') }} />
         : page === 'Migrations' ? <Migrations selected={migration} onSelect={setMigration} />
+          : page === 'Operations' ? <Operations />
           : page === 'Telemetry' ? <Telemetry />
             : <Audit />
   return <div className="min-h-screen bg-ink-950 lg:grid lg:grid-cols-[240px_1fr]">

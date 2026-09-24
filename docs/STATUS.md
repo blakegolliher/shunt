@@ -43,7 +43,9 @@ route runs under one, so a second step on a bucket is refused with `operation_co
 than queued. One contract test runs against both the etcd and the lab store. H0c followed: every
 request that creates an operation needs an `Idempotency-Key`, and a retry runs nothing twice;
 `If-Generation` refuses a request made against a moved placement or cluster; a capacity limit
-answers 429. H0d–H0e are pending. New endpoints/commands in those documents are design
+answers 429. H0d: refusals say whether they are `retryable`; `shunt operation list|show|wait`
+and the web UI's Operations screen read the records; `shunt directory set-state|set-default`
+write around the control API and now need `--offline`. H0e is pending. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
