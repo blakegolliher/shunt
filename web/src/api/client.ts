@@ -70,7 +70,9 @@ export interface PlacementStatus {
   primary: string
   source?: string
   target?: string
-  names: Record<string, string>
+  // names maps each cluster to its backend bucket; null for a bucket spread over legs, whose
+  // buckets are in legs instead (ADR-0018).
+  names: Record<string, string> | null
   read_only: boolean
   reject_writes: boolean
   client_keys?: number // keys that can reach the bucket; absent when this shunt holds no keys

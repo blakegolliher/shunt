@@ -7,6 +7,7 @@ import { Migrations } from './screens/Migrations'
 import { Telemetry } from './screens/Telemetry'
 import { Audit } from './screens/Audit'
 import { Operations } from './screens/Operations'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { useStore } from './store'
 
 const pages = ['Control plane', 'Clusters', 'Buckets', 'Migrations', 'Operations', 'Telemetry', 'Audit'] as const
@@ -53,7 +54,7 @@ export function App() {
         <div><p className="text-sm font-semibold">{store.control?.node ?? 'Connecting…'}</p><p className="text-xs text-muted">{store.control?.cluster.has_quorum ? 'quorum healthy' : 'quorum unavailable'} · {members.length} proxies</p></div>
         <div className="flex items-center gap-3">{stale > 0 && <span className="rounded-full border border-red-600/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200">{stale} stale</span>}<button type="button" onClick={store.clearToken} className="rounded-md border border-ink-700 px-3 py-1.5 text-xs text-muted hover:text-paper">Forget token</button></div>
       </header>
-      <main className="p-5 sm:p-7"><div className="mb-6"><p className="eyebrow">Live control data</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">{page}</h1></div>{store.error && page !== 'Control plane' && <div role="alert" className="mb-5 rounded-lg border border-red-600 bg-red-950/40 p-3 text-sm text-red-100">Control data unavailable: {store.error}. Existing data may be stale.</div>}{store.control && !store.control.cluster.has_quorum && <div role="alert" className="mb-5 rounded-lg border border-red-600 bg-red-950/40 p-3 text-sm text-red-100">Control-plane quorum is lost. Read models may be stale and mutating actions are unavailable until a majority returns.</div>}{screen}</main>
+      <main className="p-5 sm:p-7"><div className="mb-6"><p className="eyebrow">Live control data</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">{page}</h1></div>{store.error && page !== 'Control plane' && <div role="alert" className="mb-5 rounded-lg border border-red-600 bg-red-950/40 p-3 text-sm text-red-100">Control data unavailable: {store.error}. Existing data may be stale.</div>}{store.control && !store.control.cluster.has_quorum && <div role="alert" className="mb-5 rounded-lg border border-red-600 bg-red-950/40 p-3 text-sm text-red-100">Control-plane quorum is lost. Read models may be stale and mutating actions are unavailable until a majority returns.</div>}<ErrorBoundary resetKey={page}>{screen}</ErrorBoundary></main>
     </div>
     <div aria-live="polite" aria-atomic="true" className="fixed bottom-4 left-4 z-50 grid max-w-sm gap-2">{store.toasts.map((toast) => <button type="button" key={toast.id} onClick={() => store.dismissToast(toast.id)} className={`rounded-lg border p-3 text-left text-sm shadow-xl ${toast.tone === 'danger' ? 'border-red-600 bg-red-950 text-red-100' : 'border-ember-500 bg-ink-900 text-paper'}`}>{toast.message}</button>)}</div>
   </div>
