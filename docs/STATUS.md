@@ -160,8 +160,12 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   spread bucket can hold two legs on one cluster; upload ids issued during such a move carry a tag
   of their bucket. Gate: fleet property test on a move within garage, 3 runs, 0 violations in 25,287
   operations, negative control failing every run; proxy test (fails with the bucket looked up by
-  cluster, and untagged), control test through purge, 30 UI tests. Next: verify retrying the
-  ADR-0016 hold 503s, then N3c (consolidation).
+  cluster, and untagged), control test through purge, 30 UI tests. **Live (2026-09-23):** a bucket on
+  minio02 moved to a new bucket on minio02 (ramp 25/60/100% held, migrate, mover converged, cutover,
+  purge of the old bucket's 151 objects) under two concurrent `shunt verify` runs: 234,420
+  operations, the only errors the 695 hold 503s the proxies counted exactly; three 12 MiB uploads
+  begun mid-ramp read back identical through the other proxy; the old bucket was deleted and the
+  new one held every key. Next: verify retrying the ADR-0016 hold 503s, then N3c (consolidation).
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
