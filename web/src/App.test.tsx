@@ -11,8 +11,8 @@ const control = {
   ], quorum: 2, started: 3, has_quorum: true, revision: 42, db_bytes: 1048576, db_in_use_bytes: 524288, quota_bytes: 2147483648, leader: 'c1' },
 }
 const fleet = { version: 12, members: [
-  { id: 'proxy-a', live: true, applied: 12, seq: 3, host: 'host-a', version: 'test' },
-  { id: 'proxy-b', live: true, applied: 12, seq: 4, host: 'host-b', version: 'test' },
+  { id: 'proxy-a', live: true, applied: 12, durable: 12, seq: 3, host: 'host-a', version: 'test' },
+  { id: 'proxy-b', live: true, applied: 12, durable: 11, seq: 4, host: 'host-b', version: 'test' },
 ] }
 const directory = { version: 12, clusters: [], placements: [] }
 
@@ -37,6 +37,8 @@ test('shows quorum and two live proxies from the control API', async () => {
   expect(screen.getByText('proxy-a')).toBeInTheDocument()
   expect(screen.getByText('proxy-b')).toBeInTheDocument()
   expect(screen.getByText('2 live')).toBeInTheDocument()
+  // Installed and durable are shown apart: proxy-b's restart cache is a version behind.
+  expect(screen.getByText('11 (not durable)')).toBeInTheDocument()
   await waitFor(() => expect(fetch).toHaveBeenCalledWith('/v1/control', expect.objectContaining({ headers: expect.any(Headers) })))
 })
 

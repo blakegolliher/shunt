@@ -42,6 +42,8 @@ type Metrics struct {
 	// The runtime bundle (ADR-0021 D1), resign mode.
 	BundlesRetired      prometheus.Gauge // shunt_runtime_bundles_retired
 	InstallBackpressure prometheus.Gauge // shunt_install_backpressure
+	// The restart cache (ADR-0021 D1), fleet members.
+	CacheFailures *prometheus.CounterVec // shunt_directory_cache_failures_total{stage}
 }
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
@@ -145,11 +147,15 @@ func NewMetrics() *Metrics {
 		InstallBackpressure: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "shunt_install_backpressure", Help: "1 while an installed directory version waits for a retired runtime bundle to drain.",
 		}),
+		CacheFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_directory_cache_failures_total", Help: "Member: restart-cache writes that failed, by stage; the version is not durable.",
+		}, []string{"stage"}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
 		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
 		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge, m.BundlesRetired, m.InstallBackpressure,
+		m.CacheFailures,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

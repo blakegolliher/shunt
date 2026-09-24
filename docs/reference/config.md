@@ -60,7 +60,7 @@ Makes this proxy a **member** of a fleet run by `shunt-control` (ADR-0015, ADR-0
 | `token_ref` | `env:NAME` / `file:/path` | | The control plane's bearer token |
 | `plaintext` | bool | false | Required `true` while the endpoints are `http`: the control channel then carries directory versions, cluster secrets and client keys in the clear. TLS for it is deferred (ADR-0015); this key exists so that is stated, as `listener.plaintext` must be |
 | `proxy_id` | string | `<hostname>-<admin port>` | This member's id: 1-64 letters, digits, `.`, `_`, `-`. Stable across restarts, so a restarted proxy is the same member |
-| `cache_dir` | path | | Required. The last directory this proxy installed, kept 0700, and served after a restart with the control plane down (ACTIVE buckets only; moving ones refuse writes until the lease is back) |
+| `cache_dir` | path | | Required. The last directory this proxy installed, kept 0700, and served after a restart with the control plane down (ACTIVE buckets only; moving ones refuse writes until the lease is back). Written to a 0600 temporary file, fsynced, renamed and the directory fsynced; a cache that is torn, altered, over 64 MiB, of another format or written by another proxy id is ignored and the proxy starts empty. A cache written by a shunt before H1d is of another format |
 | `heartbeat_interval` | duration | 1s | How often a member reports the directory version it has installed |
 | `lease_ttl` | duration | 10s | At least three heartbeats. The longest lease this member takes: a lease runs from a heartbeat's send time for the shorter of this and the control plane's grant. A member whose lease has run out refuses writes on moving buckets |
 

@@ -11,6 +11,9 @@ export interface ProxyMember {
   id: string
   live: boolean
   applied: number
+  // durable is the version the proxy's restart cache holds durably; it lags applied while a cache
+  // write is in progress or failing.
+  durable?: number
   seq: number
   started?: string
   seen?: string

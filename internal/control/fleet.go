@@ -85,6 +85,10 @@ type Heartbeat struct {
 	Seq int64 `json:"seq"`
 	// Applied is the directory version the member has installed.
 	Applied int64 `json:"applied"`
+	// Durable is the version the member's restart cache holds durably (fsynced, renamed, its
+	// directory synced); 0 when none. It lags Applied while a write is in progress or failing
+	// (ADR-0021 D1).
+	Durable int64 `json:"durable,omitempty"`
 	// FallbackReads is shunt_migration_fallback_reads_total for each bucket that is not ACTIVE in
 	// the member's snapshot: bounded by migrations in flight, never by buckets.
 	FallbackReads map[string]float64 `json:"fallback_reads,omitempty"`
@@ -119,6 +123,7 @@ type Member struct {
 	// when it is the control plane's.
 	Identity      directory.Identity `json:"identity,omitzero"`
 	Applied       int64              `json:"applied"`
+	Durable       int64              `json:"durable,omitempty"` // Heartbeat.Durable
 	Seq           int64              `json:"seq"`
 	Started       time.Time          `json:"started,omitzero"`
 	Seen          time.Time          `json:"seen,omitzero"`        // when its last heartbeat arrived

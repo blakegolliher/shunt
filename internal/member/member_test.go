@@ -473,13 +473,8 @@ func TestMemberNeverInstallsAnOlderVersionOverANewerOne(t *testing.T) {
 	if v := c.Snapshot().Version(); v != 3 {
 		t.Fatalf("a late older version was installed over 3: at %d", v)
 	}
-	var cached control.Directory
-	data, err := os.ReadFile(filepath.Join(c.cfg.CacheDir, "directory.json"))
-	if err == nil {
-		err = json.Unmarshal(data, &cached)
-	}
-	if err != nil || cached.Version != 3 {
-		t.Fatalf("cache at version %d (%v), want 3", cached.Version, err)
+	if cached := readCache(t, c); cached.Version != 3 {
+		t.Fatalf("cache at version %d, want 3", cached.Version)
 	}
 }
 
@@ -691,29 +686,6 @@ func TestMemberStaysStaleAcrossAnEpochChange(t *testing.T) {
 	_ = c.beat(ctx)
 	if !c.Stale() {
 		t.Fatal("a lineage fault cleared by itself")
-	}
-}
-
-// A cache written before schema 2 has no identity: it is ignored rather than served, since none of
-// its versions can be compared with the control plane's.
-func TestMemberIgnoresACacheWithoutIdentity(t *testing.T) {
-	f := newFakeControl(t)
-	dir := t.TempDir()
-	d := f.version(t, 7)
-	d.Identity = directory.Identity{}
-	data, err := json.Marshal(d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "directory.json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c := New(Config{Endpoints: []string{f.srv.URL}, ProxyID: "p1", CacheDir: dir, Interval: time.Second, LeaseTTL: 3 * time.Second}, slog.New(slog.DiscardHandler))
-	if err := c.Load(); err != nil {
-		t.Fatal(err)
-	}
-	if v := c.Snapshot().Version(); v != 0 {
-		t.Fatalf("a cache with no identity was installed at version %d", v)
 	}
 }
 

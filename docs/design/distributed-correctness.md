@@ -218,8 +218,21 @@ becomes the pending bundle (a newer one replaces it) and is published when a hel
 requests keep the served version meanwhile, the member's heartbeat reports that served version and
 its secret generations as `applied`, so a fence waits, and `shunt_install_backpressure` and
 `shunt_runtime_bundles_retired` show it. Nothing cuts a request short. There are no transport
-health loops yet (P3a), so none needs sharing. Remaining for H1: the restart cache, rotation
-API/CLI/GUI, fleet install diagnostics (which will carry the backpressure state), and benchmarks.
+health loops yet (P3a), so none needs sharing.
+
+**Landed (2026-09-24, H1d):** the restart cache. The member writes an envelope (cache schema,
+fleet protocol, proxy ID, identity, version, SHA-256 of the directory as written) to a 0600
+temporary file, fsyncs it, renames it and fsyncs the directory, after the install lock is let go.
+Writes are serialized and a version older than one already attempted is skipped, so the cache only
+moves forward. A failure at any stage keeps the in-memory version and the last durable file (no
+temporary file stays), counts `shunt_directory_cache_failures_total{stage}`, and is reported:
+`/-/fleet` shows `durable` and `cache_error`, the heartbeat carries `durable`, and the Control
+plane screen's proxy table shows Durable beside Applied. A cache that is torn, altered, oversized
+(64 MiB, checked before decoding), of another schema or protocol, another proxy's, or without
+identity is ignored and the proxy starts empty. T04's fault tests fail each stage and restart.
+Incarnation lifecycle metadata, and refusing a restart from a cache older than an acknowledged
+barrier, come with incarnations and barriers in H2. Remaining for H1: rotation API/CLI/GUI, fleet
+install diagnostics (which will carry the backpressure and cache state), and benchmarks.
 
 ### Runtime bundle and installation
 

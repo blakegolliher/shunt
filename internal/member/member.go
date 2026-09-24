@@ -16,7 +16,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -88,6 +87,15 @@ type Client struct {
 	// request path for every moving bucket, so it is a pointer load, not a lock.
 	lease atomic.Pointer[grant]
 
+	// caching serializes cache writes; cached is the last version a write was attempted for, so
+	// a slower older write never lands after a newer one. durable is the version the cache holds
+	// durably (renamed and its directory synced), and cacheErr why the newest attempt failed.
+	caching  sync.Mutex
+	cached   int64
+	durable  atomic.Int64
+	cacheErr atomic.Pointer[string]
+	ops      cacheOps
+
 	// lineage, once set, is why this member's directory is on another lineage than the control
 	// plane's (ADR-0021): another cluster, or another epoch after a restore. The member stays stale
 	// until it is re-enrolled; nothing it installed compares with the control plane's versions.
@@ -104,7 +112,7 @@ func New(cfg Config, log *slog.Logger) *Client {
 	if cfg.LongPoll == 0 {
 		cfg.LongPoll = 30 * time.Second
 	}
-	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now}
+	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now, ops: osCacheOps}
 	c.cond = sync.NewCond(&c.mu)
 	c.snap.Store(directory.NewSnapshot(&directory.File{}))
 	empty := map[string]string{}
@@ -156,40 +164,18 @@ func (c *Client) Stale() bool {
 // cacheFile is the last installed directory, with its secrets, on local disk (0600).
 func (c *Client) cacheFile() string { return filepath.Join(c.cfg.CacheDir, "directory.json") }
 
-// Load installs the cached directory, if any: a proxy restarting with the control plane down
-// serves ACTIVE buckets from it, stale, until the control plane is back.
-func (c *Client) Load() error {
-	if err := os.MkdirAll(c.cfg.CacheDir, 0o700); err != nil {
-		return fmt.Errorf("control.cache_dir: %w", err)
-	}
-	data, err := os.ReadFile(c.cacheFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("directory cache: %w", err)
-	}
-	var d control.Directory
-	if err := json.Unmarshal(data, &d); err != nil {
-		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
-	}
-	if d.Identity.IsZero() {
-		// A cache written before schema 2 carries no lineage, so nothing in it can be compared
-		// with the control plane's versions: start empty and fetch.
-		c.log.Warn("directory cache has no identity (written by an older shunt); ignored, the directory is fetched from the control plane", "cache", c.cacheFile())
-		return nil
-	}
-	if _, err := c.install(&d, false); err != nil {
-		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
-	}
-	c.log.Info("directory loaded from the local cache; serving it stale until the control plane answers", "version", d.Version, "cache", c.cacheFile())
-	return nil
-}
-
 // install validates and installs one directory version, and writes the cache when asked. A
 // version no newer than the installed one is dropped (installed false, no error): installs are
-// serialized, so the installed version, and the cache, only move forward.
+// serialized, so the installed version, and the cache, only move forward. The cache is written
+// after the install lock is let go, so a slow disk never holds up the next install.
 func (c *Client) install(d *control.Directory, cache bool) (installed bool, err error) {
+	if installed, err = c.apply(d); installed && cache {
+		c.persist(d)
+	}
+	return installed, err
+}
+
+func (c *Client) apply(d *control.Directory) (installed bool, err error) {
 	c.installing.Lock()
 	defer c.installing.Unlock()
 	f := &d.File
@@ -233,40 +219,7 @@ func (c *Client) install(d *control.Directory, cache bool) (installed bool, err 
 	if c.OnInstall != nil {
 		c.OnInstall(snap)
 	}
-	if cache {
-		if err := c.writeCache(d); err != nil {
-			c.log.Warn("directory cache not written; a restart with the control plane down would start empty", "err", err.Error())
-		}
-	}
 	return true, nil
-}
-
-func (c *Client) writeCache(d *control.Directory) error {
-	data, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(c.cfg.CacheDir, ".directory-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), c.cacheFile())
 }
 
 // WaitVersion blocks until the installed version is at least v, or ctx ends.
@@ -336,7 +289,7 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) (
 	if resp.StatusCode == http.StatusNotModified {
 		return true, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectory))
 	if err != nil {
 		return false, err
 	}
@@ -476,7 +429,7 @@ func (c *Client) beat(ctx context.Context) error {
 	sent := c.Now()
 	snap := c.serving()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
-		Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
+		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File())}
 	if c.Telemetry != nil {
 		hb.Telemetry = c.Telemetry.Completed(c.Now())
 	}
@@ -634,6 +587,10 @@ type Status struct {
 	// LeaseLeft is how long the lease has to run; negative once it has lapsed.
 	LeaseLeft string `json:"lease_left,omitempty"`
 	Applied   int64  `json:"applied"`
+	// Durable is the version the restart cache holds durably; CacheError why the newest version
+	// is not durable, when it is not (ADR-0021 D1: installed and durable are reported apart).
+	Durable    int64  `json:"durable"`
+	CacheError string `json:"cache_error,omitempty"`
 	// Identity is the installed directory's lineage; LineageFault says why it is not the control
 	// plane's, when it is not.
 	Identity     directory.Identity `json:"identity,omitzero"`
@@ -645,6 +602,10 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().File().Identity}
 	if why := c.lineage.Load(); why != nil {
 		st.LineageFault = *why
+	}
+	st.Durable = c.durable.Load()
+	if why := c.cacheErr.Load(); why != nil {
+		st.CacheError = *why
 	}
 	now := c.Now()
 	if ack := c.lastAck.Load(); ack != nil {

@@ -59,6 +59,7 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	m.TelemetryMerge.Observe(0.001)
 	m.BundlesRetired.Set(0)
 	m.InstallBackpressure.Set(0)
+	m.CacheFailures.WithLabelValues("fsync").Inc()
 	families, err := m.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -79,9 +80,9 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 			t.Logf("catalog row %s has no registered metric yet", name)
 		}
 	}
-	// POC-4's fifteen, POC-6's four for the fleet, UI-1's merge latency, and H1c's two for the
-	// runtime bundle.
-	if len(registered) != 22 {
-		t.Errorf("H1c registers exactly twenty-two shunt_ metrics, got %d: %v", len(registered), registered)
+	// POC-4's fifteen, POC-6's four for the fleet, UI-1's merge latency, H1c's two for the runtime
+	// bundle and H1d's cache failures.
+	if len(registered) != 23 {
+		t.Errorf("H1d registers exactly twenty-three shunt_ metrics, got %d: %v", len(registered), registered)
 	}
 }
