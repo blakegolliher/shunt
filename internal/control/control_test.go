@@ -44,6 +44,8 @@ type fakeCluster struct {
 	keys      map[string]bool    // when set, an access key not in it answers 403 InvalidAccessKeyId
 	noCreate  bool               // CreateBucket answers 403 AccessDenied, as VAST does for a key without the permission
 	owned     bool               // CreateBucket of an existing bucket answers 409 BucketAlreadyOwnedByYou, as MinIO does
+	listMu    sync.Mutex
+	listed    []string // the prefix of every ListObjectsV2 and ListMultipartUploads request, in order
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -70,6 +72,11 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 			if !fc.condDel {
 				r.Header.Del("If-Match")
 			}
+		}
+		if q := r.URL.Query(); r.Method == http.MethodGet && (q.Get("list-type") == "2" || q.Has("uploads")) {
+			fc.listMu.Lock()
+			fc.listed = append(fc.listed, q.Get("prefix"))
+			fc.listMu.Unlock()
 		}
 		if q := r.URL.Query(); fc.onList != nil && r.Method == http.MethodGet && q.Get("list-type") == "2" {
 			fc.onList(q.Get("continuation-token"))
@@ -781,7 +788,7 @@ func TestPurgeDiffIgnoresConcurrentDeletes(t *testing.T) {
 		}
 		dst.onList = nil
 	}
-	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20, nil)
+	missing, _, _, err := missingOn(context.Background(), fakeBackend(t, "src", src), "b", fakeBackend(t, "dst", dst), "b", 20, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1411,7 +1418,7 @@ func TestCarveAndMergeThroughTheAPI(t *testing.T) {
 	if len(so.Buckets) != 1 || !strings.Contains(strings.Join(so.Buckets[0].Problems, " "), "merge them (shunt expand data01 --merge <prefix>") {
 		t.Fatalf("step-out of a carved bucket: %+v", so)
 	}
-	rg.refused("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5, To: "vast02", Name: "data01-b", Create: true}, "ADR-0020 P2")
+	rg.refused("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5, To: "vast02", Name: "data01-b", Create: true, Scope: "logs/"}, "no prefix rule \"logs/\"; carve it first")
 	if ok, _ := rg.vast02.be.BucketExists("data01-b"); ok {
 		t.Fatal("a refused move made a bucket")
 	}
@@ -1427,6 +1434,81 @@ func TestCarveAndMergeThroughTheAPI(t *testing.T) {
 	after, _ := rg.dir.Snapshot().Lookup("acme", "data01")
 	if !reflect.DeepEqual(*after, plain) {
 		t.Fatalf("carve then merge did not give back the plain bucket:\n got  %+v\n want %+v", *after, plain)
+	}
+}
+
+// A move of one prefix rule's keys through the API (ADR-0020 P2): archive/ is carved in a plain
+// bucket and moved whole to vast02; the purge compares and deletes archive/'s keys alone, listing
+// only that prefix, and keeps the source bucket, which holds the rest.
+func TestScopedMoveThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	archive := []string{"archive/a", "archive/b", "archive/c"}
+	rest := []string{"data/a", "data/b", "archived"} // "archived" shares the prefix's letters, not the prefix
+	for _, k := range append(slices.Clone(archive), rest...) {
+		rg.vast01.put(t, "data01", k, "v")
+	}
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, nil)
+
+	var tr TransitionResult
+	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{Scope: "archive/", To: "vast02", Name: "data01-arch", Create: true}, &tr)
+	if tr.To != directory.StateMigrating || tr.Primary != "vast02" || tr.Source != "vast01" || tr.Range == nil || *tr.Range != directory.FullRange {
+		t.Fatalf("moving archive/: %+v", tr)
+	}
+	var st Status
+	rg.must("GET", "/v1/status?bucket=acme/data01", nil, &st)
+	if m := st.Placements[0].Move; m == nil || m.Scope != "archive/" {
+		t.Fatalf("status of the move: %+v", st.Placements[0])
+	}
+	rg.refused("DELETE", "/v1/placements/acme/data01/prefixes?prefix=archive/", nil, "only at rest")
+	for _, k := range archive {
+		rg.vast02.put(t, "data01-arch", k, "v") // the mover's work
+	}
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
+	rg.refused("POST", "/v1/placements/acme/data01/finish", nil, "keeps other keys of the bucket")
+
+	rg.vast01.listMu.Lock()
+	rg.vast01.listed = nil
+	rg.vast01.listMu.Unlock()
+	var dry PurgeDryRun
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Objects != len(archive) || dry.Bucket != "data01" {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	var pg PurgeResult
+	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
+	if pg.ObjectsDeleted != len(archive) {
+		t.Fatalf("purge deleted %d objects; archive/ has %d", pg.ObjectsDeleted, len(archive))
+	}
+	rg.vast01.listMu.Lock()
+	listed := slices.Clone(rg.vast01.listed)
+	rg.vast01.listMu.Unlock()
+	if len(listed) == 0 || slices.ContainsFunc(listed, func(p string) bool { return p != "archive/" }) {
+		t.Fatalf("purge listed the source under %q; want archive/ only", listed)
+	}
+	for _, k := range archive {
+		if rg.vast01.has("data01", k) {
+			t.Fatalf("%s of the moved prefix is still on the source", k)
+		}
+	}
+	for _, k := range rest {
+		if !rg.vast01.has("data01", k) {
+			t.Fatalf("%s is outside the moved prefix and was purged", k)
+		}
+	}
+	if ok, _ := rg.vast01.be.BucketExists("data01"); !ok {
+		t.Fatal("the source bucket holds the rest of the bucket, but was deleted")
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.State != directory.StateActive || p.Move != nil || len(p.Prefixes) != 1 || p.Prefixes[0].Owners[0].Leg != "vast02" || p.Owners[0].Leg != "vast01" {
+		t.Fatalf("after the move: %+v", p)
 	}
 }
 

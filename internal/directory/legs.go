@@ -66,6 +66,9 @@ type Owner struct {
 // Move transfers the keys of one range from one leg to another, through the placement's state
 // (RAMPING, MIGRATING, CUTOVER). Ramp and cutover evidence belong to the move.
 type Move struct {
+	// Scope is the prefix rule whose table the move changes (ADR-0020); "" is the scope of the keys
+	// no rule claims. A key is in the move when its scope is this one and its hash is in Range.
+	Scope   string           `yaml:"scope,omitempty" json:"scope,omitempty"`
 	Range   HashRange        `yaml:"range" json:"range"`
 	From    string           `yaml:"from" json:"from"`
 	To      string           `yaml:"to" json:"to"`
@@ -155,11 +158,15 @@ func checkSpread(p *Placement) error {
 	if m == nil {
 		return nil
 	}
-	if len(p.Prefixes) > 0 {
-		return fmt.Errorf("move: a move in a bucket with prefix rules needs ADR-0020 P2; this build moves only buckets without them")
+	table, ok := p.scopeTable(m.Scope)
+	if !ok {
+		return fmt.Errorf("move.scope: %q is not a prefix rule of this bucket", m.Scope)
 	}
-	if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To }) {
-		return fmt.Errorf("move.range: leg %q does not own all of %s", m.From, rangeText(m.Range))
+	if !slices.ContainsFunc(table, func(o Owner) bool { return o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To }) {
+		return fmt.Errorf("move.range: leg %q does not own all of %s%s", m.From, rangeText(m.Range), scopeText(m.Scope))
+	}
+	if m.Scope != "" && m.Ramp != nil && (len(m.Ramp.Prefixes) > 0 || (m.Ramp.Hold != nil && len(m.Ramp.Hold.Prefixes) > 0)) {
+		return fmt.Errorf("move.ramp.prefixes: a move within a prefix rule ramps by ratio only (ADR-0020)")
 	}
 	switch {
 	case p.State == StateRamping && m.Ramp == nil:

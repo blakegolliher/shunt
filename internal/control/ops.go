@@ -34,6 +34,7 @@ type TransitionResult struct {
 	Warning       string                     `json:"warning,omitempty"`
 	Cutover       *directory.CutoverEvidence `json:"cutover,omitempty"`
 	Range         *directory.HashRange       `json:"range,omitempty"` // the moving range, for part of a bucket (ADR-0018 N3)
+	Scope         string                     `json:"scope,omitempty"` // the prefix rule whose keys move (ADR-0020)
 	// The fleet (ADR-0016). Held: the step was written as a hold first and completed once every
 	// proxy had it. Proxies: member proxies the change had to reach, besides this one. WaitingOn:
 	// members that have not installed it yet, so it is not in effect everywhere (pending).
@@ -157,7 +158,7 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 
 	tenant, bucket, _ := directory.SplitKey(key)
 	complete := t // the step as written once every member holds it: never with a target
-	complete.Target, complete.Name, complete.Complete, complete.Range, complete.Leg = "", "", true, nil, ""
+	complete.Target, complete.Name, complete.Complete, complete.Range, complete.Leg, complete.Scope = "", "", true, nil, "", ""
 	var heldAt int64
 	var created string
 	if p.Held() {
@@ -282,6 +283,10 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 	res := TransitionResult{Key: key, From: p.State, To: full.State, Primary: dstCluster, Source: srcCluster}
 	if p.Move != nil || full.Move != nil {
 		res.Range = moveRange(&p, &full)
+		res.Scope = moveScope(full)
+		if full.Move == nil {
+			res.Scope = moveScope(p) // the step that ended the move
+		}
 	}
 	if np.Ramp != nil {
 		res.Ratio = np.Ramp.Ratio
@@ -355,14 +360,12 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 	return res, nil
 }
 
-// ownsBeyond reports whether leg owns any key outside rg.
-func ownsBeyond(p directory.Placement, leg string, rg directory.HashRange) bool {
-	for _, o := range p.Owners {
-		if o.Leg == leg && (o.From < rg.From || o.To > rg.To) {
-			return true
-		}
+// moveScope is the prefix rule a placement's move changes (ADR-0020), or "".
+func moveScope(p directory.Placement) string {
+	if p.Move != nil {
+		return p.Move.Scope
 	}
-	return false
+	return ""
 }
 
 // moving is the two-cluster placement the control plane reasons about: for a bucket part of which
@@ -796,7 +799,10 @@ type RampRequest struct {
 	// Range, leaving ACTIVE, moves only the keys whose hash it holds, to the target's leg (ADR-0018 N3).
 	Range *directory.HashRange `json:"range,omitempty"`
 	// Leg, leaving ACTIVE, moves the first range that leg owns instead of a named range (ADR-0018 N3c).
-	Leg    string `json:"leg,omitempty"`
+	Leg string `json:"leg,omitempty"`
+	// Scope, leaving ACTIVE, is the prefix rule whose keys move; Range and Leg are read in its table
+	// (ADR-0020).
+	Scope  string `json:"scope,omitempty"`
 	Create bool   `json:"create,omitempty"`
 	Wait   string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
@@ -814,7 +820,7 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg}, req.Create, false, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, false, wait)
 	if err != nil {
 		return res, err
 	}
@@ -829,6 +835,7 @@ type MigrateRequest struct {
 	Name                  string               `json:"name,omitempty"`
 	Range                 *directory.HashRange `json:"range,omitempty"` // leaving ACTIVE: move only these keys (ADR-0018 N3)
 	Leg                   string               `json:"leg,omitempty"`   // leaving ACTIVE: move this leg's first range (N3c)
+	Scope                 string               `json:"scope,omitempty"` // leaving ACTIVE: the prefix rule whose keys move (ADR-0020)
 	Create                bool                 `json:"create,omitempty"`
 	AcceptLostWriteWindow bool                 `json:"accept_lost_write_window,omitempty"`
 	Wait                  string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
@@ -847,7 +854,7 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		return res, err
 	}
@@ -1051,6 +1058,7 @@ type purgePlan struct {
 	// keep, for a move of part of a bucket (ADR-0018 N3), is the moving range: only its keys are
 	// compared and deleted, and the source bucket stays unless its leg owns nothing else.
 	keep       func(string) bool
+	prefix     string // the move's scope (ADR-0020): purge lists only its keys
 	dropBucket bool
 }
 
@@ -1071,7 +1079,8 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	if m := p.Move; m != nil {
 		spread := p
 		plan.keep = func(k string) bool { return migrate.InMove(&spread, k) }
-		plan.dropBucket = !ownsBeyond(p, m.From, m.Range)
+		plan.prefix = m.Scope
+		plan.dropBucket = !directory.OwnsBeyond(&spread, m.From, m.Scope, m.Range)
 	}
 	p = moving(p)
 	// A proxy that has not installed the cutover still reads the source on a miss: it must have it
@@ -1088,7 +1097,7 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	}
 	plan.srcBucket, plan.dstBucket = p.Names[p.Source], p.Names[p.Primary]
 	tr.phase(PhaseDiff)
-	plan.missing, plan.objects, plan.bytes, err = missingOn(tr.ctx, plan.src, plan.srcBucket, dst, plan.dstBucket, 20, plan.keep)
+	plan.missing, plan.objects, plan.bytes, err = missingOn(tr.ctx, plan.src, plan.srcBucket, dst, plan.dstBucket, 20, plan.keep, plan.prefix)
 	if err != nil {
 		return plan, err
 	}
@@ -1132,7 +1141,7 @@ func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDr
 	}
 	ctx, cancel := context.WithTimeout(tr.ctx, backendTimeout)
 	defer cancel()
-	if res.UploadsInFlight, err = s.uploadsInProgress(ctx, pv.ClusterOf(pv.Source), plan.srcBucket); err != nil {
+	if res.UploadsInFlight, err = s.uploadsInProgress(ctx, pv.ClusterOf(pv.Source), plan.srcBucket, plan.prefix); err != nil {
 		return res, err
 	}
 	res.Allowed = true
@@ -1171,7 +1180,7 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	progress := func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") }
 	var objects, uploads int
 	if plan.keep != nil {
-		objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.keep, progress)
+		objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.prefix, plan.keep, progress)
 	} else {
 		objects, uploads, err = plan.src.empty(tr.ctx, plan.srcBucket, progress)
 	}
@@ -1205,7 +1214,7 @@ func (s *Server) runFinish(tr *tracker, key string) (TransitionResult, error) {
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	if m := p.Move; m != nil && ownsBeyond(p, m.From, m.Range) {
+	if m := p.Move; m != nil && directory.OwnsBeyond(&p, m.From, m.Scope, m.Range) {
 		// Left in place, the range's keys would be strays on a leg that stays in the bucket: a later
 		// move into that leg would take them for the bucket's own (ADR-0018 N3).
 		return TransitionResult{}, refuse("%s: leg %s keeps other keys of the bucket, so the moved range's copies there must go: use purge-source, which deletes only that range", key, m.From)

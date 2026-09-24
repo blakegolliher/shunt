@@ -348,6 +348,7 @@ type ScopeStatus struct {
 // MoveStatus is a move of part of a bucket: its legs, its range, and that range's share of the
 // key space.
 type MoveStatus struct {
+	Scope string              `json:"scope,omitempty"` // the prefix rule whose keys move (ADR-0020); share is of its keys then
 	From  string              `json:"from"`
 	To    string              `json:"to"`
 	Range directory.HashRange `json:"range"`
@@ -484,7 +485,7 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 		ps.Scopes = scopeStatuses(pl)
 	}
 	if m := pl.Move; m != nil {
-		ps.Move = &MoveStatus{From: m.From, To: m.To, Range: m.Range, Share: (float64(m.Range.To) - float64(m.Range.From) + 1) / (1 << 64)}
+		ps.Move = &MoveStatus{Scope: m.Scope, From: m.From, To: m.To, Range: m.Range, Share: (float64(m.Range.To) - float64(m.Range.From) + 1) / (1 << 64)}
 	}
 	if s.Keys != nil {
 		tenant, bucket, _ := directory.SplitKey(key)

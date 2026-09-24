@@ -183,8 +183,13 @@ its single leg. `DELETE ?prefix=` **merges** a rule back, only when its table eq
 scope's; merging the last rule of a bucket one leg owns makes it plain again. Both return
 `{"key", "prefix", "rules", "version"}` and are refused (409 `refused`) unless the placement is
 `ACTIVE` with no move; carve also refuses a bucket with a target, cold tier or lifecycle recorded,
-a prefix already carved, and more than 64 rules or 1024-byte prefixes. A move in a bucket with rules
-is refused in this build (ADR-0020 P2). Status reports the rules as `scopes`, each with its legs.
+a prefix already carved, and more than 64 rules or 1024-byte prefixes. Status reports the rules as `scopes`, each with its legs.
+
+A move of a rule's keys is a first step with `"scope": "archive/"` (ADR-0020 P2): `range` and `leg`
+are then read in that rule's table, and a rule one leg owns moves whole with neither. The mover,
+purge's diff and its deletes list only the prefix, and leave keys of nested rules alone; status's
+`move` names its `scope`. A scoped move ramps by ratio only; carve and merge are refused while any
+move is in progress.
 `shunt expand <bucket> --carve <prefix>` and `--merge <prefix>` call them.
 
 ### `POST /v1/placements/{tenant}/{bucket}/read-only`

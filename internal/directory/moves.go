@@ -44,11 +44,17 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 	if t.Leg != "" && t.Leg != m.From {
 		return fail("a move of leg %s's keys is in progress; finish it before moving another leg's", m.From)
 	}
+	if t.Scope != "" && t.Scope != m.Scope {
+		return fail("a move of the keys under %q is in progress; finish it before moving another prefix's", m.Scope)
+	}
+	if m.Scope != "" && len(t.Prefixes) > 0 {
+		return fail("a move within a prefix rule ramps by ratio only (ADR-0020)")
+	}
 	v := p.MoveView()
 	if t.Target != "" && t.Target != v.ClusterOf(v.Primary) {
 		return fail("the move goes to %s; a later step may only repeat that target", v.ClusterOf(v.Primary))
 	}
-	t.Range, t.Leg, t.Target, t.Name = nil, "", "", ""
+	t.Range, t.Leg, t.Scope, t.Target, t.Name = nil, "", "", "", ""
 	nv, err := Apply(v, t)
 	if err != nil {
 		return p, err
@@ -63,7 +69,8 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 	case nv.State == StateActive:
 		// The move is over: the destination owns the range, and a source left owning nothing goes.
 		np.State, np.Move = StateActive, nil
-		np.Owners = reassign(p.Owners, m.Range, m.To)
+		table, _ := p.scopeTable(m.Scope)
+		np.setScopeTable(m.Scope, reassign(table, m.Range, m.To))
 		if !np.ownsKeys(m.From) {
 			delete(np.Legs, m.From)
 		}
@@ -88,10 +95,13 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if p.State != StateActive {
 		return fail("a move of part of a bucket starts from ACTIVE")
 	}
-	if len(p.Prefixes) > 0 {
-		return fail("the bucket has prefix rules; moving its keys needs ADR-0020 P2, not in this build")
+	if t.Scope != "" && !slices.ContainsFunc(p.Prefixes, func(r PrefixRule) bool { return r.Prefix == t.Scope }) {
+		return fail("the bucket has no prefix rule %q; carve it first (shunt expand --carve)", t.Scope)
 	}
-	if t.Range == nil && t.Leg == "" {
+	if t.Scope != "" && len(t.Prefixes) > 0 {
+		return fail("a move within a prefix rule ramps by ratio only (ADR-0020)")
+	}
+	if t.Range == nil && t.Leg == "" && t.Scope == "" {
 		return fail("name the range of keys to move, or the leg whose keys move: the bucket is spread over legs")
 	}
 	if t.Range != nil && t.Range.From > t.Range.To {
@@ -121,30 +131,37 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if t.Target == "" {
 		return fail("the target cluster is required")
 	}
+	table, _ := np.scopeTable(t.Scope)
+	if t.Range == nil && t.Leg == "" { // a scope one leg owns whole moves whole
+		if len(table) != 1 {
+			return fail("the keys under %q are split over %d ranges; name the leg (or range) to move", t.Scope, len(table))
+		}
+		t.Leg = table[0].Leg
+	}
 	if t.Range == nil { // the leg's first range; a leg that owns several moves them one at a time
 		if _, ok := np.Legs[t.Leg]; !ok {
 			return fail("the bucket has no leg %s; its legs are %v", t.Leg, slices.Sorted(maps.Keys(np.Legs)))
 		}
-		for _, o := range np.Owners {
+		for _, o := range table {
 			if o.Leg == t.Leg {
 				t.Range = &HashRange{From: o.From, To: o.To}
 				break
 			}
 		}
 		if t.Range == nil {
-			return fail("leg %s owns no keys; there is nothing of it to move", t.Leg)
+			return fail("leg %s owns no keys%s; there is nothing of it to move", t.Leg, scopeText(t.Scope))
 		}
 	}
 	rg := *t.Range
 	src := ""
-	for _, o := range np.Owners {
+	for _, o := range table {
 		if o.From <= rg.From && rg.To <= o.To {
 			src = o.Leg
 		}
 	}
 	switch {
 	case src == "":
-		return fail("the range %s spans more than one leg; move one leg's keys at a time", rangeText(rg))
+		return fail("the range %s%s spans more than one leg; move one leg's keys at a time", rangeText(rg), scopeText(t.Scope))
 	case t.Leg != "" && src != t.Leg:
 		return fail("the range %s is leg %s's, not leg %s's", rangeText(rg), src, t.Leg)
 	}
@@ -179,13 +196,13 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	// named by leg as in MoveView.
 	view := Placement{State: StateActive, Primary: src, Names: map[string]string{src: np.Legs[src].Bucket}}
 	tv := t
-	tv.Range, tv.Leg, tv.Target, tv.Name = nil, "", dst, np.Legs[dst].Bucket
+	tv.Range, tv.Leg, tv.Scope, tv.Target, tv.Name = nil, "", "", dst, np.Legs[dst].Bucket
 	nv, err := Apply(view, tv)
 	if err != nil {
 		return p, err
 	}
 	np.State = nv.State
-	np.Move = &Move{Range: rg, From: src, To: dst, Ramp: nv.Ramp, Cutover: nv.Cutover}
+	np.Move = &Move{Scope: t.Scope, Range: rg, From: src, To: dst, Ramp: nv.Ramp, Cutover: nv.Cutover}
 	if np.Move.Ramp != nil {
 		r := rg
 		np.Move.Ramp.Range = &r

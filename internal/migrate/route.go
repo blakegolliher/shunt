@@ -245,15 +245,13 @@ func OwnerOf(p *directory.Placement, key string) (string, error) {
 // InMove reports whether key is one the placement's move is taking to another leg: in the move's
 // scope and hash range. It is the one test of move membership: the proxy's narrowing, the listing
 // merge, the mover and purge all ask it (ADR-0020), so a key has the same two homes everywhere.
-// Moves happen only in buckets without prefix rules until ADR-0020 P2, so the move's scope is
-// the empty prefix, which holds the keys no rule claims.
 func InMove(p *directory.Placement, key string) bool {
 	m := p.Move
 	if m == nil || !InRangeHash(m.Range, key) {
 		return false
 	}
 	scope, _ := p.Scope(key)
-	return scope == ""
+	return scope == m.Scope
 }
 
 // Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the key,

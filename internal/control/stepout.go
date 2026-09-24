@@ -100,7 +100,7 @@ func (s *Server) stepOut(w http.ResponseWriter, r *http.Request) {
 			b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is named %s on %s: clients going direct would have to use that name, and a bucket cannot be renamed; move it once more with --name %s", key, b.Name, p.Primary, bucket))
 		}
 		if p.State == directory.StateActive {
-			if n, err := s.uploadsInProgress(ctx, p.Primary, b.Name); err != nil {
+			if n, err := s.uploadsInProgress(ctx, p.Primary, b.Name, ""); err != nil {
 				b.Problems = append(b.Problems, fmt.Sprintf("cannot list multipart uploads of %s on %s: %v", b.Name, p.Primary, err))
 			} else if n > 0 {
 				b.Problems = append(b.Problems, fmt.Sprintf("bucket %s has multipart uploads in progress on %s: their upload ids only work through shunt, so let them finish or abort them", key, p.Primary))
@@ -222,14 +222,18 @@ func listBucketsAs(ctx context.Context, b backend) (names []string, problem stri
 	return names, ""
 }
 
-// uploadsInProgress counts the in-progress multipart uploads of a bucket (one page is enough to
-// know whether there are any).
-func (s *Server) uploadsInProgress(ctx context.Context, cluster, bucket string) (int, error) {
+// uploadsInProgress counts the in-progress multipart uploads of a bucket, under prefix when it is
+// set (a move within a prefix rule, ADR-0020); one page is enough to know whether there are any.
+func (s *Server) uploadsInProgress(ctx context.Context, cluster, bucket, prefix string) (int, error) {
 	b, err := s.backendFor(cluster)
 	if err != nil {
 		return 0, err
 	}
-	r, err := b.do(ctx, http.MethodGet, bucket, "", url.Values{"uploads": {""}, "max-uploads": {"1"}}, nil, nil)
+	q := url.Values{"uploads": {""}, "max-uploads": {"1"}}
+	if prefix != "" {
+		q.Set("prefix", prefix)
+	}
+	r, err := b.do(ctx, http.MethodGet, bucket, "", q, nil, nil)
 	switch {
 	case err != nil:
 		return 0, err

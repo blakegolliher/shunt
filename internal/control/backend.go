@@ -202,8 +202,13 @@ type listEntry struct {
 	size int64
 }
 
-func (b backend) listPage(ctx context.Context, bucket, token string) (entries []listEntry, next string, err error) {
+// listPage lists one page of bucket, under prefix when it is set: a move within a prefix rule
+// (ADR-0020) reads only its prefix, not the whole bucket.
+func (b backend) listPage(ctx context.Context, bucket, prefix, token string) (entries []listEntry, next string, err error) {
 	q := url.Values{"list-type": {"2"}, "encoding-type": {"url"}}
+	if prefix != "" {
+		q.Set("prefix", prefix)
+	}
 	if token != "" {
 		q.Set("continuation-token", token)
 	}
@@ -239,6 +244,7 @@ type lister struct {
 	b       backend
 	bucket  string
 	keep    func(key string) bool // nil: every key; a move's range otherwise (ADR-0018 N3)
+	prefix  string                // a move's scope: only keys under it are listed (ADR-0020)
 	page    []listEntry
 	next    string
 	done    bool
@@ -251,7 +257,7 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 		if l.done {
 			return "", false, nil
 		}
-		entries, next, err := l.b.listPage(ctx, l.bucket, l.next)
+		entries, next, err := l.b.listPage(ctx, l.bucket, l.prefix, l.next)
 		if err != nil {
 			return "", false, err
 		}
@@ -272,9 +278,9 @@ func (l *lister) nextKey(ctx context.Context) (key string, ok bool, err error) {
 // is confirmed with HEADs before it counts (stillMissing), so a client delete landing between the
 // two listings' pages is not reported. It also returns how many objects and bytes the source
 // listing held, as far as it was walked.
-func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int, keep func(string) bool) (missing []string, objects int, size int64, err error) {
-	src := &lister{b: source, bucket: sourceBucket, keep: keep}
-	dst := &lister{b: primary, bucket: primaryBucket, keep: keep}
+func missingOn(ctx context.Context, source backend, sourceBucket string, primary backend, primaryBucket string, limit int, keep func(string) bool, prefix string) (missing []string, objects int, size int64, err error) {
+	src := &lister{b: source, bucket: sourceBucket, keep: keep, prefix: prefix}
+	dst := &lister{b: primary, bucket: primaryBucket, keep: keep, prefix: prefix}
 	d, dok, err := dst.nextKey(ctx)
 	if err != nil {
 		return nil, 0, 0, err
@@ -379,7 +385,7 @@ func (b backend) empty(ctx context.Context, bucket string, progress func(deleted
 	// Deleting while paging with continuation tokens can skip keys, so every round lists from the
 	// start until a listing comes back empty.
 	for {
-		entries, _, err := b.listPage(ctx, bucket, "")
+		entries, _, err := b.listPage(ctx, bucket, "", "")
 		if err != nil {
 			return objects, uploads, err
 		}
@@ -405,10 +411,13 @@ func (b backend) empty(ctx context.Context, bucket string, progress func(deleted
 // emptyRange deletes the keys keep holds, and aborts the multipart uploads of those keys, leaving
 // every other key: a move's source leg giving up one range and keeping the rest (ADR-0018 N3).
 // Deleting while paging can skip keys, so it walks the bucket until a whole walk deletes nothing.
-func (b backend) emptyRange(ctx context.Context, bucket string, keep func(string) bool, progress func(deleted int)) (objects, uploads int, err error) {
+func (b backend) emptyRange(ctx context.Context, bucket, prefix string, keep func(string) bool, progress func(deleted int)) (objects, uploads int, err error) {
 	keyMarker, idMarker := "", ""
 	for {
 		q := url.Values{"uploads": {""}}
+		if prefix != "" {
+			q.Set("prefix", prefix)
+		}
 		if keyMarker != "" {
 			q.Set("key-marker", keyMarker)
 			q.Set("upload-id-marker", idMarker)
@@ -457,7 +466,7 @@ func (b backend) emptyRange(ctx context.Context, bucket string, keep func(string
 		deleted := 0
 		token := ""
 		for {
-			entries, next, err := b.listPage(ctx, bucket, token)
+			entries, next, err := b.listPage(ctx, bucket, prefix, token)
 			if err != nil {
 				return objects, uploads, err
 			}

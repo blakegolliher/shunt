@@ -13,6 +13,7 @@ import (
 	"go.yaml.in/yaml/v4"
 
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/migrate"
 )
 
 // ownScope carves prefix in acme/spread and then gives its scope to minio alone, as a finished
@@ -116,5 +117,77 @@ func TestPrefixRuleRoutesAndListsOnlyItsLegs(t *testing.T) {
 	}
 	if m.garage.listed("spread-g") == before {
 		t.Fatal("a listing of the whole bucket did not read garage")
+	}
+}
+
+// During a move within a scope (ADR-0020 P2), keys of the scope in the moving range write to the
+// destination and read back from either leg, and a listing under the prefix merges both; keys
+// outside the scope in the same hash range stay where they are.
+func TestScopedMoveThroughTheProxy(t *testing.T) {
+	m := newMixedRig(t, nil)
+	spread(t, m)
+	if err := m.dir.Carve(context.Background(), "acme", "spread", "archive/", "test"); err != nil {
+		t.Fatal(err)
+	}
+	p0, _ := m.dir.Snapshot().Lookup("acme", "spread")
+	// Keys hashing into garage's range of archive/: one written before the move, one after; and a
+	// key outside archive/ in the same range.
+	var before, after, outside string
+	for i := 0; before == "" || after == "" || outside == ""; i++ {
+		for _, k := range []string{fmt.Sprintf("archive/%03d", i), fmt.Sprintf("data/%03d", i)} {
+			if id, _ := migrate.OwnerOf(p0, k); id != "garage" {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(k, "data/") && outside == "":
+				outside = k
+			case strings.HasPrefix(k, "archive/") && before == "":
+				before = k
+			case strings.HasPrefix(k, "archive/") && after == "":
+				after = k
+			}
+		}
+	}
+	if r := m.acme(t, "PUT", "/spread/"+before, []byte("old")); r.StatusCode != 200 {
+		t.Fatalf("PUT %s: %d", before, r.StatusCode)
+	}
+	f := m.dir.Snapshot().File()
+	p := f.Placements["acme/spread"]
+	var garageRange directory.HashRange
+	for _, o := range p.Prefixes[0].Owners {
+		if o.Leg == "garage" {
+			garageRange = directory.HashRange{From: o.From, To: o.To}
+		}
+	}
+	p.State, p.Move = directory.StateMigrating, &directory.Move{Scope: "archive/", Range: garageRange, From: "garage", To: "minio"}
+	f.Placements["acme/spread"] = p
+	f.Version++
+	body, err := yaml.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.WriteAtomic(m.dirPath, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.dir.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{after, outside} {
+		if r := m.acme(t, "PUT", "/spread/"+k, []byte("new")); r.StatusCode != 200 {
+			t.Fatalf("PUT %s: %d %s", k, r.StatusCode, r.body)
+		}
+	}
+	if !m.minio.holds("spread-m", after) || m.garage.holds("spread-g", after) {
+		t.Fatalf("%s is in the moving scope and range: it belongs on minio", after)
+	}
+	if !m.garage.holds("spread-g", outside) || m.minio.holds("spread-m", outside) {
+		t.Fatalf("%s is outside the moving scope: it stays on garage", outside)
+	}
+	if r := m.acme(t, "GET", "/spread/"+before, nil); r.StatusCode != 200 || string(r.body) != "old" {
+		t.Fatalf("GET %s, written before the move: %d %s", before, r.StatusCode, r.body)
+	}
+	r := m.acme(t, "GET", "/spread?list-type=2&prefix=archive/", nil)
+	if got := listKeys(t, r.body, "Key"); !slices.Contains(got, before) || !slices.Contains(got, after) || len(got) != 2 {
+		t.Fatalf("listing archive/ during the move: %v", got)
 	}
 }

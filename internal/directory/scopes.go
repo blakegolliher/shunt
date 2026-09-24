@@ -70,6 +70,64 @@ func (p *Placement) parentTable(prefix string) []Owner {
 	return p.Prefixes[best].Owners
 }
 
+// scopeTable is the owners table of scope: the placement's own for "", a rule's otherwise.
+func (p *Placement) scopeTable(scope string) ([]Owner, bool) {
+	if scope == "" {
+		return p.Owners, true
+	}
+	for i := range p.Prefixes {
+		if p.Prefixes[i].Prefix == scope {
+			return p.Prefixes[i].Owners, true
+		}
+	}
+	return nil, false
+}
+
+// setScopeTable replaces scope's owners table.
+func (p *Placement) setScopeTable(scope string, owners []Owner) {
+	if scope == "" {
+		p.Owners = owners
+		return
+	}
+	for i := range p.Prefixes {
+		if p.Prefixes[i].Prefix == scope {
+			p.Prefixes[i].Owners = owners
+		}
+	}
+}
+
+// OwnsBeyond reports whether leg owns any key outside the range rg of scope: in another scope, or
+// elsewhere in this one. Purge keeps a move's source bucket, and finish is refused, while it does.
+func OwnsBeyond(p *Placement, leg, scope string, rg HashRange) bool {
+	if scope != "" || len(p.Prefixes) > 0 {
+		for _, s := range append([]string{""}, prefixesOf(p)...) {
+			if s == scope {
+				continue
+			}
+			if t, _ := p.scopeTable(s); slices.ContainsFunc(t, func(o Owner) bool { return o.Leg == leg }) {
+				return true
+			}
+		}
+	}
+	t, _ := p.scopeTable(scope)
+	return slices.ContainsFunc(t, func(o Owner) bool { return o.Leg == leg && (o.From < rg.From || o.To > rg.To) })
+}
+
+func prefixesOf(p *Placement) []string {
+	out := make([]string, 0, len(p.Prefixes))
+	for _, r := range p.Prefixes {
+		out = append(out, r.Prefix)
+	}
+	return out
+}
+
+func scopeText(scope string) string {
+	if scope == "" {
+		return ""
+	}
+	return fmt.Sprintf(" of the keys under %q", scope)
+}
+
 // ownsKeys reports whether leg owns a range in any scope of p.
 func (p *Placement) ownsKeys(leg string) bool {
 	owns := func(o Owner) bool { return o.Leg == leg }

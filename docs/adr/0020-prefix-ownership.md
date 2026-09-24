@@ -1,6 +1,6 @@
 # ADR-0020: prefix ownership in a spread bucket
 
-Status: proposed (2026-09-23); P1 built (2026-09-23). Decisions confirmed 2026-09-23: scopes by
+Status: proposed (2026-09-23); P1 and P2 built (2026-09-23). Decisions confirmed 2026-09-23: scopes by
 longest match, each with its own table; the caps below; the CLI names below; a move's ramp by
 ratio only. Amends ADR-0018 (its "Prefix rules" open question). Branch:
 `1-to-n-bucket-support`.
@@ -128,6 +128,35 @@ A side benefit: a listing under a prefix that one leg owns needs to read only th
   reading the other leg; it fails with the scope ignored in OwnerOf, and with every leg listed.
   Control and CLI tests carve, show, refuse a move, and merge back to the plain bucket. Cost:
   `Scope` over 64 rules is 444 ns, `OwnerOf` with 3 rules 82 ns, no allocation.
+
+## P2 as built (2026-09-23): moves within a scope
+
+- **`move.scope`** names the rule whose table a move changes (`Transition.Scope`; `scope` on ramp and
+  migrate start; `--scope` on the CLI). `InMove` is now "the key's scope is the move's scope, and
+  its hash is in the range"; every caller already went through it (P1), so the proxy, the listing
+  merge, the mover and purge changed with it and nothing else did. The decoder checks the scope is
+  a rule and the range lies inside one leg's range of that rule's table.
+- **Start and end** read and write the scope's table: `--leg` takes that leg's first range there,
+  a scope one leg owns moves whole with no range or leg, and the end reassigns the range in the
+  scope's table. A source leg is dropped only when it owns nothing in any scope
+  (`directory.OwnsBeyond` counts every scope); purge keeps its bucket, and finish is refused, while
+  it owns keys anywhere.
+- **Reads only the prefix.** The mover lists the source with `prefix=<scope>`, and purge's listing
+  diff, deletes and its in-flight-upload count do too; keys of nested rules, which such a listing
+  also returns, are filtered out by `InMove`.
+- **Refused:** a move of a prefix with no rule (carve it first), a prefix ramp inside a scoped move
+  (ratio only), another scope or leg while a move is in progress, and carve or merge while any
+  move is in progress.
+- **Proof.** The fleet property test's scoped run carves `f/0` with nested `f/00` and `f/03` over
+  the clients' keys `f/000`–`f/047` and moves `f/0` to minio through every ramp step with B cut off
+  midway: 5 runs, 158,095 client operations, 0 violations, 7 of 7 steps held in each; minio never
+  held a key of the nested rules. The negative control (no fence) found violations in every run.
+  With `InMove` ignoring scope the client's view stays consistent (every path agrees on the wrong
+  set) but the nested keys reach minio, which the run reports. A directory test consolidates a
+  scope from two legs onto a third, leaving the rest of the bucket and a nested rule unchanged,
+  then moves it back whole; a control test moves `archive/` through purge, which lists only
+  `archive/` (it fails with the prefix removed) and deletes only its keys; proxy, mover and CLI
+  tests cover routing, listing and the flags.
 
 ## Open questions
 

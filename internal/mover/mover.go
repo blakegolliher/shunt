@@ -68,6 +68,8 @@ type job struct {
 	// keep, for a move of part of a bucket (ADR-0018 N3), is the moving range: the source leg also
 	// holds keys it keeps, which are never copied. Nil copies every key.
 	keep func(key string) bool
+	// prefix, for a move within a prefix rule (ADR-0020), is the only part of the source listed.
+	prefix string
 }
 
 // LedgerEntry is one row of a run's append-only record, in the order the mover wrote it.
@@ -152,10 +154,12 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 	for _, key := range keys {
 		p := dir.Placements[key]
 		var keep func(string) bool
+		prefix := ""
 		if m := p.Move; m != nil {
 			// Part of a bucket moves: the move's two legs, and only the keys in its range (ADR-0018 N3).
 			spread := p
 			keep = func(k string) bool { return migrate.InMove(&spread, k) }
+			prefix = m.Scope
 			p = p.MoveView()
 		}
 		tenant, name, _ := strings.Cut(key, "/")
@@ -199,6 +203,7 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 			// Never assumed: a target that ignores If-Match on DELETE would delete a newer write.
 			condDelete: dir.Clusters[dstName].Capabilities.ConditionalDeleteOr(false),
 			keep:       keep,
+			prefix:     prefix,
 		})
 	}
 	return jobs, nil
@@ -224,7 +229,7 @@ func move(ctx context.Context, j job, paths Paths, dryRun bool, out, errOut io.W
 	var token *string
 	for {
 		page, err := j.src.cl.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket: &j.src.bucket, ContinuationToken: token, StartAfter: optional(after),
+			Bucket: &j.src.bucket, ContinuationToken: token, StartAfter: optional(after), Prefix: optional(j.prefix),
 		})
 		if err != nil {
 			return s, fmt.Errorf("list %s: %w", j.src.bucket, err)

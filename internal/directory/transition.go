@@ -34,6 +34,9 @@ type Transition struct {
 	// first range that leg owns (ADR-0018 N3c). Moving a leg's keys to another leg, one leg at a time,
 	// consolidates a bucket; later steps of the move name the same leg or none.
 	Leg string
+	// Scope, leaving ACTIVE, is the prefix rule whose keys move (ADR-0020); "" the keys no rule
+	// claims. Range and Leg are then read in that rule's table.
+	Scope string
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -89,7 +92,7 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		}
 		t.Leg = "" // the one leg of a plain bucket is all of it
 	}
-	if p.Spread() || t.Range != nil {
+	if p.Spread() || t.Range != nil || t.Scope != "" {
 		return applyMove(p, t)
 	}
 	if t.Release {

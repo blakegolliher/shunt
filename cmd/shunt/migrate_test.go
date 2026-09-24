@@ -533,4 +533,29 @@ func TestCarveAndMergeThroughTheCLI(t *testing.T) {
 	if out := rg.must(t, "status", "--all"); strings.Contains(out, "spread over") || !strings.Contains(out, "vast01/data01") {
 		t.Fatalf("status after merging: %s", out)
 	}
+	if out := rg.must(t, "expand", "acme/data01", "--carve", "archive/"); !strings.Contains(out, "carved") {
+		t.Fatalf("carve again: %s", out)
+	}
+	// A move of the rule's keys (P2): the whole scope, which one leg owns, to vast02.
+	rg.addCluster(t, "vast02", rg.ep02)
+	out = rg.must(t, "ramp", "acme/data01", "--scope", "archive/", "--to", "vast02", "--name", "data01-arch", "--create", "--ratio", "0.5")
+	if !strings.Contains(out, `only keys under "archive/" (no longer prefix rule claims them) whose hash is in 0000000000000000-ffffffffffffffff move`) {
+		t.Fatalf("ramp --scope: %s", out)
+	}
+	out = rg.must(t, "status", "acme/data01")
+	row := func(prefix, want string) bool {
+		for _, l := range strings.Split(out, "\n") {
+			if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, prefix+" vast01 ") {
+				return strings.Contains(f, want)
+			}
+		}
+		return false
+	}
+	if !row("archive/", "data01 100.0% 0000000000000000-ffffffffffffffff out to vast02: 0000000000000000-ffffffffffffffff (100.0% of its keys)") ||
+		!row("(other keys)", "data01 100.0% 0000000000000000-ffffffffffffffff -") {
+		t.Fatalf("status during the scoped move:\n%s", out)
+	}
+	if out, err := rg.cli(t, "expand", "acme/data01", "--merge", "archive/"); err == nil || !strings.Contains(out, "only at rest") {
+		t.Fatalf("merge during the move: %v %s", err, out)
+	}
 }

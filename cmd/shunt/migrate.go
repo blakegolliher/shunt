@@ -571,13 +571,14 @@ func newRamp() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
-	addMoveFlags(cmd, &rangeText, &req.Leg)
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
 }
 
 // addMoveFlags adds the flags that make a first step move part of a bucket (ADR-0018 N3).
-func addMoveFlags(cmd *cobra.Command, rangeText, leg *string) {
+func addMoveFlags(cmd *cobra.Command, rangeText, leg, scope *string) {
 	f := cmd.Flags()
+	f.StringVar(scope, "scope", "", "move keys of this prefix rule (shunt expand --carve made it); --range and --leg are read in its table, and a rule one leg owns moves whole (ADR-0020)")
 	f.StringVar(rangeText, "range", "", "move only the keys whose hash is in `from-to` (16 hex digits each, inclusive), out of the one leg that owns them")
 	f.StringVar(leg, "leg", "", "move the keys of this leg of a spread bucket (its first range; repeat per range); consolidating a bucket is this, once per other leg")
 }
@@ -642,7 +643,7 @@ func newMigrateStart() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
 	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
-	addMoveFlags(cmd, &rangeText, &req.Leg)
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
 }
 
@@ -927,8 +928,12 @@ func legRows(tw io.Writer, p *control.PlacementStatus, prefix string, legs []con
 			ranges = append(ranges, "none here")
 		}
 		moving := "-"
-		if m := p.Move; m != nil && prefix == "" {
-			rg := fmt.Sprintf("%016x-%016x (%.1f%% of keys)", uint64(m.Range.From), uint64(m.Range.To), 100*m.Share)
+		if m := p.Move; m != nil && prefix == m.Scope {
+			of := "keys"
+			if m.Scope != "" {
+				of = "its keys"
+			}
+			rg := fmt.Sprintf("%016x-%016x (%.1f%% of %s)", uint64(m.Range.From), uint64(m.Range.To), 100*m.Share, of)
 			switch l.ID {
 			case m.From:
 				moving = "out to " + m.To + ": " + rg
@@ -961,7 +966,11 @@ func transition(cmd *cobra.Command, api *apiClient, o apiOptions, key, kind stri
 	}
 	_, _ = fmt.Fprintf(out, "%s: %s -> %s (directory version %d)\n", shown(res.Key), res.From, res.To, res.Version)
 	if rg := res.Range; rg != nil {
-		_, _ = fmt.Fprintf(out, "only keys whose hash is in %016x-%016x move; the ratio is a share of that range\n", uint64(rg.From), uint64(rg.To))
+		under := ""
+		if res.Scope != "" {
+			under = fmt.Sprintf(" under %q (no longer prefix rule claims them)", res.Scope)
+		}
+		_, _ = fmt.Fprintf(out, "only keys%s whose hash is in %016x-%016x move; the ratio is a share of that range\n", under, uint64(rg.From), uint64(rg.To))
 	}
 	switch res.To {
 	case directory.StateRamping:

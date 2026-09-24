@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -253,8 +254,11 @@ func TestPrefixRulesRefusalsAndCaps(t *testing.T) {
 		t.Fatalf("a bucket at the cap: %v", err)
 	}
 	p := f.Placements["acme/spr"]
-	if _, err := Apply(p, Transition{To: StateRamping, Target: "cold", Name: "x", Leg: "garage", Ratio: 0.5}); err == nil || !strings.Contains(err.Error(), "ADR-0020 P2") {
-		t.Fatalf("a move in a bucket with rules: %v", err)
+	if _, err := Apply(p, Transition{To: StateRamping, Target: "cold", Name: "xyz", Leg: "garage", Scope: "nope/", Ratio: 0.5}); err == nil || !strings.Contains(err.Error(), "carve it first") {
+		t.Fatalf("a move of a prefix with no rule: %v", err)
+	}
+	if _, err := Apply(p, Transition{To: StateRamping, Target: "cold", Name: "xyz", Leg: "garage", Scope: "a/", Prefixes: []string{"a/b"}}); err == nil || !strings.Contains(err.Error(), "ratio only") {
+		t.Fatalf("a move within a rule by prefix: %v", err)
 	}
 	// A leg owning keys only under a rule is not idle: expand --clear must not retire it.
 	q := Placement{State: StateActive, Legs: threeLegs(), KeyHash: RampHash, Owners: EvenOwners([]string{"garage", "minio"}),
@@ -308,5 +312,79 @@ func TestPrefixesSampleRoundTrips(t *testing.T) {
 	back, err := parse(body)
 	if err != nil || !reflect.DeepEqual(back.Placements["acme/scoped"], p) {
 		t.Fatalf("YAML round trip: %v\n%s", err, body)
+	}
+}
+
+// A move within a scope (ADR-0020 P2): archive/ is carved in a bucket split over garage and minio,
+// and its keys are consolidated onto a new leg on cold, one move per leg. Only archive/'s table
+// changes; the rest of the bucket, and the legs that keep its keys, are untouched.
+func TestMoveWithinAScope(t *testing.T) {
+	f := &File{Clusters: sampleClusters(t), Tenants: map[string]Tenant{"acme": {DefaultCluster: "garage"}}, Placements: map[string]Placement{}}
+	if err := f.CreateSpread("acme", "spr", []Leg{{Cluster: "garage", Bucket: "spr-g"}, {Cluster: "minio", Bucket: "spr-m"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Carve("acme", "spr", "archive/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Carve("acme", "spr", "archive/keep/"); err != nil {
+		t.Fatal(err)
+	}
+	p := f.Placements["acme/spr"]
+	rest := slices.Clone(p.Owners)
+	ev := &CutoverEvidence{At: time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC), Window: time.Minute}
+	for i, leg := range []string{"garage", "minio"} {
+		p = step(t, p, Transition{To: StateRamping, Target: "cold", Name: "spr-c", Scope: "archive/", Leg: leg, Ratio: 0.5})
+		if p.Move.Scope != "archive/" || p.Move.From != leg || p.Move.To != "cold" {
+			t.Fatalf("move %d: %+v", i, p.Move)
+		}
+		f.Placements["acme/spr"] = p
+		if err := validate(f); err != nil {
+			t.Fatalf("move %d while ramping: %v", i, err)
+		}
+		if err := f.Carve("acme", "spr", "logs/"); err == nil || !strings.Contains(err.Error(), "only at rest") {
+			t.Fatalf("carve during a move: %v", err)
+		}
+		for name, tr := range map[string]Transition{
+			"another scope":   {To: StateRamping, Ratio: 1, Scope: "archive/keep/"},
+			"ramp by prefix":  {To: StateRamping, Ratio: 1, Prefixes: []string{"archive/x"}},
+			"another leg now": {To: StateRamping, Ratio: 1, Leg: "cold"},
+		} {
+			if _, err := Apply(p, tr); err == nil {
+				t.Errorf("move %d, %s: accepted", i, name)
+			}
+		}
+		p = step(t, p, Transition{To: StateRamping, Ratio: 1})
+		p = step(t, p, Transition{To: StateMigrating})
+		p = step(t, p, Transition{To: StateCutover, Cutover: ev})
+		p = step(t, p, Transition{To: StateActive})
+		if !OwnsBeyond(&p, leg, "archive/", FullRange) {
+			t.Fatalf("leg %s keeps the rest of the bucket, but OwnsBeyond says it does not", leg)
+		}
+	}
+	if len(p.Legs) != 3 || !reflect.DeepEqual(p.Owners, rest) {
+		t.Fatalf("the rest of the bucket changed: legs %v owners %+v", p.Legs, p.Owners)
+	}
+	if got := p.Prefixes[0]; got.Prefix != "archive/" || len(got.Owners) != 1 || got.Owners[0].Leg != "cold" || got.Owners[0].From != 0 || got.Owners[0].To != FullRange.To {
+		t.Fatalf("archive/ after consolidating: %+v", got)
+	}
+	if nested := p.Prefixes[1]; nested.Prefix != "archive/keep/" || !reflect.DeepEqual(nested.Owners, rest) {
+		t.Fatalf("the nested rule changed: %+v", nested)
+	}
+	if ownerAt(&p, "archive/x", 12345) != "cold" || ownerAt(&p, "archive/keep/x", 0) != "garage" {
+		t.Fatal("owners after the moves")
+	}
+	f.Placements["acme/spr"] = p
+	if err := validate(f); err != nil {
+		t.Fatal(err)
+	}
+	// Moving archive/ back into garage whole needs no range: one leg owns the scope.
+	q := step(t, p, Transition{To: StateMigrating, Target: "garage", Name: "spr-g", Scope: "archive/"})
+	if q.Move.From != "cold" || q.Move.Range != FullRange {
+		t.Fatalf("a scope one leg owns moves whole: %+v", q.Move)
+	}
+	q = step(t, q, Transition{To: StateCutover, Cutover: ev})
+	q = step(t, q, Transition{To: StateActive})
+	if _, kept := q.Legs["cold"]; kept {
+		t.Fatalf("cold owns nothing after archive/ left it, but was kept: %+v", q.Legs)
 	}
 }
