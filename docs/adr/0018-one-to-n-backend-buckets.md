@@ -271,9 +271,8 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
 
 ## Open questions
 
-- **Prefix rules.** Today a ramp may go by prefix (`runs/2026-09/`). Ownership here is by hash only.
-  Either ownership rules become an ordered list of prefix-or-range → leg (more expressive, harder to
-  validate as a partition), or prefix rules survive only inside a move's ramp.
+- **Prefix rules.** Decided (2026-09-23): wanted. Designed in ADR-0020 (proposed): scopes by
+  longest matching prefix, each with its own hash table of owners.
 - **`start-after` across backends.** Measured on Garage, MinIO and VAST (2026-09-23,
   docs/reference/backend-compat.md); AWS is not measured.
 - **The listing target** that would justify raising the cap: a p99 for a 1 000-key page at N legs,
