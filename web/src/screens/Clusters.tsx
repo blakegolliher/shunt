@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, setClusterReadOnly } from '../api/client'
+import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, setClusterReadOnly, setTenantDefault } from '../api/client'
 import type { ClusterInput, ClusterProbeResult, ClusterStatus, ClusterView, RemoveDryRun } from '../api/client'
 import { Card } from '../components/Card'
 import { Drawer } from '../components/Drawer'
@@ -36,6 +36,7 @@ export function Clusters() {
   const [history, setHistory] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
   const [removal, setRemoval] = useState<RemoveDryRun | null>(null)
+  const [newDefault, setNewDefault] = useState<Record<string, string>>({}) // tenant → the cluster chosen to replace this one as its default
 
   useEffect(() => {
     let live = true
@@ -90,7 +91,14 @@ export function Clusters() {
       {detail ? <div className="space-y-6">
         <div className="grid grid-cols-2 gap-3 text-sm"><div><p className="text-muted">Endpoint</p><p className="mt-1 font-mono">{detail.scheme}://{detail.endpoints.join(', ')}</p></div><div><p className="text-muted">Health history</p><Sparkline values={history.length ? history : [detail.probe.latency_ms]} label={`${detail.name} latency history`} /></div></div>
         <Card title="Capability profile"><dl className="grid gap-3 text-sm">{Object.entries(detail.capabilities).map(([name, value]) => <div key={name} className="flex justify-between"><dt className="text-muted">{name.replaceAll('_', ' ')}</dt><dd>{String(value.value)} · {value.known ? 'measured' : 'assumed'}</dd></div>)}</dl></Card>
-        <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => <li key={ref} className="font-mono">{ref}</li>)}</ul> : <p className="text-sm text-muted">Nothing references this cluster.</p>}</Card>
+        <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => {
+          // A tenant defaulting to this cluster blocks its removal; the fix is here, not on another screen.
+          const tenant = /^tenants\.(.+)\.default_cluster$/.exec(ref)?.[1]
+          const others = clusters.filter((c) => c.name !== detail.name)
+          if (!tenant) return <li key={ref} className="font-mono">{ref}</li>
+          const choice = newDefault[tenant] ?? others[0]?.name ?? ''
+          return <li key={ref}><span className="font-mono">{ref}</span><span className="mt-1 block text-xs text-muted">New buckets of tenant {tenant} are created on {detail.name}.</span>{others.length > 0 && <div className="mt-2 flex flex-wrap items-center gap-2"><select aria-label={`New default cluster for tenant ${tenant}`} value={choice} onChange={(event) => setNewDefault((old) => ({ ...old, [tenant]: event.target.value }))} className="rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm">{others.map((c) => <option key={c.name}>{c.name}</option>)}</select><button type="button" disabled={busy || !choice} onClick={() => void act(() => setTenantDefault(token, tenant, choice), `${choice} is now tenant ${tenant}'s default cluster`).then((ok) => { if (ok) setRemoval(null) })} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Make it tenant {tenant}'s default</button></div>}</li>
+        })}</ul> : <p className="text-sm text-muted">Nothing references this cluster.</p>}</Card>
         <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => void act(() => setClusterReadOnly(token, detail.name, !detail.read_only), `Cluster ${detail.name} is ${detail.read_only ? 'writable' : 'read-only'}`)} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { setBusy(true); void removeClusterDryRun(token, detail.name).then(setRemoval).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')).finally(() => setBusy(false)) }} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white">Remove cluster</button></div>
         {removal && <div className="rounded-lg border border-red-600/60 bg-red-950/20 p-4 text-sm"><p className="font-semibold">Dry run</p><p className="mt-2 text-red-100">{removal.allowed ? `Will remove ${removal.name} and ${removal.secret_files} stored secret file(s).` : removal.reason}</p>{removal.allowed && removal.token && <button type="button" className="mt-4 rounded-lg bg-red-600 px-4 py-2 font-semibold text-white" disabled={busy} onClick={() => void act(() => removeCluster(token, detail.name, removal.token ?? ''), `Cluster ${detail.name} removed`).then((ok) => { if (ok) { setSelected(null); setRemoval(null) } })}>Confirm removal</button>}</div>}
       </div> : <p className="text-muted">Loading cluster detail…</p>}
