@@ -62,4 +62,5 @@ jobs:
           cat test/e2e/data/fleet/c1.log test/e2e/data/fleet/c2.log test/e2e/data/fleet/c3.log test/e2e/data/fleet/a.log test/e2e/data/fleet/b.log test/e2e/data/fleet/writer.log || true
       - name: e2e down
         if: always()
-        run: make e2e-down COMPOSE="docker compose"
+        # Docker runs the backends as root, so the data they wrote into the bind mounts is root's.
+        run: make e2e-down COMPOSE="docker compose" E2E_RM="sudo rm -rf"
