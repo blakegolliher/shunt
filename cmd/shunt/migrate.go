@@ -718,8 +718,12 @@ func newPurgeSource() *cobra.Command {
 			case o.json && dryRun:
 				return printJSON(cmd, plan)
 			case !o.json:
-				_, _ = fmt.Fprintf(out, "%s: would delete %d objects (%s) and abort %d in-flight uploads from %s/%s, then forget the source\n",
-					shown(plan.Key), plan.Objects, humanBytes(plan.Bytes), plan.UploadsInFlight, plan.Source, plan.Bucket)
+				then := "then forget the source"
+				if plan.KeepsBucket {
+					then = "and keep the bucket, which holds the rest of the bucket's keys"
+				}
+				_, _ = fmt.Fprintf(out, "%s: would delete %d objects (%s) and abort %d in-flight uploads from %s/%s, %s\n",
+					shown(plan.Key), plan.Objects, humanBytes(plan.Bytes), plan.UploadsInFlight, plan.Source, plan.Bucket, then)
 			}
 			if dryRun {
 				return nil
@@ -732,8 +736,12 @@ func newPurgeSource() *cobra.Command {
 			if o.json {
 				return printJSON(cmd, res)
 			}
-			_, err = fmt.Fprintf(out, "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, deleted the bucket; ACTIVE on its primary (directory version %d)\n",
-				shown(res.Key), res.ObjectsDeleted, res.UploadsAborted, res.Source, res.Bucket, res.Version)
+			bucket := "deleted the bucket; ACTIVE on its primary"
+			if !res.BucketDeleted {
+				bucket = "kept the bucket, which holds the rest of the bucket's keys; ACTIVE"
+			}
+			_, err = fmt.Fprintf(out, "%s: listing diff empty; deleted %d objects and aborted %d uploads from %s/%s, %s (directory version %d)\n",
+				shown(res.Key), res.ObjectsDeleted, res.UploadsAborted, res.Source, res.Bucket, bucket, res.Version)
 			return err
 		},
 	}

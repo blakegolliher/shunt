@@ -200,6 +200,15 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   negative controls, control and CLI tests; lint and race suite green (internal/cp's etcd join
   flake, "incompatible with current running cluster", recurred in two runs and passed on rerun).
   Next: P2, moves within a scope.
+- **ADR-0020 P2 built (2026-09-23): moves within a prefix rule.** `--scope` on ramp and migrate
+  start; move membership is scope and range; the mover and purge list only the prefix. Gate: fleet
+  property test's scoped run with nested rules, 5 runs, 158,095 client operations, 0 violations,
+  negative control failing every run, and a stray check that catches a move ignoring scope;
+  directory, control (purge lists only the prefix), proxy, mover and CLI tests. **Live:** `archive/`
+  carved in `n4-live` under load and half of it moved minio01 → minio02 under three verify runs:
+  309,059 operations, 0 errors, holds retried equal to the proxies' 59 + 72. Fixed on the way:
+  purge-source reported "deleted the bucket" for a purge of part of a bucket, which keeps it.
+  Next: P3 (UI; the CLI landed in P1 and P2).
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

@@ -157,6 +157,16 @@ A side benefit: a listing under a prefix that one leg owns needs to read only th
   then moves it back whole; a control test moves `archive/` through purge, which lists only
   `archive/` (it fails with the prefix removed) and deletes only its keys; proxy, mover and CLI
   tests cover routing, listing and the flags.
+- **Live (2026-09-23), demo fleet (3 control nodes, 2 proxies, two MinIOs), through the CLI:**
+  `n4-live`, spread over minio01 and minio02, had `archive/` carved under load and its minio01
+  range moved to minio02 (`ramp --scope archive/ --leg minio01`, 25/60/100%, migrate, mover
+  converged, cutover, purge) under three `shunt verify` runs: two under `archive/`, one per proxy,
+  and one outside it. 309,059 operations, **0 errors**; 131 holds retried, exactly the 59 + 72 the
+  proxies counted, and none on the run outside the scope. Afterwards minio01 held no `archive/` key
+  and all 20 of its other keys, minio02 all 100 seeded `archive/` objects, and every seeded object
+  read back identical. The run found a false message: `purge-source` said "deleted the bucket"
+  after any purge, including one of part of a bucket that keeps its bucket (since ADR-0018 N3a);
+  results now carry `bucket_deleted` and dry runs `keeps_bucket`, and the CLI says which.
 
 ## Open questions
 

@@ -1235,8 +1235,8 @@ func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
-	if ok, _ := rg.vast01.be.BucketExists("data01"); ok {
-		t.Fatal("the source leg owns nothing, but its bucket was kept")
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok || !pg.BucketDeleted {
+		t.Fatalf("the source leg owns nothing, but its bucket was kept (bucket_deleted %v)", pg.BucketDeleted)
 	}
 	p, _ = rg.dir.Snapshot().Lookup("acme", "data01")
 	if p.Spread() || p.Primary != "vast02" || p.Names["vast02"] != "data01-b" || len(p.Names) != 1 {
@@ -1479,13 +1479,13 @@ func TestScopedMoveThroughTheAPI(t *testing.T) {
 	rg.vast01.listMu.Unlock()
 	var dry PurgeDryRun
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
-	if !dry.Allowed || dry.Objects != len(archive) || dry.Bucket != "data01" {
+	if !dry.Allowed || dry.Objects != len(archive) || dry.Bucket != "data01" || !dry.KeepsBucket {
 		t.Fatalf("dry run: %+v", dry)
 	}
 	var pg PurgeResult
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
-	if pg.ObjectsDeleted != len(archive) {
-		t.Fatalf("purge deleted %d objects; archive/ has %d", pg.ObjectsDeleted, len(archive))
+	if pg.ObjectsDeleted != len(archive) || pg.BucketDeleted {
+		t.Fatalf("purge deleted %d objects (archive/ has %d), bucket deleted %v", pg.ObjectsDeleted, len(archive), pg.BucketDeleted)
 	}
 	rg.vast01.listMu.Lock()
 	listed := slices.Clone(rg.vast01.listed)

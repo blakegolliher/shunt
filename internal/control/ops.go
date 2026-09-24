@@ -1001,8 +1001,11 @@ type PurgeResult struct {
 	Bucket         string `json:"bucket"`
 	ObjectsDeleted int    `json:"objects_deleted"`
 	UploadsAborted int    `json:"uploads_aborted"`
-	Version        int64  `json:"version"`
-	Operation      string `json:"operation,omitempty"`
+	// BucketDeleted is false when the source's leg keeps other keys of the bucket (a move of part
+	// of it, ADR-0018 N3 and ADR-0020): only the moved keys were deleted, and the bucket stays.
+	BucketDeleted bool   `json:"bucket_deleted"`
+	Version       int64  `json:"version"`
+	Operation     string `json:"operation,omitempty"`
 }
 
 // PurgeDryRun is what purge-source would do (ADR-0017): every check the real call makes, the
@@ -1016,7 +1019,8 @@ type PurgeDryRun struct {
 	Objects         int       `json:"objects"`
 	Bytes           int64     `json:"bytes"`
 	UploadsInFlight int       `json:"uploads_in_flight"`
-	Missing         []string  `json:"missing"` // source keys the primary lacks, first 20
+	KeepsBucket     bool      `json:"keeps_bucket,omitempty"` // the source's leg keeps other keys: only the moved ones go
+	Missing         []string  `json:"missing"`                // source keys the primary lacks, first 20
 	Version         int64     `json:"version"`
 	Token           string    `json:"token,omitempty"`
 	ExpiresAt       time.Time `json:"expires_at,omitzero"`
@@ -1129,6 +1133,7 @@ func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDr
 	plan, err := s.purgeChecks(tr, key, wait)
 	pv := moving(plan.p)
 	res.Source, res.Bucket, res.Objects, res.Bytes = pv.ClusterOf(pv.Source), plan.srcBucket, plan.objects, plan.bytes
+	res.KeepsBucket = plan.p.Move != nil && !plan.dropBucket
 	if plan.missing != nil {
 		res.Missing = plan.missing
 	}
@@ -1201,7 +1206,7 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	pv := moving(p)
 	s.info(tr.actor, "source purged", "placement", key, "cluster", pv.ClusterOf(pv.Source), "bucket", plan.srcBucket, "objects_deleted", objects, "uploads_aborted", uploads,
 		"bucket_deleted", plan.dropBucket, "state", directory.StateActive, "primary", pv.ClusterOf(pv.Primary), "version", v)
-	return PurgeResult{Key: key, Source: pv.ClusterOf(pv.Source), Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, Version: v, Operation: tr.id()}, nil
+	return PurgeResult{Key: key, Source: pv.ClusterOf(pv.Source), Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, BucketDeleted: plan.dropBucket, Version: v, Operation: tr.id()}, nil
 }
 
 // finish drops the source from a CUTOVER placement without touching its data.
