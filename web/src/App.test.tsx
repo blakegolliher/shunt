@@ -23,6 +23,7 @@ beforeEach(() => {
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json(fleet)
     if (url.endsWith('/v1/fleet/proxy-b')) return Response.json({ ...fleet.members[1], directory: 12, lineage: true, behind: 0, backpressure: false,
+      lease: { granted: 3e9, seq: 4, age: 7e8, live: true },
       secrets: [{ cluster: 'vast01', want: '12', have: '11', current: false }], problems: ['restart cache at version 11, behind the 12 it serves'] })
     if (url.endsWith('/v1/status?all=1')) return Response.json(directory)
     if (url.endsWith('/v1/audit?limit=100')) return Response.json({ changes: [{ ts: '2026-09-22T12:00:00Z', actor: 'token:abc123def456', op: 'set-target', key: 'default/ui-demo', version: 12 }] })
@@ -49,6 +50,8 @@ test('opens a proxy and shows what is off with its install', async () => {
   fireEvent.click(await screen.findByText('proxy-b'))
   expect(await screen.findByText('restart cache at version 11, behind the 12 it serves')).toBeInTheDocument()
   expect(screen.getByText('generation 11 (control holds 12)')).toBeInTheDocument()
+  // The lease as the control plane grants it (T07): the grant, the heartbeat it answered and its age.
+  expect(screen.getByText(/grants 3 s per heartbeat; heartbeat 4 seen 0\.7 s ago/)).toBeInTheDocument()
 })
 
 test('shows the live audit tail instead of a placeholder screen', async () => {

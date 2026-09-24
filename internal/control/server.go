@@ -52,8 +52,10 @@ type Server struct {
 	// ClusterSecrets resolves the cluster secret_refs only the control plane can (control:<name>),
 	// for GET /v1/directory and the mover. nil: every ref resolves on the reader's own host.
 	ClusterSecrets func() map[string]string
-	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab.
-	Fleet Fleet
+	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab. LeaseTTL is the grant
+	// every heartbeat answer carries, for the diagnostics.
+	Fleet    Fleet
+	LeaseTTL time.Duration
 	// FencePoll is how often a fenced change re-reads the fleet; default 100ms.
 	FencePoll time.Duration
 	Log       *slog.Logger

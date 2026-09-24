@@ -319,6 +319,10 @@ export interface ProxyDiagnostics extends ProxyMember {
   behind: number
   backpressure: boolean
   secrets: { cluster: string; want: string; have: string; current: boolean }[]
+  // lease is the member's lease as the control plane grants it: granted is the TTL in nanoseconds,
+  // seq the last heartbeat recorded, age how long ago it arrived (nanoseconds, the control node's
+  // clock). The member measures its own staleness from its send time.
+  lease: { granted: number; seq: number; seen?: string; age?: number; live: boolean }
   problems: string[]
 }
 export const getProxyDiagnostics = (token: string, id: string) => request<ProxyDiagnostics>(`/v1/fleet/${encodeURIComponent(id)}`, token)

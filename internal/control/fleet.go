@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -159,9 +160,43 @@ type Heartbeat struct {
 	// strings: what it signs with since its last install (ADR-0021 D1). A cluster the control plane
 	// holds no secret for is absent.
 	Secrets map[string]string `json:"secrets,omitempty"`
+	// Barriers is the member's drain proof for every barrier in its installed directory
+	// (ADR-0021 D2): whether it has closed the barrier's gates, and how many requests are still
+	// out and how many backend outcomes it never learned through them. Bounded by barriers in
+	// flight; a member drops its telemetry window before any of this when a heartbeat would pass
+	// the size cap.
+	Barriers []admission.Ack `json:"barriers,omitempty"`
 	// Telemetry is the member's last completed 10-second window. It is re-sent until the next
 	// window closes, and the control node de-duplicates it by proxy and start time.
 	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
+}
+
+// MaxBarrierAcks bounds the acknowledgements one heartbeat carries: unfinished operations are
+// capped (DefaultCapacity), so a member reporting more is malformed.
+const MaxBarrierAcks = 4096
+
+// validateAcks checks a heartbeat's barrier acknowledgements: bounded, well-formed, no negative
+// counts (T20).
+func validateAcks(acks []admission.Ack) error {
+	if len(acks) > MaxBarrierAcks {
+		return fmt.Errorf("barriers: %d acknowledgements, at most %d", len(acks), MaxBarrierAcks)
+	}
+	for i := range acks {
+		a := &acks[i]
+		if !config.ValidBarrierID(a.ID) {
+			return fmt.Errorf("barriers[%d].id %q: want 1-64 letters, digits, '.', '_', ':' or '-'", i, a.ID)
+		}
+		if _, ok := admission.KindOf(a.Kind); !ok {
+			return fmt.Errorf("barriers[%d].kind %q: want %s or %s", i, a.Kind, config.BarrierMutations, config.BarrierSource)
+		}
+		if !strings.HasPrefix(a.Scope, "placement:") && !strings.HasPrefix(a.Scope, "cluster:") {
+			return fmt.Errorf("barriers[%d].scope %q: want placement:<tenant>/<bucket> or cluster:<name>", i, a.Scope)
+		}
+		if a.Generation < 0 || a.Inflight < 0 || a.Uncertain < 0 {
+			return fmt.Errorf("barriers[%d]: negative generation or count", i)
+		}
+	}
+	return nil
 }
 
 // HeartbeatAnswer tells a member the current version and its lease. Seq echoes the heartbeat it
@@ -198,8 +233,9 @@ type Member struct {
 	Incarnation     *Incarnation  `json:"incarnation,omitempty"`
 	Unresolved      []Incarnation `json:"unresolved,omitempty"`
 	RetireRequested bool          `json:"retire_requested,omitempty"`
-	// Uncertain is Heartbeat.Uncertain from the member's last heartbeat.
-	Uncertain int64 `json:"uncertain,omitempty"`
+	// Uncertain is Heartbeat.Uncertain from the member's last heartbeat; Barriers its drain proof.
+	Uncertain int64           `json:"uncertain,omitempty"`
+	Barriers  []admission.Ack `json:"barriers,omitempty"`
 	// Identity is the lineage of the directory it last reported installed: Applied counts only
 	// when it is the control plane's.
 	Identity      directory.Identity `json:"identity,omitzero"`
@@ -386,6 +422,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "uncertain: want a non-negative count")
 		return
 	}
+	if err := validateAcks(hb.Barriers); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	snap := s.Dir.Snapshot()
 	if err := checkLineage(snap, hb.Identity, hb.Applied); err != nil {
 		// No lease: a member on another lineage must not count as present for a fence.
@@ -514,8 +554,25 @@ type ProxyDiagnostics struct {
 	Backpressure bool  `json:"backpressure"`
 	// Secrets compares, per cluster the control plane holds a secret for, the generation it holds
 	// with the one the proxy signs with.
-	Secrets  []SecretInstall `json:"secrets"`
-	Problems []string        `json:"problems"`
+	Secrets []SecretInstall `json:"secrets"`
+	// Lease is the member's lease as the control plane grants it (T07): what it answered the last
+	// heartbeat with, and how long ago the control plane saw that heartbeat. The member measures
+	// its own staleness from its send time, never from these.
+	Lease    LeaseStatus `json:"lease"`
+	Problems []string    `json:"problems"`
+}
+
+// LeaseStatus is a member's lease as the control plane sees it.
+type LeaseStatus struct {
+	// Granted is the TTL every heartbeat answer grants (the control plane's --lease-ttl); the
+	// member runs its lease for the shorter of it and its own control.lease_ttl.
+	Granted time.Duration `json:"granted"`
+	// Seq is the last heartbeat the control plane recorded, Seen when it arrived, Age how long ago
+	// by the control plane's clock, and Live whether the lease it renewed has expired.
+	Seq  int64         `json:"seq"`
+	Seen time.Time     `json:"seen,omitzero"`
+	Age  time.Duration `json:"age,omitempty"`
+	Live bool          `json:"live"`
 }
 
 // SecretInstall is one cluster's secret generation on the control plane (Want) and on a proxy (Have,
@@ -543,6 +600,7 @@ func (s *Server) proxyDiagnostics(w http.ResponseWriter, r *http.Request) {
 	f := snap.File()
 	d := ProxyDiagnostics{Member: ms[i], Directory: snap.Version(), Current: f.Identity, Secrets: []SecretInstall{}, Problems: []string{}}
 	m := &d.Member
+	d.Lease = LeaseStatus{Granted: s.LeaseTTL, Seq: m.Seq, Seen: m.Seen, Age: m.SinceSeen, Live: m.Live}
 	d.Lineage = m.Identity == f.Identity
 	d.Backpressure = m.Installed > m.Applied
 	if d.Lineage && m.Applied < d.Directory {

@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/admission"
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
+	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/telemetry"
 )
 
 func readMarker(t *testing.T, c *Client) marker {
@@ -152,5 +155,51 @@ func TestRetireRequestedByTheControlPlane(t *testing.T) {
 	st := status(t, c)
 	if st.Incarnation != c.Incarnation() || st.Uncertain != 0 {
 		t.Fatalf("/-/fleet: %+v", st)
+	}
+}
+
+// The heartbeat carries this proxy's drain proof for every barrier in its installed directory
+// (ADR-0021 D2), and drops its telemetry window, never the proof, when it would pass the cap.
+func TestHeartbeatCarriesBarrierAcks(t *testing.T) {
+	f := newFakeControl(t)
+	f.mu.Lock()
+	p := f.dir.Placements["acme/data"]
+	p.Barrier = &config.Barrier{ID: "op-7", Kind: config.BarrierMutations}
+	f.dir.Placements = cloneP(f.dir.Placements)
+	f.dir.Placements["acme/data"] = p
+	f.dir.Generations = map[string]int64{directory.PlacementResource("acme/data"): 1}
+	f.mu.Unlock()
+	c := newClient(t, f)
+	c.Gates = admission.New()
+	ctx := context.Background()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Gates.Close("acme/data", admission.Mutations, "op-7")
+	tok, _, _ := c.Gates.Enter("acme/data", admission.Source)
+	if err := c.beat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	last := f.beats[len(f.beats)-1]
+	f.mu.Unlock()
+	if len(last.Barriers) != 1 || last.Barriers[0].ID != "op-7" || last.Barriers[0].Scope != "placement:acme/data" || last.Barriers[0].Generation != 1 || !last.Barriers[0].Closed || last.Barriers[0].Inflight != 0 {
+		t.Fatalf("heartbeat acks: %+v", last.Barriers)
+	}
+	tok.Release(c.Gates, admission.Definitive)
+	st := status(t, c)
+	if len(st.Barriers) != 1 || st.LeaseSeq == 0 || st.LeaseGranted != "1s" || st.GrantError != "" {
+		t.Fatalf("/-/fleet lease and barriers: %+v", st)
+	}
+
+	// The cap: a heartbeat whose telemetry would push it past the cap keeps everything but the window.
+	hb := control.Heartbeat{Incarnation: c.Incarnation(), Barriers: []admission.Ack{{ID: "op-7"}},
+		Telemetry: &telemetry.Window{Sketches: []telemetry.Sketch{{Data: make([]byte, 2000)}}}}
+	if dropped, size := capTelemetry(&hb, 1000); !dropped || size < 2000 || hb.Telemetry != nil || len(hb.Barriers) != 1 {
+		t.Fatalf("capTelemetry over the cap: dropped %v size %d %+v", dropped, size, hb)
+	}
+	hb.Telemetry = &telemetry.Window{}
+	if dropped, _ := capTelemetry(&hb, 1<<20); dropped || hb.Telemetry == nil {
+		t.Fatal("capTelemetry under the cap dropped the window")
 	}
 }

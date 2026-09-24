@@ -17,6 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -632,15 +635,17 @@ func TestMemberLeaseFollowsTheServerGrant(t *testing.T) {
 		t.Fatal("fresh past the server's 1 s grant: the lease followed the proxy's own 60 s lease_ttl")
 	}
 
+	c.Metrics = telemetry.NewMetrics()
 	refused := []struct {
-		name string
-		edit func(*control.HeartbeatAnswer)
+		name   string
+		reason string
+		edit   func(*control.HeartbeatAnswer)
 	}{
-		{"an answer delayed past the lease it grants", func(*control.HeartbeatAnswer) { clock.Add(2 * time.Second) }},
-		{"a zero grant", func(a *control.HeartbeatAnswer) { a.LeaseTTL = 0 }},
-		{"an answer to another heartbeat", func(a *control.HeartbeatAnswer) { a.Seq-- }},
-		{"a version behind the proxy's", func(a *control.HeartbeatAnswer) { a.Version = 0 }},
-		{"an answer for another lineage", func(a *control.HeartbeatAnswer) { a.Identity.Epoch = "e0000000000000000000000000000002" }},
+		{"an answer delayed past the lease it grants", GrantLate, func(*control.HeartbeatAnswer) { clock.Add(2 * time.Second) }},
+		{"a zero grant", GrantNoGrant, func(a *control.HeartbeatAnswer) { a.LeaseTTL = 0 }},
+		{"an answer to another heartbeat", GrantSequence, func(a *control.HeartbeatAnswer) { a.Seq-- }},
+		{"a version behind the proxy's", GrantBehind, func(a *control.HeartbeatAnswer) { a.Version = 0 }},
+		{"an answer for another lineage", GrantLineage, func(a *control.HeartbeatAnswer) { a.Identity.Epoch = "e0000000000000000000000000000002" }},
 	}
 	for _, r := range refused {
 		f.setAnswer(r.edit)
@@ -650,11 +655,28 @@ func TestMemberLeaseFollowsTheServerGrant(t *testing.T) {
 		if !c.Stale() {
 			t.Errorf("%s renewed the lease", r.name)
 		}
+		if got := counterValue(t, c.Metrics.LeaseGrantErrors.WithLabelValues(r.reason)); got != 1 {
+			t.Errorf("%s: lease grant errors{reason=%s} = %v, want 1", r.name, r.reason, got)
+		}
+		if st := status(t, c); st.GrantError != r.reason {
+			t.Errorf("%s: /-/fleet grant_error %q, want %s", r.name, st.GrantError, r.reason)
+		}
 	}
+	f.down.Store(true)
+	if err := c.beat(ctx); err == nil {
+		t.Error("a heartbeat to a control plane that is down: no error")
+	}
+	if got := counterValue(t, c.Metrics.LeaseGrantErrors.WithLabelValues(GrantUnreachable)); got != 1 {
+		t.Errorf("lease grant errors{reason=unreachable} = %v, want 1", got)
+	}
+	f.down.Store(false)
 
 	f.setAnswer(nil)
 	if err := c.beat(ctx); err != nil || c.Stale() {
 		t.Fatalf("a good answer after the refused ones: %v, stale %v", err, c.Stale())
+	}
+	if st := status(t, c); st.GrantError != "" || st.LeaseGranted != "1s" || st.LeaseSeq != c.seq.Load() {
+		t.Fatalf("/-/fleet after a granted heartbeat: %+v", st)
 	}
 	// An older answer never replaces a newer grant, even with a later deadline.
 	if err := c.renew(ctx, c.seq.Load()-1, clock.Now().Add(time.Hour), c.Snapshot().Version(), control.HeartbeatAnswer{Seq: c.seq.Load() - 1, Identity: testIdentity, Version: c.Snapshot().Version(), LeaseTTL: time.Second}); err != nil {
@@ -745,4 +767,13 @@ func benchInstall(b *testing.B, placements int) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }

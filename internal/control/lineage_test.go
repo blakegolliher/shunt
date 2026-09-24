@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/directory"
 )
 
@@ -140,6 +141,10 @@ func TestDirectoryAndHeartbeatRefuseAnotherLineage(t *testing.T) {
 		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Uncertain: -1},
 		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: inc, State: IncarnationUnclean}},
 		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: "fedcba9876543210fedcba9876543210", State: "active"}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "placement:a/b", Kind: "elsewhere"}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "object:a/b/k", Kind: "mutations"}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "placement:a/b", Kind: "mutations", Inflight: -1}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: make([]admission.Ack, MaxBarrierAcks+1)},
 	} {
 		if code, e := beat(bad); code != http.StatusBadRequest || e != "bad_request" {
 			t.Errorf("a heartbeat with a malformed incarnation (%+v): %d %s", bad, code, e)
@@ -188,12 +193,13 @@ func TestProxyDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seen := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
 	ms := []Member{
-		{ID: "ok", Live: true, Identity: lineageA, Applied: 7, Durable: 7, Secrets: map[string]string{"vast01": "6"}},
+		{ID: "ok", Live: true, Identity: lineageA, Applied: 7, Durable: 7, Secrets: map[string]string{"vast01": "6"}, Seq: 41, Seen: seen, SinceSeen: 700 * time.Millisecond},
 		{ID: "slow", Live: true, Identity: lineageA, Applied: 5, Installed: 7, Durable: 4, CacheError: "version 5 not durable: fsync: disk", Secrets: map[string]string{"vast01": "3"}},
 		{ID: "restored", Live: true, Identity: lineageB, Applied: 9, Durable: 9, Secrets: map[string]string{"vast01": "9"}},
 	}
-	h := (&Server{Dir: d, Fleet: staticFleet{ms: ms}}).Handler()
+	h := (&Server{Dir: d, Fleet: staticFleet{ms: ms}, LeaseTTL: 3 * time.Second}).Handler()
 	get := func(id string) (int, ProxyDiagnostics) {
 		req := httptest.NewRequest("GET", "/v1/fleet/"+id, nil)
 		req.RemoteAddr = "127.0.0.1:1"
@@ -203,8 +209,9 @@ func TestProxyDiagnostics(t *testing.T) {
 		_ = json.Unmarshal(rec.Body.Bytes(), &out)
 		return rec.Code, out
 	}
-	if code, ok := get("ok"); code != http.StatusOK || len(ok.Problems) != 0 || !ok.Lineage || ok.Behind != 0 || len(ok.Secrets) != 1 || !ok.Secrets[0].Current {
-		t.Fatalf("a current proxy: %d %+v", code, ok)
+	if code, ok := get("ok"); code != http.StatusOK || len(ok.Problems) != 0 || !ok.Lineage || ok.Behind != 0 || len(ok.Secrets) != 1 || !ok.Secrets[0].Current ||
+		ok.Lease.Granted != 3*time.Second || ok.Lease.Seq != 41 || !ok.Lease.Seen.Equal(seen) || ok.Lease.Age != 700*time.Millisecond || !ok.Lease.Live {
+		t.Fatalf("a current proxy: %d %+v lease %+v", code, ok, ok.Lease)
 	}
 	_, slow := get("slow")
 	if slow.Behind != 2 || !slow.Backpressure || len(slow.Secrets) != 1 || slow.Secrets[0].Current {

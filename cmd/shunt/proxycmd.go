@@ -115,6 +115,9 @@ func newProxyShow() *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "proxy %s (%s, %s)\n", d.ID, memberState(d.Member), d.Host)
 			_, _ = fmt.Fprintf(out, "  directory %d; requests use %d; installed %d; restart cache durable at %d\n", d.Directory, d.Applied, installed, d.Durable)
+			if l := d.Lease; l.Seq > 0 {
+				_, _ = fmt.Fprintf(out, "  lease: grants %s per heartbeat; last heartbeat %d seen %s ago (control node's clock); %s\n", l.Granted, l.Seq, l.Age.Round(time.Second), map[bool]string{true: "live", false: "expired"}[l.Live])
+			}
 			if inc := d.Incarnation; inc != nil {
 				_, _ = fmt.Fprintf(out, "  incarnation %s: %s since %s", inc.ID, inc.State, inc.Started.Format(time.RFC3339))
 				if !inc.Ended.IsZero() {

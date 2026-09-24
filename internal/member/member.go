@@ -85,8 +85,10 @@ type Client struct {
 	stale      atomic.Bool
 
 	// lease is the grant held, replaced whole by renew; nil: never granted. Stale reads it on the
-	// request path for every moving bucket, so it is a pointer load, not a lock.
-	lease atomic.Pointer[grant]
+	// request path for every moving bucket, so it is a pointer load, not a lock. grantErr is why
+	// the last heartbeat granted no lease, nil when it did.
+	lease    atomic.Pointer[grant]
+	grantErr atomic.Pointer[string]
 
 	// caching serializes cache writes; cached is the last version a write was attempted for, so
 	// a slower older write never lands after a newer one. durable is the version the cache holds
@@ -445,14 +447,22 @@ func (c *Client) beat(ctx context.Context) error {
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
 		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File()),
 		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
-	if installed := c.Snapshot().Version(); installed > hb.Applied {
+	installedSnap := c.Snapshot()
+	if installed := installedSnap.Version(); installed > hb.Applied {
 		hb.Installed = installed
 	}
 	if why := c.cacheErr.Load(); why != nil {
 		hb.CacheError = *why
 	}
+	// The drain proof for every barrier in the installed directory (ADR-0021 D2). The gates are
+	// closed on install, so the acknowledgement reports the installed version's barriers, and the
+	// control plane checks the durable version against each barrier's generation.
+	hb.Barriers = c.Gates.Acks(installedSnap)
 	if c.Telemetry != nil {
 		hb.Telemetry = c.Telemetry.Completed(c.Now())
+	}
+	if dropped, size := capTelemetry(&hb, maxHeartbeatBytes); dropped {
+		c.log.Warn("heartbeat over the size cap; its telemetry window is dropped so the lease and the drain proof get through", "bytes", size, "cap", maxHeartbeatBytes)
 	}
 	f := snap.File()
 	for key := range f.Placements {
@@ -484,6 +494,15 @@ func (c *Client) beat(ctx context.Context) error {
 	} else {
 		err = c.checkAnswer(err)
 	}
+	if err != nil {
+		reason := grantReason(err)
+		c.grantErr.Store(&reason)
+		if c.Metrics != nil {
+			c.Metrics.LeaseGrantErrors.WithLabelValues(reason).Inc()
+		}
+	} else {
+		c.grantErr.Store(nil)
+	}
 	stale := c.Stale()
 	if was := c.stale.Swap(stale); was != stale {
 		if stale {
@@ -513,25 +532,25 @@ func (c *Client) beat(ctx context.Context) error {
 func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied int64, ans control.HeartbeatAnswer) error {
 	switch {
 	case ans.Seq != seq:
-		return fmt.Errorf("heartbeat %d answered as heartbeat %d; not a lease", seq, ans.Seq)
+		return &grantError{reason: GrantSequence, msg: fmt.Sprintf("heartbeat %d answered as heartbeat %d; not a lease", seq, ans.Seq)}
 	case ans.LeaseTTL <= 0:
-		return fmt.Errorf("the control plane granted no lease (lease_ttl %s)", ans.LeaseTTL)
+		return &grantError{reason: GrantNoGrant, msg: fmt.Sprintf("the control plane granted no lease (lease_ttl %s)", ans.LeaseTTL)}
 	case ans.Version < applied:
-		return fmt.Errorf("the control plane answered with directory version %d, behind this proxy's %d; not a lease", ans.Version, applied)
+		return &grantError{reason: GrantBehind, msg: fmt.Sprintf("the control plane answered with directory version %d, behind this proxy's %d; not a lease", ans.Version, applied)}
 	}
 	if ans.Version > c.Snapshot().Version() {
 		// The control plane has a newer directory: fetch it now, not at the poll's next turn.
 		_, _ = c.fetch(ctx, c.Snapshot().Version(), 0) //nolint:errcheck // the poll loop retries
 	}
 	if id := c.Snapshot().File().Identity; id != ans.Identity {
-		return fmt.Errorf("the heartbeat was answered for cluster %s epoch %s; this proxy's directory is cluster %s epoch %s; not a lease", ans.Identity.ClusterID, ans.Identity.Epoch, id.ClusterID, id.Epoch)
+		return &grantError{reason: GrantLineage, msg: fmt.Sprintf("the heartbeat was answered for cluster %s epoch %s; this proxy's directory is cluster %s epoch %s; not a lease", ans.Identity.ClusterID, ans.Identity.Epoch, id.ClusterID, id.Epoch)}
 	}
 	if v := c.Snapshot().Version(); v < ans.Version {
-		return fmt.Errorf("directory version %d is behind the control plane's %d", v, ans.Version)
+		return &grantError{reason: GrantBehind, msg: fmt.Sprintf("directory version %d is behind the control plane's %d", v, ans.Version)}
 	}
-	next := &grant{seq: seq, until: sent.Add(min(ans.LeaseTTL, c.cfg.LeaseTTL))}
+	next := &grant{seq: seq, until: sent.Add(min(ans.LeaseTTL, c.cfg.LeaseTTL)), ttl: ans.LeaseTTL}
 	if c.Now().After(next.until) {
-		return fmt.Errorf("heartbeat %d was answered after the lease it grants had run out", seq)
+		return &grantError{reason: GrantLate, msg: fmt.Sprintf("heartbeat %d was answered after the lease it grants had run out", seq)}
 	}
 	for {
 		cur := c.lease.Load()
@@ -545,11 +564,63 @@ func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied i
 	}
 }
 
-// grant is one lease: the heartbeat that earned it, and when it runs out, from that heartbeat's
-// send time on c.Now's clock.
+// grant is one lease: the heartbeat that earned it, when it runs out, from that heartbeat's send
+// time on c.Now's clock, and the TTL the control plane granted.
 type grant struct {
 	seq   int64
 	until time.Time
+	ttl   time.Duration
+}
+
+// The reasons a heartbeat's answer grants no lease (shunt_lease_grant_errors_total, ADR-0021 T07).
+const (
+	GrantSequence    = "sequence"    // the answer is to another heartbeat
+	GrantNoGrant     = "no_grant"    // the answer carries no positive lease TTL
+	GrantBehind      = "behind"      // the answer's version is behind this proxy's, or this proxy has not installed the answer's yet
+	GrantLate        = "late"        // the answer arrived after the lease it grants had run out
+	GrantLineage     = "lineage"     // the answer is from another cluster or epoch
+	GrantUnreachable = "unreachable" // the heartbeat got no answer
+)
+
+// grantError is a heartbeat's answer that granted no lease, with why, for the metric.
+type grantError struct {
+	reason string
+	msg    string
+}
+
+func (e *grantError) Error() string { return e.msg }
+
+// grantReason is the metric label for a heartbeat's error.
+func grantReason(err error) string {
+	var ge *grantError
+	if errors.As(err, &ge) {
+		return ge.reason
+	}
+	var e *Error
+	if errors.As(err, &e) && (e.Code == control.CodeEpochMismatch || e.Code == control.CodeClusterMismatch) {
+		return GrantLineage
+	}
+	return GrantUnreachable
+}
+
+// maxHeartbeatBytes is the largest heartbeat a member sends: the control plane's 1 MiB decoder cap
+// less a margin. Safety state (identity, incarnation, barrier acknowledgements) comes before
+// telemetry: a heartbeat over the cap drops its telemetry window rather than its lease or its
+// drain proof (ADR-0021 D2).
+const maxHeartbeatBytes = 1<<20 - 64<<10
+
+// capTelemetry drops a heartbeat's telemetry window when the heartbeat would pass limit bytes, and
+// reports whether it did and how large the heartbeat was.
+func capTelemetry(hb *control.Heartbeat, limit int) (dropped bool, size int) {
+	if hb.Telemetry == nil {
+		return false, 0
+	}
+	raw, err := json.Marshal(hb)
+	if err != nil || len(raw) <= limit {
+		return false, len(raw)
+	}
+	hb.Telemetry = nil
+	return true, len(raw)
 }
 
 // secretGenerations are the secret generations of the installed directory, by cluster: what the
@@ -629,6 +700,14 @@ type Status struct {
 	// (ADR-0021 D2).
 	Incarnation string `json:"incarnation"`
 	Uncertain   int64  `json:"uncertain"`
+	// The lease as granted (T07): the heartbeat it answered, the TTL the control plane granted
+	// (the lease runs for the shorter of it and control.lease_ttl, from the heartbeat's send
+	// time), and why the last heartbeat granted none, when it did not.
+	LeaseSeq     int64  `json:"lease_seq,omitempty"`
+	LeaseGranted string `json:"lease_granted,omitempty"`
+	GrantError   string `json:"grant_error,omitempty"`
+	// Barriers is the drain proof this proxy reports for every barrier in its directory.
+	Barriers []admission.Ack `json:"barriers"`
 }
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
@@ -648,6 +727,14 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	if g := c.lease.Load(); g != nil {
 		st.LeaseLeft = g.until.Sub(now).Round(time.Millisecond).String()
+		st.LeaseSeq, st.LeaseGranted = g.seq, g.ttl.String()
+	}
+	if why := c.grantErr.Load(); why != nil {
+		st.GrantError = *why
+	}
+	st.Barriers = c.Gates.Acks(c.Snapshot())
+	if st.Barriers == nil {
+		st.Barriers = []admission.Ack{}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)

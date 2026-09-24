@@ -60,6 +60,11 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 	m.BundlesRetired.Set(0)
 	m.InstallBackpressure.Set(0)
 	m.CacheFailures.WithLabelValues("fsync").Inc()
+	m.LeaseGrantErrors.WithLabelValues("late").Inc()
+	m.BarrierDuration.WithLabelValues("drain").Observe(1)
+	m.BarrierBlockers.WithLabelValues("old_requests").Set(1)
+	m.UnresolvedIncarnations.Set(0)
+	m.Operations.WithLabelValues("blocked", "none").Set(1)
 	families, err := m.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -81,8 +86,8 @@ func TestEveryMetricIsInTheCatalog(t *testing.T) {
 		}
 	}
 	// POC-4's fifteen, POC-6's four for the fleet, UI-1's merge latency, H1c's two for the runtime
-	// bundle and H1d's cache failures.
-	if len(registered) != 23 {
-		t.Errorf("H1d registers exactly twenty-three shunt_ metrics, got %d: %v", len(registered), registered)
+	// bundle, H1d's cache failures, and H2's five for leases, barriers, incarnations and operations.
+	if len(registered) != 28 {
+		t.Errorf("H2 registers exactly twenty-eight shunt_ metrics, got %d: %v", len(registered), registered)
 	}
 }
