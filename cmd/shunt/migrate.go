@@ -428,6 +428,8 @@ func newExpand() *cobra.Command {
 		o           apiOptions
 		req         control.ExpandRequest
 		clearTarget bool
+		carve       string
+		merge       string
 	)
 	cmd := &cobra.Command{
 		Use:   "expand <bucket>",
@@ -435,7 +437,10 @@ func newExpand() *cobra.Command {
 		Long: "Records the cluster and bucket a later ramp or migrate step moves the bucket to. The target\n" +
 			"bucket must be empty: its objects would join this bucket (--accept-existing-objects takes one\n" +
 			"whose objects are this bucket's, copied ahead). --clear forgets the target again before the\n" +
-			"first step, leaving its bucket where it is.",
+			"first step, leaving its bucket where it is.\n\n" +
+			"--carve <prefix> gives the keys under a prefix a scope of their own, owned exactly as they are now,\n" +
+			"so later moves can place that prefix on its own (ADR-0020); no data moves. --merge <prefix>\n" +
+			"removes a scope again once its keys are owned as the rest of their parent scope is.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := placementPath(args[0])
@@ -444,6 +449,24 @@ func newExpand() *cobra.Command {
 			}
 			api, err := o.client()
 			if err != nil {
+				return err
+			}
+			if carve != "" || merge != "" {
+				if carve != "" && merge != "" {
+					return errors.New("give --carve or --merge, not both")
+				}
+				var out control.PrefixResult
+				method, route, body, did := "POST", path+"/prefixes", any(control.PrefixRequest{Prefix: carve}), "carved: its keys have a scope of their own, owned as before"
+				if merge != "" {
+					method, route, body, did = "DELETE", path+"/prefixes?prefix="+url.QueryEscape(merge), nil, "merged back into its parent scope"
+				}
+				if callErr := api.call(cmd.Context(), method, route, body, &out); callErr != nil {
+					return callErr
+				}
+				if o.json {
+					return printJSON(cmd, out)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s: prefix %q %s; %d prefix rules (directory version %d)\n", shown(out.Key), out.Prefix, did, out.Rules, out.Version)
 				return err
 			}
 			if clearTarget {
@@ -500,6 +523,8 @@ func newExpand() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name there (default: <name>-001, the lowest unused)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket there if it does not exist")
 	f.BoolVar(&req.AcceptObjects, "accept-existing-objects", false, "take a target bucket that holds objects: they are this bucket's, copied ahead")
+	f.StringVar(&carve, "carve", "", "give the keys under this `prefix` a scope of their own, owned as they are now (ADR-0020)")
+	f.StringVar(&merge, "merge", "", "remove the scope of this `prefix`, once it is owned as its parent scope is")
 	f.BoolVar(&clearTarget, "clear", false, "forget the target expand recorded, before the first step; for a spread bucket, retire its legs that own no keys")
 	return cmd
 }
@@ -868,17 +893,41 @@ func printLegs(out io.Writer, p *control.PlacementStatus) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "  LEG\tCLUSTER\tBUCKET\tSHARE\tHASH RANGES\tMOVING")
-	for _, l := range p.Legs {
+	scope := ""
+	if len(p.Scopes) > 0 {
+		scope = "SCOPE\t"
+	}
+	_, _ = fmt.Fprintln(tw, "  "+scope+"LEG\tCLUSTER\tBUCKET\tSHARE\tHASH RANGES\tMOVING")
+	legRows(tw, p, "", p.Legs)
+	// Each prefix rule's keys, owned by its own table (ADR-0020); the rows above are every other key.
+	for _, sc := range p.Scopes {
+		legRows(tw, p, sc.Prefix, sc.Legs)
+	}
+	return tw.Flush()
+}
+
+func legRows(tw io.Writer, p *control.PlacementStatus, prefix string, legs []control.LegStatus) {
+	scope := ""
+	if len(p.Scopes) > 0 {
+		scope = "(other keys)\t"
+		if prefix != "" {
+			scope = prefix + "\t"
+		}
+	}
+	for _, l := range legs {
 		ranges := make([]string, 0, len(l.Ranges))
 		for _, rg := range l.Ranges {
 			ranges = append(ranges, fmt.Sprintf("%016x-%016x", uint64(rg.From), uint64(rg.To)))
 		}
-		if len(ranges) == 0 {
+		switch {
+		case len(ranges) > 0:
+		case l.Idle:
 			ranges = append(ranges, "none (idle: expand --clear retires it)")
+		default:
+			ranges = append(ranges, "none here")
 		}
 		moving := "-"
-		if m := p.Move; m != nil {
+		if m := p.Move; m != nil && prefix == "" {
 			rg := fmt.Sprintf("%016x-%016x (%.1f%% of keys)", uint64(m.Range.From), uint64(m.Range.To), 100*m.Share)
 			switch l.ID {
 			case m.From:
@@ -887,9 +936,8 @@ func printLegs(out io.Writer, p *control.PlacementStatus) error {
 				moving = "in from " + m.From + ": " + rg
 			}
 		}
-		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%.1f%%\t%s\t%s\n", l.ID, l.Cluster, l.Bucket, 100*l.Share, strings.Join(ranges, " "), moving)
+		_, _ = fmt.Fprintf(tw, "  %s%s\t%s\t%s\t%.1f%%\t%s\t%s\n", scope, l.ID, l.Cluster, l.Bucket, 100*l.Share, strings.Join(ranges, " "), moving)
 	}
-	return tw.Flush()
 }
 
 // transition runs one state change as an operation record, polls it, and prints what it did.

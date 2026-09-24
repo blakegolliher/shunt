@@ -630,6 +630,56 @@ func (s *Server) clearTarget(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// PrefixRequest names a prefix rule to carve (ADR-0020).
+type PrefixRequest struct {
+	Prefix string `json:"prefix"`
+}
+
+// PrefixResult is a placement after a carve or merge.
+type PrefixResult struct {
+	Key     string `json:"key"`
+	Prefix  string `json:"prefix"`
+	Rules   int    `json:"rules"` // prefix rules the bucket has now
+	Version int64  `json:"version"`
+}
+
+// carve adds a prefix rule owned exactly as its keys are now. No key changes owner, so a proxy on
+// the version before routes every key as one on the version after: it needs no fence (ADR-0020).
+func (s *Server) carve(w http.ResponseWriter, r *http.Request) {
+	var req PrefixRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	s.changePrefixes(w, r, req.Prefix, "prefix rule carved", s.Dir.Carve)
+}
+
+// merge removes a prefix rule owned as its parent scope is; again no key changes owner.
+func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
+	s.changePrefixes(w, r, r.URL.Query().Get("prefix"), "prefix rule merged", s.Dir.Merge)
+}
+
+func (s *Server) changePrefixes(w http.ResponseWriter, r *http.Request, prefix, msg string, change func(ctx context.Context, tenant, bucket, prefix, actor string) error) {
+	key, _, _, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if prefix == "" {
+		writeError(w, http.StatusBadRequest, "invalid", "a prefix is required")
+		return
+	}
+	tenant, bucket, _ := directory.SplitKey(key)
+	if err := change(r.Context(), tenant, bucket, prefix, actor(r)); err != nil {
+		fail(w, err)
+		return
+	}
+	res := PrefixResult{Key: key, Prefix: prefix, Version: s.Dir.Snapshot().Version()}
+	if p, found := s.Dir.Snapshot().Lookup(tenant, bucket); found {
+		res.Rules = len(p.Prefixes)
+	}
+	s.info(actor(r), msg, "placement", key, "prefix", prefix, "rules", res.Rules, "version", res.Version)
+	writeJSON(w, http.StatusOK, res)
+}
+
 // nextName is base-NNN with the lowest NNN no placement uses on cluster.
 func nextName(f *directory.File, cluster, base string) string {
 	used := map[string]bool{}
@@ -1019,9 +1069,9 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	}
 	plan.dropBucket = true
 	if m := p.Move; m != nil {
-		rg := m.Range
-		plan.keep = func(k string) bool { return migrate.InRangeHash(rg, k) }
-		plan.dropBucket = !ownsBeyond(p, m.From, rg)
+		spread := p
+		plan.keep = func(k string) bool { return migrate.InMove(&spread, k) }
+		plan.dropBucket = !ownsBeyond(p, m.From, m.Range)
 	}
 	p = moving(p)
 	// A proxy that has not installed the cutover still reads the source on a miss: it must have it

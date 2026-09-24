@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1373,6 +1374,59 @@ func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
 		if strings.Contains(strings.Join(b.Problems, " "), "spread over") {
 			t.Fatalf("a consolidated bucket is still reported spread: %+v", b)
 		}
+	}
+}
+
+// Prefix rules through the API (ADR-0020 P1): carve gives a prefix a scope of its own without moving
+// anything, status and step-out show it, a move is refused while it exists (P2), and merge gives
+// back the plain bucket.
+func TestCarveAndMergeThroughTheAPI(t *testing.T) {
+	rg := newRig(t)
+	if err := rg.vast01.be.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.vast01.put(t, "data01", "archive/a", "v")
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/adopt", AdoptRequest{Cluster: "vast01"}, nil)
+	before, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	plain := *before
+
+	rg.answers("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{}, http.StatusBadRequest, "invalid")
+	var res PrefixResult
+	rg.must("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, &res)
+	if res.Rules != 1 || res.Prefix != "archive/" {
+		t.Fatalf("carve: %+v", res)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/prefixes", PrefixRequest{Prefix: "archive/"}, "already has a rule")
+	var st Status
+	rg.must("GET", "/v1/status?bucket=acme/data01", nil, &st)
+	if ps := st.Placements[0]; len(ps.Scopes) != 1 || ps.Scopes[0].Prefix != "archive/" || len(ps.Scopes[0].Legs) != 1 || ps.Scopes[0].Legs[0].Bucket != "data01" || ps.Scopes[0].Legs[0].Share != 1 {
+		t.Fatalf("status of a carved bucket: %+v", st.Placements[0])
+	} else if len(ps.Legs) != 1 || ps.Legs[0].Idle {
+		t.Fatalf("its legs: %+v", ps.Legs)
+	}
+	var so StepOut
+	rg.must("GET", "/v1/tenants/acme/step-out", nil, &so)
+	if len(so.Buckets) != 1 || !strings.Contains(strings.Join(so.Buckets[0].Problems, " "), "merge them (shunt expand data01 --merge <prefix>") {
+		t.Fatalf("step-out of a carved bucket: %+v", so)
+	}
+	rg.refused("POST", "/v1/placements/acme/data01/ramp", RampRequest{Ratio: 0.5, To: "vast02", Name: "data01-b", Create: true}, "ADR-0020 P2")
+	if ok, _ := rg.vast02.be.BucketExists("data01-b"); ok {
+		t.Fatal("a refused move made a bucket")
+	}
+	if !rg.vast01.has("data01", "archive/a") {
+		t.Fatal("carving moved data")
+	}
+
+	rg.refused("DELETE", "/v1/placements/acme/data01/prefixes?prefix=logs/", nil, "no rule")
+	rg.must("DELETE", "/v1/placements/acme/data01/prefixes?prefix=archive/", nil, &res)
+	if res.Rules != 0 {
+		t.Fatalf("merge: %+v", res)
+	}
+	after, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if !reflect.DeepEqual(*after, plain) {
+		t.Fatalf("carve then merge did not give back the plain bucket:\n got  %+v\n want %+v", *after, plain)
 	}
 }
 

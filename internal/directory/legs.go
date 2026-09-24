@@ -78,7 +78,9 @@ type Move struct {
 var legID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
 // isV2 reports whether p was decoded from schema v2.
-func (p *Placement) isV2() bool { return p.Legs != nil || p.Owners != nil || p.Move != nil }
+func (p *Placement) isV2() bool {
+	return p.Legs != nil || p.Owners != nil || p.Move != nil || p.Prefixes != nil
+}
 
 // fromV2 converts a placement decoded from schema v2 into the v1 fields this build routes by, and
 // clears the v2 ones. A v1 placement is left as it is.
@@ -92,7 +94,7 @@ func (p *Placement) fromV2() error {
 	if err := checkV2(p); err != nil {
 		return err
 	}
-	if len(p.Owners) > 1 || (p.Move != nil && (p.Move.Range != FullRange || sameClusterMove(p))) {
+	if len(p.Owners) > 1 || len(p.Prefixes) > 0 || (p.Move != nil && (p.Move.Range != FullRange || sameClusterMove(p))) {
 		return checkSpread(p)
 	}
 	cluster := func(leg string) string { return p.Legs[leg].Cluster }
@@ -134,8 +136,9 @@ func (p *Placement) fromV2() error {
 }
 
 // Spread reports whether p keeps its v2 fields in memory (ADR-0018): several legs own its keys
-// (N2), or part of its keys is moving to another leg (N3). Its Primary and Names are empty then.
-func (p *Placement) Spread() bool { return len(p.Owners) > 1 || p.Move != nil }
+// (N2), part of its keys is moving to another leg (N3), or it has prefix rules (ADR-0020). Its
+// Primary and Names are empty then.
+func (p *Placement) Spread() bool { return len(p.Owners) > 1 || p.Move != nil || len(p.Prefixes) > 0 }
 
 // checkSpread is what this build routes of a spread placement: untiered, one leg per cluster, and
 // at rest when ACTIVE, or moving one range that a single leg owns from that leg to another.
@@ -151,6 +154,9 @@ func checkSpread(p *Placement) error {
 	m := p.Move
 	if m == nil {
 		return nil
+	}
+	if len(p.Prefixes) > 0 {
+		return fmt.Errorf("move: a move in a bucket with prefix rules needs ADR-0020 P2; this build moves only buckets without them")
 	}
 	if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To }) {
 		return fmt.Errorf("move.range: leg %q does not own all of %s", m.From, rangeText(m.Range))
@@ -217,6 +223,9 @@ func checkV2(p *Placement) error {
 		return fmt.Errorf("hash: required when owners split the key space, e.g. %s", RampHash)
 	}
 	if err := checkOwners(p.Owners, p.Legs); err != nil {
+		return err
+	}
+	if err := checkPrefixes(p); err != nil {
 		return err
 	}
 	if m := p.Move; m != nil {

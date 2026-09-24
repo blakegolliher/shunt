@@ -503,3 +503,34 @@ func TestSpreadBucketThroughTheCLI(t *testing.T) {
 		t.Fatal("adopt --create made no bucket")
 	}
 }
+
+// Prefix rules through the CLI (ADR-0020 P1): expand --carve and --merge, and status's scope rows.
+func TestCarveAndMergeThroughTheCLI(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data01"); err != nil {
+		t.Fatal(err)
+	}
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.must(t, "adopt", "vast01", "acme/data01")
+	if out, err := rg.cli(t, "expand", "acme/data01", "--carve", "a/", "--merge", "a/"); err == nil || !strings.Contains(out, "not both") {
+		t.Fatalf("both flags: %v %s", err, out)
+	}
+	if out := rg.must(t, "expand", "acme/data01", "--carve", "archive/"); !strings.Contains(out, `acme/data01: prefix "archive/" carved: its keys have a scope of their own, owned as before; 1 prefix rules`) {
+		t.Fatalf("carve: %s", out)
+	}
+	out := rg.must(t, "status", "--all")
+	for _, want := range []string{"SCOPE", "(other keys)  vast01  vast01   data01  100.0%", "archive/      vast01  vast01   data01  100.0%"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status lacks %q:\n%s", want, out)
+		}
+	}
+	if out, err := rg.cli(t, "expand", "acme/data01", "--carve", "archive/"); err == nil || !strings.Contains(out, "already has a rule") {
+		t.Fatalf("a second carve: %v %s", err, out)
+	}
+	if out := rg.must(t, "expand", "acme/data01", "--merge", "archive/"); !strings.Contains(out, "merged back into its parent scope; 0 prefix rules") {
+		t.Fatalf("merge: %s", out)
+	}
+	if out := rg.must(t, "status", "--all"); strings.Contains(out, "spread over") || !strings.Contains(out, "vast01/data01") {
+		t.Fatalf("status after merging: %s", out)
+	}
+}

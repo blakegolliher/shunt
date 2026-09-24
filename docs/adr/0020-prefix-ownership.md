@@ -1,6 +1,8 @@
 # ADR-0020: prefix ownership in a spread bucket
 
-Status: proposed (2026-09-23). Amends ADR-0018 (its "Prefix rules" open question). Branch:
+Status: proposed (2026-09-23); P1 built (2026-09-23). Decisions confirmed 2026-09-23: scopes by
+longest match, each with its own table; the caps below; the CLI names below; a move's ramp by
+ratio only. Amends ADR-0018 (its "Prefix rules" open question). Branch:
 `1-to-n-bucket-support`.
 
 ## Context
@@ -97,9 +99,38 @@ A side benefit: a listing under a prefix that one leg owns needs to read only th
 3. **P3, CLI and UI.** Carve and merge verbs, `--scope` on ramp and migrate start, status per
    scope, the ownership bar per scope, docs/spread-buckets.md.
 
+## P1 as built (2026-09-23): scopes at rest
+
+- **Schema.** `prefixes: [{prefix, owners}]` on a v2 placement, sorted by prefix, each prefix once
+  and non-empty; `hash` is required with them. A placement with rules stays in v2 form in memory
+  (`Spread()`), even when one leg owns every key, until its last rule is merged.
+- **One ownership path.** `Placement.Scope(key)` is the longest rule the key starts with;
+  `migrate.OwnerOf` reads that scope's table; `migrate.InMove` is the one test of move membership,
+  and the proxy's narrowing, the listing merge, the mover's filter and purge's filter all call it.
+  Moves are refused in a bucket with rules until P2 (by the transition and by the decoder), so a
+  move's scope is the empty prefix for now.
+- **Carve and merge.** `directory.File.Carve` and `Merge`, in both stores; `POST` and `DELETE
+  /v1/placements/{tenant}/{bucket}/prefixes`; `shunt expand <bucket> --carve <prefix>` and
+  `--merge <prefix>` (the CLI came in P1, being two flags). Carving a plain bucket makes it v2 with
+  its one leg; merging the last rule of a bucket one leg owns makes it plain again, byte for byte.
+  Both refuse unless ACTIVE with no move; carve also refuses a bucket with a target, cold tier or
+  lifecycle recorded. Refusals are `directory.ErrRefused` (409 `refused`).
+- **Listing.** A listing reads only `directory.ListingLegs(p, prefix)`: the legs of the scope the
+  prefix falls in, of every rule nested under it, and a move's two legs.
+- **Status and step-out.** Status adds `scopes` (each rule's legs) and a leg's `idle` (no key in any
+  scope; the UI's Retire idle leg now reads it, since a leg may own keys only under a rule).
+  `shunt status` prints a SCOPE column when a bucket has rules. Step-out tells a bucket one leg
+  holds but rules keep spread to merge them.
+- **Proof.** A property test: over 300 random rule sets whose tables differ, every carve and merge
+  leaves every key's owner unchanged (it fails when carve copies the empty prefix's table instead
+  of the parent's). `FuzzOwnerOf` holds OwnerOf and InMove to a brute-force longest match (4.5 M
+  inputs). A proxy test routes a rule's keys to its one leg and lists under the prefix without
+  reading the other leg; it fails with the scope ignored in OwnerOf, and with every leg listed.
+  Control and CLI tests carve, show, refuse a move, and merge back to the plain bucket. Cost:
+  `Scope` over 64 rules is 444 ns, `OwnerOf` with 3 rules 82 ns, no allocation.
+
 ## Open questions
 
-- **CLI names.** Proposed: `shunt expand <bucket> --carve <prefix>` and `--merge <prefix>`
-  (directory-only changes, like `--clear`), and `--scope <prefix>` on ramp and migrate start
-  (`--prefix` is taken by the whole-bucket ramp).
-- **A move's ramp by prefix** inside a scope, or ratio only (P1).
+- **CLI names.** Decided: `shunt expand <bucket> --carve <prefix>` and `--merge <prefix>`, and
+  `--scope <prefix>` on ramp and migrate start (P2).
+- **A move's ramp** is by ratio only within its scope (decided 2026-09-23).

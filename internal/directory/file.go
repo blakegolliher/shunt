@@ -258,6 +258,16 @@ func (d *FileDir) CreateSpread(ctx context.Context, tenant, bucket string, legs 
 	return d.mutate(ctx, actor, "create-spread", Key(tenant, bucket), func(f *File) error { return f.CreateSpread(tenant, bucket, legs, d.now()) })
 }
 
+// Carve implements Store.
+func (d *FileDir) Carve(ctx context.Context, tenant, bucket, prefix, actor string) error {
+	return d.mutate(ctx, actor, "carve", Key(tenant, bucket), func(f *File) error { return f.Carve(tenant, bucket, prefix) })
+}
+
+// Merge implements Store.
+func (d *FileDir) Merge(ctx context.Context, tenant, bucket, prefix, actor string) error {
+	return d.mutate(ctx, actor, "merge", Key(tenant, bucket), func(f *File) error { return f.Merge(tenant, bucket, prefix) })
+}
+
 // ClearTarget implements Store.
 func (d *FileDir) ClearTarget(ctx context.Context, tenant, bucket, actor string) error {
 	return d.mutate(ctx, actor, "clear-target", Key(tenant, bucket), func(f *File) error { return f.ClearTarget(tenant, bucket) })

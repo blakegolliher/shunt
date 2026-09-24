@@ -8,7 +8,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -103,14 +102,22 @@ func (h *Handler) spreadListing(ctx context.Context, w http.ResponseWriter, r *h
 	// Keys interleave across legs by hash, so each leg holds about maxKeys/n of a page; a quarter
 	// more plus a little covers the variance, and a leg that runs short reads its next page. Memory
 	// and backend reads then scale with the client's page, not with maxKeys times the legs.
-	live := len(p.Legs) - len(tok.Done)
+	// Only the legs that can hold a key under the listing's prefix (ADR-0020): with prefix rules, a
+	// listing under a prefix one leg owns reads that leg alone.
+	ids := directory.ListingLegs(p, q.Get("prefix"))
+	live := 0
+	for _, id := range ids {
+		if !slices.Contains(tok.Done, id) {
+			live++
+		}
+	}
 	pageSize := max(maxKeys, 1)
 	if live > 1 {
 		pageSize = max(min(maxKeys, maxKeys/live+maxKeys/(4*live)+16), 1)
 	}
-	legs := make([]*spreadLeg, 0, len(p.Legs))
-	routes := make([]string, 0, len(p.Legs))
-	for _, id := range slices.Sorted(maps.Keys(p.Legs)) {
+	legs := make([]*spreadLeg, 0, len(ids))
+	routes := make([]string, 0, len(ids))
+	for _, id := range ids {
 		l := p.Legs[id]
 		cl, ok := clusters.Get(l.Cluster)
 		if !ok {
@@ -131,7 +138,7 @@ func (h *Handler) spreadListing(ctx context.Context, w http.ResponseWriter, r *h
 			if it.prefix {
 				return false
 			}
-			if m := p.Move; m != nil && (l.id == m.From || l.id == m.To) && migrate.InRangeHash(m.Range, it.name) {
+			if m := p.Move; m != nil && (l.id == m.From || l.id == m.To) && migrate.InMove(p, it.name) {
 				return false
 			}
 			owner, err := migrate.OwnerOf(p, it.name)

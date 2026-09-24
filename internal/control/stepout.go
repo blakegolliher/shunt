@@ -75,8 +75,14 @@ func (s *Server) stepOut(w http.ResponseWriter, r *http.Request) {
 					clusters = append(clusters, l.Cluster)
 				}
 			}
-			b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is spread over %d backend buckets (%s): clients going direct need all its keys in one bucket; consolidate it first, moving each other leg's keys into the one to keep (shunt ramp or migrate start --leg; ADR-0018 N3c)",
-				key, len(where), strings.Join(where, ", ")))
+			if owning := len(where) - len(directory.IdleLegs(p)); owning <= 1 && len(p.Prefixes) > 0 {
+				// One bucket holds every key already; only its prefix rules keep it spread.
+				b.Problems = append(b.Problems, fmt.Sprintf("bucket %s has %d prefix rules though one backend bucket holds all its keys: merge them (shunt expand %s --merge <prefix>, ADR-0020) to make it one bucket",
+					key, len(p.Prefixes), bucket))
+			} else {
+				b.Problems = append(b.Problems, fmt.Sprintf("bucket %s is spread over %d backend buckets (%s): clients going direct need all its keys in one bucket; consolidate it first, moving each other leg's keys into the one to keep (shunt ramp or migrate start --leg; ADR-0018 N3c)",
+					key, len(where), strings.Join(where, ", ")))
+			}
 			out.Buckets = append(out.Buckets, b)
 			continue
 		}

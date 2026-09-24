@@ -174,6 +174,19 @@ Returns `{"key", "target", "name", "created_bucket", "canary", "conditional_writ
 
 Forgets the target `expand` recorded, while the placement is still `ACTIVE`, so it can be expanded somewhere else. A recorded target routes nothing, so this needs no fence round. The target's bucket stays on its cluster, since shunt may not have created it. Returns `{"key", "target", "name", "version"}`. Refused once a step has used the target (`… is RAMPING, moving to …`) and when there is none. For a spread bucket (ADR-0018 N3c) it retires the legs that own no keys, such as the destination of a first step released before it routed anything, and returns them as `retired` (`[{"id", "cluster", "bucket", …}]`); their buckets stay where they are, and a bucket one leg owns afterwards returns to its plain form. Refused when every leg owns keys. `shunt expand <bucket> --clear` calls it.
 
+### `POST /v1/placements/{tenant}/{bucket}/prefixes` and `DELETE …/prefixes?prefix=<prefix>`
+
+Prefix rules (ADR-0020). `POST` with `{"prefix": "archive/"}` **carves** a rule: the keys under the
+prefix get a scope of their own whose owners table is a copy of the table they fall in now, so no
+key changes owner, no data moves and no fence round is needed. A plain bucket becomes a v2 one with
+its single leg. `DELETE ?prefix=` **merges** a rule back, only when its table equals its parent
+scope's; merging the last rule of a bucket one leg owns makes it plain again. Both return
+`{"key", "prefix", "rules", "version"}` and are refused (409 `refused`) unless the placement is
+`ACTIVE` with no move; carve also refuses a bucket with a target, cold tier or lifecycle recorded,
+a prefix already carved, and more than 64 rules or 1024-byte prefixes. A move in a bucket with rules
+is refused in this build (ADR-0020 P2). Status reports the rules as `scopes`, each with its legs.
+`shunt expand <bucket> --carve <prefix>` and `--merge <prefix>` call them.
+
 ### `POST /v1/placements/{tenant}/{bucket}/read-only`
 
 The same body and operation result as cluster read-only, scoped to one placement. The flag is

@@ -52,6 +52,8 @@ func (s *Server) routes() []Route {
 		mut("POST", "/v1/placements/{tenant}/{bucket}/adopt", "adopt", s.recorded(OpAdopt, placement, s.adopt), "adopt"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/expand", "expand", s.recorded(OpExpand, placement, s.expand), "expand"),
 		mut("DELETE", "/v1/placements/{tenant}/{bucket}/target", "expand clear", s.clearTarget, "expand"),
+		mut("POST", "/v1/placements/{tenant}/{bucket}/prefixes", "expand carve", s.carve, "expand"),
+		mut("DELETE", "/v1/placements/{tenant}/{bucket}/prefixes", "expand merge", s.merge, "expand"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/read-only", "placement read-only", s.placementReadOnly, "readonly"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/ramp", "ramp", s.ramp, "ramp"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/migrate", "migrate start", s.migrateStart, "migrate start"),

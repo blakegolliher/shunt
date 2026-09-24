@@ -658,6 +658,16 @@ func (s *Store) CreateSpread(ctx context.Context, tenant, bucket string, legs []
 	})
 }
 
+// Carve implements directory.Store.
+func (s *Store) Carve(ctx context.Context, tenant, bucket, prefix, actor string) error {
+	return s.mutate(ctx, actor, "carve", directory.Key(tenant, bucket), func(st *state) error { return st.file.Carve(tenant, bucket, prefix) })
+}
+
+// Merge implements directory.Store.
+func (s *Store) Merge(ctx context.Context, tenant, bucket, prefix, actor string) error {
+	return s.mutate(ctx, actor, "merge", directory.Key(tenant, bucket), func(st *state) error { return st.file.Merge(tenant, bucket, prefix) })
+}
+
 // ClearTarget implements directory.Store.
 func (s *Store) ClearTarget(ctx context.Context, tenant, bucket, actor string) error {
 	return s.mutate(ctx, actor, "clear-target", directory.Key(tenant, bucket), func(st *state) error { return st.file.ClearTarget(tenant, bucket) })

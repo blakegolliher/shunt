@@ -93,6 +93,8 @@ type Placement struct {
 	Owners  []Owner        `yaml:"owners,omitempty" json:"owners,omitempty"`
 	KeyHash string         `yaml:"hash,omitempty" json:"hash,omitempty"` // splits the key space among Owners
 	Move    *Move          `yaml:"move,omitempty" json:"move,omitempty"`
+	// Prefixes are prefix rules (ADR-0020, scopes.go): scopes of keys owned by their own table.
+	Prefixes []PrefixRule `yaml:"prefixes,omitempty" json:"prefixes,omitempty"`
 
 	// LegClusters is set only on a move's view (MoveView), never stored: its roles (Source, Primary
 	// and the keys of Names) are leg ids there, since two legs may share a cluster (ADR-0018 N3b),
@@ -120,6 +122,7 @@ func (p Placement) clone() Placement {
 	c.Legs = maps.Clone(p.Legs)
 	c.LegClusters = maps.Clone(p.LegClusters)
 	c.Owners = slices.Clone(p.Owners)
+	c.Prefixes = clonePrefixes(p.Prefixes)
 	if p.Move != nil {
 		m := *p.Move
 		m.Ramp, m.Cutover = v2ramp(p.Move.Ramp), v2cutover(p.Move.Cutover)
@@ -257,6 +260,10 @@ type Store interface {
 	CreateSpread(ctx context.Context, tenant, bucket string, legs []Leg, actor string) error
 	// ClearTarget forgets an ACTIVE placement's prepared target before any step has used it.
 	ClearTarget(ctx context.Context, tenant, bucket, actor string) error
+	// Carve adds a prefix rule owned as its keys are now, and Merge removes one owned as its
+	// parent scope is (ADR-0020): neither changes any key's owner.
+	Carve(ctx context.Context, tenant, bucket, prefix, actor string) error
+	Merge(ctx context.Context, tenant, bucket, prefix, actor string) error
 	// SetTenantDefault changes where a tenant's new buckets are created.
 	SetTenantDefault(ctx context.Context, tenant, cluster, actor string) error
 	// PutCluster adds or replaces a cluster. secret, when not empty, is the cluster's secret key for
@@ -272,10 +279,12 @@ type Store interface {
 
 // Errors returned by Directory implementations.
 var (
-	ErrExists       = errors.New("directory: placement already exists")
-	ErrInUse        = errors.New("directory: cluster is still in use")
-	ErrNotFound     = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
-	ErrConflict     = errors.New("directory: placement changed concurrently")
+	ErrExists   = errors.New("directory: placement already exists")
+	ErrInUse    = errors.New("directory: cluster is still in use")
+	ErrNotFound = errors.New("directory: not found") // wrapped with what was not found: a placement, tenant or cluster
+	ErrConflict = errors.New("directory: placement changed concurrently")
+	// ErrRefused is a change refused on its merits, whatever else changes concurrently.
+	ErrRefused      = errors.New("directory: refused")
 	ErrReadOnly     = errors.New("directory: directory file is not writable")
 	ErrSecretInline = errors.New("directory: the directory file carries only secret_refs, never a secret")
 	ErrLockTimeout  = errors.New("directory: timed out waiting for the directory lock")

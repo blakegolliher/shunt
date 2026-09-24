@@ -280,7 +280,7 @@ test('consolidates a spread bucket one leg at a time and retires an idle leg', a
   const placement: PlacementStatus = { key: 'acme/wide', state: 'ACTIVE', primary: '', names: {}, read_only: false, reject_writes: false,
     legs: [{ id: 'source', cluster: 'source', bucket: 'wide', share: 0.75, ranges: [{ from: '0000000000000000', to: '7fffffffffffffff' }, { from: 'c000000000000000', to: 'ffffffffffffffff' }] },
       { id: 'target', cluster: 'target', bucket: 'wide-t', share: 0.25, ranges: [{ from: '8000000000000000', to: 'bfffffffffffffff' }] },
-      { id: 'target-2', cluster: 'target', bucket: 'wide-idle', share: 0, ranges: [] }] }
+      { id: 'target-2', cluster: 'target', bucket: 'wide-idle', share: 0, ranges: [], idle: true }] }
   const directory: DirectoryStatus = { version: 3, clusters: [source, target], placements: [placement] }
   let started: unknown
   let retired = false

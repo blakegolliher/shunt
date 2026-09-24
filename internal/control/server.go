@@ -230,7 +230,7 @@ func errorOf(err error) (int, Error) {
 	switch {
 	case errors.As(err, &br):
 		return http.StatusBadRequest, Error{Code: "bad_request", Message: err.Error()}
-	case errors.As(err, &ref), errors.Is(err, directory.ErrInUse), errors.As(err, &te):
+	case errors.As(err, &ref), errors.Is(err, directory.ErrInUse), errors.Is(err, directory.ErrRefused), errors.As(err, &te):
 		return http.StatusConflict, Error{Code: "refused", Message: err.Error()}
 	case errors.Is(err, directory.ErrNotFound):
 		return http.StatusNotFound, Error{Code: "not_found", Message: err.Error()}
@@ -313,6 +313,8 @@ type PlacementStatus struct {
 	// Legs are the backend buckets of a bucket spread over legs (ADR-0018 N2), in key-space order;
 	// Primary and Names are empty then.
 	Legs []LegStatus `json:"legs,omitempty"`
+	// Scopes are its prefix rules (ADR-0020); Legs is then the scope of the empty prefix.
+	Scopes []ScopeStatus `json:"scopes,omitempty"`
 	// Move is the part of a spread bucket moving between legs; Primary and Source are its two
 	// clusters then (ADR-0018 N3), and PrimaryBucket and SourceBucket its two buckets, which names
 	// cannot both hold when the legs share a cluster (N3b).
@@ -331,6 +333,16 @@ type LegStatus struct {
 	Bucket  string                `json:"bucket"`
 	Share   float64               `json:"share"`  // fraction of the key hash space, 0..1
 	Ranges  []directory.HashRange `json:"ranges"` // the hash ranges it owns, in order
+	// Idle is a leg that owns no key in any scope and takes part in no move: expand --clear
+	// retires it. A leg owning keys only under a prefix rule has no ranges here but is not idle.
+	Idle bool `json:"idle,omitempty"`
+}
+
+// ScopeStatus is one prefix rule of a spread bucket (ADR-0020): the keys under Prefix that no
+// longer rule claims, and the legs that own them.
+type ScopeStatus struct {
+	Prefix string      `json:"prefix"`
+	Legs   []LegStatus `json:"legs"`
 }
 
 // MoveStatus is a move of part of a bucket: its legs, its range, and that range's share of the
@@ -342,11 +354,34 @@ type MoveStatus struct {
 	Share float64             `json:"share"`
 }
 
-// legStatuses lists a spread placement's legs in the order their ranges run.
+// legStatuses lists a spread placement's legs in the order their ranges run in the scope of the
+// empty prefix, then the legs owning nothing there.
 func legStatuses(p directory.Placement) []LegStatus {
-	var out []LegStatus
-	seen := map[string]int{}
-	for _, o := range p.Owners {
+	out, seen := ownerStatuses(p, p.Owners)
+	idle := directory.IdleLegs(p)
+	for _, id := range sortedKeys(p.Legs) { // a leg owning nothing here: a move's new destination, or one owning only under a prefix rule
+		if _, ok := seen[id]; !ok {
+			l := p.Legs[id]
+			out = append(out, LegStatus{ID: id, Cluster: l.Cluster, Bucket: l.Bucket, Ranges: []directory.HashRange{}, Idle: slices.Contains(idle, id)})
+		}
+	}
+	return out
+}
+
+// scopeStatuses lists a spread placement's prefix rules, each with the legs owning its keys.
+func scopeStatuses(p directory.Placement) []ScopeStatus {
+	out := make([]ScopeStatus, 0, len(p.Prefixes))
+	for _, r := range p.Prefixes {
+		legs, _ := ownerStatuses(p, r.Owners)
+		out = append(out, ScopeStatus{Prefix: r.Prefix, Legs: legs})
+	}
+	return out
+}
+
+// ownerStatuses lists the legs of one owners table in the order their ranges run.
+func ownerStatuses(p directory.Placement, owners []directory.Owner) (out []LegStatus, seen map[string]int) {
+	seen = map[string]int{}
+	for _, o := range owners {
 		share := (float64(o.To) - float64(o.From) + 1) / (1 << 64)
 		rg := directory.HashRange{From: o.From, To: o.To}
 		if i, ok := seen[o.Leg]; ok {
@@ -358,13 +393,7 @@ func legStatuses(p directory.Placement) []LegStatus {
 		seen[o.Leg] = len(out)
 		out = append(out, LegStatus{ID: o.Leg, Cluster: l.Cluster, Bucket: l.Bucket, Share: share, Ranges: []directory.HashRange{rg}})
 	}
-	for _, id := range sortedKeys(p.Legs) { // a leg owning nothing yet: a move's new destination
-		if _, ok := seen[id]; !ok {
-			l := p.Legs[id]
-			out = append(out, LegStatus{ID: id, Cluster: l.Cluster, Bucket: l.Bucket, Ranges: []directory.HashRange{}})
-		}
-	}
-	return out
+	return out, seen
 }
 
 // placementClusters names every cluster a placement uses: its roles, or its legs when spread.
@@ -452,6 +481,7 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 	}
 	if pl.Spread() {
 		ps.Legs = legStatuses(pl)
+		ps.Scopes = scopeStatuses(pl)
 	}
 	if m := pl.Move; m != nil {
 		ps.Move = &MoveStatus{From: m.From, To: m.To, Range: m.Range, Share: (float64(m.Range.To) - float64(m.Range.From) + 1) / (1 << 64)}

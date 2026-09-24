@@ -64,7 +64,7 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 		// The move is over: the destination owns the range, and a source left owning nothing goes.
 		np.State, np.Move = StateActive, nil
 		np.Owners = reassign(p.Owners, m.Range, m.To)
-		if !slices.ContainsFunc(np.Owners, func(o Owner) bool { return o.Leg == m.From }) {
+		if !np.ownsKeys(m.From) {
 			delete(np.Legs, m.From)
 		}
 		return settle(np), nil
@@ -87,6 +87,9 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	}
 	if p.State != StateActive {
 		return fail("a move of part of a bucket starts from ACTIVE")
+	}
+	if len(p.Prefixes) > 0 {
+		return fail("the bucket has prefix rules; moving its keys needs ADR-0020 P2, not in this build")
 	}
 	if t.Range == nil && t.Leg == "" {
 		return fail("name the range of keys to move, or the leg whose keys move: the bucket is spread over legs")
@@ -238,7 +241,7 @@ func reassign(owners []Owner, rg HashRange, leg string) []Owner {
 // that leg is the primary, and another leg that owns nothing is the recorded target, as expand
 // leaves it.
 func settle(p Placement) Placement {
-	if p.Move != nil || len(p.Owners) != 1 {
+	if p.Move != nil || len(p.Owners) != 1 || len(p.Prefixes) > 0 {
 		return p
 	}
 	owner := p.Owners[0].Leg
@@ -266,7 +269,7 @@ func IdleLegs(p Placement) []string {
 		if p.Move != nil && (id == p.Move.From || id == p.Move.To) {
 			continue
 		}
-		if !slices.ContainsFunc(p.Owners, func(o Owner) bool { return o.Leg == id }) {
+		if !p.ownsKeys(id) {
 			out = append(out, id)
 		}
 	}

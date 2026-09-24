@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
-	"sort"
 	"strings"
 
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -227,18 +226,34 @@ func InHold(r *directory.Ramp, key string) (bool, error) {
 }
 
 // OwnerOf returns the id of the leg that owns key in a placement spread over legs (ADR-0018 N2):
-// the leg whose hash range holds the key's hash, by the placement's own hash. A placement naming a
-// hash this build does not implement is refused with ErrUnknownRampHash, never split differently.
+// in the table of the key's scope (the longest prefix rule it starts with, ADR-0020), the leg
+// whose hash range holds the key's hash, by the placement's own hash. A placement naming a hash
+// this build does not implement is refused with ErrUnknownRampHash, never split differently.
 func OwnerOf(p *directory.Placement, key string) (string, error) {
 	if p.KeyHash != directory.RampHash {
 		return "", fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
 	}
 	h := directory.Hash(rampHash(key))
-	i := sort.Search(len(p.Owners), func(i int) bool { return p.Owners[i].To >= h })
-	if i == len(p.Owners) {
+	_, owners := p.Scope(key)
+	leg := directory.OwnerIn(owners, h)
+	if leg == "" {
 		return "", fmt.Errorf("owners do not cover hash %016x", uint64(h)) // validation makes this unreachable
 	}
-	return p.Owners[i].Leg, nil
+	return leg, nil
+}
+
+// InMove reports whether key is one the placement's move is taking to another leg: in the move's
+// scope and hash range. It is the one test of move membership: the proxy's narrowing, the listing
+// merge, the mover and purge all ask it (ADR-0020), so a key has the same two homes everywhere.
+// Moves happen only in buckets without prefix rules until ADR-0020 P2, so the move's scope is
+// the empty prefix, which holds the keys no rule claims.
+func InMove(p *directory.Placement, key string) bool {
+	m := p.Move
+	if m == nil || !InRangeHash(m.Range, key) {
+		return false
+	}
+	scope, _ := p.Scope(key)
+	return scope == ""
 }
 
 // Narrow is a spread placement as one request for key sees it: ACTIVE on the leg that owns the key,
@@ -251,7 +266,7 @@ func Narrow(p *directory.Placement, key string) (directory.Placement, error) {
 		if p.KeyHash != directory.RampHash {
 			return directory.Placement{}, fmt.Errorf("%w %q: this build splits keys by %s", ErrUnknownRampHash, p.KeyHash, directory.RampHash)
 		}
-		if InRangeHash(m.Range, key) {
+		if InMove(p, key) {
 			// A key in the moving range: the move is the two-cluster migration it is (ADR-0018 N3).
 			return p.MoveView(), nil
 		}

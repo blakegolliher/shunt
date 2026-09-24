@@ -191,6 +191,15 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   bucket detail and Migrations; docs/spread-buckets.md. Every ADR-0018 phase is now built; its
   open questions (prefix ownership, concurrent moves, the listing target for raising the cap,
   rebalancing policy) remain.
+- **ADR-0020 (prefix ownership) P1 built (2026-09-23).** Decided: rebalancing is never proposed by
+  shunt; the listing target and concurrent moves stay deferred; prefix ownership is wanted. P1:
+  prefix rules as scopes with their own tables, carve and merge (API and `expand --carve/--merge`)
+  that change no key's owner, one ownership path (`Scope`, `OwnerOf`, `InMove`) for the proxy,
+  listing, mover and purge, listings reading only the legs a prefix can use, status per scope.
+  Gate: carve/merge property test with its negative control, `FuzzOwnerOf`, proxy test with two
+  negative controls, control and CLI tests; lint and race suite green (internal/cp's etcd join
+  flake, "incompatible with current running cluster", recurred in two runs and passed on rerun).
+  Next: P2, moves within a scope.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap

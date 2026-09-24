@@ -24,7 +24,7 @@ test('the ownership bar draws the ranges of each leg and marks the part moving',
   const legs = [
     { id: 'a', cluster: 'minio01', bucket: 'wide', share: 0.75, ranges: [{ from: '0000000000000000', to: '3fffffffffffffff' }, { from: '8000000000000000', to: 'ffffffffffffffff' }] },
     { id: 'b', cluster: 'minio02', bucket: 'wide-b', share: 0.25, ranges: [{ from: '4000000000000000', to: '7fffffffffffffff' }] },
-    { id: 'c', cluster: 'minio02', bucket: 'wide-c', share: 0, ranges: [] },
+    { id: 'c', cluster: 'minio02', bucket: 'wide-c', share: 0, ranges: [], idle: true },
   ]
   const move = { from: 'a', to: 'b', range: { from: '8000000000000000', to: 'bfffffffffffffff' }, share: 0.25 }
   const { container } = render(<OwnershipBar legs={legs} move={move} />)

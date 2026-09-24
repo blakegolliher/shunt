@@ -110,7 +110,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
     const args = { to: kept.cluster, name: kept.bucket, leg: next.id, ratio: consolidateRatio, wait: '30s' }
     if (await act(() => startOperation(token, 'ramp', key, args), `${key}: moving leg ${next.id}'s keys into ${kept.cluster}/${kept.bucket}`)) { setConsolidating(null); onMigrate(key) }
   }
-  const idleLegs = (placement: PlacementStatus) => placement.state === 'ACTIVE' && !placement.move ? (placement.legs ?? []).filter((l) => l.ranges.length === 0) : []
+  const idleLegs = (placement: PlacementStatus) => placement.state === 'ACTIVE' && !placement.move ? (placement.legs ?? []).filter((l) => l.idle) : []
   const growing = useMemo(() => placements.find((item) => item.key === expanding), [placements, expanding])
   // Another cluster, or another bucket on the bucket's own cluster (ADR-0018 N3b), listed last.
   const targets = growing ? [...clusters.filter((item) => item.name !== growing.primary), ...clusters.filter((item) => item.name === growing.primary)] : []
@@ -218,7 +218,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
           <div className="mt-2"><CopyLine value={`shunt client add <access-key> --tenant ${splitKey(detail.key)[0]} --check ${detail.primary} --api ${window.location.origin}`} /></div>
         </div>}
         <FenceStatus held={detail.fence.held} version={detail.fence.version} waitingOn={detail.fence.waiting_on} />
-        {detail.legs?.length ? <Card title="Legs"><OwnershipBar legs={detail.legs} move={detail.move} /><dl className="mt-4 grid gap-3 text-sm">{detail.legs.map((l) => <div key={l.id} className="flex justify-between gap-4"><dt>{l.cluster}{l.id !== l.cluster && <span className="text-muted"> (leg {l.id})</span>}</dt><dd className="text-right font-mono text-muted">{l.bucket} · {l.ranges.length ? `${Math.round(l.share * 1000) / 10}% of keys` : 'idle'}{l.ranges.map((r) => <span key={r.from} className="block text-xs">{r.from}–{r.to}</span>)}</dd></div>)}</dl></Card> : null}
+        {detail.legs?.length ? <Card title="Legs"><OwnershipBar legs={detail.legs} move={detail.move} /><dl className="mt-4 grid gap-3 text-sm">{detail.legs.map((l) => <div key={l.id} className="flex justify-between gap-4"><dt>{l.cluster}{l.id !== l.cluster && <span className="text-muted"> (leg {l.id})</span>}</dt><dd className="text-right font-mono text-muted">{l.bucket} · {l.ranges.length ? `${Math.round(l.share * 1000) / 10}% of keys` : l.idle ? 'idle' : 'no keys outside its prefix rules'}{l.ranges.map((r) => <span key={r.from} className="block text-xs">{r.from}–{r.to}</span>)}</dd></div>)}</dl></Card> : null}
         <Card title="Placement names"><dl className="grid gap-3 text-sm">{Object.entries(detail.names).map(([name, value]) => <div key={name} className="flex justify-between gap-4"><dt>{name}</dt><dd className="font-mono text-muted">{value}</dd></div>)}</dl></Card>
         <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), `${detail.key} is ${detail.read_only ? 'writable' : 'read-only'}`) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button></div>
       </div> : <p className="text-muted">Loading bucket detail…</p>}

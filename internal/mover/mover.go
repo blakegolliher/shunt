@@ -154,8 +154,8 @@ func selectPlacements(dir *directory.File, secrets map[string]string, one, from 
 		var keep func(string) bool
 		if m := p.Move; m != nil {
 			// Part of a bucket moves: the move's two legs, and only the keys in its range (ADR-0018 N3).
-			rg := m.Range
-			keep = func(k string) bool { return migrate.InRangeHash(rg, k) }
+			spread := p
+			keep = func(k string) bool { return migrate.InMove(&spread, k) }
 			p = p.MoveView()
 		}
 		tenant, name, _ := strings.Cut(key, "/")
