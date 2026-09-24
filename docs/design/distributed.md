@@ -2,6 +2,12 @@
 
 Referenced from `docs/DESIGN.md` §12. Supersedes §1.5 where they differ: Postgres is replaced by etcd embedded in `shunt-control`. ADR-0015 records the decision.
 
+**Proposed hardening:** [ADR-0018](../adr/0018-distributed-correctness.md) and
+[distributed correctness](distributed-correctness.md) address gaps in the
+implemented version fence, runtime installation, recovery and membership. The
+proposal is not implemented; use its [delivery plan](../prompts/distributed-hardening.md)
+for the next correctness work, including required API/CLI/GUI and test coverage.
+
 ## 12.0 Where this sits
 
 This section is the fleet-scale form of work that starts on a single proxy. `docs/POC-6.md` is the
@@ -168,4 +174,3 @@ Requirements the runbook states plainly: three nodes on separate failure domains
 - Fence: a ramp change never advances to phase 2 while any live proxy lags; a proxy whose lease expires is dropped from the fence and lands in stale mode.
 - Quorum loss: kill two of three control nodes under load; data-path error rate on ACTIVE placements stays zero; transitional placements see only 503s with `Retry-After`; recovery restores everything with no operator action.
 - Mover claims: two movers on the same migration never copy conflicting content; a mover killed mid-range is taken over within one lease TTL.
-

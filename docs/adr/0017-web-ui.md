@@ -2,6 +2,11 @@
 
 Status: accepted (UI-6, 2026-09-22). UI-0 through UI-6 are built and their Go, UI-unit, fleet and license gates pass; browser-flow and screenshot acceptance are manual by the operator's explicit choice. Overrides the "a web UI" entry of docs/DESIGN.md §3 (non-goals for v1) on the `distributed` branch. Supersedes item 1 of docs/prompts/P3e.md. Source: docs/prompts/webui.md.
 
+Proposed follow-up: [ADR-0018](0018-distributed-correctness.md) and its
+[interface contract](../design/distributed-correctness-contracts.md) tighten
+operation outcomes, maintenance evidence, health and draft/event consistency.
+They are not implemented; they retain the manual visual acceptance policy.
+
 ## Context
 
 Every operator action is a CLI verb over the control API (ADR-0008). A demo that walks a bucket across clusters (docs/prompts/webui.md, the demo table) needs the same actions from a browser, with what the CLI prints as text shown live: the two-phase fence pending then applied, the write split, fallback reads trending to zero, the purge dry run. The API as it stood could not carry that: each long-running verb was one blocking HTTP call whose fence state (waiting-on names) was discarded when it answered; members long-polled a payload that carries secrets; `GET /v1/status` mixed every read model; `purge-source` and `cluster remove` had no dry run.

@@ -2,6 +2,12 @@
 
 Status: accepted (POC-6 item 3, 2026-09-21). Amends ADR-0004 (migration races), ADR-0008 (the control API), docs/DESIGN.md §2.5 and §12.6. Source: POC-6 item 3; docs/design/distributed.md §12.6.
 
+Known gap and proposed follow-up: installation alone does not drain requests
+using an older snapshot, including on a single proxy. Lease expiry also does not
+prove a dispatched backend write completed. [ADR-0018](0018-distributed-correctness.md)
+specifies stronger admission/drain and recovery semantics, including changes to
+the timeout, forget and dead-member rules below. That proposal is not implemented.
+
 ## Context
 
 Several proxies can serve one directory: each polls the file (`directory.poll_interval`, 1 s) and routes by whatever version it last read. Until now a ramp step, `migrate start` or `cutover` took effect the moment it was written, and each proxy picked it up on its own schedule. Three things follow, and none of them shows up with one proxy:
