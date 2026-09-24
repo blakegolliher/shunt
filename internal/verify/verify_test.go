@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,24 @@ func TestCleanRunHasNoErrors(t *testing.T) {
 }
 
 // A backend that acknowledges writes it did not keep is caught by the model.
+// Keys left under the prefix by an earlier run are reported as such, at once, not as deletes that
+// came back after the grace.
+func TestStaleKeysUnderThePrefix(t *testing.T) {
+	c := backend(t, nil)
+	for i := range 20 {
+		if _, err := c.Do(context.Background(), http.MethodPut, fmt.Sprintf("old/%04d", i), []byte("x"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep := Run(context.Background(), c, Options{Workers: 2, Keys: 20, Duration: 300 * time.Millisecond, Prefix: "old/", Seed: 3})
+	if rep.Errors == 0 || !strings.Contains(strings.Join(rep.ErrorSamples, "\n"), "this run never wrote it") {
+		t.Fatalf("stale keys: %+v", rep)
+	}
+	if strings.Contains(strings.Join(rep.ErrorSamples, "\n"), "deleted ") {
+		t.Fatalf("stale keys reported as resurrections: %v", rep.ErrorSamples)
+	}
+}
+
 func TestLostWritesAreErrors(t *testing.T) {
 	var n atomic.Int64
 	c := backend(t, func(w http.ResponseWriter, r *http.Request, next http.Handler) {

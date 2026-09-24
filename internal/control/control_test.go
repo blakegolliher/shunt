@@ -1288,7 +1288,12 @@ func TestMoveToAnotherBucketOnTheSameClusterThroughTheAPI(t *testing.T) {
 func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
 	rg := newRig(t)
 	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: rg.vast01.definition(true)}, nil)
-	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: rg.vast02.definition(true)}, nil)
+	// vast02's conditional-write profile is only assumed: the first step into it measures it, as
+	// expand would, or the mover would refuse the destination.
+	unmeasured := rg.vast02.definition(true)
+	unmeasured.Capabilities = config.Capabilities{}
+	rg.vast02.condPut = true
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast02", Cluster: unmeasured}, nil)
 	rg.must("POST", "/v1/placements/acme/spd/create-backend",
 		CreateBackendRequest{Legs: []LegRequest{{Cluster: "vast01", Name: "sp-a"}, {Cluster: "vast02", Name: "sp-b"}}}, nil)
 	p, _ := rg.dir.Snapshot().Lookup("acme", "spd")
@@ -1319,6 +1324,12 @@ func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
 		rg.must("POST", "/v1/placements/acme/spd/migrate", MigrateRequest{To: "vast02", Name: "sp-final", Create: true, Leg: leg}, &tr)
 		if tr.To != directory.StateMigrating || tr.Range == nil {
 			t.Fatalf("moving leg %s: %+v", leg, tr)
+		}
+		if cl, _ := rg.dir.Snapshot().Cluster("vast02"); cl.Capabilities.ConditionalWrite == nil || !*cl.Capabilities.ConditionalWrite || cl.Capabilities.ConditionalDelete == nil {
+			t.Fatalf("the destination's profile was not measured: %+v", cl.Capabilities)
+		}
+		if err := rg.ctl.checkMover("acme/spd", MoverRequest{}); err != nil && strings.Contains(err.Error(), "conditional-write profile") {
+			t.Fatalf("the mover refuses the move's destination: %v", err)
 		}
 		rg.refused("POST", "/v1/placements/acme/spd/ramp", RampRequest{Ratio: 1, Leg: "other"}, "finish it before moving another leg")
 		for _, k := range keys[leg] {

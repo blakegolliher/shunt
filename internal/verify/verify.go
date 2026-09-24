@@ -388,6 +388,9 @@ func (r *runner) get(ctx context.Context, i int, k *Key) {
 		r.fail("GET %s: read %q, wrote %q", r.key(i), snippet(rep.Body), k.Body)
 	case k.Present:
 		r.tally(r.reads, rep.Route)
+	case rep.Status == http.StatusOK && k.Deleted.IsZero():
+		// Not a resurrection: this run never wrote or deleted the key, so it predates the run.
+		r.fail("GET %s: readable, but this run never wrote it; the prefix holds keys from an earlier run (use a fresh --prefix, or --cleanup)", r.key(i))
 	case rep.Status == http.StatusOK:
 		if r.gone(ctx, i) {
 			r.resurrections.Add(1)

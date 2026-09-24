@@ -237,6 +237,11 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   step released before it routed anything leaves such a leg. A leg can only come to own nothing
   through a move's end, which drops it, or a release, which never routed anything to it, so it holds
   no keys.
+- **A first step measures its destination.** The mover refuses a destination whose conditional-write
+  profile is assumed (ADR-0004), and only expand measured it, so a move into a leg that expand never
+  prepared stalled at the mover (found live, 2026-09-23). A first step now measures an unmeasured
+  destination cluster as expand does, with a `.shunt-probe-<random>` object it deletes at once; on
+  a live leg a listing can see that object for the few milliseconds it exists.
 - **Split** needs no action of its own: a move may take any range inside one leg's ownership, and
   the owners table is cut where the move's range ends.
 - **CLI:** `shunt ramp` and `shunt migrate start` take `--range <from>-<to>` and `--leg`; the result

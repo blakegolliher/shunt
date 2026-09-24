@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
@@ -308,7 +309,7 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 		case !exists && !create:
 			return TransitionResult{}, refuse("bucket %s does not exist on %s; create it there, or ask for it to be created (--create)", name, dstCluster)
 		case !exists:
-			if _, err := target.createBucket(ctx, name); err != nil {
+			if _, err = target.createBucket(ctx, name); err != nil {
 				return TransitionResult{}, err
 			}
 			res.CreatedBucket = name
@@ -316,9 +317,21 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 			// A first step that names its own target; one expand prepared was checked there, and a leg
 			// already in the bucket holds only keys it owns: a move's source is purged, never left
 			// holding the range (finish).
-			if err := targetEmpty(ctx, target, dstCluster, name, "expand, which can accept them (--accept-existing-objects), before the first step"); err != nil {
-				return TransitionResult{}, err
+			if emptyErr := targetEmpty(ctx, target, dstCluster, name, "expand, which can accept them (--accept-existing-objects), before the first step"); emptyErr != nil {
+				return TransitionResult{}, emptyErr
 			}
+		}
+		// A first step without expand measures the destination as expand would, or the mover would
+		// refuse it later for an assumed profile.
+		measured, err := s.measureConditionals(ctx, target, dstCluster, name, tr.actor)
+		if err != nil {
+			return TransitionResult{}, err
+		}
+		if measured != nil && !*measured.ConditionalWrite && full.State == directory.StateMigrating && !lossWindow {
+			if !acceptLoss {
+				return TransitionResult{}, lostWriteWindow(key, dstCluster)
+			}
+			res.Warning = "accepted with accept_lost_write_window: " + lostWriteWindow(key, dstCluster).Error()
 		}
 	}
 	if full.State == directory.StateRamping || full.State == directory.StateMigrating {
@@ -554,24 +567,12 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		fail(w, refuse("canary write/read/delete on %s/%s failed: %v", req.To, req.Name, err))
 		return
 	}
-	if target.Capabilities.ConditionalWrite == nil || target.Capabilities.ConditionalDelete == nil {
-		cw, cd, perr := probeConditionals(ctx, tb, req.Name)
-		if perr != nil {
-			fail(w, refuse("measuring conditional writes on %s/%s failed: %v; set --conditional-write and --conditional-delete on the cluster instead", req.To, req.Name, perr))
-			return
-		}
-		if target.Capabilities.ConditionalWrite == nil {
-			target.Capabilities.ConditionalWrite = &cw
-		}
-		if target.Capabilities.ConditionalDelete == nil {
-			target.Capabilities.ConditionalDelete = &cd
-		}
-		if err = s.Dir.PutCluster(r.Context(), req.To, target, "", actor(r)); err != nil {
-			fail(w, err)
-			return
-		}
+	if measured, err := s.measureConditionals(ctx, tb, req.To, req.Name, actor(r)); err != nil {
+		fail(w, err)
+		return
+	} else if measured != nil {
 		res.Measured = true
-		res.ConditionalWrite, res.ConditionalDelete = *target.Capabilities.ConditionalWrite, *target.Capabilities.ConditionalDelete
+		res.ConditionalWrite, res.ConditionalDelete = *measured.ConditionalWrite, *measured.ConditionalDelete
 	}
 	if err := s.Dir.SetTarget(r.Context(), tenant, bucket, req.To, req.Name, actor(r)); err != nil {
 		fail(w, err)
@@ -683,6 +684,34 @@ func canary(ctx context.Context, b backend, bucket string) (string, error) {
 // a PUT with If-None-Match: * over an existing object (412), and a DELETE whose If-Match names the
 // wrong ETag (412). It works on one scratch object, which it removes. A backend that ignores a header
 // simply does the write, which is the answer.
+// measureConditionals measures and records a cluster's conditional-write profile when it is only
+// assumed, probing bucket on it; it returns the capabilities it recorded, or nil when both were set.
+// The mover refuses a destination whose profile is assumed (ADR-0004), so expand measures it, and
+// so does a first step that names its own destination, such as a move into a leg (ADR-0018 N3c).
+func (s *Server) measureConditionals(ctx context.Context, b backend, cluster, bucket, who string) (*config.Capabilities, error) {
+	cl, ok := s.Dir.Snapshot().Cluster(cluster)
+	if !ok {
+		return nil, fmt.Errorf("%w: cluster %s", directory.ErrNotFound, cluster)
+	}
+	if cl.Capabilities.ConditionalWrite != nil && cl.Capabilities.ConditionalDelete != nil {
+		return nil, nil //nolint:nilnil // nothing to measure
+	}
+	cw, cd, err := probeConditionals(ctx, b, bucket)
+	if err != nil {
+		return nil, refuse("measuring conditional writes on %s/%s failed: %v; set --conditional-write and --conditional-delete on the cluster instead", cluster, bucket, err)
+	}
+	if cl.Capabilities.ConditionalWrite == nil {
+		cl.Capabilities.ConditionalWrite = &cw
+	}
+	if cl.Capabilities.ConditionalDelete == nil {
+		cl.Capabilities.ConditionalDelete = &cd
+	}
+	if err := s.Dir.PutCluster(ctx, cluster, cl, "", who); err != nil {
+		return nil, err
+	}
+	return &cl.Capabilities, nil
+}
+
 func probeConditionals(ctx context.Context, b backend, bucket string) (conditionalWrite, conditionalDelete bool, err error) {
 	var id [8]byte
 	_, _ = rand.Read(id[:])
