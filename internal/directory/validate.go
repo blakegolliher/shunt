@@ -75,6 +75,7 @@ func validate(f *File) error {
 	if f.Version < 0 {
 		e.add("version", "must not be negative")
 	}
+	validateLineage(&e, f)
 	if err := config.ValidateClusters("clusters", clusters); err != nil {
 		e = append(e, err)
 	}

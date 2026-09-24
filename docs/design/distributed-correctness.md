@@ -47,6 +47,16 @@ S3 workload. Existing backend capability checks remain release requirements.
 
 ### Identity
 
+**Landed (2026-09-24, H0a):** `directory.Identity` (`cluster_id`, `epoch`), drawn by the first
+write under schema 2 and stored in the same transaction as the version (`/shunt/v1/identity`, and
+in the lab file); a node starting on schema-1 data upgrades it with one ordinary write. Resource
+generations are the version of the write that last changed each placement, cluster or tenant
+(`directory.Stamp`); a cluster's secret-only change counts. Unchanged resources stay unstamped
+(generation 0) so the upgrade is one bounded transaction. The directory poll, the heartbeat, the
+member cache and the fence carry and compare the identity (`checkLineage`, `Member.Has`); the
+wire keeps the numeric `version` for now, and the string-typed `identity.version` of the contracts
+arrives with the typed read models (H0d).
+
 Persist a random `cluster_id` at initial creation and a random `epoch` for each
 recovery lineage. Snapshot `version` increases within one epoch. Placement and
 cluster `generation` increase on changes to that resource. Secret generations

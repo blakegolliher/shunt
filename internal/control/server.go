@@ -175,6 +175,8 @@ func pathKey(r *http.Request) string {
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// CurrentIdentity is the control plane's directory lineage, on a lineage refusal.
+	CurrentIdentity *directory.Identity `json:"current_identity,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -226,8 +228,12 @@ func errorOf(err error) (int, Error) {
 		ref *refusal
 		te  *directory.TransitionError
 		ce  *config.Error
+		le  *lineageError
 	)
 	switch {
+	case errors.As(err, &le):
+		cur := le.cur
+		return http.StatusConflict, Error{Code: le.code, Message: err.Error(), CurrentIdentity: &cur}
 	case errors.As(err, &br):
 		return http.StatusBadRequest, Error{Code: "bad_request", Message: err.Error()}
 	case errors.As(err, &ref), errors.Is(err, directory.ErrInUse), errors.Is(err, directory.ErrRefused), errors.As(err, &te):

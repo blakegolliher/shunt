@@ -154,7 +154,8 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 
 // fenceStatus reads the fleet once and says who has the current version.
 func (s *Server) fenceStatus(ctx context.Context, p directory.Placement) FenceStatus {
-	fs := FenceStatus{Version: s.Dir.Snapshot().Version(), Held: p.Held(), WaitingOn: []string{}, Silent: []string{}}
+	snap := s.Dir.Snapshot()
+	fs := FenceStatus{Version: snap.Version(), Held: p.Held(), WaitingOn: []string{}, Silent: []string{}}
 	ms, err := s.members(ctx)
 	if err != nil {
 		return fs
@@ -165,7 +166,7 @@ func (s *Server) fenceStatus(ctx context.Context, p directory.Placement) FenceSt
 			fs.Silent = append(fs.Silent, m.ID)
 		default:
 			fs.Proxies++
-			if m.Applied < fs.Version {
+			if !m.Has(snap.File().Identity, fs.Version) {
 				fs.WaitingOn = append(fs.WaitingOn, m.ID)
 			}
 		}

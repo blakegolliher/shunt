@@ -39,7 +39,7 @@ type fakeControl struct {
 func newFakeControl(t *testing.T) *fakeControl {
 	t.Helper()
 	f := &fakeControl{}
-	f.dir = control.Directory{File: directory.File{Version: 1,
+	f.dir = control.Directory{File: directory.File{Version: 1, Identity: testIdentity,
 		Clusters:   map[string]config.Cluster{"vast01": {Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"127.0.0.1:1"}, Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}},
 		Tenants:    map[string]directory.Tenant{"acme": {DefaultCluster: "vast01"}},
 		Placements: map[string]directory.Placement{"acme/data": {State: directory.StateActive, Primary: "vast01", Names: map[string]string{"vast01": "data"}}}},
@@ -53,6 +53,14 @@ func newFakeControl(t *testing.T) *fakeControl {
 		}
 		var since int64
 		_, _ = fmtSscan(r.URL.Query().Get("since"), &since)
+		f.mu.Lock()
+		cur := f.dir.Identity
+		f.mu.Unlock()
+		if e := r.URL.Query().Get("epoch"); e != "" && e != cur.Epoch {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
+			return
+		}
 		deadline := time.Now().Add(200 * time.Millisecond)
 		for {
 			f.mu.Lock()
@@ -85,7 +93,20 @@ func newFakeControl(t *testing.T) *fakeControl {
 		}
 		edit := f.answer
 		f.mu.Unlock()
-		a := control.HeartbeatAnswer{Seq: hb.Seq, Version: v, LeaseTTL: time.Second}
+		if hb.Protocol != control.Protocol {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeProtocol, Message: "protocol"})
+			return
+		}
+		f.mu.Lock()
+		cur := f.dir.Identity
+		f.mu.Unlock()
+		if !hb.Identity.IsZero() && hb.Identity != cur {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
+			return
+		}
+		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second}
 		if edit != nil {
 			edit(&a)
 		}
@@ -125,6 +146,9 @@ func newFakeControl(t *testing.T) *fakeControl {
 	t.Cleanup(f.srv.Close)
 	return f
 }
+
+// testIdentity is the fake control plane's lineage.
+var testIdentity = directory.Identity{ClusterID: "c0ffee00c0ffee00c0ffee00c0ffee00", Epoch: "e0000000000000000000000000000001"}
 
 func cloneP(m map[string]directory.Placement) map[string]directory.Placement {
 	out := make(map[string]directory.Placement, len(m))
@@ -560,6 +584,7 @@ func TestMemberLeaseFollowsTheServerGrant(t *testing.T) {
 		{"a zero grant", func(a *control.HeartbeatAnswer) { a.LeaseTTL = 0 }},
 		{"an answer to another heartbeat", func(a *control.HeartbeatAnswer) { a.Seq-- }},
 		{"a version behind the proxy's", func(a *control.HeartbeatAnswer) { a.Version = 0 }},
+		{"an answer for another lineage", func(a *control.HeartbeatAnswer) { a.Identity.Epoch = "e0000000000000000000000000000002" }},
 	}
 	for _, r := range refused {
 		f.setAnswer(r.edit)
@@ -576,11 +601,73 @@ func TestMemberLeaseFollowsTheServerGrant(t *testing.T) {
 		t.Fatalf("a good answer after the refused ones: %v, stale %v", err, c.Stale())
 	}
 	// An older answer never replaces a newer grant, even with a later deadline.
-	if err := c.renew(ctx, c.seq.Load()-1, clock.Now().Add(time.Hour), c.Snapshot().Version(), control.HeartbeatAnswer{Seq: c.seq.Load() - 1, Version: c.Snapshot().Version(), LeaseTTL: time.Second}); err != nil {
+	if err := c.renew(ctx, c.seq.Load()-1, clock.Now().Add(time.Hour), c.Snapshot().Version(), control.HeartbeatAnswer{Seq: c.seq.Load() - 1, Identity: testIdentity, Version: c.Snapshot().Version(), LeaseTTL: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	clock.Add(time.Second + time.Millisecond)
 	if !c.Stale() {
 		t.Fatal("an older heartbeat's answer extended the lease")
+	}
+}
+
+// A control plane that moves to another epoch (a restore) leaves this member on the old lineage:
+// its versions compare with nothing there. The member refuses the new lineage's directory, takes
+// no lease, and stays stale until it is re-enrolled; it never installs across lineages.
+func TestMemberStaysStaleAcrossAnEpochChange(t *testing.T) {
+	f := newFakeControl(t)
+	c := newClient(t, f)
+	ctx := context.Background()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.Stale() {
+		t.Fatal("stale after registering")
+	}
+	f.mu.Lock()
+	f.dir.Identity.Epoch = "e0000000000000000000000000000002"
+	f.dir.Version = 1 // a restore: a lower or equal version in the new epoch
+	f.mu.Unlock()
+	if err := c.beat(ctx); err == nil {
+		t.Fatal("a heartbeat from the old epoch was answered with a lease")
+	}
+	if !c.Stale() {
+		t.Fatal("fresh after the control plane moved to another epoch")
+	}
+	if _, err := c.fetch(ctx, c.Snapshot().Version(), 0); err == nil {
+		t.Fatal("the new epoch's directory was fetched as if it continued the old one")
+	}
+	if _, err := c.install(f.version(t, 5), true); err == nil {
+		t.Fatal("a directory from another epoch was installed")
+	}
+	if id := c.Snapshot().File().Identity; id != testIdentity {
+		t.Fatalf("installed lineage changed to %+v", id)
+	}
+	f.setAnswer(nil)
+	_ = c.beat(ctx)
+	if !c.Stale() {
+		t.Fatal("a lineage fault cleared by itself")
+	}
+}
+
+// A cache written before schema 2 has no identity: it is ignored rather than served, since none of
+// its versions can be compared with the control plane's.
+func TestMemberIgnoresACacheWithoutIdentity(t *testing.T) {
+	f := newFakeControl(t)
+	dir := t.TempDir()
+	d := f.version(t, 7)
+	d.Identity = directory.Identity{}
+	data, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "directory.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := New(Config{Endpoints: []string{f.srv.URL}, ProxyID: "p1", CacheDir: dir, Interval: time.Second, LeaseTTL: 3 * time.Second}, slog.New(slog.DiscardHandler))
+	if err := c.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if v := c.Snapshot().Version(); v != 0 {
+		t.Fatalf("a cache with no identity was installed at version %d", v)
 	}
 }

@@ -135,6 +135,13 @@ func (p Placement) clone() Placement {
 // carry a higher version is rejected.
 type File struct {
 	Version int64 `yaml:"version" json:"version"`
+	// Schema is the schema the directory was written with (SchemaVersion); 0 is schema 1.
+	Schema int `yaml:"schema,omitempty" json:"schema,omitempty"`
+	// Identity is the directory's lineage; zero until the first write under schema 2.
+	Identity Identity `yaml:"identity,omitempty" json:"identity,omitzero"`
+	// Generations maps each resource (PlacementResource, ClusterResource, TenantResource) to the
+	// version of the write that last changed it. Stamp keeps it.
+	Generations map[string]int64 `yaml:"generations,omitempty" json:"generations,omitempty"`
 	// Clusters are the backends placements route to (docs/DESIGN.md §1.5: control-plane state).
 	// Credentials are secret_refs only; a secret never lives in this file.
 	Clusters   map[string]config.Cluster `yaml:"clusters,omitempty" json:"clusters"`
@@ -143,7 +150,8 @@ type File struct {
 }
 
 func (f *File) clone() *File {
-	c := &File{Version: f.Version, Clusters: make(map[string]config.Cluster, len(f.Clusters)), Tenants: maps.Clone(f.Tenants),
+	c := &File{Version: f.Version, Schema: f.Schema, Identity: f.Identity, Generations: maps.Clone(f.Generations),
+		Clusters: make(map[string]config.Cluster, len(f.Clusters)), Tenants: maps.Clone(f.Tenants),
 		Placements: make(map[string]Placement, len(f.Placements))}
 	for name := range f.Clusters {
 		cl := f.Clusters[name]

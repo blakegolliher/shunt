@@ -27,9 +27,53 @@ const defaultFenceWait = 30 * time.Second
 // control plane has lost quorum, or this node is starting. Answered as 503.
 var ErrUnavailable = errors.New("control plane unavailable")
 
+// Protocol is the fleet protocol this build speaks (ADR-0021). There is no mixed-version fleet: a
+// heartbeat in another protocol is refused, and the proxy that sent it never takes a lease.
+const Protocol = 2
+
+// Lineage refusal codes: the request was made against a directory lineage that is not the
+// control plane's (answered 409 with its current identity).
+const (
+	CodeClusterMismatch = "cluster_mismatch" // another cluster's directory
+	CodeEpochMismatch   = "epoch_mismatch"   // another recovery lineage of this cluster
+	CodeResyncRequired  = "resync_required"  // same lineage, but the caller claims a version this node does not have
+	CodeProtocol        = "protocol_unsupported"
+)
+
+// lineageError is a request made against another lineage than cur.
+type lineageError struct {
+	code string
+	msg  string
+	cur  directory.Identity
+}
+
+func (e *lineageError) Error() string { return e.msg }
+
+// checkLineage compares a caller's directory (have, at version v) with the installed one. A caller
+// with no identity has nothing installed yet. Versions compare only within one identity.
+func checkLineage(snap *directory.Snapshot, have directory.Identity, v int64) error {
+	cur := snap.File().Identity
+	switch {
+	case have.IsZero():
+		return nil
+	case have.ClusterID != cur.ClusterID:
+		return &lineageError{code: CodeClusterMismatch, cur: cur, msg: fmt.Sprintf("this control plane serves cluster %s; the caller's directory is from cluster %s", cur.ClusterID, have.ClusterID)}
+	case have.Epoch != cur.Epoch:
+		return &lineageError{code: CodeEpochMismatch, cur: cur, msg: fmt.Sprintf("the directory is in epoch %s; the caller's is from epoch %s, another recovery lineage: its versions compare with nothing here", cur.Epoch, have.Epoch)}
+	case v > snap.Version():
+		return &lineageError{code: CodeResyncRequired, cur: cur, msg: fmt.Sprintf("the caller claims directory version %d; this control node has %d in the same epoch", v, snap.Version())}
+	}
+	return nil
+}
+
 // Heartbeat is a member's report to the control plane.
 type Heartbeat struct {
-	Started time.Time `json:"started"`
+	// Protocol is the fleet protocol the member speaks; it must be Protocol.
+	Protocol int `json:"protocol"`
+	// Identity is the lineage of the directory the member has installed (Applied); zero before
+	// it has installed one.
+	Identity directory.Identity `json:"identity,omitzero"`
+	Started  time.Time          `json:"started"`
 	// Seq counts this member's heartbeats since it started, so a caller can tell which reports
 	// were assembled after a point in time.
 	Seq int64 `json:"seq"`
@@ -49,9 +93,10 @@ type Heartbeat struct {
 // HeartbeatAnswer tells a member the current version and its lease. Seq echoes the heartbeat it
 // answers: a member takes a lease only from the answer to the heartbeat it sent.
 type HeartbeatAnswer struct {
-	Seq      int64         `json:"seq"`
-	Version  int64         `json:"version"`
-	LeaseTTL time.Duration `json:"lease_ttl"`
+	Seq      int64              `json:"seq"`
+	Identity directory.Identity `json:"identity"`
+	Version  int64              `json:"version"`
+	LeaseTTL time.Duration      `json:"lease_ttl"`
 }
 
 // Member is one registered proxy as the control plane sees it.
@@ -59,7 +104,10 @@ type Member struct {
 	ID string `json:"id"`
 	// Live: its lease has not expired. A member stays a member after its lease expires, until it
 	// is forgotten; a bucket's first step waits for it either way.
-	Live          bool               `json:"live"`
+	Live bool `json:"live"`
+	// Identity is the lineage of the directory it last reported installed: Applied counts only
+	// when it is the control plane's.
+	Identity      directory.Identity `json:"identity,omitzero"`
 	Applied       int64              `json:"applied"`
 	Seq           int64              `json:"seq"`
 	Started       time.Time          `json:"started,omitzero"`
@@ -70,6 +118,10 @@ type Member struct {
 	Version       string             `json:"version,omitempty"` // the member's build
 	Telemetry     *telemetry.Window  `json:"telemetry,omitempty"`
 }
+
+// Has reports whether the member has installed version v of lineage id. A larger version from
+// another lineage (a member that outlived a restore) proves nothing about this directory.
+func (m Member) Has(id directory.Identity, v int64) bool { return m.Identity == id && m.Applied >= v }
 
 // Fleet is the fleet table. Two implementations: the control plane's, on leased etcd keys
 // (internal/cp), and NoFleet for a single-node lab whose proxy has no members.
@@ -102,8 +154,9 @@ func (NoFleet) Forget(_ context.Context, id string) error {
 
 // FleetStatus is the answer to GET /v1/fleet.
 type FleetStatus struct {
-	Version int64    `json:"version"`
-	Members []Member `json:"members"`
+	Identity directory.Identity `json:"identity"`
+	Version  int64              `json:"version"`
+	Members  []Member           `json:"members"`
 }
 
 func (s *Server) fleet() Fleet {
@@ -157,12 +210,22 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &hb) {
 		return
 	}
+	if hb.Protocol != Protocol {
+		writeError(w, http.StatusBadRequest, CodeProtocol, fmt.Sprintf("proxy %s speaks fleet protocol %d; this control plane speaks %d and takes no other: upgrade the proxy (ADR-0021)", id, hb.Protocol, Protocol))
+		return
+	}
+	snap := s.Dir.Snapshot()
+	if err := checkLineage(snap, hb.Identity, hb.Applied); err != nil {
+		// No lease: a member on another lineage must not count as present for a fence.
+		fail(w, err)
+		return
+	}
 	ttl, err := s.fleet().Heartbeat(r.Context(), id, hb)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Version: s.Dir.Snapshot().Version(), LeaseTTL: ttl})
+	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Identity: snap.File().Identity, Version: snap.Version(), LeaseTTL: ttl})
 }
 
 func (s *Server) fleetList(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +237,8 @@ func (s *Server) fleetList(w http.ResponseWriter, r *http.Request) {
 	if ms == nil {
 		ms = []Member{}
 	}
-	writeJSON(w, http.StatusOK, FleetStatus{Version: s.Dir.Snapshot().Version(), Members: ms})
+	snap := s.Dir.Snapshot()
+	writeJSON(w, http.StatusOK, FleetStatus{Identity: snap.File().Identity, Version: snap.Version(), Members: ms})
 }
 
 // forgetProxy removes a member: the operator's statement that the proxy is gone for good.
@@ -201,9 +265,10 @@ func (s *Server) fenceRound(tr *tracker, v int64, strict bool, wait time.Duratio
 		if err != nil {
 			return nil, err
 		}
+		cur := s.Dir.Snapshot().File().Identity
 		var waiting []string
 		for _, m := range ms {
-			if (strict || m.Live) && m.Applied < v {
+			if (strict || m.Live) && !m.Has(cur, v) {
 				waiting = append(waiting, m.ID)
 			}
 		}
@@ -338,8 +403,11 @@ type Credential struct {
 	Buckets   []string `json:"buckets,omitempty"`
 }
 
-// directoryHandler is GET /v1/directory?since=<version>&wait=<duration>: the whole directory once
-// it is newer than since, or 304 when wait runs out first. A member proxy long-polls it.
+// directoryHandler is GET /v1/directory?cluster_id=<id>&epoch=<epoch>&since=<version>&wait=<duration>:
+// the whole directory once it is newer than since, or 304 when wait runs out first. A member proxy
+// long-polls it. 304 answers only a caller on this lineage (ADR-0021): a caller on another cluster
+// or epoch, or ahead of this node in the same epoch, gets 409 and the current identity, and a
+// caller with a version must name its lineage.
 func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var since int64
@@ -348,6 +416,16 @@ func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "bad_request", "since: want a directory version")
 			return
 		}
+	}
+	have := directory.Identity{ClusterID: q.Get("cluster_id"), Epoch: q.Get("epoch")}
+	if !have.IsZero() {
+		if err := have.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	} else if since > 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "since needs cluster_id and epoch: a version means nothing outside its lineage")
+		return
 	}
 	wait, err := parseWait(q.Get("wait"))
 	if err != nil {
@@ -360,6 +438,10 @@ func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 	start := s.now()
 	for {
 		snap := s.Dir.Snapshot()
+		if err := checkLineage(snap, have, since); err != nil {
+			fail(w, err)
+			return
+		}
 		if snap.Version() > since {
 			payload := Directory{File: *snap.File(), Credentials: []Credential{}}
 			if s.Keys != nil {

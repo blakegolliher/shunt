@@ -68,6 +68,12 @@ Directory file schema (validated by `check-config` and `shunt directory validate
 
 ```yaml
 version: 12                       # increments on every write; a reload needs a higher version
+schema: 2                         # written by shunt; a newer schema is refused at open (ADR-0021)
+identity:                         # drawn by the first write under schema 2, never changed by a write
+  cluster_id: 3f0c…               # 32 lowercase hex characters
+  epoch: 9a1e…                    # 32 lowercase hex characters; a restore starts a new epoch
+generations:                      # written by shunt: the version of the write that last changed each resource
+  placement:acme/data: 11         # placement:<tenant>/<bucket> | cluster:<name> | tenant:<name>; absent = unchanged since the upgrade
 clusters:                         # same schema as clusters.<name> below; since POC-5 (ADR-0008)
   vast-a:
     type: vast

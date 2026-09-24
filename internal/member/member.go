@@ -79,6 +79,11 @@ type Client struct {
 	lease      sync.Mutex
 	leaseSeq   int64     // the heartbeat whose answer granted the lease
 	leaseUntil time.Time // from the heartbeat's send time on c.Now's clock; zero: never granted
+
+	// lineage, once set, is why this member's directory is on another lineage than the control
+	// plane's (ADR-0021): another cluster, or another epoch after a restore. The member stays stale
+	// until it is re-enrolled; nothing it installed compares with the control plane's versions.
+	lineage atomic.Pointer[string]
 }
 
 var _ directory.Directory = (*Client)(nil)
@@ -126,6 +131,9 @@ func resolveFrom(secrets map[string]string, ref string) (string, error) {
 // control plane unreachable, with no way to know whether a bucket it sees as ACTIVE has started to
 // move.
 func (c *Client) Stale() bool {
+	if c.lineage.Load() != nil {
+		return true
+	}
 	c.lease.Lock()
 	until := c.leaseUntil
 	c.lease.Unlock()
@@ -152,6 +160,12 @@ func (c *Client) Load() error {
 	if err := json.Unmarshal(data, &d); err != nil {
 		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
 	}
+	if d.Identity.IsZero() {
+		// A cache written before schema 2 carries no lineage, so nothing in it can be compared
+		// with the control plane's versions: start empty and fetch.
+		c.log.Warn("directory cache has no identity (written by an older shunt); ignored, the directory is fetched from the control plane", "cache", c.cacheFile())
+		return nil
+	}
 	if _, err := c.install(&d, false); err != nil {
 		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
 	}
@@ -165,10 +179,16 @@ func (c *Client) Load() error {
 func (c *Client) install(d *control.Directory, cache bool) (installed bool, err error) {
 	c.installing.Lock()
 	defer c.installing.Unlock()
+	f := &d.File
+	if err := f.Identity.Validate(); err != nil {
+		return false, fmt.Errorf("directory version %d carries no valid identity: %w", d.Version, err)
+	}
+	if cur := c.Snapshot().File().Identity; !cur.IsZero() && cur != f.Identity {
+		return false, c.lineageFault(fmt.Sprintf("directory version %d is from cluster %s epoch %s; this proxy's is from cluster %s epoch %s", d.Version, f.Identity.ClusterID, f.Identity.Epoch, cur.ClusterID, cur.Epoch))
+	}
 	if d.Version <= c.Snapshot().Version() {
 		return false, nil
 	}
-	f := &d.File
 	config.ApplyClusterDefaults(f.Clusters)
 	if err := directory.Validate(f); err != nil {
 		return false, err
@@ -341,12 +361,37 @@ func (e *Error) Is(target error) bool {
 	return false
 }
 
-// fetch gets the directory once it is newer than since, waiting up to wait, and installs it.
+// lineageFault records that this member's directory is on another lineage than the control
+// plane's, and returns it as an error.
+func (c *Client) lineageFault(why string) error {
+	if c.lineage.Swap(&why) == nil {
+		c.log.Error("this proxy's directory is from another lineage than the control plane's; it stays stale, refusing writes on moving buckets, until it is re-enrolled with an empty control.cache_dir (ADR-0021)", "reason", why)
+	}
+	return errors.New(why)
+}
+
+// checkAnswer records a lineage refusal from the control plane.
+func (c *Client) checkAnswer(err error) error {
+	var e *Error
+	if errors.As(err, &e) && (e.Code == control.CodeEpochMismatch || e.Code == control.CodeClusterMismatch) {
+		return c.lineageFault(e.Message)
+	}
+	return err
+}
+
+// fetch gets the directory once it is newer than since, waiting up to wait, and installs it. It
+// names the installed lineage, so the control plane answers 304 only on the same one.
 func (c *Client) fetch(ctx context.Context, since int64, wait time.Duration) (installed bool, err error) {
 	var d control.Directory
-	notModified, err := c.call(ctx, http.MethodGet, fmt.Sprintf("/v1/directory?since=%d&wait=%s", since, wait), nil, &d)
+	path := fmt.Sprintf("/v1/directory?since=%d&wait=%s", since, wait)
+	if id := c.Snapshot().File().Identity; !id.IsZero() {
+		path += "&cluster_id=" + id.ClusterID + "&epoch=" + id.Epoch
+	} else {
+		path = fmt.Sprintf("/v1/directory?since=0&wait=%s", wait)
+	}
+	notModified, err := c.call(ctx, http.MethodGet, path, nil, &d)
 	if err != nil || notModified {
-		return false, err
+		return false, c.checkAnswer(err)
 	}
 	installed, err = c.install(&d, true)
 	if err != nil {
@@ -410,7 +455,8 @@ func (c *Client) beat(ctx context.Context) error {
 	seq := c.seq.Add(1)
 	sent := c.Now()
 	snap := c.Snapshot()
-	hb := control.Heartbeat{Started: c.started, Seq: seq, Applied: snap.Version(), Host: c.cfg.Host, Version: c.cfg.Version}
+	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
+		Host: c.cfg.Host, Version: c.cfg.Version}
 	if c.Telemetry != nil {
 		hb.Telemetry = c.Telemetry.Completed(c.Now())
 	}
@@ -432,6 +478,8 @@ func (c *Client) beat(ctx context.Context) error {
 	_, err := c.call(bctx, http.MethodPost, "/v1/fleet/"+c.cfg.ProxyID+"/heartbeat", hb, &ans)
 	if err == nil {
 		err = c.renew(ctx, seq, sent, snap.Version(), ans)
+	} else {
+		err = c.checkAnswer(err)
 	}
 	stale := c.Stale()
 	if was := c.stale.Swap(stale); was != stale {
@@ -471,6 +519,9 @@ func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied i
 	if ans.Version > c.Snapshot().Version() {
 		// The control plane has a newer directory: fetch it now, not at the poll's next turn.
 		_, _ = c.fetch(ctx, c.Snapshot().Version(), 0) //nolint:errcheck // the poll loop retries
+	}
+	if id := c.Snapshot().File().Identity; id != ans.Identity {
+		return fmt.Errorf("the heartbeat was answered for cluster %s epoch %s; this proxy's directory is cluster %s epoch %s; not a lease", ans.Identity.ClusterID, ans.Identity.Epoch, id.ClusterID, id.Epoch)
 	}
 	if v := c.Snapshot().Version(); v < ans.Version {
 		return fmt.Errorf("directory version %d is behind the control plane's %d", v, ans.Version)
@@ -539,11 +590,18 @@ type Status struct {
 	// LeaseLeft is how long the lease has to run; negative once it has lapsed.
 	LeaseLeft string `json:"lease_left,omitempty"`
 	Applied   int64  `json:"applied"`
+	// Identity is the installed directory's lineage; LineageFault says why it is not the control
+	// plane's, when it is not.
+	Identity     directory.Identity `json:"identity,omitzero"`
+	LineageFault string             `json:"lineage_fault,omitempty"`
 }
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
 func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.Snapshot().Version()}
+	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.Snapshot().Version(), Identity: c.Snapshot().File().Identity}
+	if why := c.lineage.Load(); why != nil {
+		st.LineageFault = *why
+	}
 	now := c.Now()
 	if ack := c.lastAck.Load(); ack != nil {
 		st.LastAck = now.Sub(*ack).Round(time.Millisecond).String()

@@ -32,7 +32,11 @@ uncommitted candidate changes no live secret, key or cluster, on the member, the
 and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease
 follows the server's grant from the send time). Decided the same day: no protocol-1 fleet is
 deployed, so protocol 2 replaces it with no handover; the file backend stays lab-only and etcd
-carries the transaction contract (ADR-0021). New endpoints/commands in those documents are design
+carries the transaction contract (ADR-0021). H0a landed the same day: a directory identity
+(`cluster_id`, `epoch`) and per-resource generations, written in the same transaction as the
+version; schema-1 data upgraded in place when a node starts; the directory poll, heartbeat, member
+cache and fence compare lineage, with a negative regression proving a version-only fence counts a
+member that outlived a restore. H0b–H0e are pending. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

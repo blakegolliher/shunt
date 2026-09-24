@@ -61,7 +61,10 @@ func newProxyList() *cobra.Command {
 					seen = "none since the control node started"
 				}
 				applied := fmt.Sprint(m.Applied)
-				if m.Applied < fl.Version {
+				switch {
+				case m.Identity != fl.Identity:
+					applied += " (other lineage)"
+				case m.Applied < fl.Version:
 					applied += " (behind)"
 				}
 				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", m.ID, state, applied, seen)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -293,6 +294,99 @@ func TestStoreFailedWriteLeavesTheLiveClusters(t *testing.T) {
 	}
 	if sec, err := s.Resolve("control:vast01"); err != nil || sec != "s1" {
 		t.Errorf("the store resolves %q (%v) after a failed write, want s1", sec, err)
+	}
+}
+
+// The identity is drawn by the first write, in the same transaction as the version, and every
+// node reads the same one. A secret-only rotation changes the cluster's generation though its
+// definition does not.
+func TestStoreIdentityAndGenerations(t *testing.T) {
+	tc := startCluster(t, 2)
+	key := make([]byte, 32)
+	a, b := openStore(t, tc, 0, key), openStore(t, tc, 1, key)
+	ctx := context.Background()
+	if !a.Snapshot().File().Identity.IsZero() {
+		t.Fatal("an empty directory has an identity")
+	}
+	if err := a.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	fa := a.Snapshot().File()
+	if fa.Schema != directory.SchemaVersion || fa.Identity.Validate() != nil {
+		t.Fatalf("after the first write: schema %d identity %+v", fa.Schema, fa.Identity)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if id := b.Snapshot().File().Identity; id != fa.Identity {
+		t.Fatalf("node b reads identity %+v, node a %+v", id, fa.Identity)
+	}
+	g1 := fa.Generation(directory.ClusterResource("vast01"))
+	if g1 != fa.Version {
+		t.Fatalf("new cluster generation %d, want %d", g1, fa.Version)
+	}
+	if err := a.PutCluster(ctx, "vast01", cluster("control:vast01"), "s2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fb := b.Snapshot().File()
+	if g := fb.Generation(directory.ClusterResource("vast01")); g != fb.Version || g <= g1 {
+		t.Fatalf("after a secret-only rotation, cluster generation %d (was %d), version %d", g, g1, fb.Version)
+	}
+	if fb.Identity != fa.Identity {
+		t.Fatal("a write changed the identity")
+	}
+}
+
+// A directory written before schema 2 is upgraded when a node starts: one new version carrying the
+// identity, with nothing else changed. Two nodes starting together upgrade it once.
+func TestStoreUpgradesASchema1Directory(t *testing.T) {
+	tc := startCluster(t, 2)
+	cli := tc.nodes[0].Client()
+	ctx := context.Background()
+	t1, _ := json.Marshal(directory.Tenant{DefaultCluster: "vast01"})
+	cl := cluster("env:X")
+	cl.EndpointMode = "static"
+	c1, _ := json.Marshal(clusterRecord{Cluster: cl})
+	if _, err := cli.Txn(ctx).Then(clientv3.OpPut(kVersion, "7"), clientv3.OpPut(kClusters+"vast01", string(c1)), clientv3.OpPut(kTenants+"acme", string(t1))).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	a, b := openStore(t, tc, 0, key), openStore(t, tc, 1, key)
+	if err := a.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fa, fb := a.Snapshot().File(), b.Snapshot().File()
+	if fa.Version != 8 || fb.Version != 8 {
+		t.Fatalf("versions after the upgrade: %d and %d, want 8 (one upgrade write)", fa.Version, fb.Version)
+	}
+	if fa.Identity.Validate() != nil || fa.Identity != fb.Identity {
+		t.Fatalf("identities after the upgrade: %+v and %+v", fa.Identity, fb.Identity)
+	}
+	if _, ok := fa.Clusters["vast01"]; !ok || len(fa.Generations) != 0 {
+		t.Fatalf("the upgrade changed resources: clusters %v generations %v", fa.Clusters, fa.Generations)
+	}
+}
+
+// A directory written by a newer shunt is refused at start.
+func TestStoreRefusesANewerSchema(t *testing.T) {
+	tc := startCluster(t, 1)
+	cli := tc.nodes[0].Client()
+	ctx := context.Background()
+	if _, err := cli.Txn(ctx).Then(clientv3.OpPut(kVersion, "1"), clientv3.OpPut(kSchema, strconv.Itoa(directory.SchemaVersion+1))).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, cli, c, slog.New(slog.DiscardHandler)); err == nil || !errors.Is(err, directory.ErrNewerSchema) {
+		t.Fatalf("opening a newer schema: %v", err)
 	}
 }
 

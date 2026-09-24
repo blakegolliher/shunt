@@ -203,7 +203,8 @@ func (m *member) beat() {
 	if m.follow.Load() {
 		m.applied.Store(m.node.store.Version())
 	}
-	hb := control.Heartbeat{Seq: m.seq.Add(1), Applied: m.applied.Load(), FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
+	hb := control.Heartbeat{Protocol: control.Protocol, Identity: m.node.store.Snapshot().File().Identity, Seq: m.seq.Add(1), Applied: m.applied.Load(),
+		FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
 	m.node.call(http.MethodPost, "/v1/fleet/"+m.id+"/heartbeat", hb, nil) //nolint:errcheck // a member that cannot reach the node just misses a beat
 }
 
@@ -265,8 +266,15 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	if dir.Version != b.store.Version() || dir.Secrets["control:vast01"] != "s1" || len(dir.Credentials) != 1 || dir.Credentials[0].Secret != "cs" || len(dir.Placements) != 1 {
 		t.Fatalf("directory payload: version %d secrets %v creds %+v placements %d", dir.Version, dir.Secrets, dir.Credentials, len(dir.Placements))
 	}
-	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms", dir.Version), nil, nil); code != http.StatusNotModified {
+	if dir.Identity.Validate() != nil || dir.Identity != a.store.Snapshot().File().Identity {
+		t.Fatalf("directory payload identity %+v", dir.Identity)
+	}
+	lineage := "&cluster_id=" + dir.Identity.ClusterID + "&epoch=" + dir.Identity.Epoch
+	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms%s", dir.Version, lineage), nil, nil); code != http.StatusNotModified {
 		t.Fatalf("long-poll at the current version: %d", code)
+	}
+	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms", dir.Version), nil, nil); code != http.StatusBadRequest {
+		t.Fatalf("long-poll with a version and no lineage: %d, want 400", code)
 	}
 
 	// Two members, heartbeating to different nodes. A ramp step is held until both have it.

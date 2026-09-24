@@ -45,6 +45,9 @@ const (
 	kPlacements  = prefix + "placements/"
 	kCredentials = prefix + "credentials/"
 	kChanges     = prefix + "changes/"
+	kSchema      = prefix + "schema"       // directory.SchemaVersion, decimal
+	kIdentity    = prefix + "identity"     // directory.Identity, JSON
+	kGenerations = prefix + "generations/" // <resource> → generation, decimal
 
 	// changeRetention is how many audit records stay in etcd; older ones are deleted by the write
 	// that makes them older. Export to object storage is deferred (docs/POC-6.md, P3c-2).
@@ -130,8 +133,35 @@ func (s *Store) Start(ctx context.Context) error {
 	}
 	wctx, cancel := context.WithCancel(context.Background())
 	s.stop = cancel
-	s.ready.Store(true)
 	go s.watch(wctx, rev)
+	if err := s.upgrade(ctx); err != nil {
+		cancel()
+		<-s.done
+		s.done, s.stop = make(chan struct{}), nil
+		return err
+	}
+	s.ready.Store(true)
+	return nil
+}
+
+// upgrade gives a schema-1 directory its identity (ADR-0021) with one ordinary write: a new version
+// carrying the schema and a new cluster id and epoch, and no resource change. Every node that
+// starts races to do it; the compare-and-swap lets one win, and the others see it by their watch.
+// An empty directory gets its identity with its first real write instead.
+func (s *Store) upgrade(ctx context.Context) error {
+	if st := s.cur.Load(); st.version == 0 || !st.file.Identity.IsZero() {
+		return nil
+	}
+	err := s.mutate(ctx, "shunt-control", "schema-upgrade", "", func(st *state) error {
+		if !st.file.Identity.IsZero() {
+			return errUnchanged // another node upgraded it first
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("upgrading the directory to schema %d: %w", directory.SchemaVersion, err)
+	}
+	s.log.Info("directory upgraded", "schema", directory.SchemaVersion, "cluster_id", s.cur.Load().file.Identity.ClusterID, "version", s.Version())
 	return nil
 }
 
@@ -171,6 +201,9 @@ func (s *Store) load(ctx context.Context) (int64, error) {
 		}
 	}
 	st.file.Version = st.version
+	if err := directory.CheckSchema(st.file.Schema); err != nil {
+		return 0, err
+	}
 	if err := directory.Validate(st.file); err != nil {
 		return 0, fmt.Errorf("the directory in etcd is invalid: %w", err)
 	}
@@ -248,6 +281,37 @@ func (s *Store) apply(st *state, key string, value []byte, deleted bool) error {
 			return fmt.Errorf("credential %s: %w", ak, err)
 		}
 		st.creds[ak] = sigv4.Credential{AccessKey: ak, Secret: plain, Tenant: rec.Tenant, Buckets: rec.Buckets}
+	case key == kSchema:
+		if deleted {
+			st.file.Schema = 0
+			return nil
+		}
+		v, err := strconv.Atoi(string(value))
+		if err != nil {
+			return fmt.Errorf("directory schema %q: %w", value, err)
+		}
+		st.file.Schema = v
+	case key == kIdentity:
+		if deleted {
+			return errors.New("the directory identity key was deleted")
+		}
+		if err := json.Unmarshal(value, &st.file.Identity); err != nil {
+			return fmt.Errorf("directory identity: %w", err)
+		}
+	case strings.HasPrefix(key, kGenerations):
+		res := strings.TrimPrefix(key, kGenerations)
+		if deleted {
+			delete(st.file.Generations, res)
+			return nil
+		}
+		g, err := strconv.ParseInt(string(value), 10, 64)
+		if err != nil {
+			return fmt.Errorf("generation of %s %q: %w", res, value, err)
+		}
+		if st.file.Generations == nil {
+			st.file.Generations = map[string]int64{}
+		}
+		st.file.Generations[res] = g
 	case strings.HasPrefix(key, kChanges):
 		// audit records are written, never read back into the state
 	default:
@@ -474,6 +538,15 @@ func (s *Store) mutate(ctx context.Context, actor, op, key string, fn func(st *s
 		}
 		next.version = cur.version + 1
 		next.file.Version = next.version
+		var rotated []string // a secret changes a cluster though its definition does not
+		for name := range next.file.Clusters {
+			if ref := SecretRefPrefix + name; next.secrets[ref] != cur.secrets[ref] {
+				rotated = append(rotated, directory.ClusterResource(name))
+			}
+		}
+		if err := directory.Stamp(cur.file, next.file, rotated...); err != nil {
+			return err
+		}
 		if err := directory.Validate(next.file); err != nil {
 			return err
 		}
@@ -592,6 +665,23 @@ func (s *Store) diff(cur, next *state) ([]clientv3.Op, error) {
 	for k := range cur.file.Placements {
 		if _, ok := next.file.Placements[k]; !ok {
 			ops = append(ops, clientv3.OpDelete(kPlacements+k))
+		}
+	}
+	if next.file.Schema != cur.file.Schema {
+		ops = append(ops, clientv3.OpPut(kSchema, strconv.Itoa(next.file.Schema)))
+	}
+	if next.file.Identity != cur.file.Identity {
+		b, _ := json.Marshal(next.file.Identity)
+		ops = append(ops, clientv3.OpPut(kIdentity, string(b)))
+	}
+	for res, g := range next.file.Generations {
+		if old, had := cur.file.Generations[res]; !had || old != g {
+			ops = append(ops, clientv3.OpPut(kGenerations+res, strconv.FormatInt(g, 10)))
+		}
+	}
+	for res := range cur.file.Generations {
+		if _, ok := next.file.Generations[res]; !ok {
+			ops = append(ops, clientv3.OpDelete(kGenerations+res))
 		}
 	}
 	for ak, c := range next.creds {

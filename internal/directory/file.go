@@ -314,6 +314,7 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	if f.Placements == nil {
 		f.Placements = map[string]Placement{}
 	}
+	prev := f.clone()
 	change := Change{Actor: actor, Op: op, Key: k}
 	clusterName, isCluster := strings.CutPrefix(k, "clusters/")
 	if p, ok := f.Placements[k]; ok && !isCluster {
@@ -327,6 +328,9 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 		return ferr
 	}
 	f.Version++
+	if serr := Stamp(prev, f); serr != nil {
+		return serr
+	}
 	if verr := validate(f); verr != nil {
 		return verr
 	}
