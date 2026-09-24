@@ -116,7 +116,7 @@ func validSeries(v string) bool {
 	case telemetry.SeriesClientTotal, telemetry.SeriesUpstreamTTFB, telemetry.SeriesUpstreamTotal, telemetry.SeriesProxyOverhead:
 		return true
 	case telemetry.SeriesRequestsPerSecond, telemetry.SeriesBytesInPerSecond, telemetry.SeriesBytesOutPerSecond,
-		telemetry.SeriesErrors0PerSecond, telemetry.SeriesErrors4xxPerSecond, telemetry.SeriesErrors5xxPerSecond, telemetry.SeriesNotFoundPerSecond:
+		telemetry.SeriesErrors0PerSecond, telemetry.SeriesErrors4xxPerSecond, telemetry.SeriesErrors5xxPerSecond, telemetry.SeriesNotFoundPerSecond, telemetry.SeriesStatusPerSecond:
 		return true
 	}
 	return false

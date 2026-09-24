@@ -1,4 +1,4 @@
-import { latencyChartData, scalarChartData } from './telemetryData'
+import { latencyChartData, scalarChartData, statusSeries } from './telemetryData'
 import type { TelemetryPoint } from './api/client'
 
 test('passes emitted percentiles to chart data without browser math', () => {
@@ -54,4 +54,15 @@ test('shows each backend cluster share of requests, and says when a compared clu
     sessionStorage.clear()
     vi.restoreAllMocks()
   }
+})
+
+test('draws one line per status code the scope answered, a read 404 last and named as not an error', () => {
+  const at = (end: string, code: string, value: number) => ({ start: end, end, series: 'status_per_second', op: 'all', code, value })
+  const points = [at('t1', '503', 2), at('t1', 'not_found', 9), at('t1', '403', 1), at('t2', '503', 4), at('t2', '0', 1), at('t2', '5xx', 1)]
+  const { series, names } = statusSeries(points)
+  expect(names).toEqual(['no response', '403', '503', 'other 5xx', '404 on read (not an error)'])
+  expect(scalarChartData(series, names)).toEqual([
+    { end: 't1', '503': 2, '403': 1, '404 on read (not an error)': 9 },
+    { end: 't2', '503': 4, 'no response': 1, 'other 5xx': 1 },
+  ])
 })

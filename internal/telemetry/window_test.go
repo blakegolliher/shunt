@@ -57,8 +57,8 @@ func TestCollectorRotatesLazilyAndResends(t *testing.T) {
 	if w == nil || len(w.Sketches) != 4 || len(w.Counters) != 1 {
 		t.Fatalf("completed window: %#v", w)
 	}
-	if got := w.Counters[0].Errors["5xx"]; got != 1 {
-		t.Fatalf("5xx errors = %d, want 1", got)
+	if got := w.Counters[0].Errors["503"]; got != 1 {
+		t.Fatalf("503 errors = %d, want 1", got)
 	}
 	if again := c.Completed(windowBase.Add(2 * WindowDuration)); again != w {
 		t.Fatal("an empty interval did not re-send the last non-empty window")
@@ -261,10 +261,10 @@ func TestReadNotFoundIsNotAnError(t *testing.T) {
 			write = ct
 		}
 	}
-	if read.Errors[notFound] != 2 || read.Errors["4xx"] != 1 {
-		t.Fatalf("read counters %v: want 2 not found and 1 4xx", read.Errors)
+	if read.Errors[notFound] != 2 || read.Errors["403"] != 1 {
+		t.Fatalf("read counters %v: want 2 not found and one 403", read.Errors)
 	}
-	if write.Errors["4xx"] != 1 || write.Errors[notFound] != 0 {
+	if write.Errors["404"] != 1 || write.Errors[notFound] != 0 {
 		t.Fatalf("write counters %v: a write's 404 is an error", write.Errors)
 	}
 	s := NewStore(time.Hour)
@@ -274,5 +274,59 @@ func TestReadNotFoundIsNotAnError(t *testing.T) {
 	pts := s.CounterSeries("fleet", SeriesNotFoundPerSecond, OpRead, windowBase.Add(-time.Minute), windowBase.Add(time.Hour))
 	if len(pts) != 1 || pts[0].Value != 2/WindowDuration.Seconds() {
 		t.Fatalf("not_found_per_second: %+v", pts)
+	}
+}
+
+func TestStatusKeys(t *testing.T) {
+	cases := []struct {
+		status int
+		op     OpClass
+		want   string
+	}{
+		{0, OpRead, "0"}, {404, OpRead, notFound}, {404, OpList, notFound}, {404, OpWrite, "404"}, {404, OpDelete, "404"},
+		{403, OpRead, "403"}, {412, OpWrite, "412"}, {418, OpRead, "4xx"}, {429, OpWrite, "429"},
+		{500, OpRead, "500"}, {503, OpWrite, "503"}, {507, OpWrite, "5xx"},
+	}
+	for _, c := range cases {
+		if got := StatusKey(c.status, c.op); got != c.want {
+			t.Errorf("StatusKey(%d, %s) = %q, want %q", c.status, c.op, got, c.want)
+		}
+	}
+}
+
+// The class series sum their codes, and status_per_second names each code seen.
+func TestStatusSeries(t *testing.T) {
+	c := NewCollector()
+	at := windowBase.Add(time.Second)
+	for status, n := range map[int]int{503: 3, 500: 1, 403: 2, 418: 1, 507: 1} {
+		for range n {
+			c.Observe(Observation{At: at, Operation: "PutObject", Cluster: "a", Status: status, ClientTotal: time.Millisecond})
+		}
+	}
+	c.Observe(Observation{At: at, Operation: "GetObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond})
+	s := NewStore(time.Hour)
+	if _, err := s.Ingest([]MemberWindow{{ID: "p", Live: true, Telemetry: c.Completed(windowBase.Add(WindowDuration))}}); err != nil {
+		t.Fatal(err)
+	}
+	from, to := windowBase.Add(-time.Minute), windowBase.Add(time.Hour)
+	per := WindowDuration.Seconds()
+	for series, want := range map[string]float64{SeriesErrors5xxPerSecond: 5 / per, SeriesErrors4xxPerSecond: 3 / per, SeriesNotFoundPerSecond: 0} {
+		pts := s.CounterSeries("fleet", series, OpWrite, from, to)
+		if len(pts) != 1 || pts[0].Value != want {
+			t.Errorf("%s: %+v, want %v", series, pts, want)
+		}
+	}
+	got := map[string]float64{}
+	for _, p := range s.CounterSeries("fleet", SeriesStatusPerSecond, OpAll, from, to) {
+		got[p.Code] = p.Value * per
+	}
+	want := map[string]float64{"503": 3, "500": 1, "403": 2, "4xx": 1, "5xx": 1, notFound: 1}
+	if len(got) != len(want) {
+		t.Fatalf("status keys %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("status %s: %v, want %v", k, got[k], v)
+		}
 	}
 }

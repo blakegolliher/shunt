@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +36,47 @@ const (
 	// SeriesNotFoundPerSecond counts reads answered 404: a HEAD or GET of a key or bucket that is
 	// not there is an answer, not a failure, so it is kept out of errors_4xx_per_second.
 	SeriesNotFoundPerSecond = "not_found_per_second"
+	// SeriesStatusPerSecond is the non-2xx responses by status: one point per status key seen in a
+	// window, named by ScalarPoint.Code (StatusKey).
+	SeriesStatusPerSecond = "status_per_second"
 )
 
 // notFound is the Errors key of a read answered 404 (SeriesNotFoundPerSecond).
 const notFound = "not_found"
+
+// trackedStatus are the codes counted on their own; any other 4xx or 5xx counts as "4xx" or "5xx".
+// The set is fixed, so a window carries at most len(trackedStatus)+4 status keys.
+var trackedStatus = map[int]bool{400: true, 403: true, 404: true, 405: true, 409: true, 411: true, 412: true, 416: true, 429: true,
+	500: true, 501: true, 502: true, 503: true, 504: true}
+
+// StatusKey is the Errors key a response counts under: "0" for no response, "not_found" for a read
+// or listing answered 404, the code itself for a tracked code, else "4xx" or "5xx".
+func StatusKey(status int, op OpClass) string {
+	switch {
+	case status == 0:
+		return "0"
+	case status == 404 && (op == OpRead || op == OpList):
+		return notFound
+	case trackedStatus[status]:
+		return strconv.Itoa(status)
+	case status >= 500:
+		return "5xx"
+	}
+	return "4xx"
+}
+
+// statusClass is the class a status key belongs to: "0", "4xx", "5xx", or "" for a read's 404.
+func statusClass(key string) string {
+	switch {
+	case key == "0":
+		return "0"
+	case key == notFound:
+		return ""
+	case strings.HasPrefix(key, "5"):
+		return "5xx"
+	}
+	return "4xx"
+}
 
 // OpClass is the bounded operation dimension carried in window telemetry.
 type OpClass string
@@ -287,11 +325,7 @@ func (c *Collector) Observe(o Observation) {
 		if count.Errors == nil {
 			count.Errors = map[string]int64{}
 		}
-		class := StatusClass(o.Status)
-		if o.Status == 404 && (op == OpRead || op == OpList) {
-			class = notFound
-		}
-		count.Errors[class]++
+		count.Errors[StatusKey(o.Status, op)]++
 	}
 }
 
@@ -695,6 +729,12 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 			if seconds <= 0 {
 				continue
 			}
+			if series == SeriesStatusPerSecond {
+				for _, key := range slices.Sorted(maps.Keys(c.Errors)) {
+					out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Code: key, Value: float64(c.Errors[key]) / seconds})
+				}
+				continue
+			}
 			var total int64
 			switch series {
 			case SeriesRequestsPerSecond:
@@ -703,12 +743,13 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 				total = c.BytesIn
 			case SeriesBytesOutPerSecond:
 				total = c.BytesOut
-			case SeriesErrors0PerSecond:
-				total = c.Errors["0"]
-			case SeriesErrors4xxPerSecond:
-				total = c.Errors["4xx"]
-			case SeriesErrors5xxPerSecond:
-				total = c.Errors["5xx"]
+			case SeriesErrors0PerSecond, SeriesErrors4xxPerSecond, SeriesErrors5xxPerSecond:
+				class := strings.TrimSuffix(strings.TrimPrefix(series, "errors_"), "_per_second")
+				for key, n := range c.Errors {
+					if statusClass(key) == class {
+						total += n
+					}
+				}
 			case SeriesNotFoundPerSecond:
 				total = c.Errors[notFound]
 			default:
@@ -733,5 +774,7 @@ type ScalarPoint struct {
 	End    time.Time `json:"end"`
 	Series string    `json:"series"`
 	Op     OpClass   `json:"op"`
-	Value  float64   `json:"value"`
+	// Code is the status key of a status_per_second point (StatusKey).
+	Code  string  `json:"code,omitempty"`
+	Value float64 `json:"value"`
 }

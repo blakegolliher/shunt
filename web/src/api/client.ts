@@ -229,6 +229,9 @@ export interface TelemetryPoint {
   max_us?: number
   count?: number
   value?: number
+  // code is the status key of a status_per_second point: a tracked code such as "503", "4xx" or
+  // "5xx" for the others, "0" for no response, "not_found" for a read answered 404.
+  code?: string
 }
 
 export interface StreamEvent {

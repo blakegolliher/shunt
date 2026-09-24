@@ -395,9 +395,22 @@ Server-sent events from this control node (ADR-0017): `Content-Type: text/event-
 
 Query parameters are `scope=fleet|cluster:<name>|proxy:<id>`,
 `series=client_total|upstream_ttfb|upstream_total|proxy_overhead` or one of the exact-counter rates
-`requests_per_second|bytes_in_per_second|bytes_out_per_second|errors_0_per_second|errors_4xx_per_second|errors_5xx_per_second`,
+`requests_per_second|bytes_in_per_second|bytes_out_per_second|errors_0_per_second|errors_4xx_per_second|errors_5xx_per_second|not_found_per_second|status_per_second`,
 `op=all|read|write|list|delete|multipart|other` (default `all`), and optional RFC3339 `from` /
-`to`. The answer is a chronological slice of the 60-minute, 10-second-window ring:
+`to`. The answer is a chronological slice of the 60-minute, 10-second-window ring.
+
+Responses that were not a success count under a status key: `400`, `403`, `404`, `405`, `409`,
+`411`, `412`, `416`, `429`, `500`, `501`, `502`, `503` or `504` for those codes, `4xx` and `5xx`
+for any other, `0` for no response, and `not_found` for a read or listing answered 404, which is an
+answer (a key that is not there), not an error. `errors_{0,4xx,5xx}_per_second` sum the keys of
+their class and leave `not_found` out; `not_found_per_second` is that key alone;
+`status_per_second` answers one point per key seen in each window, named by `code`:
+
+```json
+{"start":"2026-09-24T16:00:00Z","end":"2026-09-24T16:00:10Z","series":"status_per_second","op":"all","code":"503","value":0.4}
+```
+
+A latency series answers:
 
 ```json
 {"scope":"fleet","series":"client_total","op":"all","points":[
