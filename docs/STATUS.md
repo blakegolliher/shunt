@@ -175,7 +175,17 @@ One client bucket over 1 to N backend buckets ("legs", capped at 32), phased N1�
   the bucket settles to plain, where step-out handles it as before. `expand --clear` retires legs
   that own nothing. CLI `--range`/`--leg` on ramp and migrate start; UI Consolidate and Retire idle
   leg. Gate: directory, control (consolidation through purge, step-out before and after) and UI
-  tests; lint and race suite green. Not yet run live. Next: N4.
+  tests; lint and race suite green. **Live (2026-09-23), demo fleet (3 control nodes, 2 proxies, two
+  MinIOs), steps through the CLI:** `n3-live`, spread over minio01/n3-live and minio02/n3-live-b,
+  consolidated into minio01/n3-live (`ramp --leg minio02` 25/60/100%, migrate, mover converged,
+  cutover, purge of 343 objects and the minio02 bucket) under two `shunt verify` runs, one per
+  proxy: 215,942 operations, **0 errors**, 141 hold 503s retried, exactly the 72 + 69 the proxies
+  counted. It ended a plain bucket on minio01, all 150 seed objects read back identical, and
+  step-out reports no problem for it. The first attempt, on `n2-live`, stalled at the mover:
+  minio01's conditional-write profile had never been measured, since only expand measured one.
+  A first step now measures its destination (ADR-0018 N3c). minio01 was measured by hand for the
+  move already in flight, which then finished under two more verify runs (138,765 operations,
+  0 errors) and left `n2-live` plain on minio01, ready for step-out. Next: N4.
 - `docs/design/distributed.md` (§12 of the design) + `docs/prompts/P3d.md`, `P3e.md` — what is
   left of the fleet-scale form: movers as workers, fleet decisions, the web UI (its seven build
   prompts: `docs/prompts/webui.md`), and the P3c-2 deferrals (deltas, object-storage bootstrap
