@@ -1,0 +1,294 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/proxy
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkSmallGET-16                          	    3244	    356101 ns/op	   21715 B/op	     107 allocs/op
+BenchmarkSmallGET-16                          	    4108	    349128 ns/op	   24144 B/op	     107 allocs/op
+BenchmarkSmallGET-16                          	    2964	    387302 ns/op	   22578 B/op	     107 allocs/op
+BenchmarkSmallGET-16                          	    3171	    366688 ns/op	   23290 B/op	     107 allocs/op
+BenchmarkSmallGET-16                          	    3340	    371572 ns/op	   22733 B/op	     107 allocs/op
+BenchmarkSmallGET-16                          	    3387	    360282 ns/op	   23890 B/op	     107 allocs/op
+BenchmarkPUT1MiB-16                           	     632	   1806344 ns/op	 580.50 MB/s	   61817 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                           	     550	   2505354 ns/op	 418.53 MB/s	   61870 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                           	     513	   2038214 ns/op	 514.46 MB/s	   65752 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                           	     525	   1992906 ns/op	 526.15 MB/s	   64440 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                           	     658	   1893303 ns/op	 553.83 MB/s	   59435 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                           	     534	   2003987 ns/op	 523.24 MB/s	   58691 B/op	     179 allocs/op
+BenchmarkOwnCopy-16                           	148513006	         7.974 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnCopy-16                           	157444447	         7.892 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnCopy-16                           	124108392	         9.477 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnCopy-16                           	124055995	         9.092 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnCopy-16                           	121518270	         9.931 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnCopy-16                           	147810868	         8.100 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     295	   4070560 ns/op	  15.24 MB/s	  693974 B/op	     923 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     391	   2947628 ns/op	  21.05 MB/s	  670936 B/op	     915 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     358	   3028899 ns/op	  20.48 MB/s	  665047 B/op	     914 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     373	   3165712 ns/op	  19.60 MB/s	  668212 B/op	     914 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     380	   3083754 ns/op	  20.12 MB/s	  662167 B/op	     913 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	     373	   3015263 ns/op	  20.57 MB/s	  666711 B/op	     915 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      24	  48497161 ns/op	22276377 B/op	  146322 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      18	  59186068 ns/op	22246751 B/op	  146301 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      25	  50827531 ns/op	22255253 B/op	  146300 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      27	  48341463 ns/op	22246176 B/op	  146298 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      26	  45819634 ns/op	22250522 B/op	  146297 allocs/op
+BenchmarkMergedListingPage1000Keys-16         	      20	  50737290 ns/op	22252203 B/op	  146301 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1594609	       791.9 ns/op	     400 B/op	       5 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1321898	       903.8 ns/op	     400 B/op	       5 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1291209	       916.5 ns/op	     400 B/op	       5 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1355395	       901.5 ns/op	     400 B/op	       5 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1323906	       875.2 ns/op	     400 B/op	       5 allocs/op
+BenchmarkLossLedgerObserve-16                 	 1439548	       838.5 ns/op	     400 B/op	       5 allocs/op
+BenchmarkResignSmallGET-16                    	    2482	    528023 ns/op	   36021 B/op	     240 allocs/op
+BenchmarkResignSmallGET-16                    	    2493	    519114 ns/op	   37452 B/op	     240 allocs/op
+BenchmarkResignSmallGET-16                    	    2280	    440258 ns/op	   34657 B/op	     240 allocs/op
+BenchmarkResignSmallGET-16                    	    2660	    448929 ns/op	   37192 B/op	     240 allocs/op
+BenchmarkResignSmallGET-16                    	    2238	    525255 ns/op	   36704 B/op	     240 allocs/op
+BenchmarkResignSmallGET-16                    	    2360	    568701 ns/op	   36409 B/op	     240 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     187	   6086319 ns/op	 172.28 MB/s	 1013376 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     236	   5058481 ns/op	 207.29 MB/s	 1003746 B/op	    4727 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     218	   5809248 ns/op	 180.50 MB/s	 1004641 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     241	   4807062 ns/op	 218.13 MB/s	 1006734 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     255	   4874514 ns/op	 215.11 MB/s	 1012705 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16          	     231	   4917887 ns/op	 213.22 MB/s	  989521 B/op	    4727 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	     100	  11515050 ns/op	 8298274 B/op	   11710 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	      94	  12220576 ns/op	 8273467 B/op	   11698 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	     100	  11483750 ns/op	 8273773 B/op	   11696 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	     100	  11714887 ns/op	 8280145 B/op	   11697 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	     120	  10263966 ns/op	 8284143 B/op	   11698 allocs/op
+BenchmarkSpreadListingPage/legs=1-16          	      98	  11853414 ns/op	 8270694 B/op	   11697 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      49	  22534370 ns/op	12171544 B/op	   76307 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      63	  25138639 ns/op	12166505 B/op	   76289 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      61	  20259189 ns/op	12163540 B/op	   76291 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      57	  22904240 ns/op	12162948 B/op	   76291 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      56	  20853787 ns/op	12165572 B/op	   76292 allocs/op
+BenchmarkSpreadListingPage/legs=2-16          	      54	  22565870 ns/op	12169221 B/op	   76292 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      51	  21582528 ns/op	12485690 B/op	   78755 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      52	  22943163 ns/op	12427307 B/op	   78716 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      68	  18021440 ns/op	12471090 B/op	   78723 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      61	  20012132 ns/op	12458486 B/op	   78720 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      56	  19713719 ns/op	12453207 B/op	   78722 allocs/op
+BenchmarkSpreadListingPage/legs=8-16          	      61	  19766888 ns/op	12455713 B/op	   78717 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      55	  20248855 ns/op	13394918 B/op	   88022 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      43	  24952090 ns/op	13317999 B/op	   87925 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      61	  18604872 ns/op	13272441 B/op	   87911 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      61	  19684380 ns/op	13318580 B/op	   87917 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      46	  22632241 ns/op	13311650 B/op	   87933 allocs/op
+BenchmarkSpreadListingPage/legs=32-16         	      52	  21984106 ns/op	13315413 B/op	   87923 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/proxy	142.309s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/sigv4
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkVerifyHeader-16    	   59401	     20152 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkVerifyHeader-16    	   57082	     21725 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkVerifyHeader-16    	   64404	     20557 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkVerifyHeader-16    	   47606	     23996 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkVerifyHeader-16    	   43969	     25557 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkVerifyHeader-16    	   56097	     22446 ns/op	    6088 B/op	      76 allocs/op
+BenchmarkSign-16            	   77862	     16259 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSign-16            	   72241	     18573 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSign-16            	   61014	     18043 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSign-16            	   73514	     17286 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSign-16            	   70912	     20042 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSign-16            	   66242	     18147 ns/op	    5368 B/op	      72 allocs/op
+BenchmarkSigningKey-16      	  225036	      5130 ns/op	    2144 B/op	      29 allocs/op
+BenchmarkSigningKey-16      	  281450	      4707 ns/op	    2144 B/op	      29 allocs/op
+BenchmarkSigningKey-16      	  248583	      5009 ns/op	    2144 B/op	      29 allocs/op
+BenchmarkSigningKey-16      	  213070	      4900 ns/op	    2144 B/op	      29 allocs/op
+BenchmarkSigningKey-16      	  202651	      5104 ns/op	    2144 B/op	      29 allocs/op
+BenchmarkSigningKey-16      	  220023	      4647 ns/op	    2144 B/op	      29 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/sigv4	21.779s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/sigv4/chunked
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkEncode1MiB-16            	    1518	    978304 ns/op	1071.83 MB/s	 1247112 B/op	      43 allocs/op
+BenchmarkEncode1MiB-16            	    1026	   1122922 ns/op	 933.79 MB/s	 1247116 B/op	      43 allocs/op
+BenchmarkEncode1MiB-16            	    1376	    934996 ns/op	1121.48 MB/s	 1247030 B/op	      43 allocs/op
+BenchmarkEncode1MiB-16            	    1556	    929898 ns/op	1127.62 MB/s	 1247034 B/op	      43 allocs/op
+BenchmarkEncode1MiB-16            	    1543	    909708 ns/op	1152.65 MB/s	 1247079 B/op	      43 allocs/op
+BenchmarkEncode1MiB-16            	    1042	   1003410 ns/op	1045.01 MB/s	 1247107 B/op	      43 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    7645	    133280 ns/op	7867.49 MB/s	    1764 B/op	      47 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    9426	    154522 ns/op	6785.94 MB/s	    1762 B/op	      47 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    6472	    168855 ns/op	6209.94 MB/s	    1764 B/op	      47 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    9591	    147827 ns/op	7093.25 MB/s	    1763 B/op	      47 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    7843	    138147 ns/op	7590.29 MB/s	    1763 B/op	      47 allocs/op
+BenchmarkUnsignedDecode1MiB-16    	    7893	    152736 ns/op	6865.28 MB/s	    1765 B/op	      47 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/sigv4/chunked	15.153s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/s3
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkValidBucketName-16            	 5360914	       222.3 ns/op	      48 B/op	       1 allocs/op
+BenchmarkValidBucketName-16            	 5427538	       227.2 ns/op	      48 B/op	       1 allocs/op
+BenchmarkValidBucketName-16            	 5146608	       239.7 ns/op	      48 B/op	       1 allocs/op
+BenchmarkValidBucketName-16            	 5776512	       213.9 ns/op	      48 B/op	       1 allocs/op
+BenchmarkValidBucketName-16            	 5615533	       225.5 ns/op	      48 B/op	       1 allocs/op
+BenchmarkValidBucketName-16            	 4849258	       260.2 ns/op	      48 B/op	       1 allocs/op
+BenchmarkClassify-16                   	 2013644	       657.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16                   	 1951098	       684.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16                   	 1814466	       642.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16                   	 1703269	       675.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16                   	 1841802	       624.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassify-16                   	 1856956	       668.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 2672449	       508.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 2983659	       387.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 3139004	       358.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 2691538	       489.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 2775148	       421.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyGetObject-16          	 3022333	       373.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	25743651	        47.93 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	21063714	        50.59 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	15728463	        64.87 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	20890492	        56.89 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	22329966	        50.78 ns/op	       0 B/op	       0 allocs/op
+BenchmarkClassifyCredentialError-16    	20648575	        51.70 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRender-16                     	  234314	      5853 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16                     	  175720	      6209 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16                     	  231376	      5885 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16                     	  217282	      6099 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16                     	  198559	      6009 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkRender-16                     	  233104	      5996 ns/op	    4896 B/op	      11 allocs/op
+BenchmarkLookup-16                     	44252205	        27.83 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16                     	47623472	        29.60 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16                     	49911537	        29.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16                     	27786852	        43.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16                     	39798604	        28.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16                     	39284578	        29.59 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParse-16                      	  602917	      2018 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                      	  572038	      1798 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                      	  621274	      1973 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                      	  839760	      2017 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                      	  539796	      2010 ns/op	     432 B/op	       4 allocs/op
+BenchmarkParse-16                      	  668160	      2042 ns/op	     432 B/op	       4 allocs/op
+BenchmarkDecodeListingKey-16           	 6140398	       202.3 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeListingKey-16           	 6665780	       182.6 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeListingKey-16           	 7893086	       162.0 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeListingKey-16           	 6830898	       168.2 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeListingKey-16           	 7113670	       183.4 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeListingKey-16           	 6317427	       187.8 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/s3	59.192s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/s3/s3response
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkMarshalListObjectsV2-16      	     181	   5878897 ns/op	  669746 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     231	   5409062 ns/op	  669500 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     285	   4480491 ns/op	  669501 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     236	   4478838 ns/op	  669502 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     248	   4682253 ns/op	  669499 B/op	    4023 allocs/op
+BenchmarkMarshalListObjectsV2-16      	     283	   4209725 ns/op	  669500 B/op	    4023 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      67	  18199617 ns/op	 2439807 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      94	  16548934 ns/op	 2439754 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      80	  20651532 ns/op	 2439747 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      74	  15074930 ns/op	 2439743 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      74	  16134376 ns/op	 2439751 B/op	   66069 allocs/op
+BenchmarkUnmarshalListObjectsV2-16    	      73	  17035195 ns/op	 2439739 B/op	   66069 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/s3/s3response	15.048s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/s3/xmlrw
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkListing1000-16    	 1880437	       605.3 ns/op	359419.01 MB/s	       0 B/op	       0 allocs/op
+BenchmarkListing1000-16    	 1685136	       665.4 ns/op	326996.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkListing1000-16    	 1758462	       675.8 ns/op	321949.58 MB/s	       0 B/op	       0 allocs/op
+BenchmarkListing1000-16    	 1919314	       606.6 ns/op	358661.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkListing1000-16    	 1355636	       795.3 ns/op	273582.71 MB/s	       0 B/op	       0 allocs/op
+BenchmarkListing1000-16    	 1986237	       613.4 ns/op	354715.86 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1131	   1069769 ns/op	 159.96 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1368	    858143 ns/op	 199.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1657	    748125 ns/op	 228.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1262	    830867 ns/op	 205.96 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1796	    699873 ns/op	 244.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUploads1000-16    	    1593	    739132 ns/op	 231.52 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/s3/xmlrw	14.045s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/upstream
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkNext-16               	149241826	         8.079 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16               	130464705	        10.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16               	148139908	         8.093 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16               	137555329	         8.549 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16               	137509518	         8.537 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNext-16               	82230574	        13.73 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	84690121	        13.63 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	88583388	        13.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	75773275	        13.59 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	88771447	        16.03 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	65033536	        15.66 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	100000000	        12.96 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/upstream	14.403s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/migrate
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkDecide-16                   	24423873	        58.89 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecide-16                   	24702406	        47.70 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecide-16                   	27613956	        44.57 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecide-16                   	30654692	        40.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecide-16                   	31154037	        49.08 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecide-16                   	18261160	        58.31 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	14359417	        74.89 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	15681072	        73.93 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	13615183	        74.09 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	14113216	        82.67 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	18475303	        79.82 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOwnerOfWithRules-16         	11900922	        97.64 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	44507293	        23.56 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	68781999	        19.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	64565710	        18.07 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	66840826	        16.39 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	81450679	        17.77 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDecodeUploadID-16           	76045773	        15.82 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	  763213	      1327 ns/op	    1137 B/op	       5 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	  818523	      1421 ns/op	    1137 B/op	       5 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	  870758	      1407 ns/op	    1137 B/op	       5 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	  842680	      1400 ns/op	    1137 B/op	       5 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	  810122	      1595 ns/op	    1137 B/op	       5 allocs/op
+BenchmarkRefuseLostWriteWindow-16    	 1000000	      1421 ns/op	    1137 B/op	       5 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/migrate	29.345s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/directory
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkLookup-16          	29640542	        39.63 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16          	31280995	        34.98 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16          	33025401	        40.08 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16          	26321851	        41.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16          	34666566	        38.37 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookup-16          	31860900	        39.56 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCreate-16          	     100	  14012693 ns/op	 1450017 B/op	    9595 allocs/op
+BenchmarkCreate-16          	     100	  14106825 ns/op	 1451613 B/op	    9592 allocs/op
+BenchmarkCreate-16          	      98	  15178345 ns/op	 1424439 B/op	    9423 allocs/op
+BenchmarkCreate-16          	     100	  15438684 ns/op	 1451353 B/op	    9599 allocs/op
+BenchmarkCreate-16          	     100	  14480133 ns/op	 1451654 B/op	    9592 allocs/op
+BenchmarkCreate-16          	      96	  15627217 ns/op	 1400963 B/op	    9264 allocs/op
+BenchmarkStamp-16           	      30	  34148686 ns/op	 6279302 B/op	   60047 allocs/op
+BenchmarkStamp-16           	      28	  41318951 ns/op	 6278572 B/op	   60046 allocs/op
+BenchmarkStamp-16           	      40	  36281180 ns/op	 6278552 B/op	   60046 allocs/op
+BenchmarkStamp-16           	      38	  35271081 ns/op	 6278558 B/op	   60046 allocs/op
+BenchmarkStamp-16           	      34	  38982920 ns/op	 6278580 B/op	   60046 allocs/op
+BenchmarkStamp-16           	      37	  31864734 ns/op	 6278571 B/op	   60046 allocs/op
+BenchmarkParseV2-16         	    1602	    872119 ns/op	  125904 B/op	    2421 allocs/op
+BenchmarkParseV2-16         	    1280	    821037 ns/op	  125897 B/op	    2421 allocs/op
+BenchmarkParseV2-16         	    1478	    846831 ns/op	  125894 B/op	    2421 allocs/op
+BenchmarkParseV2-16         	    1443	    826996 ns/op	  125896 B/op	    2421 allocs/op
+BenchmarkParseV2-16         	    1704	    824140 ns/op	  125896 B/op	    2421 allocs/op
+BenchmarkParseV2-16         	    1459	    865577 ns/op	  125895 B/op	    2421 allocs/op
+BenchmarkScope64Rules-16    	 3086630	       459.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScope64Rules-16    	 2967063	       425.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScope64Rules-16    	 3180662	       389.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScope64Rules-16    	 2682400	       393.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScope64Rules-16    	 2161819	       486.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScope64Rules-16    	 3039229	       384.6 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/directory	38.763s

@@ -1,0 +1,72 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkCacheWrite-16       	     273	   4312275 ns/op	    2245 B/op	      22 allocs/op
+BenchmarkCacheWrite-16       	     244	   4954075 ns/op	    2042 B/op	      22 allocs/op
+BenchmarkCacheWrite-16       	     248	   4902547 ns/op	    2025 B/op	      22 allocs/op
+BenchmarkCacheWrite-16       	     235	   4699945 ns/op	    2032 B/op	      22 allocs/op
+BenchmarkCacheWrite-16       	     277	   4537615 ns/op	    2024 B/op	      22 allocs/op
+BenchmarkCacheWrite-16       	     260	   4472671 ns/op	    2030 B/op	      22 allocs/op
+BenchmarkStaleParallel-16    	230232673	         4.528 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	289922688	         4.040 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	293674420	         4.082 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	292482524	         4.134 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	289728057	         4.118 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	286026040	         4.134 ns/op	       0 B/op	       0 allocs/op
+BenchmarkInstall-16          	      94	  12732936 ns/op	 2301594 B/op	   18100 allocs/op
+BenchmarkInstall-16          	      75	  14922417 ns/op	 2361089 B/op	   18092 allocs/op
+BenchmarkInstall-16          	      86	  18121510 ns/op	 2434067 B/op	   18102 allocs/op
+BenchmarkInstall-16          	      85	  16882442 ns/op	 2447050 B/op	   18103 allocs/op
+BenchmarkInstall-16          	      62	  18882801 ns/op	 2389072 B/op	   18086 allocs/op
+BenchmarkInstall-16          	      70	  16963068 ns/op	 2460837 B/op	   18096 allocs/op
+BenchmarkInstall100k-16      	       2	 930998367 ns/op	234869104 B/op	 1651087 allocs/op
+BenchmarkInstall100k-16      	       2	 904006579 ns/op	234870716 B/op	 1651090 allocs/op
+BenchmarkInstall100k-16      	       2	 901939180 ns/op	234869096 B/op	 1651087 allocs/op
+BenchmarkInstall100k-16      	       2	 806338958 ns/op	234869200 B/op	 1651088 allocs/op
+BenchmarkInstall100k-16      	       2	 771193312 ns/op	234866844 B/op	 1651086 allocs/op
+BenchmarkInstall100k-16      	       2	 762914305 ns/op	234869152 B/op	 1651088 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	35.623s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/upstream
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkRegistryLoadGet-16    	69013758	        18.40 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	83186647	        14.42 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	91949640	        15.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	66370953	        15.96 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	82242474	        14.27 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	72972212	        15.35 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/upstream	7.259s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/runtimecfg
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkLoad-16                    	1000000000	         0.1456 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1329 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1190 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1226 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1156 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1147 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	32296412	        36.87 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	31769239	        36.96 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	32555722	        36.77 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	28313912	        37.07 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	28762423	        37.52 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	27831391	        37.19 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPublish-16                 	 1000000	      1391 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublish-16                 	 1000000	      1495 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublish-16                 	  706804	      1582 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublish-16                 	  661299	      1590 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublish-16                 	  699739	      1614 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublish-16                 	  773875	      2108 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	  542902	      2047 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	  798590	      1803 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	  820359	      1370 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	 1000000	      1654 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	 1000000	      1599 ns/op	     936 B/op	      17 allocs/op
+BenchmarkPublishBackpressured-16    	  666135	      1672 ns/op	     936 B/op	      17 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/runtimecfg	24.790s

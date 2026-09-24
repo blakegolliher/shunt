@@ -242,7 +242,15 @@ add's credential check, so a wrong pair is refused with the old secret in place,
 proxy's served, installed and durable versions, its secret generations against the control
 plane's, and the problems in words; the heartbeat carries `installed` (while backpressured) and
 `cache_error` for it. `old_generation_drained` is the D2 barrier's to prove; until H2 the UI and
-CLI say that installed is not drained. Remaining for H1: benchmarks.
+CLI say that installed is not drained.
+
+**Landed (2026-09-24, H1f); H1 passed:** docs/bench/h1.md. The data path is statistically
+unchanged against the last pre-H1 commit; a request's bundle acquire costs 37 ns under sixteen-way
+contention. A member install of 1,000 placements is 20 % slower (+2.4 ms), the durable cache's
+directory fsync and checksummed envelope, off the request path and outside the install lock. A
+100,000-placement install takes 854 ms and 224 MiB of transient allocation. Fifty secret-only
+rotations with requests between them open one backend connection; the negative control opens
+fifty. `make fleet` and `make walkthrough` passed on the H1 build.
 
 ### Runtime bundle and installation
 

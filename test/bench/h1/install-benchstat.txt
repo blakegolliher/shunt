@@ -1,0 +1,15 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+           │ /home/vastdata/projects/shunt/test/bench/h1/install-64148e8.txt │ /home/vastdata/projects/shunt/test/bench/h1/install-h1.txt │
+           │                             sec/op                              │               sec/op                 vs base               │
+Install-16                                                       12.08m ± 5%                           14.49m ± 8%  +20.00% (p=0.002 n=6)
+
+           │ /home/vastdata/projects/shunt/test/bench/h1/install-64148e8.txt │ /home/vastdata/projects/shunt/test/bench/h1/install-h1.txt │
+           │                              B/op                               │                 B/op                  vs base              │
+Install-16                                                      2.263Mi ± 1%                           2.358Mi ± 1%  +4.20% (p=0.002 n=6)
+
+           │ /home/vastdata/projects/shunt/test/bench/h1/install-64148e8.txt │ /home/vastdata/projects/shunt/test/bench/h1/install-h1.txt │
+           │                            allocs/op                            │                 allocs/op                  vs base         │
+Install-16                                                       18.10k ± 0%                                 18.11k ± 0%  ~ (p=0.080 n=6)

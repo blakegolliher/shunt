@@ -243,7 +243,7 @@ implemented reference. Do not mark a known pending gate green.
       removing both MinIOs. There is no controlled upgrade: no fleet is deployed, and a newer
       schema is refused. Deferred by design: resume and cancel actions and owner terms (H2),
       required If-Generation (H5), string-typed identity versions (read models, H5).*
-- [ ] H1 atomic snapshot/credential/cache paths pass T01–T04 and parity gates.
+- [x] H1 atomic snapshot/credential/cache paths pass T01–T04 and parity gates (2026-09-24; docs/bench/h1.md).
 - [ ] H2 drain/lease/maintenance paths pass T05–T09 and worker/fleet gates.
 - [ ] H3 resumable membership/observed health pass T12–T13 on real etcd.
 - [ ] H4 restore/reconciliation passes T10–T11 with data newer than backup.

@@ -2,10 +2,14 @@ package proxy
 
 import (
 	"context"
+	"io"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,5 +181,83 @@ func TestInstallBackpressure(t *testing.T) {
 	}
 	if cl, _ := rt.Load().Clusters.Get(rt.Load().Clusters.Names()[0]); cl.SecretGeneration != gen {
 		t.Fatalf("serving secret generation %d, want the last rotation %d", cl.SecretGeneration, gen)
+	}
+}
+
+// Secret-only rotations reuse the backend connections (ADR-0021 D1), measured on the wire: fifty
+// rotations, each published and followed by a request, open one TCP connection to the backend.
+// The negative control moves the endpoint each time, which builds a new transport per rotation and
+// dials fifty.
+func TestRotationReusesConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint bool // the rotation also changes the endpoint (localhost vs 127.0.0.1)
+		want     int64
+	}{{"secret only", false, 1}, {"endpoint too (negative control)", true, 50}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dials atomic.Int64
+			be := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+			be.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+				if st == http.StateNew {
+					dials.Add(1)
+				}
+			}
+			be.Start()
+			t.Cleanup(be.Close)
+			hostport := strings.TrimPrefix(be.URL, "http://")
+			_, port, _ := net.SplitHostPort(hostport)
+			_, dir := resignParts(t, hostport, Capabilities{true, true}, "t")
+			reg := upstream.NewRegistry(upstream.Options{}, func(string) (string, error) { return "s", nil })
+			t.Cleanup(reg.Close)
+			gen := int64(0)
+			rotate := func() *upstream.Set {
+				gen++
+				clusters := maps.Clone(dir.Snapshot().File().Clusters)
+				if tc.endpoint {
+					for name, c := range clusters {
+						c.Endpoints = []string{hostport}
+						if gen%2 == 0 {
+							c.Endpoints = []string{"localhost:" + port}
+						}
+						clusters[name] = c
+					}
+				}
+				c, err := reg.PrepareWith(clusters, nil, func(string) int64 { return gen })
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Commit()
+				return reg.Load()
+			}
+			keys := mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}
+			rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: keys, Clusters: rotate()})
+			r := newRig(t, be.Config.Handler, 5*time.Second)
+			r.h.Mode, r.h.Runtime, r.h.Dir, r.h.Rewrite = ModeResign, rt, dir, true
+			client := fresh()
+			for i := range 50 {
+				if i > 0 {
+					if err := rt.Refresh(dir.Snapshot(), keys, rotate()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				req, err := http.NewRequest(http.MethodGet, r.front.URL+"/bbb/k", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				clientSign(req, sigv4.UnsignedPayload)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("request %d: %d", i, resp.StatusCode)
+				}
+			}
+			if n := dials.Load(); n != tc.want {
+				t.Fatalf("%d backend connections over 50 rotations, want %d", n, tc.want)
+			}
+		})
 	}
 }

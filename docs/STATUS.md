@@ -52,7 +52,7 @@ control-plane baseline for H1–H5 (docs/bench/h0.md). H0 passed on 2026-09-24: 
 `make walkthrough` green, and a manual acceptance pass of the web UI on `make demo-ui` (a bucket
 spread over two MinIOs, moved onto a third backend, consolidated, and both MinIOs removed). That
 pass found and fixed eight UI and telemetry bugs, and added per-code status charts and per-bucket
-traffic by backend (`shunt watch`). H1 has started: H1a (the runtime bundle), H1b (secret generations, reported per member and per cluster) H1c (counted bundles, sets and transports; at most eight retired bundles, then installs back up) H1d (a checksummed, fsynced restart cache, durable reported apart from applied) and H1e (`cluster credentials` and `proxy show` on API, CLI and UI) have landed; H1f (benchmarks) is next. New endpoints/commands in those documents are design
+traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations, reported per member and per cluster), H1c (counted bundles, sets and transports; at most eight retired bundles, then installs back up), H1d (a checksummed, fsynced restart cache, durable reported apart from applied), H1e (`cluster credentials` and `proxy show` on API, CLI and UI) and H1f (docs/bench/h1.md: data path unchanged, a member install +20 % for the durable cache, transport reuse measured on the wire); `make fleet` and `make walkthrough` passed on the H1 build. H2 is next. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

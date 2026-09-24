@@ -213,3 +213,39 @@ func BenchmarkAcquire(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkPublish is one install's publication with no request holding a bundle: the swap, the
+// old bundle drained at once.
+func BenchmarkPublish(b *testing.B) {
+	p := NewPublisher(bundle(lineage, 0))
+	v := int64(0)
+	for b.Loop() {
+		v++
+		if err := p.Publish(bundle(lineage, v)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkPublishBackpressured is one install's publication while long requests hold MaxRetired
+// bundles: it replaces the pending bundle instead of swapping.
+func BenchmarkPublishBackpressured(b *testing.B) {
+	p := NewPublisher(bundle(lineage, 0))
+	v := int64(0)
+	for range MaxRetired {
+		p.Acquire() // held for the benchmark's life
+		v++
+		if err := p.Publish(bundle(lineage, v)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for b.Loop() {
+		v++
+		if err := p.Publish(bundle(lineage, v)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if st := p.Stats(); st.Pending == 0 {
+		b.Fatalf("not backpressured: %+v", st)
+	}
+}

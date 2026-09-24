@@ -705,15 +705,21 @@ func BenchmarkStaleParallel(b *testing.B) {
 
 // BenchmarkInstall is one directory version of 1,000 placements through validation, preparation,
 // publication and the cache write.
-func BenchmarkInstall(b *testing.B) {
-	c := New(Config{CacheDir: b.TempDir(), LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
+func BenchmarkInstall(b *testing.B) { benchInstall(b, 1000) }
+
+// BenchmarkInstall100k is design §8's snapshot reload: one version of 100,000 placements, one
+// installation build and one cache write per version.
+func BenchmarkInstall100k(b *testing.B) { benchInstall(b, 100_000) }
+
+func benchInstall(b *testing.B, placements int) {
+	c := New(Config{ProxyID: "p1", CacheDir: b.TempDir(), LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
 	base := control.Directory{File: directory.File{Identity: testIdentity,
 		Clusters: map[string]config.Cluster{"vast01": {Type: "s3", Scheme: "http", Region: "r", EndpointMode: "static", Endpoints: []string{"127.0.0.1:1"},
 			Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}},
 		Tenants: map[string]directory.Tenant{"acme": {DefaultCluster: "vast01"}}, Placements: map[string]directory.Placement{}},
 		Secrets: map[string]string{"control:vast01": "s1"}}
-	for i := range 1000 {
-		name := fmt.Sprintf("bucket-%04d", i)
+	for i := range placements {
+		name := fmt.Sprintf("bucket-%06d", i)
 		base.Placements["acme/"+name] = directory.Placement{State: directory.StateActive, Primary: "vast01", Names: map[string]string{"vast01": name}}
 	}
 	for i := 0; b.Loop(); i++ {

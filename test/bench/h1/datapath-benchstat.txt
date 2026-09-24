@@ -1,0 +1,286 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/directory
+cpu: AMD EPYC 7402P 24-Core Processor               
+                │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                │               sec/op               │    sec/op     vs base               │
+Lookup-16                               39.59n ± 12%   45.81n ± 31%        ~ (p=0.093 n=6)
+Create-16                               14.83m ±  6%   13.07m ±  9%  -11.89% (p=0.002 n=6)
+Stamp-16                                35.78m ± 15%   40.40m ±  8%        ~ (p=0.065 n=6)
+ParseV2-16                              836.9µ ±  4%   837.4µ ± 18%        ~ (p=0.937 n=6)
+Scope64Rules-16                         409.6n ± 19%   450.3n ± 22%        ~ (p=0.485 n=6)
+geomean                                 93.64µ         98.17µ         +4.83%
+
+                │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt     │
+                │                B/op                │     B/op      vs base                │
+Lookup-16                               0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Create-16                             1.383Mi ± 3%     1.384Mi ± 0%       ~ (p=0.818 n=6)
+Stamp-16                              5.988Mi ± 0%     5.988Mi ± 0%       ~ (p=0.818 n=6)
+ParseV2-16                            122.9Ki ± 0%     122.9Ki ± 0%       ~ (p=0.331 n=6)
+Scope64Rules-16                         0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                            ²                 +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                │             allocs/op              │  allocs/op   vs base                │
+Lookup-16                               0.000 ± 0%      0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Create-16                              9.592k ± 3%     9.594k ± 0%       ~ (p=0.472 n=6)
+Stamp-16                               60.05k ± 0%     60.05k ± 0%       ~ (p=1.000 n=6)
+ParseV2-16                             2.421k ± 0%     2.421k ± 0%       ~ (p=1.000 n=6) ¹
+Scope64Rules-16                         0.000 ± 0%      0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                            ²                +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/migrate
+                         │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                         │               sec/op               │    sec/op     vs base              │
+Decide-16                                        48.39n ± 22%   46.46n ± 18%       ~ (p=0.589 n=6)
+OwnerOfWithRules-16                              77.35n ± 26%   70.95n ± 17%       ~ (p=0.132 n=6)
+DecodeUploadID-16                                17.92n ± 31%   18.42n ± 16%       ~ (p=1.000 n=6)
+RefuseLostWriteWindow-16                         1.414µ ± 13%   1.481µ ± 12%       ~ (p=0.221 n=6)
+geomean                                          98.69n         97.37n        -1.33%
+
+                         │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt     │
+                         │                B/op                │     B/op      vs base                │
+Decide-16                                        0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+OwnerOfWithRules-16                              0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeUploadID-16                                0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RefuseLostWriteWindow-16                       1.110Ki ± 0%     1.110Ki ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                     ²                 +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                         │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                         │             allocs/op              │ allocs/op   vs base                │
+Decide-16                                        0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+OwnerOfWithRules-16                              0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeUploadID-16                                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RefuseLostWriteWindow-16                         5.000 ± 0%     5.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                     ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/proxy
+                                  │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                                  │               sec/op               │    sec/op     vs base              │
+SmallGET-16                                               363.5µ ±  7%   389.5µ ± 17%       ~ (p=0.310 n=6)
+PUT1MiB-16                                                1.998m ± 25%   1.929m ± 24%       ~ (p=0.699 n=6)
+OwnCopy-16                                                8.596n ± 16%   8.843n ± 31%       ~ (p=0.699 n=6)
+MigratingDeleteObjects1000Keys-16                         3.056m ± 33%   3.249m ± 23%       ~ (p=0.485 n=6)
+MergedListingPage1000Keys-16                              49.62m ± 19%   54.14m ± 17%       ~ (p=0.093 n=6)
+LossLedgerObserve-16                                      888.4n ± 11%   853.2n ± 33%       ~ (p=1.000 n=6)
+ResignSmallGET-16                                         522.2µ ± 16%   495.4µ ± 11%       ~ (p=0.485 n=6)
+ResignSignedChunkPUT1MiB-16                               4.988m ± 22%   5.173m ±  7%       ~ (p=0.818 n=6)
+SpreadListingPage/legs=1-16                               11.61m ± 12%   12.20m ± 13%       ~ (p=0.310 n=6)
+SpreadListingPage/legs=2-16                               22.55m ± 11%   24.22m ±  9%       ~ (p=0.180 n=6)
+SpreadListingPage/legs=8-16                               19.89m ± 15%   18.89m ±  9%  -5.03% (p=0.041 n=6)
+SpreadListingPage/legs=32-16                              21.12m ± 18%   23.61m ± 26%       ~ (p=0.699 n=6)
+geomean                                                   888.2µ         913.3µ        +2.82%
+
+                                  │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt     │
+                                  │                B/op                │     B/op      vs base                │
+SmallGET-16                                             22.47Ki ± 6%     22.60Ki ± 8%       ~ (p=0.818 n=6)
+PUT1MiB-16                                              60.39Ki ± 6%     59.70Ki ± 6%       ~ (p=0.240 n=6)
+OwnCopy-16                                                0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+MigratingDeleteObjects1000Keys-16                       651.8Ki ± 4%     655.6Ki ± 3%       ~ (p=0.485 n=6)
+MergedListingPage1000Keys-16                            21.22Mi ± 0%     21.22Mi ± 0%       ~ (p=0.699 n=6)
+LossLedgerObserve-16                                      400.0 ± 0%       400.0 ± 0%       ~ (p=1.000 n=6) ¹
+ResignSmallGET-16                                       35.70Ki ± 5%     36.45Ki ± 6%       ~ (p=0.240 n=6)
+ResignSignedChunkPUT1MiB-16                             982.1Ki ± 2%     977.0Ki ± 1%       ~ (p=0.589 n=6)
+SpreadListingPage/legs=1-16                             7.894Mi ± 0%     7.894Mi ± 0%       ~ (p=1.000 n=6)
+SpreadListingPage/legs=2-16                             11.60Mi ± 0%     11.60Mi ± 0%       ~ (p=0.485 n=6)
+SpreadListingPage/legs=8-16                             11.88Mi ± 0%     11.89Mi ± 0%       ~ (p=0.485 n=6)
+SpreadListingPage/legs=32-16                            12.70Mi ± 1%     12.70Mi ± 1%       ~ (p=0.818 n=6)
+geomean                                                              ²                 +0.14%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                  │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                                  │             allocs/op              │  allocs/op   vs base                │
+SmallGET-16                                               107.0 ± 0%      107.0 ± 0%       ~ (p=1.000 n=6) ¹
+PUT1MiB-16                                                179.0 ± 0%      179.0 ± 0%       ~ (p=1.000 n=6) ¹
+OwnCopy-16                                                0.000 ± 0%      0.000 ± 0%       ~ (p=1.000 n=6) ¹
+MigratingDeleteObjects1000Keys-16                         914.5 ± 1%      915.5 ± 1%       ~ (p=0.649 n=6)
+MergedListingPage1000Keys-16                             146.3k ± 0%     146.3k ± 0%       ~ (p=0.329 n=6)
+LossLedgerObserve-16                                      5.000 ± 0%      5.000 ± 0%       ~ (p=1.000 n=6) ¹
+ResignSmallGET-16                                         240.0 ± 0%      240.0 ± 0%       ~ (p=1.000 n=6) ¹
+ResignSignedChunkPUT1MiB-16                              4.728k ± 0%     4.727k ± 0%       ~ (p=0.567 n=6)
+SpreadListingPage/legs=1-16                              11.70k ± 0%     11.70k ± 0%       ~ (p=0.745 n=6)
+SpreadListingPage/legs=2-16                              76.29k ± 0%     76.29k ± 0%       ~ (p=0.688 n=6)
+SpreadListingPage/legs=8-16                              78.72k ± 0%     78.72k ± 0%       ~ (p=0.909 n=6)
+SpreadListingPage/legs=32-16                             87.92k ± 0%     87.93k ± 0%       ~ (p=0.589 n=6)
+geomean                                                              ²                +0.01%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                  │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                                  │                B/s                 │      B/s       vs base              │
+PUT1MiB-16                                               500.4Mi ± 20%   519.0Mi ± 20%       ~ (p=0.699 n=6)
+MigratingDeleteObjects1000Keys-16                        19.36Mi ± 25%   18.28Mi ± 19%       ~ (p=0.513 n=6)
+ResignSignedChunkPUT1MiB-16                              200.5Mi ± 18%   193.3Mi ±  7%       ~ (p=0.818 n=6)
+geomean                                                  124.8Mi         122.4Mi        -1.90%
+
+pkg: github.com/blakegolliher/shunt/internal/s3
+                           │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                           │               sec/op               │    sec/op     vs base              │
+ValidBucketName-16                                 226.3n ± 15%   247.2n ± 10%       ~ (p=0.485 n=6)
+Classify-16                                        663.0n ±  6%   678.0n ± 13%       ~ (p=0.485 n=6)
+ClassifyGetObject-16                               404.8n ± 26%   410.8n ± 22%       ~ (p=0.818 n=6)
+ClassifyCredentialError-16                         51.24n ± 27%   52.33n ± 11%       ~ (p=0.937 n=6)
+Render-16                                          6.003µ ±  3%   6.258µ ±  7%       ~ (p=0.394 n=6)
+Lookup-16                                          29.30n ± 47%   28.72n ±  9%       ~ (p=0.818 n=6)
+Parse-16                                           2.014µ ± 11%   2.007µ ±  9%       ~ (p=0.699 n=6)
+DecodeListingKey-16                                183.0n ± 11%   179.4n ± 10%       ~ (p=1.000 n=6)
+geomean                                            345.2n         351.5n        +1.83%
+
+                           │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt     │
+                           │                B/op                │     B/op      vs base                │
+ValidBucketName-16                                 48.00 ± 0%       48.00 ± 0%       ~ (p=1.000 n=6) ¹
+Classify-16                                        0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyGetObject-16                               0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyCredentialError-16                         0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Render-16                                        4.781Ki ± 0%     4.781Ki ± 0%       ~ (p=1.000 n=6) ¹
+Lookup-16                                          0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Parse-16                                           432.0 ± 0%       432.0 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeListingKey-16                                16.00 ± 0%       16.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                       ²                 +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                           │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                           │             allocs/op              │ allocs/op   vs base                │
+ValidBucketName-16                                 1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=6) ¹
+Classify-16                                        0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyGetObject-16                               0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyCredentialError-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Render-16                                          11.00 ± 0%     11.00 ± 0%       ~ (p=1.000 n=6) ¹
+Lookup-16                                          0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Parse-16                                           4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeListingKey-16                                1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                       ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/s3/s3response
+                          │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                          │               sec/op               │    sec/op     vs base              │
+MarshalListObjectsV2-16                           4.581m ± 28%   4.757m ±  8%       ~ (p=0.937 n=6)
+UnmarshalListObjectsV2-16                         16.79m ± 23%   17.37m ± 16%       ~ (p=0.818 n=6)
+geomean                                           8.771m         9.090m        +3.63%
+
+                          │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                          │                B/op                │     B/op      vs base              │
+MarshalListObjectsV2-16                           653.8Ki ± 0%   653.8Ki ± 0%       ~ (p=0.610 n=6)
+UnmarshalListObjectsV2-16                         2.327Mi ± 0%   2.327Mi ± 0%       ~ (p=0.623 n=6)
+geomean                                           1.219Mi        1.219Mi       -0.00%
+
+                          │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                          │             allocs/op              │  allocs/op   vs base                │
+MarshalListObjectsV2-16                            4.023k ± 0%   4.023k ± 0%       ~ (p=1.000 n=6) ¹
+UnmarshalListObjectsV2-16                          66.07k ± 0%   66.07k ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                            16.30k        16.30k       +0.00%
+¹ all samples are equal
+
+pkg: github.com/blakegolliher/shunt/internal/s3/xmlrw
+               │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+               │               sec/op               │    sec/op     vs base              │
+Listing1000-16                         639.4n ± 24%   730.3n ± 37%       ~ (p=0.180 n=6)
+Uploads1000-16                         789.5µ ± 36%   798.4µ ± 21%       ~ (p=0.589 n=6)
+geomean                                22.47µ         24.15µ        +7.47%
+
+               │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+               │                B/op                │    B/op     vs base                │
+Listing1000-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Uploads1000-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                           ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+               │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+               │             allocs/op              │ allocs/op   vs base                │
+Listing1000-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Uploads1000-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                           ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+               │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+               │                B/s                 │      B/s       vs base              │
+Listing1000-16                        317.4Gi ± 20%   277.7Gi ± 27%       ~ (p=0.180 n=6)
+Uploads1000-16                        207.3Mi ± 26%   204.4Mi ± 18%       ~ (p=0.589 n=6)
+geomean                               8.016Gi         7.445Gi        -7.12%
+
+pkg: github.com/blakegolliher/shunt/internal/sigv4
+                │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                │               sec/op               │    sec/op     vs base              │
+VerifyHeader-16                         22.09µ ± 16%   22.88µ ± 17%       ~ (p=1.000 n=6)
+Sign-16                                 18.10µ ± 11%   16.52µ ±  7%  -8.72% (p=0.041 n=6)
+SigningKey-16                           4.955µ ±  6%   4.993µ ±  7%       ~ (p=0.589 n=6)
+geomean                                 12.56µ         12.36µ        -1.59%
+
+                │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt     │
+                │                B/op                │     B/op      vs base                │
+VerifyHeader-16                         5.945Ki ± 0%   5.945Ki ± 0%       ~ (p=1.000 n=6) ¹
+Sign-16                                 5.242Ki ± 0%   5.242Ki ± 0%       ~ (p=1.000 n=6) ¹
+SigningKey-16                           2.094Ki ± 0%   2.094Ki ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                 4.026Ki        4.026Ki       +0.00%
+¹ all samples are equal
+
+                │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                │             allocs/op              │ allocs/op   vs base                │
+VerifyHeader-16                           76.00 ± 0%   76.00 ± 0%       ~ (p=1.000 n=6) ¹
+Sign-16                                   72.00 ± 0%   72.00 ± 0%       ~ (p=1.000 n=6) ¹
+SigningKey-16                             29.00 ± 0%   29.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                   54.14        54.14       +0.00%
+¹ all samples are equal
+
+pkg: github.com/blakegolliher/shunt/internal/sigv4/chunked
+                      │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                      │               sec/op               │    sec/op      vs base              │
+Encode1MiB-16                                 956.7µ ± 17%   1057.6µ ± 21%       ~ (p=0.093 n=6)
+UnsignedDecode1MiB-16                         150.3µ ± 12%    154.3µ ± 10%       ~ (p=0.485 n=6)
+geomean                                       379.2µ          403.9µ        +6.53%
+
+                      │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                      │                B/op                │     B/op      vs base              │
+Encode1MiB-16                                 1.189Mi ± 0%   1.189Mi ± 0%       ~ (p=0.485 n=6)
+UnsignedDecode1MiB-16                         1.722Ki ± 0%   1.722Ki ± 0%       ~ (p=0.374 n=6)
+geomean                                       45.80Ki        45.79Ki       -0.02%
+
+                      │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                      │             allocs/op              │ allocs/op   vs base                │
+Encode1MiB-16                                   43.00 ± 0%   43.00 ± 0%       ~ (p=1.000 n=6) ¹
+UnsignedDecode1MiB-16                           47.00 ± 0%   47.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                         44.96        44.96       +0.00%
+¹ all samples are equal
+
+                      │ test/bench/h1/datapath-64148e8.txt │    test/bench/h1/datapath-h1.txt    │
+                      │                B/s                 │      B/s       vs base              │
+Encode1MiB-16                               1045.9Mi ± 15%   945.6Mi ± 18%       ~ (p=0.093 n=6)
+UnsignedDecode1MiB-16                        6.500Gi ± 13%   6.335Gi ±  9%       ~ (p=0.485 n=6)
+geomean                                      2.577Gi         2.419Gi        -6.13%
+
+pkg: github.com/blakegolliher/shunt/internal/upstream
+                   │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                   │               sec/op               │    sec/op     vs base              │
+Next-16                                    8.543n ± 61%   8.958n ± 14%       ~ (p=0.589 n=6)
+RegistryLoadGet-16                         13.61n ± 18%   14.81n ± 27%       ~ (p=0.818 n=6)
+geomean                                    10.78n         11.52n        +6.82%
+
+                   │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                   │                B/op                │    B/op     vs base                │
+Next-16                                    0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RegistryLoadGet-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                               ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                   │ test/bench/h1/datapath-64148e8.txt │   test/bench/h1/datapath-h1.txt    │
+                   │             allocs/op              │ allocs/op   vs base                │
+Next-16                                    0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RegistryLoadGet-16                         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                               ²               +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean

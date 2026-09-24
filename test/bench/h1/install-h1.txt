@@ -1,0 +1,12 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkInstall-16    	      70	  14487718 ns/op	 2508746 B/op	   18110 allocs/op
+BenchmarkInstall-16    	      90	  14500585 ns/op	 2467478 B/op	   18107 allocs/op
+BenchmarkInstall-16    	      92	  13635273 ns/op	 2486804 B/op	   18109 allocs/op
+BenchmarkInstall-16    	      85	  15599400 ns/op	 2456550 B/op	   18104 allocs/op
+BenchmarkInstall-16    	     100	  14153369 ns/op	 2441149 B/op	   18108 allocs/op
+BenchmarkInstall-16    	     100	  14589897 ns/op	 2477594 B/op	   18111 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	7.814s
