@@ -236,7 +236,11 @@ implemented reference. Do not mark a known pending gate green.
 
 ## 5. Definition of done
 
-- [ ] H0 protocol/operation foundation complete; controlled upgrade documented.
+- [ ] H0 protocol/operation foundation complete; controlled upgrade documented. *Code landed
+      2026-09-24 (ADR-0021; docs/bench/h0.md). There is no controlled upgrade: no fleet is
+      deployed, and a newer schema is refused. Open: the Operations screen's manual visual
+      acceptance. Deferred by design: resume and cancel actions and owner terms (H2), required
+      If-Generation (H5), string-typed identity versions (read models, H5).*
 - [ ] H1 atomic snapshot/credential/cache paths pass T01–T04 and parity gates.
 - [ ] H2 drain/lease/maintenance paths pass T05–T09 and worker/fleet gates.
 - [ ] H3 resumable membership/observed health pass T12–T13 on real etcd.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -669,5 +670,41 @@ func TestMemberIgnoresACacheWithoutIdentity(t *testing.T) {
 	}
 	if v := c.Snapshot().Version(); v != 0 {
 		t.Fatalf("a cache with no identity was installed at version %d", v)
+	}
+}
+
+// Stale is on the request path for every moving bucket: a pointer load, read by many requests at
+// once while heartbeats renew the lease.
+func BenchmarkStaleParallel(b *testing.B) {
+	c := New(Config{LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
+	c.lease.Store(&grant{seq: 1, until: time.Now().Add(time.Hour)})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if c.Stale() {
+				b.Error("stale")
+			}
+		}
+	})
+}
+
+// BenchmarkInstall is one directory version of 1,000 placements through validation, preparation,
+// publication and the cache write.
+func BenchmarkInstall(b *testing.B) {
+	c := New(Config{CacheDir: b.TempDir(), LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
+	base := control.Directory{File: directory.File{Identity: testIdentity,
+		Clusters: map[string]config.Cluster{"vast01": {Type: "s3", Scheme: "http", Region: "r", EndpointMode: "static", Endpoints: []string{"127.0.0.1:1"},
+			Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}},
+		Tenants: map[string]directory.Tenant{"acme": {DefaultCluster: "vast01"}}, Placements: map[string]directory.Placement{}},
+		Secrets: map[string]string{"control:vast01": "s1"}}
+	for i := range 1000 {
+		name := fmt.Sprintf("bucket-%04d", i)
+		base.Placements["acme/"+name] = directory.Placement{State: directory.StateActive, Primary: "vast01", Names: map[string]string{"vast01": name}}
+	}
+	for i := 0; b.Loop(); i++ {
+		d := base
+		d.Version = int64(i + 1)
+		if _, err := c.install(&d, true); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

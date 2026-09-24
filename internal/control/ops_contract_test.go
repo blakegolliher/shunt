@@ -1,6 +1,7 @@
 package control_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,4 +24,36 @@ func TestMemOperationsContract(t *testing.T) {
 		}
 		return opstest.Harness{Ops: &control.MemOperations{Dir: d, Limit: o.Limit, Capacity: o.Capacity}, Dir: d}
 	})
+}
+
+// BenchmarkMemOperationsCreateUpdate is one scoped operation's life in the lab's store, with a
+// thousand ended records behind it: create (the conflict scan), start, end.
+func BenchmarkMemOperationsCreateUpdate(b *testing.B) {
+	m := &control.MemOperations{Limit: 1000, Capacity: 1 << 20}
+	for i := range 1000 {
+		op := &control.Operation{ID: fmt.Sprintf("0-%06d", i), Status: control.StatusPending, Sequence: 1,
+			Scope: &control.Scope{Resource: directory.PlacementResource(fmt.Sprintf("acme/b%d", i)), Clusters: []string{"c1"}}}
+		if err := m.Create(b.Context(), op); err != nil {
+			b.Fatal(err)
+		}
+		op.Status, op.Sequence = control.StatusSucceeded, 2
+		if err := m.Update(b.Context(), op); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for i := 0; b.Loop(); i++ {
+		op := &control.Operation{ID: fmt.Sprintf("1-%09d", i), Status: control.StatusPending, Sequence: 1,
+			Scope: &control.Scope{Resource: directory.PlacementResource("acme/data"), Clusters: []string{"c1"}}}
+		if err := m.Create(b.Context(), op); err != nil {
+			b.Fatal(err)
+		}
+		op.Status, op.Sequence = control.StatusRunning, 2
+		if err := m.Update(b.Context(), op); err != nil {
+			b.Fatal(err)
+		}
+		op.Status, op.Sequence = control.StatusSucceeded, 3
+		if err := m.Update(b.Context(), op); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

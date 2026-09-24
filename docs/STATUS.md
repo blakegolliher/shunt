@@ -45,7 +45,11 @@ request that creates an operation needs an `Idempotency-Key`, and a retry runs n
 `If-Generation` refuses a request made against a moved placement or cluster; a capacity limit
 answers 429. H0d: refusals say whether they are `retryable`; `shunt operation list|show|wait`
 and the web UI's Operations screen read the records; `shunt directory set-state|set-default`
-write around the control API and now need `--offline`. H0e is pending. New endpoints/commands in those documents are design
+write around the control API and now need `--offline`. H0e: the eight proposed metric families are
+catalogued ahead of their code, the lease read on the request path is lock-free, and the
+benchmarks show the data path statistically unchanged against the commit before this work, with a
+control-plane baseline for H1–H5 (docs/bench/h0.md). H0's code has landed. Its gate still needs
+the manual visual acceptance of the new Operations screen (ADR-0017). New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

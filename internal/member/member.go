@@ -78,9 +78,9 @@ type Client struct {
 	lastAck    atomic.Pointer[time.Time]
 	stale      atomic.Bool
 
-	lease      sync.Mutex
-	leaseSeq   int64     // the heartbeat whose answer granted the lease
-	leaseUntil time.Time // from the heartbeat's send time on c.Now's clock; zero: never granted
+	// lease is the grant held, replaced whole by renew; nil: never granted. Stale reads it on the
+	// request path for every moving bucket, so it is a pointer load, not a lock.
+	lease atomic.Pointer[grant]
 
 	// lineage, once set, is why this member's directory is on another lineage than the control
 	// plane's (ADR-0021): another cluster, or another epoch after a restore. The member stays stale
@@ -136,10 +136,8 @@ func (c *Client) Stale() bool {
 	if c.lineage.Load() != nil {
 		return true
 	}
-	c.lease.Lock()
-	until := c.leaseUntil
-	c.lease.Unlock()
-	return until.IsZero() || c.Now().After(until)
+	g := c.lease.Load()
+	return g == nil || c.Now().After(g.until)
 }
 
 // cacheFile is the last installed directory, with its secrets, on local disk (0600).
@@ -535,18 +533,27 @@ func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied i
 	if v := c.Snapshot().Version(); v < ans.Version {
 		return fmt.Errorf("directory version %d is behind the control plane's %d", v, ans.Version)
 	}
-	until := sent.Add(min(ans.LeaseTTL, c.cfg.LeaseTTL))
-	c.lease.Lock()
-	defer c.lease.Unlock()
-	if seq <= c.leaseSeq {
-		return nil // an older answer never replaces a newer grant
-	}
-	if c.Now().After(until) {
+	next := &grant{seq: seq, until: sent.Add(min(ans.LeaseTTL, c.cfg.LeaseTTL))}
+	if c.Now().After(next.until) {
 		return fmt.Errorf("heartbeat %d was answered after the lease it grants had run out", seq)
 	}
-	c.leaseSeq, c.leaseUntil = seq, until
-	c.lastAck.Store(&sent)
-	return nil
+	for {
+		cur := c.lease.Load()
+		if cur != nil && seq <= cur.seq {
+			return nil // an older answer never replaces a newer grant
+		}
+		if c.lease.CompareAndSwap(cur, next) {
+			c.lastAck.Store(&sent)
+			return nil
+		}
+	}
+}
+
+// grant is one lease: the heartbeat that earned it, and when it runs out, from that heartbeat's
+// send time on c.Now's clock.
+type grant struct {
+	seq   int64
+	until time.Time
 }
 
 func errString(err error) string {
@@ -615,11 +622,9 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if ack := c.lastAck.Load(); ack != nil {
 		st.LastAck = now.Sub(*ack).Round(time.Millisecond).String()
 	}
-	c.lease.Lock()
-	if !c.leaseUntil.IsZero() {
-		st.LeaseLeft = c.leaseUntil.Sub(now).Round(time.Millisecond).String()
+	if g := c.lease.Load(); g != nil {
+		st.LeaseLeft = g.until.Sub(now).Round(time.Millisecond).String()
 	}
-	c.lease.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

@@ -1,0 +1,286 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/directory
+cpu: AMD EPYC 7402P 24-Core Processor               
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                     sec/op                                                     │                                         sec/op                                           vs base               │
+Lookup-16                                                                                                           38.34n ± 17%                                                                              39.17n ± 13%        ~ (p=0.937 n=6)
+Create-16                                                                                                           11.64m ±  5%                                                                              13.12m ± 10%  +12.73% (p=0.002 n=6)
+ParseV2-16                                                                                                          745.5µ ±  9%                                                                              772.6µ ± 14%        ~ (p=0.699 n=6)
+Scope64Rules-16                                                                                                     467.1n ± 28%                                                                              410.1n ±  6%  -12.20% (p=0.041 n=6)
+Stamp-16                                                                                                                                                                                                      33.76m ± 12%
+geomean                                                                                                             19.85µ                                                                                    88.72µ         +1.18%
+
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                      B/op                                                      │                                         B/op                                           vs base                 │
+Lookup-16                                                                                                           0.000 ± 0%                                                                               0.000 ±  0%        ~ (p=1.000 n=6) ¹
+Create-16                                                                                                         1.136Mi ± 0%                                                                             1.383Mi ± 13%  +21.74% (p=0.002 n=6)
+ParseV2-16                                                                                                        122.9Ki ± 0%                                                                             122.9Ki ±  0%   +0.04% (p=0.002 n=6)
+Scope64Rules-16                                                                                                     0.000 ± 0%                                                                               0.000 ±  0%        ~ (p=1.000 n=6) ¹
+Stamp-16                                                                                                                                                                                                   5.988Mi ±  0%
+geomean                                                                                                                        ²                                                                                           +5.05%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                   allocs/op                                                    │                                       allocs/op                                        vs base                 │
+Lookup-16                                                                                                           0.000 ± 0%                                                                               0.000 ±  0%        ~ (p=1.000 n=6) ¹
+Create-16                                                                                                          8.079k ± 0%                                                                              9.591k ± 11%  +18.72% (p=0.002 n=6)
+ParseV2-16                                                                                                         2.421k ± 0%                                                                              2.421k ±  0%        ~ (p=1.000 n=6) ¹
+Scope64Rules-16                                                                                                     0.000 ± 0%                                                                               0.000 ±  0%        ~ (p=1.000 n=6) ¹
+Stamp-16                                                                                                                                                                                                    60.05k ±  0%
+geomean                                                                                                                        ²                                                                                           +4.38%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/migrate
+                         │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                         │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+Decide-16                                                                                                                    44.78n ± 12%                                                                               46.08n ± 35%       ~ (p=0.485 n=6)
+OwnerOfWithRules-16                                                                                                          74.24n ± 16%                                                                               75.70n ± 12%       ~ (p=0.818 n=6)
+DecodeUploadID-16                                                                                                            16.94n ± 27%                                                                               15.98n ± 42%       ~ (p=0.225 n=6)
+RefuseLostWriteWindow-16                                                                                                     1.388µ ± 10%                                                                               1.381µ ± 12%       ~ (p=0.699 n=6)
+geomean                                                                                                                      94.03n                                                                                     93.67n        -0.38%
+
+                         │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                         │                                                      B/op                                                      │                                          B/op                                           vs base                │
+Decide-16                                                                                                                    0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+OwnerOfWithRules-16                                                                                                          0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeUploadID-16                                                                                                            0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RefuseLostWriteWindow-16                                                                                                   1.110Ki ± 0%                                                                               1.110Ki ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                                 ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                         │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                         │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+Decide-16                                                                                                                    0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+OwnerOfWithRules-16                                                                                                          0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeUploadID-16                                                                                                            0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RefuseLostWriteWindow-16                                                                                                     5.000 ± 0%                                                                                 5.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                                 ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/proxy
+                                  │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                                  │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+SmallGET-16                                                                                                                           368.5µ ± 10%                                                                               384.3µ ± 14%       ~ (p=0.240 n=6)
+PUT1MiB-16                                                                                                                            1.933m ± 12%                                                                               1.940m ± 16%       ~ (p=0.699 n=6)
+OwnCopy-16                                                                                                                            8.232n ± 11%                                                                               7.915n ± 32%       ~ (p=0.818 n=6)
+MigratingDeleteObjects1000Keys-16                                                                                                     2.895m ± 17%                                                                               3.244m ± 14%       ~ (p=0.132 n=6)
+MergedListingPage1000Keys-16                                                                                                          54.80m ± 12%                                                                               51.90m ± 10%       ~ (p=0.310 n=6)
+LossLedgerObserve-16                                                                                                                  852.8n ± 14%                                                                               849.7n ± 11%       ~ (p=0.589 n=6)
+ResignSmallGET-16                                                                                                                     473.6µ ±  5%                                                                               497.5µ ± 26%       ~ (p=0.394 n=6)
+ResignSignedChunkPUT1MiB-16                                                                                                           4.883m ±  6%                                                                               5.101m ±  7%       ~ (p=0.132 n=6)
+SpreadListingPage/legs=1-16                                                                                                           10.11m ± 22%                                                                               10.52m ± 14%       ~ (p=0.240 n=6)
+SpreadListingPage/legs=2-16                                                                                                           22.52m ±  7%                                                                               22.42m ± 19%       ~ (p=1.000 n=6)
+SpreadListingPage/legs=8-16                                                                                                           18.35m ± 17%                                                                               20.78m ± 16%       ~ (p=0.240 n=6)
+SpreadListingPage/legs=32-16                                                                                                          23.61m ± 23%                                                                               20.57m ± 28%       ~ (p=0.240 n=6)
+geomean                                                                                                                               867.2µ                                                                                     880.1µ        +1.49%
+
+                                  │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                                  │                                                      B/op                                                      │                                          B/op                                           vs base                │
+SmallGET-16                                                                                                                         22.64Ki ± 5%                                                                              22.77Ki ±  9%       ~ (p=0.818 n=6)
+PUT1MiB-16                                                                                                                          60.33Ki ± 2%                                                                              61.78Ki ±  9%       ~ (p=1.000 n=6)
+OwnCopy-16                                                                                                                            0.000 ± 0%                                                                                0.000 ±  0%       ~ (p=1.000 n=6) ¹
+MigratingDeleteObjects1000Keys-16                                                                                                   649.0Ki ± 4%                                                                              650.1Ki ±  4%       ~ (p=0.937 n=6)
+MergedListingPage1000Keys-16                                                                                                        21.22Mi ± 0%                                                                              21.22Mi ±  0%       ~ (p=0.937 n=6)
+LossLedgerObserve-16                                                                                                                  400.0 ± 0%                                                                                400.0 ±  0%       ~ (p=1.000 n=6) ¹
+ResignSmallGET-16                                                                                                                   36.36Ki ± 7%                                                                              35.85Ki ± 10%       ~ (p=0.485 n=6)
+ResignSignedChunkPUT1MiB-16                                                                                                         977.2Ki ± 2%                                                                              979.8Ki ±  2%       ~ (p=0.937 n=6)
+SpreadListingPage/legs=1-16                                                                                                         7.894Mi ± 0%                                                                              7.891Mi ±  0%       ~ (p=0.937 n=6)
+SpreadListingPage/legs=2-16                                                                                                         11.60Mi ± 0%                                                                              11.60Mi ±  0%       ~ (p=0.310 n=6)
+SpreadListingPage/legs=8-16                                                                                                         11.89Mi ± 0%                                                                              11.87Mi ±  0%       ~ (p=0.310 n=6)
+SpreadListingPage/legs=32-16                                                                                                        12.70Mi ± 1%                                                                              12.70Mi ±  1%       ~ (p=0.937 n=6)
+geomean                                                                                                                                          ²                                                                                           +0.15%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                  │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                                  │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+SmallGET-16                                                                                                                           107.0 ± 0%                                                                                 107.0 ± 0%       ~ (p=1.000 n=6) ¹
+PUT1MiB-16                                                                                                                            179.0 ± 0%                                                                                 179.0 ± 0%       ~ (p=1.000 n=6) ¹
+OwnCopy-16                                                                                                                            0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+MigratingDeleteObjects1000Keys-16                                                                                                     912.5 ± 1%                                                                                 913.0 ± 1%       ~ (p=0.619 n=6)
+MergedListingPage1000Keys-16                                                                                                         146.3k ± 0%                                                                                146.3k ± 0%       ~ (p=0.260 n=6)
+LossLedgerObserve-16                                                                                                                  5.000 ± 0%                                                                                 5.000 ± 0%       ~ (p=1.000 n=6) ¹
+ResignSmallGET-16                                                                                                                     240.0 ± 0%                                                                                 240.0 ± 0%       ~ (p=1.000 n=6) ¹
+ResignSignedChunkPUT1MiB-16                                                                                                          4.728k ± 0%                                                                                4.728k ± 0%       ~ (p=1.000 n=6)
+SpreadListingPage/legs=1-16                                                                                                          11.70k ± 0%                                                                                11.70k ± 0%       ~ (p=0.766 n=6)
+SpreadListingPage/legs=2-16                                                                                                          76.29k ± 0%                                                                                76.29k ± 0%       ~ (p=0.446 n=6)
+SpreadListingPage/legs=8-16                                                                                                          78.72k ± 0%                                                                                78.72k ± 0%       ~ (p=0.920 n=6)
+SpreadListingPage/legs=32-16                                                                                                         87.93k ± 0%                                                                                87.93k ± 0%       ~ (p=0.974 n=6)
+geomean                                                                                                                                          ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                  │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                                  │                                                      B/s                                                       │                                           B/s                                             vs base              │
+PUT1MiB-16                                                                                                                           517.6Mi ± 11%                                                                              515.5Mi ± 14%       ~ (p=0.699 n=6)
+MigratingDeleteObjects1000Keys-16                                                                                                    20.45Mi ± 15%                                                                              18.24Mi ± 12%       ~ (p=0.132 n=6)
+ResignSignedChunkPUT1MiB-16                                                                                                          204.9Mi ±  6%                                                                              196.1Mi ±  6%       ~ (p=0.132 n=6)
+geomean                                                                                                                              129.4Mi                                                                                    122.6Mi        -5.27%
+
+pkg: github.com/blakegolliher/shunt/internal/s3
+                           │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                           │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+ValidBucketName-16                                                                                                             228.0n ±  7%                                                                               218.5n ±  8%       ~ (p=0.310 n=6)
+Classify-16                                                                                                                    728.5n ± 16%                                                                               677.0n ± 19%       ~ (p=0.485 n=6)
+ClassifyGetObject-16                                                                                                           374.7n ± 36%                                                                               411.7n ± 25%       ~ (p=0.589 n=6)
+ClassifyCredentialError-16                                                                                                     51.30n ± 10%                                                                               51.00n ± 11%       ~ (p=0.818 n=6)
+Render-16                                                                                                                      5.815µ ±  8%                                                                               5.807µ ±  9%       ~ (p=0.699 n=6)
+Lookup-16                                                                                                                      28.62n ± 15%                                                                               27.42n ±  5%       ~ (p=0.132 n=6)
+Parse-16                                                                                                                       1.791µ ± 12%                                                                               1.946µ ± 14%       ~ (p=0.240 n=6)
+DecodeListingKey-16                                                                                                            166.7n ±  9%                                                                               161.0n ± 16%       ~ (p=0.180 n=6)
+geomean                                                                                                                        335.0n                                                                                     334.0n        -0.30%
+
+                           │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                           │                                                      B/op                                                      │                                          B/op                                           vs base                │
+ValidBucketName-16                                                                                                             48.00 ± 0%                                                                                 48.00 ± 0%       ~ (p=1.000 n=6) ¹
+Classify-16                                                                                                                    0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyGetObject-16                                                                                                           0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyCredentialError-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Render-16                                                                                                                    4.781Ki ± 0%                                                                               4.781Ki ± 0%       ~ (p=1.000 n=6) ¹
+Lookup-16                                                                                                                      0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Parse-16                                                                                                                       432.0 ± 0%                                                                                 432.0 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeListingKey-16                                                                                                            16.00 ± 0%                                                                                 16.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                                   ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                           │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                           │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+ValidBucketName-16                                                                                                             1.000 ± 0%                                                                                 1.000 ± 0%       ~ (p=1.000 n=6) ¹
+Classify-16                                                                                                                    0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyGetObject-16                                                                                                           0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+ClassifyCredentialError-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Render-16                                                                                                                      11.00 ± 0%                                                                                 11.00 ± 0%       ~ (p=1.000 n=6) ¹
+Lookup-16                                                                                                                      0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Parse-16                                                                                                                       4.000 ± 0%                                                                                 4.000 ± 0%       ~ (p=1.000 n=6) ¹
+DecodeListingKey-16                                                                                                            1.000 ± 0%                                                                                 1.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                                   ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+pkg: github.com/blakegolliher/shunt/internal/s3/s3response
+                          │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                          │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+MarshalListObjectsV2-16                                                                                                       4.341m ± 15%                                                                               4.766m ± 10%       ~ (p=0.093 n=6)
+UnmarshalListObjectsV2-16                                                                                                     16.90m ± 12%                                                                               16.55m ± 31%       ~ (p=0.937 n=6)
+geomean                                                                                                                       8.566m                                                                                     8.881m        +3.68%
+
+                          │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                          │                                                      B/op                                                      │                                           B/op                                            vs base              │
+MarshalListObjectsV2-16                                                                                                       653.8Ki ± 0%                                                                               653.8Ki ± 0%       ~ (p=0.840 n=6)
+UnmarshalListObjectsV2-16                                                                                                     2.327Mi ± 0%                                                                               2.327Mi ± 0%       ~ (p=0.667 n=6)
+geomean                                                                                                                       1.219Mi                                                                                    1.219Mi       -0.00%
+
+                          │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                          │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+MarshalListObjectsV2-16                                                                                                        4.023k ± 0%                                                                              4.023k ± 0%       ~ (p=1.000 n=6) ¹
+UnmarshalListObjectsV2-16                                                                                                      66.07k ± 0%                                                                              66.07k ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                        16.30k                                                                                   16.30k       +0.00%
+¹ all samples are equal
+
+pkg: github.com/blakegolliher/shunt/internal/s3/xmlrw
+               │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+               │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+Listing1000-16                                                                                                     636.0n ± 37%                                                                               631.5n ± 16%       ~ (p=0.818 n=6)
+Uploads1000-16                                                                                                     772.1µ ± 38%                                                                               823.7µ ± 27%       ~ (p=0.485 n=6)
+geomean                                                                                                            22.16µ                                                                                     22.81µ        +2.92%
+
+               │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+               │                                                      B/op                                                      │                                          B/op                                           vs base                │
+Listing1000-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Uploads1000-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                       ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+               │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+               │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+Listing1000-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+Uploads1000-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                       ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+               │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+               │                                                      B/s                                                       │                                           B/s                                             vs base              │
+Listing1000-16                                                                                                    318.6Gi ± 27%                                                                              320.9Gi ± 14%       ~ (p=0.818 n=6)
+Uploads1000-16                                                                                                    211.4Mi ± 28%                                                                              198.1Mi ± 21%       ~ (p=0.485 n=6)
+geomean                                                                                                           8.111Gi                                                                                    7.880Gi        -2.84%
+
+pkg: github.com/blakegolliher/shunt/internal/sigv4
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+VerifyHeader-16                                                                                                     20.46µ ± 23%                                                                               22.18µ ± 16%       ~ (p=0.394 n=6)
+Sign-16                                                                                                             16.89µ ±  7%                                                                               16.88µ ±  6%       ~ (p=0.485 n=6)
+SigningKey-16                                                                                                       4.697µ ±  8%                                                                               4.817µ ±  8%       ~ (p=0.329 n=6)
+geomean                                                                                                             11.75µ                                                                                     12.17µ        +3.58%
+
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                      B/op                                                      │                                          B/op                                           vs base                │
+VerifyHeader-16                                                                                                     5.945Ki ± 0%                                                                             5.945Ki ± 0%       ~ (p=1.000 n=6) ¹
+Sign-16                                                                                                             5.242Ki ± 0%                                                                             5.242Ki ± 0%       ~ (p=1.000 n=6) ¹
+SigningKey-16                                                                                                       2.094Ki ± 0%                                                                             2.094Ki ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                             4.026Ki                                                                                  4.026Ki       +0.00%
+¹ all samples are equal
+
+                │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+VerifyHeader-16                                                                                                       76.00 ± 0%                                                                               76.00 ± 0%       ~ (p=1.000 n=6) ¹
+Sign-16                                                                                                               72.00 ± 0%                                                                               72.00 ± 0%       ~ (p=1.000 n=6) ¹
+SigningKey-16                                                                                                         29.00 ± 0%                                                                               29.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                               54.14                                                                                    54.14       +0.00%
+¹ all samples are equal
+
+pkg: github.com/blakegolliher/shunt/internal/sigv4/chunked
+                      │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                      │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+Encode1MiB-16                                                                                                             956.7µ ±  9%                                                                              1045.9µ ± 15%       ~ (p=0.132 n=6)
+UnsignedDecode1MiB-16                                                                                                     146.9µ ± 11%                                                                               144.1µ ± 27%       ~ (p=1.000 n=6)
+geomean                                                                                                                   374.9µ                                                                                     388.2µ        +3.54%
+
+                      │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                      │                                                      B/op                                                      │                                           B/op                                            vs base              │
+Encode1MiB-16                                                                                                             1.189Mi ± 0%                                                                               1.189Mi ± 0%       ~ (p=0.132 n=6)
+UnsignedDecode1MiB-16                                                                                                     1.722Ki ± 0%                                                                               1.722Ki ± 0%       ~ (p=0.792 n=6)
+geomean                                                                                                                   45.79Ki                                                                                    45.79Ki       +0.01%
+
+                      │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                      │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+Encode1MiB-16                                                                                                               43.00 ± 0%                                                                               43.00 ± 0%       ~ (p=1.000 n=6) ¹
+UnsignedDecode1MiB-16                                                                                                       47.00 ± 0%                                                                               47.00 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                     44.96                                                                                    44.96       +0.00%
+¹ all samples are equal
+
+                      │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                      │                                                      B/s                                                       │                                           B/s                                             vs base              │
+Encode1MiB-16                                                                                                           1046.2Mi ±  8%                                                                              957.0Mi ± 13%       ~ (p=0.132 n=6)
+UnsignedDecode1MiB-16                                                                                                    6.661Gi ± 10%                                                                              6.779Gi ± 21%       ~ (p=1.000 n=6)
+geomean                                                                                                                  2.609Gi                                                                                    2.517Gi        -3.52%
+
+pkg: github.com/blakegolliher/shunt/internal/upstream
+                   │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                   │                                                     sec/op                                                     │                                          sec/op                                           vs base              │
+Next-16                                                                                                                8.722n ± 15%                                                                               8.668n ± 36%       ~ (p=0.853 n=6)
+RegistryLoadGet-16                                                                                                     15.09n ± 16%                                                                               13.83n ± 14%       ~ (p=0.310 n=6)
+geomean                                                                                                                11.47n                                                                                     10.95n        -4.54%
+
+                   │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                   │                                                      B/op                                                      │                                          B/op                                           vs base                │
+Next-16                                                                                                                0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RegistryLoadGet-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                           ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                   │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-base.txt │ /tmp/claude-31337/-home-vastdata-projects-shunt/76a696bf-dbf8-490a-82b0-54a688e81f3a/scratchpad/bench-head.txt │
+                   │                                                   allocs/op                                                    │                                       allocs/op                                         vs base                │
+Next-16                                                                                                                0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+RegistryLoadGet-16                                                                                                     0.000 ± 0%                                                                                 0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                                                                           ²                                                                                           +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean

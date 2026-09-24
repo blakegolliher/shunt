@@ -1,0 +1,84 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/directory
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkStamp-16    	      43	  28171626 ns/op	 6279213 B/op	   60047 allocs/op
+BenchmarkStamp-16    	      46	  29523514 ns/op	 6278556 B/op	   60046 allocs/op
+BenchmarkStamp-16    	      42	  32425989 ns/op	 6278698 B/op	   60046 allocs/op
+BenchmarkStamp-16    	      39	  31219570 ns/op	 6278558 B/op	   60046 allocs/op
+BenchmarkStamp-16    	      50	  29095629 ns/op	 6278555 B/op	   60046 allocs/op
+BenchmarkStamp-16    	      43	  27558312 ns/op	 6278554 B/op	   60046 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/directory	8.019s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/control
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkStatus-16                       	    2869	    438329 ns/op	  176397 B/op	     876 allocs/op
+BenchmarkStatus-16                       	    2666	    461933 ns/op	  176493 B/op	     875 allocs/op
+BenchmarkStatus-16                       	    3018	    468502 ns/op	  176411 B/op	     875 allocs/op
+BenchmarkStatus-16                       	    2179	    512552 ns/op	  176604 B/op	     876 allocs/op
+BenchmarkStatus-16                       	    3141	    442188 ns/op	  176519 B/op	     875 allocs/op
+BenchmarkStatus-16                       	    2638	    463497 ns/op	  176375 B/op	     875 allocs/op
+BenchmarkEventsPublish-16                	  185696	      5400 ns/op	     839 B/op	       8 allocs/op
+BenchmarkEventsPublish-16                	  277044	      4224 ns/op	     840 B/op	       8 allocs/op
+BenchmarkEventsPublish-16                	  231554	      4868 ns/op	     839 B/op	       8 allocs/op
+BenchmarkEventsPublish-16                	  241243	      4586 ns/op	     839 B/op	       8 allocs/op
+BenchmarkEventsPublish-16                	  257272	      4487 ns/op	     839 B/op	       8 allocs/op
+BenchmarkEventsPublish-16                	  244256	      4682 ns/op	     839 B/op	       8 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   16446	     70089 ns/op	    9850 B/op	      15 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   15259	     77818 ns/op	    9850 B/op	      15 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   17215	     67105 ns/op	    9850 B/op	      15 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   19014	     59733 ns/op	    9850 B/op	      15 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   18427	     64532 ns/op	    9850 B/op	      15 allocs/op
+BenchmarkMemOperationsCreateUpdate-16    	   18542	     68349 ns/op	    9850 B/op	      15 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/control	21.720s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkStaleParallel-16    	282867908	         4.077 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	261321913	         4.469 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	273996374	         4.181 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	292777279	         4.331 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	268689001	         4.366 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16    	291060264	         4.202 ns/op	       0 B/op	       0 allocs/op
+BenchmarkInstall-16          	     102	  12027961 ns/op	 2388368 B/op	   18111 allocs/op
+BenchmarkInstall-16          	     100	  14489727 ns/op	 2317736 B/op	   18100 allocs/op
+BenchmarkInstall-16          	     100	  12886664 ns/op	 2269675 B/op	   18096 allocs/op
+BenchmarkInstall-16          	     100	  12190685 ns/op	 2265483 B/op	   18096 allocs/op
+BenchmarkInstall-16          	      94	  13055251 ns/op	 2265181 B/op	   18094 allocs/op
+BenchmarkInstall-16          	     100	  12185857 ns/op	 2301711 B/op	   18098 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	18.590s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/cp
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:01.417743-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     258	   5137947 ns/op	   50216 B/op	     530 allocs/op
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:04.396059-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     284	   4674126 ns/op	   49733 B/op	     527 allocs/op
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:10.165580-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     282	   4597125 ns/op	   49871 B/op	     528 allocs/op
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:15.800070-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     288	   4097277 ns/op	   50165 B/op	     530 allocs/op
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:18.802296-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     297	   4439887 ns/op	   49842 B/op	     528 allocs/op
+BenchmarkOperationsCreateUpdate-16    	{"level":"warn","ts":"2026-09-24T07:32:22.426308-0700","caller":"embed/config.go:956","msg":"Running http and grpc server on single port. This is not recommended for production."}
+     292	   4364387 ns/op	   49506 B/op	     526 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/cp	25.601s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/upstream
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkRegistryLoadGet-16    	90087438	        12.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	100000000	        14.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	93603667	        12.68 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	78896760	        14.72 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	94761550	        12.47 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16    	90707252	        13.78 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/upstream	7.376s
