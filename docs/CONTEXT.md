@@ -12,7 +12,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 | TLS termination | Userspace `crypto/tls` both sides; no kernel or NIC offload |
 | Auth mode for M1 | passthrough |
 | Product shape | Global endpoint over mixed backends (VAST, MinIO, AWS S3, any S3); tenant-scoped namespace; `resign` auth mandatory from P2 on |
-| Control-plane store | Postgres behind `shunt-control` (P3c); file backend for dev; no per-object rows anywhere |
+| Control-plane store | Embedded etcd in `shunt-control` (P3c-1, ADR-0015); file backend for dev; no per-object rows anywhere |
 | License | Apache-2.0; no AGPL code (MinIO, Garage) copied |
 
 ## Environment
@@ -35,7 +35,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 | Backend types in the first deployment (VAST / MinIO / AWS S3 / other) and how many of each | unknown (POC uses Garage + MinIO from test/e2e, plus two VAST clusters) |
 | AWS account and scratch bucket available for CI? env var names; region | unknown |
 | MinIO version and deployment shape (single node / distributed) for CI | `quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z`, single node, test/e2e/docker-compose.yml |
-| Postgres: managed (RDS etc.) or self-hosted (Patroni / CloudNativePG)? version; who runs HA | unknown (P3c) |
+| Control-store HA | Embedded etcd; three or five `shunt-control` members per ADR-0015. Production deployment/owner: unknown. No external Postgres. |
 | Tenant model: one tenant per customer? per team? how tenants get created and keyed | unknown (POC-3 keys by tenant with one tenant) |
 | Backend bucket naming rule you want (e.g. `<tenant>-<hash>-<bucket>`) and any length/charset constraints | `<tenant>-<4 hex>-<bucket>` (decided 2026-09-15, POC-3). The 4 hex are the first two bytes of SHA-256 over `tenant + "/" + bucket`, so the name is stable per pair and differs between tenants using the same bucket name; a retry after `BucketAlreadyExists` mixes an attempt counter into the hash. Lowercased, cut to 63 characters by shortening the bucket part, and always a valid S3 bucket name. `internal/directory.BackendName` |
 

@@ -17,6 +17,21 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### Planned correctness work (2026-09-24; no runtime fixes shipped here)
+
+A review of `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03` identified gaps in snapshot
+installation, in-flight request fencing, lease grants, restore lineage, secret
+rotation, interrupted joins and UI state. The historical acceptance results below
+do not cover those failures. [ADR-0018](adr/0018-distributed-correctness.md) proposes
+five coordinated fixes; the [protocol design](design/distributed-correctness.md),
+[API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
+[implementation/test plan](prompts/distributed-hardening.md) define their gates.
+All H0–H5 slices are pending. New endpoints/commands in those documents are design
+targets, not available features. Embedded-etcd restore/join tests must run on a
+runner that permits Unix sockets; they were not validated in the review sandbox.
+
+### Previously recorded implementation work
+
 This branch carries everything past POC-5; `master` keeps what is done and tagged. Two bodies of
 work were merged into one path on 2026-09-17, and P3c was pulled ahead of POC-6 items 4–5 on
 2026-09-21 because multi-host is what is required and nothing in shunt may rely on a shared
