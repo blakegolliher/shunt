@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
@@ -49,6 +50,10 @@ type copyPlan struct {
 	fallbackName string
 	rawKey       string // the source key, escaped for a request path
 	versionID    string
+	// sourceKey is the source bucket's placement key when the copy depends on that bucket's
+	// migration source (it reads it, or falls back to it): the source gate it takes a token from
+	// (ADR-0021 D2). Empty when the copy reads a settled bucket.
+	sourceKey string
 }
 
 // resolveCopySource reads x-amz-copy-source and decides how the copy can be made: rewritten for the
@@ -124,7 +129,8 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 		return "", nil, s3.NoSuchKey, "The source object's cluster is not available."
 	}
 	p := &copyPlan{src: cl, srcBackend: sp.Names[readFrom], rawKey: rawKey, versionID: versionID}
-	if route.Fallback && sp.Source != "" {
+	sourceClosed := sp.Barrier != nil && sp.Barrier.Kind == config.BarrierSource
+	if route.Fallback && sp.Source != "" && !sourceClosed {
 		other := sp.Source
 		if readFrom == sp.Source {
 			other = sp.Primary
@@ -133,7 +139,21 @@ func (h *Handler) resolveCopySource(v, tenant string, cred sigv4.Credential, sna
 			p.srcFallback, p.fallbackName = oc, sp.Names[other]
 		}
 	}
+	if sp.Source != "" && (readFrom == sp.Source || p.srcFallback != nil) {
+		if sourceClosed && readFrom == sp.Source {
+			return "", nil, s3.ServiceUnavailable, "The source bucket of this copy is being changed. Retry shortly."
+		}
+		p.sourceKey = directory.Key(tenant, bucket)
+	}
 	return "", p, "", ""
+}
+
+// noteDispatch records a copy's failed backend exchange on the request's outcome: one that may
+// have reached the destination whole leaves its outcome unknown (dispatched).
+func (o *outcome) noteDispatch(err error) {
+	if dispatched(err, nil, 0) {
+		o.uncertain = true
+	}
 }
 
 // streamCopy answers a CopyObject or UploadPartCopy whose source is on another cluster, by reading
@@ -236,6 +256,7 @@ func (h *Handler) copyWhole(ctx context.Context, w http.ResponseWriter, r *http.
 	applyCondAction(req.Header, r.Header, cond)
 	resp, err := dst.Transport.RoundTrip(req)
 	if err != nil {
+		o.noteDispatch(err)
 		h.answer(w, r, o, s3.ServiceUnavailable, "The destination cluster could not be reached for this copy.")
 		return
 	}
@@ -305,6 +326,7 @@ func (h *Handler) copyPart(ctx context.Context, w http.ResponseWriter, r *http.R
 	}
 	resp, err := dst.Transport.RoundTrip(req)
 	if err != nil {
+		o.noteDispatch(err)
 		h.answer(w, r, o, s3.ServiceUnavailable, "The destination cluster could not be reached for this copy.")
 		return
 	}
@@ -347,6 +369,7 @@ func (h *Handler) copyOnePart(ctx context.Context, o *outcome, r *http.Request, 
 	}
 	pr, err := dst.Transport.RoundTrip(put)
 	if err != nil {
+		o.noteDispatch(err)
 		return "", s3.ServiceUnavailable, "The destination cluster could not be reached for this copy."
 	}
 	defer drain(pr)
@@ -397,6 +420,7 @@ func (h *Handler) createUpload(ctx context.Context, o *outcome, r *http.Request,
 	applyCopyMetadata(req.Header, r.Header, head.Header)
 	resp, err := dst.Transport.RoundTrip(req)
 	if err != nil {
+		o.noteDispatch(err)
 		return "", s3.ServiceUnavailable, "The destination cluster could not be reached for this copy."
 	}
 	defer resp.Body.Close() //nolint:errcheck // read below
@@ -427,6 +451,7 @@ func (h *Handler) completeUpload(ctx context.Context, o *outcome, dst *upstream.
 	}
 	resp, err := dst.Transport.RoundTrip(req)
 	if err != nil {
+		o.noteDispatch(err)
 		return "", s3.ServiceUnavailable, "The destination cluster could not be reached for this copy."
 	}
 	defer resp.Body.Close() //nolint:errcheck // read below
@@ -448,6 +473,8 @@ func (h *Handler) abortUpload(ctx context.Context, o *outcome, dst *upstream.Clu
 	}
 	if resp, rerr := dst.Transport.RoundTrip(req); rerr == nil {
 		drain(resp)
+	} else {
+		o.noteDispatch(rerr)
 	}
 }
 

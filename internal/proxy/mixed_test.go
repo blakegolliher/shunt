@@ -25,6 +25,7 @@ import (
 
 	"go.yaml.in/yaml/v4"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/s3"
@@ -610,6 +611,7 @@ type mixedRig struct {
 	clusters          map[string]config.Cluster
 	accessLog, alerts *syncBuf
 	backendNames      []string
+	gates             *admission.Gates
 }
 
 func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.Cluster)) *mixedRig {
@@ -653,8 +655,10 @@ func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.
 	if store == nil {
 		store = mapStore{acmeAK: {AccessKey: acmeAK, Secret: acmeSK, Tenant: "acme"}, zedAK: {AccessKey: zedAK, Secret: zedSK, Tenant: "zed"}}
 	}
+	rt, gates := followWithGates(t, m.dir, store, set)
+	m.gates = gates
 	m.h = New(Handler{
-		Mode: ModeResign, Runtime: follow(t, m.dir, store, set), Dir: m.dir, Rewrite: true, DebugRoute: rigDebugRoute,
+		Mode: ModeResign, Runtime: rt, Gates: gates, Dir: m.dir, Rewrite: true, DebugRoute: rigDebugRoute,
 		Domains: s3.NewDomains([]string{"*.shunt.example.com"}), Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(m.accessLog),
 		Slow: telemetry.NewSlowRing(10, time.Hour), IdleTimeout: 2 * time.Second, MetadataTimeout: 5 * time.Second, Via: "1.1 shunt/test",
 		Log: slog.New(slog.NewJSONHandler(m.alerts, nil)),

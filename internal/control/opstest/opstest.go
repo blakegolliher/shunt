@@ -206,7 +206,7 @@ func generation(t *testing.T, h Harness) {
 	setup(t, h)
 	ctx := context.Background()
 	old := placementOp(h, "acme/ppp", "c1")
-	if err := h.Dir.SetPlacementReadOnly(ctx, "acme", "ppp", true, false, "test"); err != nil {
+	if err := h.Dir.SetPlacementReadOnly(ctx, "acme", "ppp", true, false, "", "test"); err != nil {
 		t.Fatal(err)
 	}
 	cur := h.Dir.Snapshot().File().Generation(directory.PlacementResource("acme/ppp"))

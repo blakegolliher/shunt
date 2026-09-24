@@ -727,10 +727,28 @@ func (s *Store) SetState(ctx context.Context, tenant, bucket, from string, t dir
 }
 
 // SetPlacementReadOnly implements directory.Store.
-func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, barrier, actor string) error {
 	return s.mutate(ctx, actor, "placement-read-only", directory.Key(tenant, bucket), func(st *state) error {
-		return st.file.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+		return st.file.SetPlacementReadOnly(tenant, bucket, readOnly, reject, barrier)
 	})
+}
+
+// SetBarrier implements directory.Store.
+func (s *Store) SetBarrier(ctx context.Context, tenant, bucket string, b directory.Barrier, actor string) error {
+	return s.mutate(ctx, actor, "set-barrier", directory.Key(tenant, bucket), func(st *state) error { return st.file.SetBarrier(tenant, bucket, b) })
+}
+
+// ClearBarrier implements directory.Store.
+func (s *Store) ClearBarrier(ctx context.Context, resource, id, actor string) error {
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		return s.mutate(ctx, actor, "clear-barrier", "clusters/"+name, func(st *state) error { return st.file.ClearClusterBarrier(name, id) })
+	}
+	key := strings.TrimPrefix(resource, "placement:")
+	tenant, bucket, ok := directory.SplitKey(key)
+	if !ok {
+		return fmt.Errorf("%w: %q is not a placement or cluster resource", directory.ErrNotFound, resource)
+	}
+	return s.mutate(ctx, actor, "clear-barrier", key, func(st *state) error { return st.file.ClearBarrier(tenant, bucket, id) })
 }
 
 // SetPlacementWatch implements directory.Store.
@@ -741,9 +759,9 @@ func (s *Store) SetPlacementWatch(ctx context.Context, tenant, bucket string, wa
 }
 
 // SetClusterReadOnly implements directory.Store.
-func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, barrier, actor string) error {
 	return s.mutate(ctx, actor, "cluster-read-only", "clusters/"+name, func(st *state) error {
-		return st.file.SetClusterReadOnly(name, readOnly, reject)
+		return st.file.SetClusterReadOnly(name, readOnly, reject, barrier)
 	})
 }
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/runtimecfg"
@@ -56,6 +57,10 @@ type Handler struct {
 	// and deletes on a moving bucket are then refused. nil: this proxy is its own control node and
 	// is never stale.
 	Stale func() bool
+	// Gates is the proxy's admission accounting (ADR-0021 D2): every mutation and every request
+	// that depends on a moving bucket's source takes a token from the bucket's gate, and a drain
+	// barrier closes it. nil: everything is admitted and nothing counted (passthrough, tests).
+	Gates *admission.Gates
 
 	pool    *bufPool   // body copy buffers
 	scratch *bufPool   // rewritten-response scratch (ADR-0006)
@@ -100,6 +105,12 @@ type outcome struct {
 	// perBucket is the placement key when telemetry counts this bucket by backend cluster: it is
 	// spread over legs, moving, or watched (telemetry.Collector.ObserveBucket).
 	perBucket string
+	// tok and src are the admission tokens the request holds (ADR-0021 D2): a mutation's, and a
+	// source-dependent request's. uncertain and srcUncertain say the backend's outcome through
+	// each was never learned.
+	tok, src     admission.Token
+	uncertain    bool
+	srcUncertain bool
 }
 
 // prepared is a request ready to send: the cluster, a builder that produces the upstream request
@@ -169,6 +180,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Metrics.Inflight.WithLabelValues(op).Inc()
 	defer h.Metrics.Inflight.WithLabelValues(op).Dec()
 	defer h.finish(r, o)
+	// Held to the end of the handler, response body included: a mutation's backend outcome is
+	// known only once its response has arrived, and a drain barrier waits for exactly that.
+	defer o.releaseTokens(h.Gates)
 
 	// Deadline class (docs/DESIGN.md §2.8): metadata ops get a total deadline, data ops an
 	// idle-progress watchdog that cancels the upstream request when nothing moves.
@@ -219,6 +233,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		o.bytesIn = inBody.count()
 	}
 	if err != nil {
+		o.uncertain = dispatched(err, inBody, r.ContentLength)
 		var berr *buildError
 		if errors.As(err, &berr) {
 			o.status = http.StatusBadRequest
@@ -236,8 +251,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				reason = sigv4.ReasonTrailer
 			}
 			h.Metrics.AuthFailures.WithLabelValues(string(reason)).Inc()
+			o.uncertain = false // the client's body was bad: the upstream request ended short of whole
 			if p.plan.decoder.DataRead() >= p.plan.decodedLen && p.plan.decodedLen > 0 {
 				h.compensate("trailer", r, o, derr.Error())
+				o.uncertain = true // every decoded byte went upstream: the backend may have committed
 			}
 			o.status = derr.Status
 			o.err = "auth: " + string(reason)

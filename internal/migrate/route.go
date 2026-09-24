@@ -59,6 +59,21 @@ func Class(op s3.Op) OpClass {
 	return ClassBucket
 }
 
+// Mutates reports whether a request of op can change a placement's backend buckets: what a drain
+// barrier's mutations gate counts and a held placement refuses (ADR-0021 D2). Every write and
+// delete; a multipart part, completion or abort, whose uploadId pins the cluster but does not slip
+// past the hold; bucket configuration and bucket deletion when the method writes; and an unknown
+// operation with a writing method, which fails closed on a held placement rather than past it.
+func Mutates(op s3.Op, method string) bool {
+	switch Class(op) {
+	case ClassWrite, ClassDelete:
+		return true
+	case ClassRead, ClassList, ClassService:
+		return false
+	}
+	return method != "GET" && method != "HEAD" && method != "OPTIONS"
+}
+
 // Route is where one request goes. Exactly one of Primary or Source is the first attempt;
 // Fallback and Both describe what happens after it.
 type Route struct {
@@ -283,7 +298,7 @@ func FirstLeg(p *directory.Placement) directory.Placement { return onLeg(p, p.Ow
 func onLeg(p *directory.Placement, id string) directory.Placement {
 	l := p.Legs[id]
 	return directory.Placement{State: directory.StateActive, Primary: l.Cluster, Names: map[string]string{l.Cluster: l.Bucket},
-		Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
+		Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites, Barrier: p.Barrier}
 }
 
 // rampHash is directory.RampHash, fnv1a-fmix64-v1. Its values are pinned by a test: changing them

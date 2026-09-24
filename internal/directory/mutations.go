@@ -80,18 +80,65 @@ func (f *File) SetState(tenant, bucket, from string, t Transition) error {
 	return nil
 }
 
-// SetPlacementReadOnly updates the maintenance switch without changing migration state.
-func (f *File) SetPlacementReadOnly(tenant, bucket string, readOnly, reject bool) error {
+// SetPlacementReadOnly updates the maintenance switch without changing migration state. barrier,
+// when read-only is switched on, is the drain barrier written with it (ADR-0021 D2): the flag is
+// the operator's wish, and the change is effective once every proxy has drained the mutations it
+// admitted before the flag. Switching off clears any barrier.
+func (f *File) SetPlacementReadOnly(tenant, bucket string, readOnly, reject bool, barrier string) error {
 	k := Key(tenant, bucket)
 	p, ok := f.Placements[k]
 	if !ok {
 		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
 	}
-	if p.ReadOnly == readOnly && p.RejectWrites == (readOnly && reject) {
+	if p.ReadOnly == readOnly && p.RejectWrites == (readOnly && reject) && (barrier == "" || p.Barrier != nil) {
 		return fmt.Errorf("%w: %s read-only is already %t", ErrConflict, k, readOnly)
 	}
-	p.ReadOnly, p.RejectWrites = readOnly, readOnly && reject
-	f.Placements[k] = p
+	if readOnly && barrier != "" && p.Barrier != nil && p.Barrier.ID != barrier {
+		return fmt.Errorf("%w: %s carries barrier %s of another change", ErrConflict, k, p.Barrier.ID)
+	}
+	np := p.clone()
+	np.ReadOnly, np.RejectWrites, np.Barrier = readOnly, readOnly && reject, nil
+	if readOnly && barrier != "" {
+		np.Barrier = &Barrier{ID: barrier, Kind: config.BarrierMutations}
+	}
+	f.Placements[k] = np
+	return nil
+}
+
+// SetBarrier writes a drain barrier on a placement that carries none (ADR-0021 D2): purge-source's
+// source barrier, before it touches the source.
+func (f *File) SetBarrier(tenant, bucket string, b Barrier) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if p.Barrier != nil {
+		if *p.Barrier == b {
+			return fmt.Errorf("%w: %s already carries barrier %s", ErrConflict, k, b.ID)
+		}
+		return fmt.Errorf("%w: %s carries barrier %s of another change", ErrConflict, k, p.Barrier.ID)
+	}
+	np := p.clone()
+	np.Barrier = &b
+	f.Placements[k] = np
+	return nil
+}
+
+// ClearBarrier removes barrier id from a placement, and only that one: a change committed or
+// called off lets the placement's gate open again.
+func (f *File) ClearBarrier(tenant, bucket, id string) error {
+	k := Key(tenant, bucket)
+	p, ok := f.Placements[k]
+	if !ok {
+		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if p.Barrier == nil || p.Barrier.ID != id {
+		return fmt.Errorf("%w: %s does not carry barrier %s", ErrConflict, k, id)
+	}
+	np := p.clone()
+	np.Barrier = nil
+	f.Placements[k] = np
 	return nil
 }
 
@@ -110,16 +157,37 @@ func (f *File) SetPlacementWatch(tenant, bucket string, watch bool) error {
 	return nil
 }
 
-// SetClusterReadOnly updates the maintenance switch on one backend.
-func (f *File) SetClusterReadOnly(name string, readOnly, reject bool) error {
+// SetClusterReadOnly updates the maintenance switch on one backend, with the drain barrier of
+// the change when it switches read-only on (SetPlacementReadOnly).
+func (f *File) SetClusterReadOnly(name string, readOnly, reject bool, barrier string) error {
 	c, ok := f.Clusters[name]
 	if !ok {
 		return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
 	}
-	if c.ReadOnly == readOnly && c.RejectWrites == (readOnly && reject) {
+	if c.ReadOnly == readOnly && c.RejectWrites == (readOnly && reject) && (barrier == "" || c.Barrier != nil) {
 		return fmt.Errorf("%w: cluster %s read-only is already %t", ErrConflict, name, readOnly)
 	}
-	c.ReadOnly, c.RejectWrites = readOnly, readOnly && reject
+	if readOnly && barrier != "" && c.Barrier != nil && c.Barrier.ID != barrier {
+		return fmt.Errorf("%w: cluster %s carries barrier %s of another change", ErrConflict, name, c.Barrier.ID)
+	}
+	c.ReadOnly, c.RejectWrites, c.Barrier = readOnly, readOnly && reject, nil
+	if readOnly && barrier != "" {
+		c.Barrier = &Barrier{ID: barrier, Kind: config.BarrierMutations}
+	}
+	f.Clusters[name] = c
+	return nil
+}
+
+// ClearClusterBarrier removes barrier id from a cluster, and only that one.
+func (f *File) ClearClusterBarrier(name, id string) error {
+	c, ok := f.Clusters[name]
+	if !ok {
+		return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
+	}
+	if c.Barrier == nil || c.Barrier.ID != id {
+		return fmt.Errorf("%w: cluster %s does not carry barrier %s", ErrConflict, name, id)
+	}
+	c.Barrier = nil
 	f.Clusters[name] = c
 	return nil
 }

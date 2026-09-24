@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/blakegolliher/shunt/internal/config"
 )
 
 // Transition is a requested state change for one placement.
@@ -26,6 +28,11 @@ type Transition struct {
 	// write happens: a hold released concurrently must not be completed, or the step would move
 	// writes that no proxy held.
 	Complete bool
+	// Barrier is the id of the drain barrier a held step writes on the placement (ADR-0021 D2):
+	// the operation's. Every proxy closes the placement's mutations while it is there. Empty, a
+	// hold refuses only the writes of the keys it moves, as before H2; the control node always
+	// names one.
+	Barrier string
 	// Range, leaving ACTIVE, moves only the keys whose hash it holds (ADR-0018 N3): from the leg that
 	// owns them to the target, which becomes a new leg unless one is on that cluster already. Later
 	// steps of the move name it again or not at all.
@@ -207,7 +214,13 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		}
 		np.Source, np.Cutover = "", nil
 	}
+	if t.Complete || t.Hold {
+		np.Barrier = nil // a completed step's barrier is over; a new hold's is written below
+	}
 	if t.Hold {
+		if t.Barrier != "" {
+			np.Barrier = &Barrier{ID: t.Barrier, Kind: config.BarrierMutations}
+		}
 		// Keep the ramp in force (none, leaving ACTIVE) and record the step as its hold.
 		base := Ramp{Hash: RampHash}
 		if p.State == StateRamping && p.Ramp != nil {
@@ -230,6 +243,7 @@ func release(p Placement) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: p.State, Reason: "there is no held step to release"}
 	}
 	np := p.clone()
+	np.Barrier = nil
 	if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 {
 		// Held from ACTIVE: nothing was ever routed to the target. Back to ACTIVE, target recorded.
 		np.State, np.Primary, np.Source, np.Target, np.Ramp = StateActive, p.Source, "", p.Primary, nil

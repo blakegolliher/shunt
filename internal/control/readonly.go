@@ -47,7 +47,7 @@ func (s *Server) runClusterReadOnly(tr *tracker, name string, req ReadOnlyReques
 		return ReadOnlyResult{}, err
 	}
 	tr.phase(PhaseStep)
-	if err := s.Dir.SetClusterReadOnly(tr.ctx, name, req.ReadOnly, req.Reject, tr.actor); err != nil {
+	if err := s.Dir.SetClusterReadOnly(tr.ctx, name, req.ReadOnly, req.Reject, "", tr.actor); err != nil {
 		return ReadOnlyResult{}, err
 	}
 	res := ReadOnlyResult{Target: "cluster:" + name, ReadOnly: req.ReadOnly, Reject: req.ReadOnly && req.Reject,
@@ -64,7 +64,7 @@ func (s *Server) runPlacementReadOnly(tr *tracker, key string, req ReadOnlyReque
 	}
 	tenant, bucket, _ := directory.SplitKey(key)
 	tr.phase(PhaseStep)
-	if err := s.Dir.SetPlacementReadOnly(tr.ctx, tenant, bucket, req.ReadOnly, req.Reject, tr.actor); err != nil {
+	if err := s.Dir.SetPlacementReadOnly(tr.ctx, tenant, bucket, req.ReadOnly, req.Reject, "", tr.actor); err != nil {
 		return ReadOnlyResult{}, err
 	}
 	res := ReadOnlyResult{Target: "placement:" + key, ReadOnly: req.ReadOnly, Reject: req.ReadOnly && req.Reject,

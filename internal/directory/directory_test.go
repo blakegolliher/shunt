@@ -102,19 +102,19 @@ func active(primary string) Placement {
 
 func TestReadOnlyMutations(t *testing.T) {
 	f := &File{Clusters: map[string]config.Cluster{"one": {}}, Placements: map[string]Placement{"acme/data": active("one")}}
-	if err := f.SetPlacementReadOnly("acme", "data", true, false); err != nil {
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if p := f.Placements["acme/data"]; !p.ReadOnly || p.RejectWrites {
 		t.Fatalf("placement flags: %+v", p)
 	}
-	if err := f.SetClusterReadOnly("one", true, true); err != nil {
+	if err := f.SetClusterReadOnly("one", true, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	if c := f.Clusters["one"]; !c.ReadOnly || !c.RejectWrites {
 		t.Fatalf("cluster flags: %+v", c)
 	}
-	if err := f.SetPlacementReadOnly("acme", "data", false, true); err != nil {
+	if err := f.SetPlacementReadOnly("acme", "data", false, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	if p := f.Placements["acme/data"]; p.ReadOnly || p.RejectWrites {

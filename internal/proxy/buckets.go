@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
@@ -148,6 +149,9 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	actor := "proxy:" + o.accessKey
 	dctx := context.WithoutCancel(ctx) // a claimed row must be released even if the client leaves
+	if tok, _, ok := h.Gates.Enter(directory.Key(o.tenant, bucket), admission.Mutations); ok {
+		o.tok = tok // a bucket that is being made carries no barrier yet; counted all the same
+	}
 
 	for attempt := 0; attempt < createAttempts; attempt++ {
 		name := directory.BackendName(o.tenant, bucket, attempt)
@@ -175,6 +179,7 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 		o.backend = name
 		resp, err := h.clusterDo(ctx, cl, http.MethodPut, "/"+name, createBody(cl), o)
 		if err != nil {
+			o.uncertain = dispatched(err, nil, 0)
 			h.releaseRow(dctx, o, bucket, actor, "backend request failed: "+err.Error())
 			h.upstreamError(w, r, o, err)
 			return
@@ -380,6 +385,7 @@ func (h *Handler) deleteOnSource(ctx context.Context, o *outcome, p *prepared) s
 	side := &outcome{rid: o.rid, info: o.info, tm: &timings{}}
 	resp, err := h.roundTrip(context.WithoutCancel(ctx), side, p, p.other, p.otherBackend, nil)
 	if err != nil {
+		o.srcUncertain = dispatched(err, nil, 0) // a delete sent whole and unanswered may have landed
 		if h.Log != nil {
 			h.Log.Error("delete did not reach the migration source; the object can come back when the mover copies it (ADR-0004)",
 				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "backend_bucket", p.otherBackend, "err", err.Error())

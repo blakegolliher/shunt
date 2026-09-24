@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/runtimecfg"
@@ -135,7 +136,19 @@ func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string
 // directory install, as serve does for the lab proxy.
 func follow(t testing.TB, dir *directory.FileDir, keys sigv4.CredentialStore, set *upstream.Registry) *runtimecfg.Publisher {
 	t.Helper()
+	rt, _ := followWithGates(t, dir, keys, set)
+	return rt
+}
+
+// followWithGates is follow with the admission gates wired as serve wires them (ADR-0021 D2): the
+// keeper closes them on install and on publish.
+func followWithGates(t testing.TB, dir *directory.FileDir, keys sigv4.CredentialStore, set *upstream.Registry) (*runtimecfg.Publisher, *admission.Gates) {
+	t.Helper()
 	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: keys, Clusters: set.Load()})
+	keeper := &GateKeeper{Gates: admission.New()}
+	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
+	keeper.Served(dir.Snapshot())
+	keeper.Installed(dir.Snapshot())
 	prev := dir.OnInstall
 	dir.OnInstall = func(s *directory.Snapshot) {
 		if prev != nil {
@@ -144,8 +157,9 @@ func follow(t testing.TB, dir *directory.FileDir, keys sigv4.CredentialStore, se
 		if err := rt.Refresh(s, keys, set.Load()); err != nil {
 			t.Error(err)
 		}
+		keeper.Installed(s)
 	}
-	return rt
+	return rt, keeper.Gates
 }
 
 func newResignRig(t *testing.T, be http.Handler, caps Capabilities) *rrig {

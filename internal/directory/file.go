@@ -229,17 +229,35 @@ func (d *FileDir) SetPlacementWatch(ctx context.Context, tenant, bucket string, 
 }
 
 // SetPlacementReadOnly implements Store.
-func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, barrier, actor string) error {
 	return d.mutate(ctx, actor, "placement-read-only", Key(tenant, bucket), func(f *File) error {
-		return f.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+		return f.SetPlacementReadOnly(tenant, bucket, readOnly, reject, barrier)
 	})
 }
 
 // SetClusterReadOnly implements Store.
-func (d *FileDir) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+func (d *FileDir) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, barrier, actor string) error {
 	return d.mutate(ctx, actor, "cluster-read-only", clusterKey(name), func(f *File) error {
-		return f.SetClusterReadOnly(name, readOnly, reject)
+		return f.SetClusterReadOnly(name, readOnly, reject, barrier)
 	})
+}
+
+// SetBarrier implements Store.
+func (d *FileDir) SetBarrier(ctx context.Context, tenant, bucket string, b Barrier, actor string) error {
+	return d.mutate(ctx, actor, "set-barrier", Key(tenant, bucket), func(f *File) error { return f.SetBarrier(tenant, bucket, b) })
+}
+
+// ClearBarrier implements Store.
+func (d *FileDir) ClearBarrier(ctx context.Context, resource, id, actor string) error {
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		return d.mutate(ctx, actor, "clear-barrier", clusterKey(name), func(f *File) error { return f.ClearClusterBarrier(name, id) })
+	}
+	key := strings.TrimPrefix(resource, "placement:")
+	tenant, bucket, ok := SplitKey(key)
+	if !ok {
+		return fmt.Errorf("%w: %q is not a placement or cluster resource", ErrNotFound, resource)
+	}
+	return d.mutate(ctx, actor, "clear-barrier", key, func(f *File) error { return f.ClearBarrier(tenant, bucket, id) })
 }
 
 // PutCluster implements Store. The proxy's Prepare hook builds the cluster (and resolves its

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/runtimecfg"
@@ -120,11 +122,19 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// Where this request goes (docs/DESIGN.md §2.5, ADR-0004). An uploadId, resolved below, wins:
 	// a multipart upload only exists on the cluster that issued its id.
 	class := migrate.Class(info.Op)
-	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	mutating := migrate.Mutates(info.Op, r.Method)
 	if p.ReadOnly && mutating {
 		h.refuseReadOnly(w, r, o, info.Bucket, "placement-read-only", "This bucket is read-only for maintenance.", p.RejectWrites)
 		return nil, false
 	}
+	// A drain barrier on the bucket in the directory this request routes by (ADR-0021 D2): its
+	// mutations pause while a change that moves them is written everywhere; the gate below is
+	// the same rule for a barrier installed since this request took its bundle.
+	if mutating && p.Barrier != nil && p.Barrier.Kind == config.BarrierMutations {
+		h.refuseWrite(w, r, o, info.Bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+		return nil, false
+	}
+	sourceClosed := p.Barrier != nil && p.Barrier.Kind == config.BarrierSource
 	route, err := migrate.Decide(p, class, info.Key)
 	if err != nil {
 		if h.Log != nil {
@@ -171,10 +181,43 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			check = append(check, p.ClusterOf(p.Source))
 		}
 		for _, name := range check {
-			if c, found := snap.Cluster(name); found && c.ReadOnly {
+			c, found := snap.Cluster(name)
+			if found && c.ReadOnly {
 				h.refuseReadOnly(w, r, o, info.Bucket, "cluster-read-only", "Backend cluster "+name+" is read-only for maintenance.", c.RejectWrites)
 				return nil, false
 			}
+			if found && c.Barrier != nil {
+				h.refuseWrite(w, r, o, info.Bucket, "barrier", "Backend cluster "+name+"'s writes pause while a change to it reaches every proxy. Retry shortly.")
+				return nil, false
+			}
+		}
+	}
+	// The bucket's gates (ADR-0021 D2). A mutation takes a token that is given back with the
+	// backend's outcome; a request that may touch a moving bucket's source takes one too. A
+	// closed mutations gate refuses; a closed source gate means the source is on its way out
+	// (purge-source), and the request goes on without it.
+	bucketKey := directory.Key(o.tenant, info.Bucket)
+	if mutating {
+		tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
+		if !admitted {
+			if h.Log != nil {
+				h.Log.Debug("mutation refused at the gate", "request_id", o.rid, "bucket", bucketKey, "barrier", barrier)
+			}
+			h.refuseWrite(w, r, o, info.Bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+			return nil, false
+		}
+		o.tok = tok
+	}
+	if route.Fallback || route.Both || route.Merge {
+		if !sourceClosed {
+			src, _, admitted := h.Gates.Enter(bucketKey, admission.Source)
+			o.src, sourceClosed = src, !admitted
+		}
+		if sourceClosed {
+			if route.Both {
+				h.Metrics.DualDelete.WithLabelValues(bucketKey, "source_closed").Inc()
+			}
+			route.Fallback, route.Both, route.Merge = false, false, false
 		}
 	}
 	cl, ok := clusters.Get(clusterName)
@@ -232,7 +275,16 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			return nil, false
 		case plan != nil:
 			// The source is on another cluster, or on a bucket whose objects are split across two:
-			// no backend can do this copy, so shunt streams it (ADR-0014).
+			// no backend can do this copy, so shunt streams it (ADR-0014). A copy that reads a
+			// moving bucket's source depends on it, and stops when the source is on its way out.
+			if plan.sourceKey != "" {
+				src, _, ok := h.Gates.Enter(plan.sourceKey, admission.Source)
+				if !ok {
+					h.answer(w, r, o, s3.ServiceUnavailable, "The source bucket of this copy is being changed. Retry shortly.")
+					return nil, false
+				}
+				o.src = src
+			}
 			h.streamCopy(ctx, w, r, o, plan, cl, backend, cond)
 			return nil, false
 		}

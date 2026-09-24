@@ -64,6 +64,10 @@ type Publisher struct {
 	// Observe, if set, is called with the state after every change, under the publisher's lock:
 	// it must not call back into the publisher. Set it before the publisher is shared.
 	Observe func(Stats)
+	// Published, if set, is called with each bundle as it becomes current, outside the lock: at
+	// Publish, or later for a bundle that waited on the retired-bundle bound. The proxy's
+	// admission gates follow it (ADR-0021 D2).
+	Published func(*Bundle)
 
 	mu      sync.Mutex // serializes Publish and retirement
 	cur     atomic.Pointer[Bundle]
@@ -164,6 +168,9 @@ func (p *Publisher) Publish(b *Bundle) error {
 	}
 	if old != nil {
 		old.Release()
+		if p.Published != nil {
+			p.Published(b)
+		}
 	}
 	return nil
 }
@@ -190,8 +197,8 @@ func (p *Publisher) drained(b *Bundle) {
 	}
 	p.mu.Lock()
 	p.retired--
-	var old *Bundle
-	if next := p.pending; next != nil {
+	var old, next *Bundle
+	if next = p.pending; next != nil {
 		p.pending = nil
 		old = p.swapLocked(next)
 	} else {
@@ -200,6 +207,9 @@ func (p *Publisher) drained(b *Bundle) {
 	p.mu.Unlock()
 	if old != nil {
 		old.Release()
+		if p.Published != nil {
+			p.Published(next)
+		}
 	}
 }
 
