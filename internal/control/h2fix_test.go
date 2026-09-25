@@ -1,6 +1,6 @@
 package control
 
-// Regressions for the blocking defects of the H2 review (docs/prompts/h2-review-handoff.md). Each
+// Regressions for the blocking defects of the H2 review (summarized in docs/prompts/h2-handoffs.md). Each
 // one left an operation blocked with no way out, or reopened admission under destructive work.
 
 import (
