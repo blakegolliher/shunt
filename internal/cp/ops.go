@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -551,6 +552,30 @@ func (o *Operations) Get(ctx context.Context, id string) (*control.Operation, er
 		return nil, fmt.Errorf("operation record %s: %w", id, err)
 	}
 	return &op, nil
+}
+
+// Evidence implements control.Operations: every unfinished or uncertain record in the index,
+// newest first, however many ended records are newer.
+func (o *Operations) Evidence(_ context.Context) ([]*control.Operation, error) {
+	o.mu.Lock()
+	raws := make(map[string][]byte, len(o.index))
+	for id, raw := range o.index {
+		raws[id] = raw
+	}
+	o.mu.Unlock()
+	ids := slices.Sorted(maps.Keys(raws))
+	slices.Reverse(ids)
+	var out []*control.Operation
+	for _, id := range ids {
+		var op control.Operation
+		if json.Unmarshal(raws[id], &op) != nil {
+			continue
+		}
+		if !op.Terminal() || op.EffectState == control.EffectUncertain {
+			out = append(out, &op)
+		}
+	}
+	return out, nil
 }
 
 // List implements control.Operations: newest first, from the index.

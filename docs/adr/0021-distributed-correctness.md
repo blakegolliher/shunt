@@ -110,6 +110,39 @@ that does not query the control plane on each request.
    coherent bundle across keys, directory and signers (T01, T02) is H1; rotation status on API,
    CLI and GUI (T03) is H1; epoch mismatch and CLI/UI grant fields (T07) are H0 and H2.
 
+## Decisions taken 2026-09-24 (H2 review fixes)
+
+A review of H2a–H2e found operations that could block forever with no operator exit, and one that
+could reopen a source under its own deletes. The fixes settle four rules.
+
+1. **The DELETE rule.** While purge-source's `source` barrier is on a placement, a DELETE (or
+   DeleteObjects) that must reach both clusters answers 503 with `Retry-After`
+   (`shunt_migration_refused_writes_total{reason="source_closed"}`) instead of skipping its source
+   leg. Skipping it, as H2e did, sent the delete to the primary alone and left the source holding a
+   key the primary lacks, which purge's re-diff must refuse; under any delete load purge could
+   neither complete nor be canceled. Pausing is what "mutations pause" means for every other
+   barrier, and a purge's hold is short. Rejected: making the re-diff tolerate keys deleted on the
+   primary since the hold. That needs either per-object state (which keys the proxies deleted) or
+   a listing comparison that cannot tell a delete from a key the mover never copied, and it would
+   turn a correctness check into a guess.
+2. **Purge's irreversible point is the first delete.** The re-diff under the drained source
+   barrier runs in the drain (a non-empty or failed diff is the `source_diff` blocker; nothing is
+   deleted and the operation can be canceled). `dispatch_started` is written to the record
+   immediately before the first backend delete, never before a check that can still refuse.
+3. **The record orders a cancellation against the owner.** Cancellation ends the record first,
+   with the cancellable check repeated inside that compare-and-swap, and only then releases the
+   hold, compared on its barrier id. The owner writes its record (phase `commit`, or
+   `dispatch_started`) before its commit or first destructive dispatch and checks the answer, so
+   exactly one of the two wins. A cancellation that finds the hold gone after the owner's commit
+   landed corrects the record to `failed` with effect `committed`. Releasing read-only names its
+   barrier and is refused once the commit cleared it. An operation still in its precondition, or a
+   barrier whose lost owner never made its hold version durable, can be canceled.
+4. **A resumed barrier drains only while its scope carries it.** A record whose commit reached the
+   directory before the record said so is reconciled by the commit (`already`), not by a drain
+   that waits for an acknowledgement no proxy can send. A dead external mover's session is resolved
+   by an operator with an attestation (`resolve-worker`, on API, CLI and GUI), which the record
+   keeps.
+
 ## Scope and cost
 
 The five fix packages are D1 runtime installation, D2 draining and leases,

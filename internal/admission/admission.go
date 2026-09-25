@@ -85,6 +85,27 @@ type gate struct {
 type Gates struct {
 	m         sync.Map     // placement key → *gate
 	uncertain atomic.Int64 // outcomes never learned, every gate, this process
+
+	// derivedMu guards derived: the barriers of the last few immutable snapshots, so a heartbeat's
+	// Acks and the gate keeper's closures do not scan every placement again for a snapshot they
+	// have already read (a proxy reads the same installed snapshot every heartbeat).
+	derivedMu sync.Mutex
+	derived   [2]*derivation
+}
+
+// derivation is what a directory's barriers are, derived once per immutable snapshot.
+type derivation struct {
+	snap       *directory.Snapshot
+	closures   Closures
+	placements map[string][]string // barrier id → the placements it closes
+	own        []ownBarrier        // placements carrying a barrier of their own, with its kind
+	clusters   []ownBarrier        // clusters carrying a barrier
+}
+
+type ownBarrier struct {
+	name string // placement key or cluster name
+	b    config.Barrier
+	kind Kind
 }
 
 // New returns empty gates.
@@ -268,11 +289,50 @@ type Directory interface {
 // a bucket on the cluster. It returns the closures and, for each barrier, the placements it closes.
 // Placements are scanned for their clusters only when some cluster carries a barrier.
 func Barriers(d Directory) (closures Closures, placements map[string][]string) {
-	closures, placements = Closures{}, map[string][]string{}
+	dv := derive(d)
+	return dv.closures, dv.placements
+}
+
+// Barriers is admission.Barriers, reusing what this Gates already derived for an immutable
+// snapshot. The returned values are shared and must not be modified.
+func (g *Gates) Barriers(d Directory) (closures Closures, placements map[string][]string) {
+	dv := g.derivationOf(d)
+	return dv.closures, dv.placements
+}
+
+// derivationOf returns d's derivation: cached for a *directory.Snapshot, which never changes,
+// derived afresh for anything else (a *directory.File a test edits).
+func (g *Gates) derivationOf(d Directory) *derivation {
+	snap, ok := d.(*directory.Snapshot)
+	if !ok || snap == nil || g == nil {
+		return derive(d)
+	}
+	g.derivedMu.Lock()
+	for _, dv := range g.derived {
+		if dv != nil && dv.snap == snap {
+			g.derivedMu.Unlock()
+			return dv
+		}
+	}
+	g.derivedMu.Unlock()
+	dv := derive(d)
+	dv.snap = snap
+	g.derivedMu.Lock()
+	g.derived[1], g.derived[0] = g.derived[0], dv
+	g.derivedMu.Unlock()
+	return dv
+}
+
+// derive scans a directory once for its barriers.
+func derive(d Directory) *derivation {
+	dv := &derivation{}
+	dv.closures, dv.placements = Closures{}, map[string][]string{}
+	closures, placements := dv.closures, dv.placements
 	clusterBarriers := map[string]string{}
 	d.EachCluster(func(name string, c *config.Cluster) bool {
 		if c.Barrier != nil {
 			clusterBarriers[name] = c.Barrier.ID
+			dv.clusters = append(dv.clusters, ownBarrier{name: name, b: *c.Barrier})
 		}
 		return true
 	})
@@ -283,6 +343,7 @@ func Barriers(d Directory) (closures Closures, placements map[string][]string) {
 				c[k] = b.ID
 				closures[key] = c
 				placements[b.ID] = append(placements[b.ID], key)
+				dv.own = append(dv.own, ownBarrier{name: key, b: *b, kind: k})
 			}
 		}
 		if len(clusterBarriers) == 0 {
@@ -302,45 +363,33 @@ func Barriers(d Directory) (closures Closures, placements map[string][]string) {
 		}
 		return true
 	})
-	return closures, placements
+	return dv
 }
 
 // Acks reports every barrier in d with this proxy's counts through the gates it closes, sorted
 // by scope. The list is bounded by barriers in flight, never by placements.
 func (g *Gates) Acks(d Directory) []Ack {
-	_, placements := Barriers(d)
-	var out []Ack
-	d.EachPlacement(func(key string, p *directory.Placement) bool {
-		b := p.Barrier
-		if b == nil {
-			return true
-		}
-		k, ok := KindOf(b.Kind)
-		if !ok {
-			return true
-		}
-		st := g.State(key)
-		out = append(out, Ack{ID: b.ID, Scope: directory.PlacementResource(key), Generation: d.Generation(directory.PlacementResource(key)), Kind: b.Kind,
-			Closed: st.Closed[k] == b.ID, Inflight: st.Inflight[k], Uncertain: st.Uncertain[k]})
-		return true
-	})
-	d.EachCluster(func(name string, c *config.Cluster) bool {
-		b := c.Barrier
-		if b == nil {
-			return true
-		}
+	dv := g.derivationOf(d)
+	out := make([]Ack, 0, len(dv.own)+len(dv.clusters))
+	for _, ob := range dv.own {
+		st := g.State(ob.name)
+		res := directory.PlacementResource(ob.name)
+		out = append(out, Ack{ID: ob.b.ID, Scope: res, Generation: d.Generation(res), Kind: ob.b.Kind,
+			Closed: st.Closed[ob.kind] == ob.b.ID, Inflight: st.Inflight[ob.kind], Uncertain: st.Uncertain[ob.kind]})
+	}
+	for _, cb := range dv.clusters {
 		// A placement whose own barrier closed its mutations first drains for both; closed by
 		// either is closed.
-		ack := Ack{ID: b.ID, Scope: directory.ClusterResource(name), Generation: d.Generation(directory.ClusterResource(name)), Kind: b.Kind, Closed: true}
-		for _, key := range placements[b.ID] {
+		res := directory.ClusterResource(cb.name)
+		ack := Ack{ID: cb.b.ID, Scope: res, Generation: d.Generation(res), Kind: cb.b.Kind, Closed: true}
+		for _, key := range dv.placements[cb.b.ID] {
 			st := g.State(key)
 			ack.Closed = ack.Closed && st.Closed[Mutations] != ""
 			ack.Inflight += st.Inflight[Mutations]
 			ack.Uncertain += st.Uncertain[Mutations]
 		}
 		out = append(out, ack)
-		return true
-	})
+	}
 	slices.SortFunc(out, func(a, b Ack) int { return strings.Compare(a.Scope, b.Scope) })
 	return out
 }

@@ -374,15 +374,17 @@ func (s *Server) members(ctx context.Context) ([]Member, error) {
 	}
 	slices.SortFunc(ms, func(a, b Member) int { return strings.Compare(a.ID, b.ID) })
 	if s.Metrics != nil {
-		live := 0
+		live, unresolved := 0, 0
 		for i := range ms {
 			m := &ms[i]
 			if m.Live {
 				live++
 			}
+			unresolved += len(m.Unresolved)
 		}
 		s.Metrics.FleetMembers.WithLabelValues("live").Set(float64(live))
 		s.Metrics.FleetMembers.WithLabelValues("silent").Set(float64(len(ms) - live))
+		s.Metrics.UnresolvedIncarnations.Set(float64(unresolved))
 	}
 	return ms, nil
 }

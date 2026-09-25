@@ -211,7 +211,11 @@ export interface Operation {
   allowed_actions?: string[]
   blockers?: Blocker[]
   blocker_count?: number
-  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number }
+  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number; dispatch_started?: boolean }
+  // worker is an external mover's session (`shunt migrate run`): an expired one is resolved by the
+  // operator with an attestation (resolve-worker), which the session then keeps.
+  worker?: WorkerSession
+  args?: Record<string, unknown>
   owner_term?: number
   phase?: string
   waiting_on?: string[]
@@ -221,6 +225,8 @@ export interface Operation {
   result?: unknown
   error?: { code: string; message: string }
 }
+
+export interface WorkerSession { id: string; state: 'active' | 'completed' | 'unresolved'; sequence: number; inflight?: number; uncertain?: number; last_seen?: string; error?: string; resolved_by?: string; attestation?: string }
 
 export interface Blocker { code: string; proxy_id?: string; incarnation?: string; count?: number; message?: string }
 
@@ -385,6 +391,9 @@ export const setBucketWatch = (token: string, tenant: string, bucket: string, wa
 export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request<Operation>(`${apiRoot}/operations`, token, json({ kind: 'placement-read-only', placement: `${tenant}/${bucket}`, args: { read_only: readOnly, reject } }))
 export const resumeOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/resume`, token, json({}))
 export const cancelOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/cancel`, token, json({}))
+// resolveWorker reconciles an external mover whose worker session expired: the operator attests
+// how its backend effects were established to have ended (ADR-0021 D2, worker sessions).
+export const resolveWorker = (token: string, id: string, session: string, attestation: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/resolve-worker`, token, json({ session, attestation }))
 export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
 export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
 export const startOperation = (token: string, kind: string, placement: string, args?: unknown) => request<Operation>(`${apiRoot}/operations`, token, json({ kind, placement, args }))

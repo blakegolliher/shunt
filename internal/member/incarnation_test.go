@@ -79,6 +79,19 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	if m := readMarker(t, c); m.State != control.IncarnationUnclean || m.Uncertain != 1 || m.Ended.IsZero() {
 		t.Fatalf("marker after an unclean retirement: %+v", m)
 	}
+	// A retired process heartbeats no more: a beat would put its lease key back and show it live.
+	f.mu.Lock()
+	beatsBefore := len(f.beats)
+	f.mu.Unlock()
+	if err := c.beat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	beatsAfter := len(f.beats)
+	f.mu.Unlock()
+	if beatsAfter != beatsBefore {
+		t.Fatalf("a retired process sent a heartbeat (%d → %d)", beatsBefore, beatsAfter)
+	}
 
 	// The next process reports the previous one until the control plane has it.
 	next := New(c.cfg, c.log)

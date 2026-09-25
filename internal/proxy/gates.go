@@ -44,7 +44,7 @@ func (k *GateKeeper) applyLocked() {
 		if snap == nil {
 			continue
 		}
-		c, _ := admission.Barriers(snap)
+		c, _ := k.Gates.Barriers(snap) // derived once per snapshot, shared with the heartbeat's acks
 		for key, closed := range c {
 			have := closures[key]
 			for i := range have {

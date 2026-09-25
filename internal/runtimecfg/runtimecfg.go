@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/upstream"
@@ -120,10 +121,20 @@ func (p *Publisher) Stats() Stats {
 func (p *Publisher) statsLocked() Stats {
 	cur := p.cur.Load()
 	st := Stats{Version: cur.Version(), Retired: p.retired, SecretsHeld: map[string]int64{}}
-	for old := range p.held {
-		for name := range cur.Snapshot.File().Clusters {
-			if old.Snapshot.File().Generation(directory.SecretResource(name)) != cur.Snapshot.File().Generation(directory.SecretResource(name)) {
-				st.SecretsHeld[name]++
+	if len(p.held) > 0 {
+		// Read the generations off the snapshots without cloning their directories: this runs
+		// under p.mu on every heartbeat (SecretsHeld).
+		var names []string
+		cur.Snapshot.EachCluster(func(name string, _ *config.Cluster) bool {
+			names = append(names, name)
+			return true
+		})
+		for old := range p.held {
+			for _, name := range names {
+				res := directory.SecretResource(name)
+				if old.Snapshot.Generation(res) != cur.Snapshot.Generation(res) {
+					st.SecretsHeld[name]++
+				}
 			}
 		}
 	}

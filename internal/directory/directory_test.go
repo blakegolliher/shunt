@@ -990,3 +990,86 @@ func TestClearTarget(t *testing.T) {
 		t.Errorf("clear of a missing placement: %v", err)
 	}
 }
+
+// Defect 3 of the H2 review: switching read-only off with a barrier id is the release of that
+// barrier's hold (a cancellation before its commit), and is refused once the hold is gone. A
+// commit that cleared the barrier left read-only in force; a late release must not undo it.
+func TestReadOnlyReleaseComparesBarrier(t *testing.T) {
+	f := &File{Clusters: map[string]config.Cluster{"one": {}}, Placements: map[string]Placement{"acme/data": active("one")}}
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, "op-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-2"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release of another barrier's hold: %v", err)
+	}
+	if err := f.ClearBarrier("acme", "data", "op-1"); err != nil { // op-1's commit
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-1"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release after the commit: %v", err)
+	}
+	if p := f.Placements["acme/data"]; !p.ReadOnly || p.Barrier != nil {
+		t.Fatalf("a committed placement read-only was undone: %+v", p)
+	}
+	if err := f.SetClusterReadOnly("one", true, false, "op-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.ClearClusterBarrier("one", "op-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetClusterReadOnly("one", false, false, "op-3"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := f.Clusters["one"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
+	}
+	// The release of a hold still in place, and the plain switch off, work as before.
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, "op-4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-4"); err != nil {
+		t.Fatalf("release of the hold in place: %v", err)
+	}
+	if p := f.Placements["acme/data"]; p.ReadOnly || p.Barrier != nil {
+		t.Fatalf("released placement: %+v", p)
+	}
+}
+
+// The same through the file store's writes.
+func TestFileDirReadOnlyReleaseComparesBarrier(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(writeDir(t, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(ctx, "acme", "data", "garage", "acme-1234-data", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetPlacementReadOnly(ctx, "acme", "data", true, false, "op-1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearBarrier(ctx, PlacementResource("acme/data"), "op-1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetPlacementReadOnly(ctx, "acme", "data", false, false, "op-1", "test"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release after the commit: %v", err)
+	}
+	if p, _ := d.Snapshot().Lookup("acme", "data"); !p.ReadOnly {
+		t.Fatalf("a committed read-only was undone: %+v", p)
+	}
+	if err := d.SetClusterReadOnly(ctx, "garage", true, false, "op-2", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearBarrier(ctx, ClusterResource("garage"), "op-2", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetClusterReadOnly(ctx, "garage", false, false, "op-2", "test"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := d.Snapshot().File().Clusters["garage"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
+	}
+}

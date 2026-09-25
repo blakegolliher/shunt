@@ -612,6 +612,7 @@ type mixedRig struct {
 	accessLog, alerts *syncBuf
 	backendNames      []string
 	gates             *admission.Gates
+	set               *upstream.Registry // the clusters' signers, which a control server in the test shares
 }
 
 func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.Cluster)) *mixedRig {
@@ -655,6 +656,7 @@ func newMixedRig(t testing.TB, store mapStore, adjust ...func(map[string]config.
 	if store == nil {
 		store = mapStore{acmeAK: {AccessKey: acmeAK, Secret: acmeSK, Tenant: "acme"}, zedAK: {AccessKey: zedAK, Secret: zedSK, Tenant: "zed"}}
 	}
+	m.set = set
 	rt, gates := followWithGates(t, m.dir, store, set)
 	m.gates = gates
 	m.h = New(Handler{

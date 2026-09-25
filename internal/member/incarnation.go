@@ -132,6 +132,7 @@ func (c *Client) Retire(ctx context.Context, uncertain int64) error {
 	if err := c.mark(state, uncertain); err != nil {
 		c.log.Error("retirement marker not written; the next process reports this one as unclean", "err", err.Error())
 	}
+	c.retired.Store(true) // no heartbeat after this: it would renew the lease of a retired process
 	req := control.RetireRequest{Incarnation: c.incarnation, Uncertain: uncertain}
 	var err error
 	for {

@@ -39,7 +39,49 @@ func newOperation() *cobra.Command {
 			"it runs (ADR-0021). A record is pending, running or blocked until it ends succeeded, failed or\n" +
 			"cancelled; its effect_state says whether it wrote the directory (none, committed, uncertain).", //nolint:misspell // the status is spelled as the contract spells it
 	}
-	cmd.AddCommand(newOperationList(), newOperationShow(), newOperationWait(), newOperationResume(), newOperationCancel())
+	cmd.AddCommand(newOperationList(), newOperationShow(), newOperationWait(), newOperationResume(), newOperationCancel(), newOperationResolveWorker())
+	return cmd
+}
+
+func newOperationResolveWorker() *cobra.Command {
+	var (
+		o                    apiOptions
+		session, attestation string
+	)
+	cmd := &cobra.Command{
+		Use:   "resolve-worker <id> --session <id> --attest <why>",
+		Short: "Resolve an external mover whose worker session expired with its work unresolved",
+		Long: "A `shunt migrate run` process that stopped without ending its session leaves its operation blocked\n" +
+			"(worker_unresolved): its last backend copy may still land, so the bucket stays reserved. Once you\n" +
+			"have established that the process and its backend requests have ended, resolve the session named\n" +
+			"by `shunt operation show <id>` with an attestation saying how. The operation then ends (failed:\n" +
+			"its copy did not finish), keeping the resolution on its record, and the bucket is free for the\n" +
+			"next mover run. Refused while the worker is still heartbeating.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if attestation == "" {
+				return errors.New("--attest is required: say how the worker's backend effects were established to have ended")
+			}
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var op control.Operation
+			req := control.ResolveWorkerRequest{Session: session, Attestation: attestation}
+			if err := api.call(cmd.Context(), "POST", "/v1/operations/"+url.PathEscape(args[0])+"/resolve-worker", req, &op); err != nil {
+				return err
+			}
+			if o.json {
+				return printJSON(cmd, op)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "worker session %s of operation %s resolved; the operation ends and frees its bucket (`shunt operation wait %s`)\n", session, args[0], args[0])
+			return nil
+		},
+	}
+	addAPIFlags(cmd, &o)
+	cmd.Flags().StringVar(&session, "session", "", "the worker session id `shunt operation show` prints")
+	cmd.Flags().StringVar(&attestation, "attest", "", "how the worker's backend effects were established to have ended")
+	_ = cmd.MarkFlagRequired("session")
 	return cmd
 }
 
@@ -229,7 +271,7 @@ func newOperationWait() *cobra.Command {
 			case !op.Terminal():
 				what := fmt.Sprintf("operation %s is still %s after %s", op.ID, op.Status, timeout)
 				if len(op.Blockers) > 0 {
-					what += "; waiting on " + blockerLine(op.Blockers)
+					what += "; waiting on " + control.BlockerText(op.Blockers)
 				}
 				return &exitError{code: exitWaitDeadline, err: fmt.Errorf("%s; it keeps running: `shunt operation wait %s` again", what, op.ID)}
 			case op.Status != control.StatusSucceeded:
@@ -296,6 +338,13 @@ func printOperation(out io.Writer, op *control.Operation) {
 			state += ", hold not written yet"
 		}
 		line("barrier", state)
+	}
+	if w := op.Worker; w != nil {
+		state := fmt.Sprintf("%s %s, sequence %d, %d in flight, %d uncertain", w.ID, w.State, w.Sequence, w.Inflight, w.Uncertain)
+		if w.ResolvedBy != "" {
+			state += ", resolved by " + w.ResolvedBy + ": " + shownText(w.Attestation)
+		}
+		line("worker", state)
 	}
 	line("actions", strings.Join(op.AllowedActions, ", "))
 	if op.Progress != nil {

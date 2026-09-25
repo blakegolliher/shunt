@@ -117,6 +117,7 @@ const (
 	BlockerInstallBackpressure   = "install_backpressure"    // a proxy installed the version but its requests do not use it yet
 	BlockerMultipartOpen         = "multipart_open"          // the source still has multipart uploads in progress
 	BlockerWorkerUnresolved      = "worker_unresolved"       // a mover's session expired without ending
+	BlockerSourceDiff            = "source_diff"             // purge-source: the source holds keys the primary lacks, or the diff could not be taken
 	BlockerOwnerLost             = "owner_lost"              // the control node running the operation is gone: resume it
 	BlockerQuorumUnavailable     = "quorum_unavailable"      // the control plane cannot be read
 )
@@ -208,6 +209,10 @@ type Operations interface {
 	Get(ctx context.Context, id string) (*Operation, error)
 	// List returns the newest records first, filtered by placement or cluster when given.
 	List(ctx context.Context, placement, cluster string, limit int) ([]*Operation, error)
+	// Evidence returns every record that is unfinished or whose effect is uncertain, however many
+	// newer records there are: what the owner-loss sweep, resume and orphan handling must see,
+	// since no history limit prunes them (ADR-0021).
+	Evidence(ctx context.Context) ([]*Operation, error)
 	// OwnerLive reports whether the control node named still runs its operations: its liveness
 	// key in the control plane holds. A lost owner's barrier operations are resumed, not repeated.
 	OwnerLive(ctx context.Context, node string) (bool, error)
@@ -265,6 +270,19 @@ func (m *MemOperations) List(_ context.Context, placement, cluster string, limit
 	for i := len(m.order) - 1; i >= 0 && len(out) < limit; i-- {
 		op := m.byID[m.order[i]]
 		if (placement == "" || op.Placement == placement) && (cluster == "" || op.Cluster == cluster) {
+			out = append(out, op.clone())
+		}
+	}
+	return out, nil
+}
+
+// Evidence implements Operations.
+func (m *MemOperations) Evidence(_ context.Context) ([]*Operation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*Operation
+	for i := len(m.order) - 1; i >= 0; i-- {
+		if op := m.byID[m.order[i]]; !op.Terminal() || op.EffectState == EffectUncertain {
 			out = append(out, op.clone())
 		}
 	}
@@ -382,6 +400,41 @@ func (tr *tracker) check() error {
 		return errLost
 	}
 	return fmt.Errorf("%w: the record of operation %s was written by another node", errLost, id)
+}
+
+// refresh re-reads the record and marks this tracker lost when another request ended it or took
+// it over: a run blocked on unchanged blockers writes nothing, so it would otherwise not discover
+// a cancellation until its blockers changed.
+func (tr *tracker) refresh() {
+	tr.mu.Lock()
+	id, node, term, lost := tr.op.ID, tr.op.Node, tr.op.OwnerTerm, tr.lost
+	tr.mu.Unlock()
+	if lost || id == "" {
+		return
+	}
+	op, err := tr.s.ops().Get(context.WithoutCancel(tr.ctx), id)
+	if err != nil || op == nil {
+		return // unreadable is not proof of a takeover; the next write finds out
+	}
+	if op.Terminal() || op.Node != node || op.OwnerTerm != term {
+		tr.mu.Lock()
+		tr.lost = true
+		tr.mu.Unlock()
+	}
+}
+
+// allow sets the actions the record accepts, writing only on a change.
+func (tr *tracker) allow(actions []string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if actions == nil {
+		actions = []string{}
+	}
+	if slices.Equal(tr.op.AllowedActions, actions) {
+		return
+	}
+	tr.op.AllowedActions = slices.Clone(actions)
+	tr.put()
 }
 
 // snapshot returns a copy of the record.
@@ -1029,7 +1082,7 @@ func (s *Server) listOperations(w http.ResponseWriter, r *http.Request) {
 // goroutines died with the process. A barrier operation is not among them: its record says where
 // it stands, and ResumeOwn carries it on.
 func (s *Server) FailOrphans(ctx context.Context) error {
-	ops, err := s.ops().List(ctx, "", "", defaultOperationLimit)
+	ops, err := s.ops().Evidence(ctx)
 	if err != nil {
 		return err
 	}
@@ -1067,7 +1120,7 @@ func orphan(op *Operation, now time.Time, why string) {
 		op.Blockers = []Blocker{{Code: BlockerOwnerLost, Message: why}}
 		op.BlockerCount = 1
 		op.AllowedActions = []string{ActionResume}
-		if op.Barrier.HoldVersion > 0 && !op.Barrier.Committed {
+		if notCancellable(op, true) == nil {
 			op.AllowedActions = append(op.AllowedActions, ActionCancel)
 		}
 		return
@@ -1082,7 +1135,7 @@ func orphan(op *Operation, now time.Time, why string) {
 // Sweep is the control node's periodic care of the records (once a second, with PublishFleet):
 // records whose owner's liveness has lapsed are orphaned, and the operations gauge is refreshed.
 func (s *Server) Sweep(ctx context.Context) error {
-	ops, err := s.ops().List(ctx, "", "", defaultOperationLimit)
+	ops, err := s.ops().Evidence(ctx)
 	if err != nil {
 		return err
 	}

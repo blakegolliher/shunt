@@ -1,6 +1,7 @@
 package admission
 
 import (
+	"slices"
 	"sync"
 	"testing"
 
@@ -224,5 +225,49 @@ func BenchmarkAcks(b *testing.B) {
 		if len(g.Acks(f)) != 8 {
 			b.Fatal("acks")
 		}
+	}
+}
+
+// BenchmarkAcksSnapshot is BenchmarkAcks over an immutable snapshot, as a proxy's heartbeat reads
+// it: the barriers are derived once for the snapshot, not by scanning every placement per beat.
+func BenchmarkAcksSnapshot(b *testing.B) {
+	f := &directory.File{Placements: map[string]directory.Placement{}, Clusters: map[string]config.Cluster{"c": {}}}
+	for i := range 10000 {
+		key := "acme/b" + string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + string(rune('a'+(i/676)%26))
+		p := directory.Placement{State: directory.StateActive, Primary: "c"}
+		if i < 8 {
+			p.Barrier = &config.Barrier{ID: "op", Kind: config.BarrierMutations}
+		}
+		f.Placements[key] = p
+	}
+	snap := directory.NewSnapshot(f)
+	g := New()
+	b.ReportAllocs()
+	for b.Loop() {
+		if len(g.Acks(snap)) != 8 {
+			b.Fatal("acks")
+		}
+	}
+}
+
+// Acks over a snapshot reuse the snapshot's derivation and agree with a fresh scan; a new
+// snapshot is derived anew.
+func TestAcksDerivedOncePerSnapshot(t *testing.T) {
+	f := &directory.File{Clusters: map[string]config.Cluster{"c": {}}, Placements: map[string]directory.Placement{
+		"acme/a": {State: directory.StateActive, Primary: "c", Barrier: &config.Barrier{ID: "op-a", Kind: config.BarrierMutations}},
+		"acme/b": {State: directory.StateActive, Primary: "c"},
+	}}
+	g := New()
+	s1 := directory.NewSnapshot(f)
+	first := g.Acks(s1)
+	if len(first) != 1 || first[0].ID != "op-a" || !slices.Equal(first, g.Acks(f)) {
+		t.Fatalf("acks over a snapshot: %+v, over the file: %+v", first, g.Acks(f))
+	}
+	if again := g.Acks(s1); !slices.Equal(again, first) {
+		t.Fatalf("a cached derivation answered %+v, want %+v", again, first)
+	}
+	f.Placements["acme/b"] = directory.Placement{State: directory.StateActive, Primary: "c", Barrier: &config.Barrier{ID: "op-b", Kind: config.BarrierSource}}
+	if got := g.Acks(directory.NewSnapshot(f)); len(got) != 2 {
+		t.Fatalf("a new snapshot reused an old derivation: %+v", got)
 	}
 }

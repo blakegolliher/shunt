@@ -483,7 +483,7 @@ func TestPurgeDestructiveFailureKeepsReservationAndCannotCancel(t *testing.T) {
 	listed := 0
 	rg.vast01.onList = func(string) {
 		listed++
-		if listed == 2 { // the diff repeated after the source barrier has drained
+		if listed == 3 { // the source's own listing as purge empties it, past its dispatch point
 			rg.vast01.reject = "AccessDenied"
 		}
 	}
@@ -503,6 +503,62 @@ func TestPurgeDestructiveFailureKeepsReservationAndCannotCancel(t *testing.T) {
 	wake()
 	if done := rg.await(blocked.ID); done.Status != StatusSucceeded || done.Barrier == nil || !done.Barrier.Committed {
 		t.Fatalf("reconciled purge: %+v", done)
+	}
+}
+
+// Defect 4 (H2 review). The diff purge-source repeats once its source barrier has drained runs
+// before its irreversible point: a refusal there is a blocker, nothing is deleted, and the
+// operation can be canceled, which reopens the source and frees the bucket for the mover.
+func TestPurgeRecheckRefusalBeforeDispatchIsCancellable(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.cutOver()
+	var dry PurgeDryRun
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Token == "" {
+		t.Fatalf("purge dry run: %+v", dry)
+	}
+	// A key on the source the primary lacks appears between the confirmation and the re-diff.
+	listed := 0
+	rg.vast01.onList = func(string) {
+		listed++
+		if listed == 2 { // the re-diff under the drained source barrier
+			rg.vast01.put(t, "data01", "late", "only on the source")
+		}
+	}
+	sleep, wake := wakingSleep()
+	rg.ctl.Sleep = sleep
+	var blocked Operation
+	if code, raw := rg.call(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token, Wait: "0s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("purge: want HTTP 202, got HTTP %d %s", code, raw)
+	}
+	if blocked.Status != StatusBlocked || blocked.Barrier == nil || blocked.Barrier.DispatchStarted || blocked.Barrier.HoldVersion == 0 ||
+		!slices.ContainsFunc(blocked.Blockers, func(b Blocker) bool { return b.Code == BlockerSourceDiff }) ||
+		!slices.Contains(blocked.AllowedActions, ActionCancel) {
+		t.Fatalf("a re-diff refusal before dispatch: %+v", blocked)
+	}
+	var canceled Operation
+	rg.must(http.MethodPost, "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &canceled)
+	wake()
+	waitNotRunning(t, rg.ctl, blocked.ID)
+	if canceled.Status != StatusCancelled {
+		t.Fatalf("canceled purge: %+v", canceled)
+	}
+	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+	if p.Barrier != nil || p.State != directory.StateCutover {
+		t.Fatalf("cancellation left the placement %+v", p)
+	}
+	for _, key := range []string{"a", "dir/b", "late"} {
+		if !rg.vast01.has("data01", key) {
+			t.Fatalf("a purge canceled before dispatch deleted %s from the source", key)
+		}
+	}
+	// The bucket is free: the mover can run on it again.
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 3, Done: true, Converged: true}, nil)
+	var again PurgeDryRun
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &again)
+	if again.Allowed || len(again.Missing) != 1 || again.Missing[0] != "late" {
+		t.Fatalf("dry run after the canceled purge: %+v", again)
 	}
 }
 

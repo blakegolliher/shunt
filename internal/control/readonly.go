@@ -50,6 +50,10 @@ func (s *Server) runReadOnly(tr *tracker, target, scope string, req ReadOnlyRequ
 			return ReadOnlyResult{}, err
 		}
 		tr.phase(PhaseStep)
+		// The phase write orders this step after any cancellation of the record.
+		if err := tr.check(); err != nil {
+			return ReadOnlyResult{}, err
+		}
 		if err := set(tr.ctx, false, false, ""); err != nil {
 			return ReadOnlyResult{}, err
 		}

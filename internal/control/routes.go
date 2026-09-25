@@ -47,6 +47,7 @@ func (s *Server) routes() []Route {
 		mut("POST", "/v1/operations/{id}/resume", "operation resume", s.resumeOperation, "operation resume"),
 		mut("POST", "/v1/operations/{id}/cancel", "operation cancel", s.cancelOperation, "operation cancel"),
 		mut("POST", "/v1/operations/{id}/worker-heartbeat", "mover worker heartbeat", s.workerHeartbeat, "migrate run"),
+		mut("POST", "/v1/operations/{id}/resolve-worker", "operation resolve-worker", s.resolveWorker, "operation resolve-worker"),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/create", "create", s.recorded(OpCreate, placement, s.createPlacement)),
 		mut("POST", "/v1/placements/{tenant}/{bucket}/create-backend", "create", s.recorded(OpCreate, placement, s.createBackendPlacement), "create"),
 		mut("DELETE", "/v1/placements/{tenant}/{bucket}", "delete", s.recorded(OpDelete, placement, s.deletePlacement)),

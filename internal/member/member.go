@@ -113,9 +113,12 @@ type Client struct {
 	incarnation  string
 	previous     *control.Incarnation
 	previousDone atomic.Bool
-	retireOnce   sync.Once
-	Gates        *admission.Gates
-	OnRetire     func()
+	// retired is set once Retire has begun: the process has stopped admitting and drained, and a
+	// heartbeat would only put its lease key back and show a retired proxy live, delaying forget.
+	retired    atomic.Bool
+	retireOnce sync.Once
+	Gates      *admission.Gates
+	OnRetire   func()
 }
 
 var _ directory.Directory = (*Client)(nil)
@@ -442,8 +445,12 @@ func (c *Client) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// beat sends one heartbeat and records whether the lease holds (renew).
+// beat sends one heartbeat and records whether the lease holds (renew). A retired process sends
+// none.
 func (c *Client) beat(ctx context.Context) error {
+	if c.retired.Load() {
+		return nil
+	}
 	seq := c.seq.Add(1)
 	sent := c.Now()
 	snap := c.serving()

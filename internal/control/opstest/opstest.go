@@ -260,6 +260,16 @@ func retention(t *testing.T, h Harness) {
 			t.Fatalf("record %s (%s, effect %s) did not survive the history limit: %v", keep.ID, keep.Status, keep.EffectState, err)
 		}
 	}
+	// Evidence lists exactly the unfinished and uncertain records, newest first, however many
+	// ended records are newer: what owner-loss handling reads.
+	var evidence []*control.Operation
+	waitFor(t, 10*time.Second, "the evidence listing", func() bool {
+		evidence, _ = h.Ops.Evidence(ctx)
+		return len(evidence) == 2
+	})
+	if evidence[0].ID != uncertain.ID || evidence[1].ID != running.ID {
+		t.Fatalf("evidence: %s, %s; want %s (uncertain), %s (running)", evidence[0].ID, evidence[1].ID, uncertain.ID, running.ID)
+	}
 }
 
 // Many creators race for one scope: exactly one wins, and every other is told who.

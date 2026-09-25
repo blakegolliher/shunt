@@ -100,8 +100,17 @@ func (s *Server) settle(tr *tracker, res *TransitionResult, v int64, wait time.D
 // is. Nothing is refused: what stands in the way is a blocker on the record (a member that has
 // not installed the version, a silent one, an unresolved incarnation), and the operation stays
 // blocked until it clears or the operation is canceled (ADR-0021 D2).
+//
+// An operation waiting here has written nothing it would need to undo (or, for purge-source's
+// re-check under its hold, nothing irreversible), so it can be canceled: the record says so while
+// it waits.
 func (s *Server) precondition(tr *tracker) error {
 	tr.phase(PhasePrecondition)
+	before := tr.snapshot().AllowedActions
+	if resumable(tr.snapshot().Kind) && !slices.Contains(before, ActionCancel) {
+		tr.allow(append(slices.Clone(before), ActionCancel))
+		defer tr.allow(before)
+	}
 	if err := s.Dir.Sync(tr.ctx); err != nil {
 		return err
 	}
@@ -127,7 +136,7 @@ func (s *Server) versionBlockers(ctx context.Context, v int64) ([]Blocker, error
 		switch {
 		case m.Retired():
 		case !m.Live:
-			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: fmt.Sprintf("%s is silent (last seen %s ago); a proxy cut off before a step would still write every key by the old routing, so every step waits for it until it is back, retires, or its incarnation is resolved", m.ID, m.SinceSeen.Round(time.Second))})
+			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: missingText(m, "a proxy cut off before a step would still write every key by the old routing, so every step waits for it until it is back, retires, or its incarnation is resolved")})
 		case m.Identity != cur:
 			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: m.ID + " is on another directory lineage and must be re-enrolled"})
 		case m.Installed >= v && m.Applied < v:
@@ -174,6 +183,10 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 			(t.To == directory.StateMigrating && (p.State != directory.StateRamping || pv.Ramp == nil || pv.Ramp.Ratio < 1 || p.Held()))
 		if !moves {
 			tr.phase(PhaseStep)
+			// The phase write orders this step after any cancellation of the record.
+			if err := tr.check(); err != nil {
+				return TransitionResult{}, err
+			}
 			res, err := s.transition(tr, key, p, f, t, create, acceptLoss)
 			if err != nil {
 				return res, err
@@ -1198,7 +1211,11 @@ type purgePlan struct {
 // purgeChecks runs every refusal purge-source gives before it deletes: the state, the evidence,
 // the fence, and the listing diff, counting the source on the way. A refusal comes back with as
 // much of the plan as was gathered, for a dry run to show.
-func (s *Server) purgeChecks(tr *tracker, key string, _ time.Duration) (purgePlan, error) {
+//
+// fence says whether to wait for every proxy to have the current directory version first: the
+// initial checks do; the re-check under the purge's own drained source barrier does not, since
+// every proxy acknowledging that barrier already has it.
+func (s *Server) purgeChecks(tr *tracker, key string, fence bool) (purgePlan, error) {
 	var plan purgePlan
 	p, f, err := s.placementOf(key)
 	if err != nil {
@@ -1219,7 +1236,9 @@ func (s *Server) purgeChecks(tr *tracker, key string, _ time.Duration) (purgePla
 	// A proxy that has not installed the cutover still reads the source on a miss: it must have it
 	// before the source is deleted. A dry run has no record to block on: it reports what stands
 	// in the way as its reason.
-	if tr.op.ID == "" {
+	switch {
+	case !fence:
+	case tr.op.ID == "":
 		if syncErr := s.Dir.Sync(tr.ctx); syncErr != nil {
 			return plan, syncErr
 		}
@@ -1228,10 +1247,12 @@ func (s *Server) purgeChecks(tr *tracker, key string, _ time.Duration) (purgePla
 			return plan, blockErr
 		}
 		if len(blockers) > 0 {
-			return plan, refuse("directory version %d is not on every proxy yet: %s", s.Dir.Snapshot().Version(), blockerText(blockers))
+			return plan, refuse("directory version %d is not on every proxy yet: %s", s.Dir.Snapshot().Version(), BlockerText(blockers))
 		}
-	} else if perr := s.precondition(tr); perr != nil {
-		return plan, perr
+	default:
+		if perr := s.precondition(tr); perr != nil {
+			return plan, perr
+		}
 	}
 	if plan.src, err = s.backendFor(p.ClusterOf(p.Source)); err != nil {
 		return plan, err
@@ -1266,12 +1287,11 @@ func purgeState(key string, pl directory.Placement) error {
 }
 
 func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDryRun, error) {
-	wait, err := parseWait(req.Wait)
-	if err != nil {
+	if _, err := parseWait(req.Wait); err != nil {
 		return PurgeDryRun{}, err
 	}
 	res := PurgeDryRun{Key: key, Missing: []string{}, Version: s.Dir.Snapshot().Version()}
-	plan, err := s.purgeChecks(tr, key, wait)
+	plan, err := s.purgeChecks(tr, key, true)
 	pv := moving(plan.p)
 	res.Source, res.Bucket, res.Objects, res.Bytes = pv.ClusterOf(pv.Source), plan.srcBucket, plan.objects, plan.bytes
 	res.KeepsBucket = plan.p.Move != nil && !plan.dropBucket
@@ -1296,8 +1316,7 @@ func (s *Server) purgeDryRun(tr *tracker, key string, req PurgeRequest) (PurgeDr
 }
 
 func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResult, error) {
-	wait, err := parseWait(req.Wait)
-	if err != nil {
+	if _, err := parseWait(req.Wait); err != nil {
 		return PurgeResult{}, err
 	}
 	// The cheap refusals first, so an operator hears about the state before the token. On resume,
@@ -1315,11 +1334,11 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	if req.Token == "" && tr.barrierState() == nil {
 		return PurgeResult{}, s.checkToken("", "purge-source", [32]byte{})
 	}
-	plan, err := s.purgeChecks(tr, key, wait)
-	if err != nil {
-		return PurgeResult{}, err
-	}
+	var plan purgePlan
 	if tr.barrierState() == nil {
+		if plan, err = s.purgeChecks(tr, key, true); err != nil {
+			return PurgeResult{}, err
+		}
 		if terr := s.checkToken(req.Token, "purge-source", purgeBinding(plan.f, plan.p)); terr != nil {
 			return PurgeResult{}, terr
 		}
@@ -1327,6 +1346,10 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	tenant, bucket, _ := directory.SplitKey(key)
 	var objects, uploads int
 	var version int64
+	// drained is the plan the drain's last diff took, once the source barrier drained and the
+	// source was still a subset of the primary: what the first delete acts on.
+	var drained *purgePlan
+	var purged bool // an earlier attempt's commit is in the directory: nothing of this run's to report
 	b := &barrier{scope: directory.PlacementResource(key), kind: config.BarrierSource,
 		hold: func() (int64, error) {
 			if err := s.Dir.Sync(tr.ctx); err != nil {
@@ -1342,18 +1365,22 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 			}
 			return s.Dir.Snapshot().Version(), nil
 		},
+		// Once the source gate has drained, the diff is taken again: the first one produced the
+		// confirmation, this one proves no retained source reader or mover changed the facts.
+		// Deletes that need the source pause while it is closed (the DELETE rule), so the diff
+		// cannot turn non-empty by a client delete. A diff that is not empty, or cannot be
+		// taken, is a blocker like any other: nothing is deleted yet, and the operation can be
+		// canceled.
+		extra: func(context.Context) ([]Blocker, error) {
+			drained = nil
+			fresh, err := s.purgeChecks(tr, key, false)
+			if err != nil {
+				return []Blocker{{Code: BlockerSourceDiff, Message: fmt.Sprintf("%v (nothing is deleted yet: cancel the purge to reopen the source)", err)}}, nil
+			}
+			drained = &fresh
+			return nil, nil
+		},
 		commit: func() (int64, bool, error) {
-			st := tr.barrierState()
-			if st == nil {
-				return 0, false, errBarrierGone
-			}
-			if !st.DispatchStarted {
-				st.DispatchStarted = true
-				tr.setBarrier(st, nil)
-				if err := tr.check(); err != nil {
-					return 0, false, err
-				}
-			}
 			if err := s.Dir.Sync(tr.ctx); err != nil {
 				return 0, false, err
 			}
@@ -1363,23 +1390,43 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 				return 0, false, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
 			}
 			if cp.State == directory.StateActive {
-				version = cur.Version
+				version, purged = cur.Version, true
 				return version, true, nil
 			}
 			if cp.Barrier == nil || cp.Barrier.ID != tr.id() {
 				return 0, false, errBarrierGone
 			}
-			// Re-evaluate the diff after the source gate drained. The first check produced the
-			// confirmation; this one proves no retained source reader or mover changed the facts.
-			fresh, err := s.purgeChecks(tr, key, wait)
-			if err != nil {
-				return 0, false, err
+			st := tr.barrierState()
+			if st == nil {
+				return 0, false, errBarrierGone
 			}
-			plan = fresh
+			if !st.DispatchStarted {
+				if drained == nil {
+					return 0, false, fmt.Errorf("purge-source reached its commit without a drained diff")
+				}
+				plan = *drained
+				// The irreversible point, durable before the first backend delete. The record's
+				// compare-and-swap orders it against a cancellation: one that came first makes
+				// this write stale, and check ends the run before anything is deleted.
+				st.DispatchStarted = true
+				tr.setBarrier(st, nil)
+				if err := tr.check(); err != nil {
+					return 0, false, err
+				}
+			} else {
+				// A retry after dispatch (or a resumed owner): what remains of the source is still a
+				// subset of the primary; take the plan again to delete the rest.
+				fresh, err := s.purgeChecks(tr, key, false)
+				if err != nil {
+					return 0, false, err
+				}
+				plan = fresh
+			}
 			tr.phase(PhasePurge)
 			total := int64(plan.objects)
 			tr.progress(0, total, "objects")
 			progress := func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") }
+			var err error
 			if plan.keep != nil {
 				objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.prefix, plan.keep, progress)
 			} else {
@@ -1405,6 +1452,9 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 		return PurgeResult{}, err
 	}
 	s.forget(key)
+	if purged {
+		return PurgeResult{Key: key, Version: version, Operation: tr.id()}, nil
+	}
 	if version == 0 {
 		version = s.Dir.Snapshot().Version()
 	}

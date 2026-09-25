@@ -195,7 +195,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// The bucket's gates (ADR-0021 D2). A mutation takes a token that is given back with the
 	// backend's outcome; a request that may touch a moving bucket's source takes one too. A
 	// closed mutations gate refuses; a closed source gate means the source is on its way out
-	// (purge-source), and the request goes on without it.
+	// (purge-source): a read or listing goes on without it, and a delete that needs it pauses.
 	bucketKey := directory.Key(o.tenant, info.Bucket)
 	if mutating {
 		tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
@@ -215,9 +215,14 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		}
 		if sourceClosed {
 			if route.Both {
-				h.Metrics.DualDelete.WithLabelValues(bucketKey, "source_closed").Inc()
+				// A delete pauses while the source is closed (ADR-0021, the DELETE rule of
+				// 2026-09-24): its source leg cannot be sent, and a primary-only delete would
+				// leave the source holding a key the primary lacks, which purge-source's
+				// re-diff must refuse. The hold is short; the client retries after it.
+				h.refuseWrite(w, r, o, info.Bucket, "source_closed", "This bucket's deletes pause while its migration source is removed. Retry shortly.")
+				return nil, false
 			}
-			route.Fallback, route.Both, route.Merge = false, false, false
+			route.Fallback, route.Merge = false, false
 		}
 	}
 	cl, ok := clusters.Get(clusterName)

@@ -233,3 +233,46 @@ func TestFleetIncarnations(t *testing.T) {
 		t.Fatalf("registration past the unresolved bound: %v", err)
 	}
 }
+
+// Defect 5 of the H2 review. A proxy that retired cleanly while the control plane was unreachable
+// says so through its marker on the next process's first heartbeat. Its record must retire that
+// incarnation, not take it for a crash: no unresolved incarnation blocks barriers, and once the
+// new process retires too, forget is allowed. A marker with uncertain work stays unresolved.
+func TestFleetCleanRetirementFromMarker(t *testing.T) {
+	tc := startCluster(t, 1)
+	ctx := context.Background()
+	f := NewFleet(tc.nodes[0].Client(), time.Second)
+	f.DropMargin = 500 * time.Millisecond
+	if _, err := f.Heartbeat(ctx, "p5", control.Heartbeat{Seq: 1, Incarnation: inc1}); err != nil {
+		t.Fatal(err)
+	}
+	// inc1 drained and wrote its retired marker; its Retire call never reached the control plane.
+	prev := &control.Incarnation{ID: inc1, State: control.IncarnationRetired, Started: time.Now().Add(-time.Hour), Ended: time.Now().Add(-time.Minute)}
+	g, err := f.Heartbeat(ctx, "p5", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: prev})
+	if err != nil || !g.PreviousRecorded {
+		t.Fatalf("the restarted process's first heartbeat: %+v %v", g, err)
+	}
+	m := members(t, f)["p5"]
+	if len(m.Unresolved) != 0 || m.Incarnation == nil || m.Incarnation.ID != inc2 || m.Incarnation.State != control.IncarnationActive {
+		t.Fatalf("a clean retirement reported by the marker was recorded as unclean: %+v", m)
+	}
+	if err := f.Retire(ctx, "p5", inc2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Forget(ctx, "p5"); err != nil {
+		t.Fatalf("forget after both processes retired cleanly: %v", err)
+	}
+
+	// A marker that says retired with work whose outcome is unknown is not proof: unresolved.
+	if _, err := f.Heartbeat(ctx, "p6", control.Heartbeat{Seq: 1, Incarnation: inc3}); err != nil {
+		t.Fatal(err)
+	}
+	unsure := &control.Incarnation{ID: inc3, State: control.IncarnationRetired, Uncertain: 2}
+	if _, err := f.Heartbeat(ctx, "p6", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: unsure}); err != nil {
+		t.Fatal(err)
+	}
+	m = members(t, f)["p6"]
+	if len(m.Unresolved) != 1 || m.Unresolved[0].ID != inc3 || m.Unresolved[0].State != control.IncarnationUnclean || m.Unresolved[0].Uncertain != 2 {
+		t.Fatalf("a marker with uncertain work: %+v", m)
+	}
+}

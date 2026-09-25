@@ -141,7 +141,7 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 			// to do (contracts §2, "CLI completion semantics"). It keeps running on the control node.
 			what := fmt.Sprintf("operation %s is still %s (phase %s)", op.ID, op.Status, op.Phase)
 			if len(op.Blockers) > 0 {
-				what += "; waiting on " + blockerLine(op.Blockers)
+				what += "; waiting on " + control.BlockerText(op.Blockers)
 			}
 			next := fmt.Sprintf("it keeps running: `shunt operation wait %s` follows it", op.ID)
 			if slices.Contains(op.AllowedActions, control.ActionCancel) {
@@ -173,22 +173,6 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 		}
 	}
 	return fmt.Errorf("%s", shownText(msg))
-}
-
-// blockerLine is an operation's blockers in one line.
-func blockerLine(bs []control.Blocker) string {
-	parts := make([]string, 0, len(bs))
-	for _, b := range bs {
-		p := b.Code
-		if b.ProxyID != "" {
-			p += " " + b.ProxyID
-		}
-		if b.Count > 0 {
-			p += fmt.Sprintf(" (%d)", b.Count)
-		}
-		parts = append(parts, p)
-	}
-	return strings.Join(parts, ", ")
 }
 
 // argsOf is an operation's args: the request body the action's own route takes.

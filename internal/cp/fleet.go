@@ -135,6 +135,30 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 		if rec.Joined.IsZero() {
 			rec.Joined = now
 		}
+		// The previous process's own marker first: it may have retired cleanly while the control
+		// plane was unreachable (internal/member/incarnation.go), and is then retired here, not
+		// taken for a crash below. Only a clean marker with nothing uncertain retires it; an
+		// unclean one, or one with uncertain work, stays unresolved with its counts.
+		if p := hb.Previous; p != nil && p.ID != hb.Incarnation {
+			clean := p.State == control.IncarnationRetired && p.Uncertain == 0
+			ended := p.Ended
+			if ended.IsZero() {
+				ended = now
+			}
+			switch cur := rec.Current; {
+			case cur != nil && cur.ID == p.ID && cur.State == control.IncarnationActive:
+				if clean {
+					cur.State, cur.Ended = control.IncarnationRetired, ended
+				} else {
+					cur.Uncertain = max(cur.Uncertain, p.Uncertain)
+				}
+			case clean:
+				// A late report of a clean retirement the record took for a crash (a reply lost
+				// before PreviousRecorded): it discharges the unresolved entry, as a retried
+				// retirement does (Retire).
+				rec.Unresolved = slices.DeleteFunc(rec.Unresolved, func(inc control.Incarnation) bool { return inc.ID == p.ID })
+			}
+		}
 		if cur := rec.Current; cur != nil && cur.ID != hb.Incarnation {
 			if cur.State == control.IncarnationActive {
 				// Replaced without retiring: a crash, or a stop whose retirement never got through.

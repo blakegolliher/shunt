@@ -346,6 +346,10 @@ wait:
 		// A clean retirement (ADR-0021 D2): admission has stopped and every request has ended, so
 		// the control plane can count this process out of every barrier. A count of outcomes
 		// never learned makes it unclean, and an operator resolves it once the backend is quiet.
+		// A request cut short can be counted twice: once in cut, and again in Uncertain if its
+		// handler has already returned its token as uncertain by the time this reads it. The sum
+		// only decides clean against unclean and is shown for the operator's reconciliation, so
+		// over-counting is the safe side; under-counting would call a live effect drained.
 		uncertain := h.Gates.Uncertain() + cut
 		rctx, rcancel := context.WithTimeout(context.Background(), cfg.Proxy.DrainTimeout)
 		if err := mem.Retire(rctx, uncertain); err != nil {

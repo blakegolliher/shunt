@@ -103,6 +103,44 @@ func TestOperationVerbs(t *testing.T) {
 	}
 }
 
+// shunt operation resolve-worker (defect 7 of the H2 review): an external mover whose worker
+// session expired, and whose owner is gone, is ended by the resolution, which it keeps.
+func TestOperationResolveWorkerVerb(t *testing.T) {
+	rg := newAPIRig(t)
+	if err := rg.vast01.CreateBucket("data"); err != nil {
+		t.Fatal(err)
+	}
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.must(t, "adopt", "vast01", "acme/data")
+	const session = "0123456789abcdef0123456789abcdef"
+	gen := rg.dir.Snapshot().Generation("placement:acme/data")
+	stale := time.Now().UTC().Add(-time.Hour)
+	planted := control.Operation{ID: "1700000000003-0000cc", Kind: control.OpMover, Placement: "acme/data", Node: "lab",
+		Identity: rg.dir.Snapshot().File().Identity, Scope: &control.Scope{Resource: "placement:acme/data", Generation: gen},
+		Status: control.StatusBlocked, Phase: control.PhaseMover, Sequence: 1, EffectState: control.EffectNone,
+		Blockers: []control.Blocker{{Code: control.BlockerWorkerUnresolved}}, BlockerCount: 1,
+		Args:    json.RawMessage(`{"external":true,"session":"` + session + `","wait":"0s"}`),
+		Worker:  &control.WorkerSession{ID: session, Identity: rg.dir.Snapshot().File().Identity, Generation: gen, Sequence: 4, State: control.WorkerActive, Inflight: 1, Uncertain: 1, LastSeen: stale},
+		Created: stale, Updated: stale}
+	if err := rg.ctl.Ops.Create(t.Context(), &planted); err != nil {
+		t.Fatal(err)
+	}
+	if out := rg.must(t, "operation", "show", planted.ID); !strings.Contains(out, "worker:      "+session+" active, sequence 4, 1 in flight, 1 uncertain") {
+		t.Fatalf("show of an expired worker: %s", out)
+	}
+	if _, err := rg.cli(t, "operation", "resolve-worker", planted.ID, "--session", session); err == nil {
+		t.Fatal("resolve-worker without an attestation succeeded")
+	}
+	out := rg.must(t, "operation", "resolve-worker", planted.ID, "--session", session, "--attest", "mover host is off; backend log is quiet")
+	if !strings.Contains(out, "worker session "+session+" of operation "+planted.ID+" resolved") {
+		t.Fatalf("resolve-worker: %s", out)
+	}
+	out, err := rg.cli(t, "operation", "wait", planted.ID)
+	if err == nil || !strings.Contains(out, "resolved by") || !strings.Contains(out, "mover host is off") || !strings.Contains(out, "status:      failed") {
+		t.Fatalf("the resolved operation: %v\n%s", err, out)
+	}
+}
+
 func TestWatchVerb(t *testing.T) {
 	rg := newAPIRig(t)
 	if err := rg.vast01.CreateBucket("data"); err != nil {

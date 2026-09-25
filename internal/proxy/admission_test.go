@@ -256,8 +256,8 @@ func TestUploadIDDoesNotBypassTheBarrier(t *testing.T) {
 
 // T06. A delete during a migration takes a source token as well as a mutation token, and a copy
 // that reads a moving bucket's source takes one on that bucket. A closed source gate (purge-source
-// is about to delete the source) skips the delete's source leg, counted as source_closed, and
-// refuses a copy that would read the source.
+// is about to delete the source) pauses a delete that needs its source leg, counted as a
+// source_closed refusal, and refuses a copy that would read the source.
 func TestSourceDependentWorkIsCounted(t *testing.T) {
 	m := newMixedRig(t, nil)
 	if r := m.acme(t, "PUT", "/data/k", []byte("on the source")); r.StatusCode != http.StatusOK {
@@ -339,17 +339,23 @@ func TestSourceDependentWorkIsCounted(t *testing.T) {
 	if ack := ackOf(t, m, "op-p"); !ack.Closed || ack.Kind != config.BarrierSource || ack.Inflight != 0 {
 		t.Fatalf("the source barrier's ack: %+v", ack)
 	}
-	if r := m.acme(t, "DELETE", "/data/k3", nil); r.StatusCode != http.StatusNoContent {
-		t.Fatalf("a delete with the source closed: %d %s", r.StatusCode, r.body)
+	// The DELETE rule (ADR-0021, 2026-09-24): a delete pauses, 503 with Retry-After, rather than
+	// reach the primary alone; the source stays a subset of the primary for purge's re-diff.
+	r := m.acme(t, "DELETE", "/data/k3", nil)
+	if r.StatusCode != http.StatusServiceUnavailable || r.Header.Get("Retry-After") == "" {
+		t.Fatalf("a delete with the source closed: %d %s, Retry-After %q", r.StatusCode, r.body, r.Header.Get("Retry-After"))
 	}
 	if _, onSource := m.garage.object("acme-1111-data", "k3"); !onSource {
 		t.Fatal("the delete reached the closed source")
 	}
-	if _, onPrimary := m.minio.object(target, "k3"); onPrimary {
-		t.Fatal("the delete did not reach the primary")
+	if _, onPrimary := m.minio.object(target, "k3"); !onPrimary {
+		t.Fatal("the delete reached the primary alone: the source now holds a key the primary lacks")
 	}
-	if got := counterValue(t, m.h.Metrics.DualDelete.WithLabelValues("acme/data", "source_closed")); got != 1 {
-		t.Errorf("dual deletes{outcome=source_closed} = %v, want 1", got)
+	if got := counterValue(t, m.h.Metrics.RefusedWrites.WithLabelValues("acme/data", "source_closed")); got != 1 {
+		t.Errorf("refused writes{reason=source_closed} = %v, want 1", got)
+	}
+	if st := m.gates.State("acme/data"); st.Inflight[admission.Mutations] != 0 || st.Uncertain != [2]int64{} {
+		t.Fatalf("a refused delete kept its token: %+v", st)
 	}
 	// A copy that has to read the source is refused while it is closed; one served by the primary
 	// is not. In CUTOVER a read is primary-only, so the copy plan never names the source.

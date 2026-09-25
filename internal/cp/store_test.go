@@ -433,3 +433,44 @@ func TestStoreReadsPlacementSchemaV2(t *testing.T) {
 		t.Fatalf("v2 placement loaded as %+v, want %+v (stored %s)", got, want, raw)
 	}
 }
+
+// Defect 3 of the H2 review on the etcd store: a read-only release names its barrier and is
+// refused once the barrier's commit has cleared it, so a late cancellation cannot undo a
+// committed read-only.
+func TestStoreReadOnlyReleaseComparesBarrier(t *testing.T) {
+	tc := startCluster(t, 1)
+	key := make([]byte, 32)
+	key[3] = 7
+	s := openStore(t, tc, 0, key)
+	ctx := context.Background()
+	if err := s.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Adopt(ctx, "acme", "data01", "vast01", "data01", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPlacementReadOnly(ctx, "acme", "data01", true, false, "op-1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearBarrier(ctx, directory.PlacementResource("acme/data01"), "op-1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPlacementReadOnly(ctx, "acme", "data01", false, false, "op-1", "t"); !errors.Is(err, directory.ErrConflict) {
+		t.Fatalf("placement release after the commit: %v", err)
+	}
+	if p, _ := s.Snapshot().Lookup("acme", "data01"); !p.ReadOnly {
+		t.Fatalf("a committed placement read-only was undone: %+v", p)
+	}
+	if err := s.SetClusterReadOnly(ctx, "vast01", true, false, "op-2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearBarrier(ctx, directory.ClusterResource("vast01"), "op-2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetClusterReadOnly(ctx, "vast01", false, false, "op-2", "t"); !errors.Is(err, directory.ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := s.Snapshot().File().Clusters["vast01"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
+	}
+}

@@ -30,6 +30,7 @@
   {"method":"GET","pattern":"/v1/operations/{id}"},
   {"method":"POST","pattern":"/v1/operations/{id}/resume"},
   {"method":"POST","pattern":"/v1/operations/{id}/cancel"},
+  {"method":"POST","pattern":"/v1/operations/{id}/resolve-worker"},
   {"method":"POST","pattern":"/v1/clusters/probe"},
   {"method":"POST","pattern":"/v1/clusters"},
   {"method":"DELETE","pattern":"/v1/clusters/{name}"},

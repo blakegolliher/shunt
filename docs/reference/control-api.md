@@ -39,7 +39,7 @@ At most `--operation-capacity` operations (default 256; a lab proxy, 256) are un
 | 409 | `conflict` | already exists, or a concurrent change won |
 | 409 | `operation_conflict` | an unfinished operation owns the placement or cluster (or, for a cluster, one on a placement touching it); `operation_id` names it ([Operations](#operations)) |
 | 409 | `generation_conflict` | the placement or cluster changed since the request was made; `current_generation` is its generation now |
-| 409 | `not_cancellable` | an operation has no durable hold to restore, has committed its guarded change, or has already ended; follow it or make a new operation as appropriate |
+| 409 | `not_cancellable` | an operation is writing or has committed its guarded change, has started destructive work, is a mover (resolve its worker instead), or has already ended; follow it or make a new operation as appropriate |
 | 409 | `retirement_unproven` | a proxy did not retire cleanly; `blockers` names the incarnation evidence that must be resolved before it can be forgotten |
 | 409 | `cluster_mismatch`, `epoch_mismatch`, `resync_required` | a request made on another directory lineage; `current_identity` is the control plane's |
 | 502 | `backend` | a cluster call failed (HEAD, create, canary, listing, delete) |
@@ -261,7 +261,8 @@ placement `generation`, a strictly increasing `sequence`, and `inflight`/`uncert
 final heartbeat explicitly closes the clean session. The operation reserves the placement while
 the mover can still touch its source. If heartbeats stop for 5 seconds, it blocks as
 `worker_unresolved`; a later heartbeat cannot erase that interval unless it sets `resolve` with an
-operator attestation.
+operator attestation. A mover process that died does not heartbeat again: the operator resolves its
+session with `POST /v1/operations/{id}/resolve-worker` (below).
 
 ### `GET /v1/placements/{tenant}/{bucket}/mover-ledger[?limit=20]`
 
@@ -296,10 +297,16 @@ Deletes the source bucket, then returns the placement to `ACTIVE` on its primary
 
 Once allowed, it installs a durable `source` barrier. That closes and drains source-dependent
 GET/LIST/copy-source work, delayed dual deletes and mover sessions before any destructive dispatch.
-Only then does it repeat the listing diff, abort the source's in-progress multipart uploads, delete
-every object and then the bucket, and atomically apply `CUTOVER → ACTIVE` while clearing the gate.
-It runs under an operation record whose `progress` counts the objects deleted. Cancellation is no
-longer offered once destructive dispatch has started.
+While the source is closed, a client DELETE (which in `CUTOVER` must reach both clusters) answers
+503 with `Retry-After` rather than reach the primary alone, so the source stays a subset of the
+primary (ADR-0021, the DELETE rule). Once the fleet has drained, the listing diff is repeated; a
+diff that is not empty, or cannot be taken, blocks the operation as `source_diff`, with nothing
+deleted and `cancel` still allowed. Only after the diff is clean does the record mark
+`dispatch_started`; then it aborts the source's in-progress multipart uploads, deletes every object
+and then the bucket, and atomically applies `CUTOVER → ACTIVE` while clearing the gate. It runs
+under an operation record whose `progress` counts the objects deleted. Cancellation is refused from
+`dispatch_started` on; a cancellation that read the record earlier is refused all the same, since
+the record's compare-and-swap orders the two.
 
 Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version", "operation"}`.
 
@@ -392,7 +399,7 @@ cluster or client secret; their secret-free response is recorded as `result`.
 | `effect_state` | `none` (nothing written to the directory), `committed` (at least one version written, the record's own or another writer's while it ran), `uncertain` (its owner was lost while it could have been writing). `failed` never means rolled back |
 | `identity`, `scope` | the directory lineage the operation was accepted on; the resource it reserves, that resource's generation then, and for a placement the clusters it touches |
 | `sequence`, `owner_term` | how many times the record has been written; how many control-node owners it has had (incremented by resume) |
-| `allowed_actions`, `blockers`, `blocker_count` | `cancel` once a hold is durable and before it commits, `resume` after owner loss, and the complete named reasons a blocked operation waits |
+| `allowed_actions`, `blockers`, `blocker_count` | `cancel` while waiting in its precondition and once a hold is durable until it commits, `resume` after owner loss, `resolve-worker` for an external mover whose session expired, and the complete named reasons a blocked operation waits |
 | `barrier` | the durable `id`, `scope`, gate `kind`, hold version and generation, and whether/where it committed; timestamps mark its hold, drain and commit boundaries |
 | `worker` | for an external mover: its session id, lineage/generation, heartbeat sequence, `active`/`unresolved`/`completed` state, bounded in-flight/uncertain counts and reconciliation evidence |
 | `phase` | where it is: `queued` (not started), `precondition` (waiting for every proxy to have the current version), `hold` (writing the hold), `drain` (the hold is durable; waiting for every gate), `commit` (writing the guarded change), `step` (a change needing no barrier), `settle` (the commit is written; waiting for every live proxy to have it), `mover`, `window`, `diff`, `purge`, or `done` |
@@ -421,17 +428,37 @@ already runs it. `shunt operation resume <id>`.
 
 ### `POST /v1/operations/{id}/cancel`
 
-Once `hold_version` is durable and before commit, releases this operation's own hold by barrier id
-and answers 200 with the `cancelled` record. A different/newer hold is never released. Before an
-operation has a barrier it is not cancellable; while its hold is being written it asks the caller
-to retry. After commit or another terminal outcome it answers 409 `not_cancellable`.
-`shunt operation cancel <id>`.
+Ends a barrier operation `cancelled` before its change is committed, then releases its own hold by
+barrier id, and answers 200 with the `cancelled` record. The record is written first, compared on
+its sequence, and the check is repeated inside that write: an owner that has since marked its
+commit or its destructive dispatch wins, and the cancellation answers 409 `not_cancellable`; an
+owner that comes later finds its record ended and stops before touching the directory or a backend.
+A different/newer hold is never released, and a committed read-only is never switched off (the
+release names its barrier). Allowed while the operation waits in its precondition (it has written
+nothing yet), and once its hold is durable up to its commit. While a live owner is writing its hold
+or its commit it answers 409, retry or follow it; once the owner is gone, a hold whose version never
+became durable is released all the same. Should the owner's commit have reached the directory
+before its record said so, the record is corrected to `failed` with effect `committed` and the
+answer is 409 `not_cancellable`: the change is in force. A repeated cancel of a `cancelled` record
+releases a hold its first attempt could not. `shunt operation cancel <id>`.
+
+### `POST /v1/operations/{id}/resolve-worker`
+
+`{"session": "…", "attestation": "…"}`. Resolves an external mover (`shunt migrate run`) whose worker
+session expired with its work unresolved, or never enrolled: its last backend copy may still land,
+so the record holds its placement until an operator establishes that the process and its backend
+requests have ended and says how. The resolution (actor and attestation) is kept on the session;
+the operation ends `failed` (its copy did not finish) and frees the placement. `session` is the id
+the record's `worker` names; the record offers `resolve-worker` in `allowed_actions` once the
+session is past its TTL. Refused while the worker still heartbeats (it ends itself), for another
+session, and for any other kind of operation. `shunt operation resolve-worker <id> --session <id>
+--attest <why>`; the Operations screen asks for the attestation.
 
 ### `GET /v1/operations[?placement=t/b][&cluster=name][&limit=50]`
 
 `{"operations": [...]}`, newest first, filtered by placement or cluster when given; `limit` defaults to 50 and is capped at 500.
 
-The CLI reads records with `shunt operation list [--placement t/b] [--cluster name] [--limit n]`, `show`, `wait`, `resume` and `cancel`. `wait` exits 0 when the operation succeeded, 1 when it ended otherwise, and 3 with the blocker line when its timeout passes unfinished; the operation keeps running either way. The web UI's Operations screen lists the same record, barrier, blockers and allowed Resume/Cancel actions.
+The CLI reads records with `shunt operation list [--placement t/b] [--cluster name] [--limit n]`, `show`, `wait`, `resume`, `cancel` and `resolve-worker`. `wait` exits 0 when the operation succeeded, 1 when it ended otherwise, and 3 with the blocker line when its timeout passes unfinished; the operation keeps running either way. The web UI's Operations screen lists the same record, barrier, worker session, blockers and allowed Resume/Cancel/Resolve-worker actions.
 
 ## Events
 

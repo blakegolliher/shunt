@@ -49,8 +49,9 @@ type BarrierState struct {
 
 // The actions a record accepts (Operation.AllowedActions).
 const (
-	ActionResume = "resume"
-	ActionCancel = "cancel"
+	ActionResume        = "resume"
+	ActionCancel        = "cancel"
+	ActionResolveWorker = "resolve-worker" // an external mover whose worker session expired
 )
 
 // CodeNotCancellable refuses a cancellation past the safe point: the change is committed, or the
@@ -75,8 +76,10 @@ type barrier struct {
 	// this barrier, or reports already when an earlier attempt's write landed and its reply was
 	// lost, or fails when the barrier is gone (released by a cancellation).
 	commit func() (version int64, already bool, err error)
-	// extra, if set, adds blockers of the barrier's own beyond the fleet's drain: cutover's
-	// multipart uploads, purge-source's worker sessions.
+	// extra, if set, adds blockers of the barrier's own once the fleet has drained: cutover's
+	// multipart uploads and quiet window, purge-source's re-diff of the drained source. A mover's
+	// worker session needs none here: its operation reserves the placement, so no cutover or
+	// purge can start while one is unresolved.
 	extra func(ctx context.Context) ([]Blocker, error)
 }
 
@@ -106,20 +109,30 @@ func (s *Server) runBarrier(tr *tracker, b *barrier) error {
 		s.observeBarrier(PhaseHold, s.now().Sub(start))
 	}
 	if !st.Committed {
-		tr.phase(PhaseDrain)
-		start := s.now()
-		if err := s.blockUntil(tr, func(ctx context.Context) ([]Blocker, error) { return s.drainBlockers(ctx, st, b.extra) }); err != nil {
-			return err
+		// A resumed record may be behind the directory: the owner wrote the commit and was lost
+		// before the record said so. The scope then no longer carries the barrier, no proxy can
+		// acknowledge it any more, and a drain would wait forever. Only a scope that still carries
+		// the barrier is drained; otherwise the commit reconciles (already written, or released).
+		carried, cerr := s.carriesBarrier(tr.ctx, b.scope, st.ID)
+		if cerr != nil {
+			return cerr
 		}
-		st.DrainedAt = s.now().UTC()
-		s.observeBarrier(PhaseDrain, s.now().Sub(start))
+		if carried {
+			tr.phase(PhaseDrain)
+			start := s.now()
+			if err := s.blockUntil(tr, func(ctx context.Context) ([]Blocker, error) { return s.drainBlockers(ctx, st, b.extra) }); err != nil {
+				return err
+			}
+			st.DrainedAt = s.now().UTC()
+			s.observeBarrier(PhaseDrain, s.now().Sub(start))
+		}
 		tr.phase(PhaseCommit)
 		// phase writes through the record CAS. A concurrent resume can make that write stale;
 		// discover the lost owner before touching the directory.
 		if err := tr.check(); err != nil {
 			return err
 		}
-		start = s.now()
+		start := s.now()
 		var v int64
 		var already bool
 		var err error
@@ -161,6 +174,27 @@ func (s *Server) runBarrier(tr *tracker, b *barrier) error {
 
 // errBarrierGone is a commit that found the scope no longer carrying the operation's barrier.
 var errBarrierGone = errors.New("the barrier is no longer on its scope")
+
+// carriesBarrier reports whether scope (a placement or a cluster resource) carries barrier id in
+// the authoritative directory: the same read every commit closure makes before it writes.
+func (s *Server) carriesBarrier(ctx context.Context, scope, id string) (bool, error) {
+	if err := s.Dir.Sync(ctx); err != nil {
+		return false, err
+	}
+	snap := s.Dir.Snapshot()
+	var b *directory.Barrier
+	if name, ok := strings.CutPrefix(scope, "cluster:"); ok {
+		if c, found := snap.Cluster(name); found {
+			b = c.Barrier
+		}
+	} else {
+		tenant, bucket, _ := directory.SplitKey(strings.TrimPrefix(scope, "placement:"))
+		if p, found := snap.Lookup(tenant, bucket); found {
+			b = p.Barrier
+		}
+	}
+	return b != nil && b.ID == id, nil
+}
 
 // blockUntil loops until eval reports no blocker, writing the blockers to the record as they
 // change and checking that this node still owns an unfinished record. There is no deadline: a
@@ -208,7 +242,7 @@ func (s *Server) drainBlockers(ctx context.Context, st *BarrierState, extra func
 			continue
 		}
 		if !m.Live {
-			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: fmt.Sprintf("%s is silent (last seen %s ago); its process may still serve the old routing", m.ID, m.SinceSeen.Round(time.Second))})
+			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: missingText(m, "its process may still serve the old routing")})
 			continue
 		}
 		if m.Identity != cur {
@@ -221,7 +255,9 @@ func (s *Server) drainBlockers(ctx context.Context, st *BarrierState, extra func
 		// A lab's own proxy: its gates drain like a member's, and its directory is on disk.
 		out = append(out, memberBlockers(s.node(), s.LocalGates.Acks(s.Dir.Snapshot()), s.Dir.Snapshot().Version(), st)...)
 	}
-	if extra != nil {
+	if extra != nil && len(out) == 0 {
+		// The barrier's own checks (cutover's quiet window, purge's re-diff) prove something only
+		// once the fleet has drained, and cutover's sleeps its window: neither runs before.
 		more, err := extra(ctx)
 		if err != nil {
 			return nil, err
@@ -229,6 +265,19 @@ func (s *Server) drainBlockers(ctx context.Context, st *BarrierState, extra func
 		out = append(out, more...)
 	}
 	return out, nil
+}
+
+// missingText is the proxy_missing message for a member that is not live. A member with no
+// current process has stopped: it retired with outcomes unknown (its incarnation is unresolved),
+// or its crashed process was resolved; either way it serves nothing, and forget is what is left.
+func missingText(m *Member, serving string) string {
+	switch {
+	case m.Incarnation == nil && len(m.Unresolved) > 0:
+		return fmt.Sprintf("%s retired with outcomes unknown; resolve its incarnation, then `shunt proxy forget %s`", m.ID, m.ID)
+	case m.Incarnation == nil:
+		return fmt.Sprintf("%s has no running process; `shunt proxy forget %s`", m.ID, m.ID)
+	}
+	return fmt.Sprintf("%s is silent (last seen %s ago); %s", m.ID, m.SinceSeen.Round(time.Second), serving)
 }
 
 // memberBlockers is what one proxy's acknowledgements say stands in a barrier's way.
@@ -239,7 +288,11 @@ func memberBlockers(id string, acks []admission.Ack, durable int64, st *BarrierS
 	}
 	ack := &acks[i]
 	var out []Blocker
-	if ack.Generation != st.Generation || !ack.Closed {
+	// The ack names this barrier by id, so it is this hold's however far the scope's generation
+	// has moved since: only this operation can clear its barrier, and a later write to the scope
+	// (a secret rotation stamping a cluster) must not strand the drain. An older generation is a
+	// proxy that has not installed the hold yet.
+	if ack.Generation < st.Generation || !ack.Closed {
 		return []Blocker{{Code: BlockerInstallPending, ProxyID: id, Message: fmt.Sprintf("%s acknowledges the hold at generation %d, closed %v; the barrier is at generation %d", id, ack.Generation, ack.Closed, st.Generation)}}
 	}
 	if durable < st.HoldVersion {
@@ -291,9 +344,12 @@ func (s *Server) publishBlockers() {
 }
 
 // releaseHold undoes an operation's hold, by kind: what a cancellation before the commit writes.
-// Each write is compared on the barrier's id, so a hold another operation wrote is never touched.
+// Each write is compared on the barrier's id, so a hold another operation wrote is never touched,
+// and a hold whose commit already cleared it is refused (TransitionError or ErrConflict). A record
+// whose hold version never became durable may still have its hold in the directory (the owner was
+// lost between the two writes): it is released the same way.
 func (s *Server) releaseHold(ctx context.Context, op *Operation, actor string) error {
-	if op.Barrier == nil || op.Barrier.HoldVersion == 0 {
+	if op.Barrier == nil {
 		return nil
 	}
 	id := op.Barrier.ID
@@ -312,12 +368,49 @@ func (s *Server) releaseHold(ctx context.Context, op *Operation, actor string) e
 	return nil
 }
 
-// cancelOperation is POST /v1/operations/{id}/cancel: a durable request. Before the commit it puts
-// the routing back as it was (the hold released, compared on the barrier's id), marks the record
-// canceled, and stops the node running it at its next check. After the commit the change is
-// in force and 409 not_cancellable says so. A record that already ended canceled answers as it is.
+// cancelPhases are the phases of a barrier operation before its first directory write: a record
+// in one of them, with no barrier yet, has nothing to release.
+var cancelPhases = []string{"", PhaseQueued, PhasePrecondition, PhaseDiff}
+
+// notCancellable says why an unfinished operation cannot be canceled now, or nil when it can.
+// ownerGone is whether the node that owns the record is known to have stopped running it. The
+// cancellation re-checks this inside its compare-and-swap of the record, so the record is the
+// point where a cancellation and the owner's next step (its hold, commit or first destructive
+// dispatch, each written to the record first) are ordered.
+func notCancellable(op *Operation, ownerGone bool) error {
+	switch {
+	case op.Kind == OpMover:
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is a mover: it ends with its worker, and an expired worker session is resolved with `shunt operation resolve-worker %s --session <id> --attest <why>`", op.ID, op.ID)}
+	case !resumable(op.Kind):
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s (%s) has no drain barrier that can be safely canceled", op.ID, op.Kind)}
+	case op.Barrier == nil:
+		if !slices.Contains(cancelPhases, op.Phase) {
+			return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is writing its change (phase %s)", op.ID, op.Phase)}
+		}
+		return nil
+	case op.Barrier.Committed:
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s committed its change at directory version %d; it settles, and a further change is a new operation", op.ID, op.Barrier.CommitVersion)}
+	case op.Barrier.DispatchStarted:
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has started destructive backend work; it must be resumed to completion", op.ID)}
+	case op.Barrier.HoldVersion == 0 && !ownerGone:
+		return refuse("operation %s is still writing its hold; retry cancellation once the record shows hold_version", op.ID)
+	case op.Phase == PhaseCommit && !ownerGone:
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is writing its commit; it settles, and a further change is a new operation", op.ID)}
+	}
+	return nil
+}
+
+// cancelOperation is POST /v1/operations/{id}/cancel: a durable request, allowed before the
+// operation's change is committed or its destructive work dispatched (notCancellable). The record
+// is ended first, compared on its sequence, so an owner still running it finds its next record
+// write stale and stops before it touches the directory or a backend. Then the hold is released,
+// compared on the barrier's id. Should the owner's commit have landed first after all (its record
+// write was lost with its node), the record is corrected to say the change is in force. A record
+// that already ended canceled answers as it is, and a hold such a record still carries (its
+// release failed) is released again.
 func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	ctx := context.WithoutCancel(r.Context())
 	op, err := s.ops().Get(r.Context(), id)
 	switch {
 	case err != nil:
@@ -327,49 +420,136 @@ func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		fail(w, notFound("no operation %s", id))
 		return
 	case op.Status == StatusCancelled:
+		if rerr := s.releaseCanceled(ctx, op, actor(r)); rerr != nil {
+			fail(w, rerr)
+			return
+		}
 		writeJSON(w, http.StatusOK, op.Public())
 		return
 	case op.Terminal():
 		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has ended %s", id, op.Status)})
 		return
-	case op.Barrier == nil:
-		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has no drain barrier that can be safely canceled", id)})
-		return
-	case op.Barrier.HoldVersion == 0:
-		fail(w, refuse("operation %s is still writing its hold; retry cancellation once the record shows hold_version", id))
-		return
-	case op.Barrier.Committed:
-		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s committed its change at directory version %d; it settles, and a further change is a new operation", id, op.Barrier.CommitVersion)})
-		return
-	case op.Barrier.DispatchStarted:
-		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has started destructive backend work; it must be resumed to completion", id)})
-		return
-	case op.Kind == OpMover:
-		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: "a mover operation is stopped by stopping its worker; its record ends with the worker"})
+	}
+	ownerGone, err := s.ownerGone(r.Context(), op)
+	if err != nil {
+		fail(w, err)
 		return
 	}
-	if rerr := s.releaseHold(context.WithoutCancel(r.Context()), op, actor(r)); rerr != nil {
-		var te *directory.TransitionError
-		if errors.As(rerr, &te) || errors.Is(rerr, directory.ErrConflict) {
-			// The commit won the race: the change is in force.
-			fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s committed its change before the cancellation reached it: %v", id, rerr)})
-			return
+	if nerr := notCancellable(op, ownerGone); nerr != nil {
+		fail(w, nerr)
+		return
+	}
+	fromNode, fromTerm := op.Node, op.OwnerTerm
+	ended, wrote, err := s.updateRecord(ctx, id, func(cur *Operation) error {
+		if cur.Node != fromNode || cur.OwnerTerm != fromTerm {
+			return refuse("operation %s was taken over by control node %s at owner term %d; retry the cancellation", id, cur.Node, cur.OwnerTerm)
 		}
-		fail(w, rerr)
-		return
-	}
-	ended, err := s.endRecord(context.WithoutCancel(r.Context()), id, func(op *Operation) error {
-		op.Status, op.Phase, op.Blockers, op.BlockerCount, op.AllowedActions = StatusCancelled, PhaseDone, nil, 0, []string{}
-		op.Error = &Error{Code: StatusCancelled, Message: "canceled by " + actor(r) + " before the change was committed; the routing is as it was before the operation"}
+		if nerr := notCancellable(cur, ownerGone); nerr != nil {
+			return nerr
+		}
+		cur.Status, cur.Phase, cur.Blockers, cur.BlockerCount, cur.AllowedActions = StatusCancelled, PhaseDone, nil, 0, []string{}
+		cur.EffectState = EffectNone
+		cur.Error = &Error{Code: StatusCancelled, Message: "canceled by " + actor(r) + " before the change was committed; the routing is as it was before the operation"}
 		return nil
 	})
 	if err != nil {
 		fail(w, err)
 		return
 	}
+	if !wrote {
+		if ended.Status == StatusCancelled {
+			writeJSON(w, http.StatusOK, ended.Public())
+			return
+		}
+		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has ended %s", id, ended.Status)})
+		return
+	}
 	s.markLost(id)
+	if ended.Barrier != nil {
+		carried, cerr := s.carriesBarrier(ctx, ended.Barrier.Scope, ended.Barrier.ID)
+		if cerr == nil && carried {
+			cerr = s.releaseHold(ctx, ended, actor(r))
+			var te *directory.TransitionError
+			if errors.As(cerr, &te) || errors.Is(cerr, directory.ErrConflict) {
+				carried, cerr = false, nil // cleared between the read and the release: by the commit
+			}
+		}
+		switch {
+		case cerr != nil:
+			fail(w, fmt.Errorf("%w: operation %s is canceled, but releasing its hold failed; retry the cancellation to release it: %w", ErrUnavailable, id, cerr))
+			return
+		case !carried && ended.Barrier.HoldVersion > 0:
+			// The hold was durable and is gone, and only its own commit clears it: the owner
+			// committed before this cancellation, and its record write was lost.
+			corrected, cerr := s.correctCommitted(ctx, id, actor(r))
+			if cerr != nil {
+				fail(w, cerr)
+				return
+			}
+			fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s committed its change before the cancellation reached it; the change is in force (%s)", id, corrected.Error.Message)})
+			return
+		}
+	}
 	s.info(actor(r), "operation canceled", "operation", id, "kind", op.Kind, "placement", op.Placement, "cluster", op.Cluster)
 	writeJSON(w, http.StatusOK, ended.Public())
+}
+
+// ownerGone reports whether op's owner has stopped running it: this node without a run of it, or
+// another node whose liveness in the control plane has lapsed.
+func (s *Server) ownerGone(ctx context.Context, op *Operation) (bool, error) {
+	if op.Node == s.node() {
+		return !s.runs(op.ID), nil
+	}
+	live, err := s.ops().OwnerLive(ctx, op.Node)
+	return !live, err
+}
+
+// releaseCanceled releases the hold a canceled record still carries: its cancellation ended the
+// record and then failed to release it. Nothing else can clear that hold; its owner has stopped.
+func (s *Server) releaseCanceled(ctx context.Context, op *Operation, actor string) error {
+	if op.Barrier == nil {
+		return nil
+	}
+	carried, err := s.carriesBarrier(ctx, op.Barrier.Scope, op.Barrier.ID)
+	if err != nil || !carried {
+		return err
+	}
+	err = s.releaseHold(ctx, op, actor)
+	var te *directory.TransitionError
+	if errors.As(err, &te) || errors.Is(err, directory.ErrConflict) {
+		return nil // released meanwhile
+	}
+	return err
+}
+
+// correctCommitted rewrites a record a cancellation ended while its commit had landed: the change
+// is in force, so the record says so (failed as asked, effect committed), and never canceled.
+func (s *Server) correctCommitted(ctx context.Context, id, actor string) (*Operation, error) {
+	for range 16 {
+		op, err := s.ops().Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if op == nil {
+			return nil, notFound("no operation %s", id)
+		}
+		if op.Barrier != nil {
+			op.Barrier.Committed = true
+		}
+		op.Status, op.EffectState = StatusFailed, EffectCommitted
+		op.Error = &Error{Code: CodeNotCancellable, Message: "the change was committed before " + actor + "'s cancellation reached it and is in force; a further change is a new operation"}
+		op.Sequence++
+		op.Updated = s.now().UTC()
+		err = s.ops().Update(ctx, op)
+		if err == nil {
+			s.info(actor, "cancellation found the change committed", "operation", id, "kind", op.Kind, "placement", op.Placement, "cluster", op.Cluster)
+			return op, nil
+		}
+		if !errors.Is(err, ErrStaleSequence) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("%w: operation %s kept changing while its record was corrected", ErrUnavailable, id)
 }
 
 // markLost tells a tracker on this node that its durable record was ended or taken over by
@@ -387,34 +567,40 @@ func (s *Server) markLost(id string) {
 	tr.mu.Unlock()
 }
 
-// endRecord writes a terminal state onto a record, over whatever the node running it wrote
-// meanwhile; a record that ended first is returned as it is.
+// endRecord writes onto an unfinished record, over whatever the node running it wrote meanwhile;
+// a record that ended first is returned as it is.
 func (s *Server) endRecord(ctx context.Context, id string, end func(*Operation) error) (*Operation, error) {
+	op, _, err := s.updateRecord(ctx, id, end)
+	return op, err
+}
+
+// updateRecord is endRecord, and reports whether its write landed (false: the record had ended).
+func (s *Server) updateRecord(ctx context.Context, id string, end func(*Operation) error) (*Operation, bool, error) {
 	for attempt := 0; attempt < 16; attempt++ {
 		op, err := s.ops().Get(ctx, id)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if op == nil {
-			return nil, notFound("no operation %s", id)
+			return nil, false, notFound("no operation %s", id)
 		}
 		if op.Terminal() {
-			return op, nil
+			return op, false, nil
 		}
 		if endErr := end(op); endErr != nil {
-			return nil, endErr
+			return nil, false, endErr
 		}
 		op.Sequence++
 		op.Updated = s.now().UTC()
 		err = s.ops().Update(ctx, op)
 		if err == nil {
-			return op, nil
+			return op, true, nil
 		}
 		if !errors.Is(err, ErrStaleSequence) {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return nil, fmt.Errorf("%w: operation %s kept changing under the cancellation; retry", ErrUnavailable, id)
+	return nil, false, fmt.Errorf("%w: operation %s kept changing under the request; retry", ErrUnavailable, id)
 }
 
 // resumeOperation is POST /v1/operations/{id}/resume: this node takes over an unfinished
@@ -537,7 +723,7 @@ func (s *Server) rerun(tr *tracker) (any, error) {
 // are written and their records say where they stand, so the node picks them up rather than
 // failing them (FailOrphans ends the rest).
 func (s *Server) ResumeOwn(ctx context.Context) error {
-	ops, err := s.ops().List(ctx, "", "", defaultOperationLimit)
+	ops, err := s.ops().Evidence(ctx)
 	if err != nil {
 		return err
 	}
@@ -596,8 +782,8 @@ type BlockerPage struct {
 	Complete  bool      `json:"complete"`
 }
 
-// blockerText is a blocker list for a log line or a message.
-func blockerText(bs []Blocker) string {
+// BlockerText is a blocker list in one line, for a log line, a message or the CLI.
+func BlockerText(bs []Blocker) string {
 	parts := make([]string, 0, len(bs))
 	for _, b := range bs {
 		p := b.Code

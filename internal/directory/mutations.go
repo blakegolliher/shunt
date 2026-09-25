@@ -83,12 +83,18 @@ func (f *File) SetState(tenant, bucket, from string, t Transition) error {
 // SetPlacementReadOnly updates the maintenance switch without changing migration state. barrier,
 // when read-only is switched on, is the drain barrier written with it (ADR-0021 D2): the flag is
 // the operator's wish, and the change is effective once every proxy has drained the mutations it
-// admitted before the flag. Switching off clears any barrier.
+// admitted before the flag. Switching off clears any barrier; switching off with a barrier id is
+// the release of that barrier's hold, refused with ErrConflict unless the placement carries it.
 func (f *File) SetPlacementReadOnly(tenant, bucket string, readOnly, reject bool, barrier string) error {
 	k := Key(tenant, bucket)
 	p, ok := f.Placements[k]
 	if !ok {
 		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if !readOnly && barrier != "" && (p.Barrier == nil || p.Barrier.ID != barrier) {
+		// A release of barrier's hold (a cancellation before its commit): only while the placement
+		// still carries that hold. Once its commit cleared it, the read-only is in force and stays.
+		return fmt.Errorf("%w: %s does not carry barrier %s", ErrConflict, k, barrier)
 	}
 	if p.ReadOnly == readOnly && p.RejectWrites == (readOnly && reject) && (barrier == "" || p.Barrier != nil) {
 		return fmt.Errorf("%w: %s read-only is already %t", ErrConflict, k, readOnly)
@@ -163,6 +169,9 @@ func (f *File) SetClusterReadOnly(name string, readOnly, reject bool, barrier st
 	c, ok := f.Clusters[name]
 	if !ok {
 		return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
+	}
+	if !readOnly && barrier != "" && (c.Barrier == nil || c.Barrier.ID != barrier) {
+		return fmt.Errorf("%w: cluster %s does not carry barrier %s", ErrConflict, name, barrier)
 	}
 	if c.ReadOnly == readOnly && c.RejectWrites == (readOnly && reject) && (barrier == "" || c.Barrier != nil) {
 		return fmt.Errorf("%w: cluster %s read-only is already %t", ErrConflict, name, readOnly)

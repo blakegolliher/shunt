@@ -101,50 +101,182 @@ func (s *Server) workerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The owner normally receives the heartbeat. Updating its tracker keeps phase/progress writes
-	// and worker sequence in one CAS stream. A different control node falls back to the durable
-	// record below; the owner's next write merges that worker-only update.
+	answer, err := s.applyWorker(r.Context(), id, func(*Operation) (WorkerHeartbeat, error) { return req, nil }, actor(r))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// applyWorker applies a worker heartbeat, built from the record as it stands, to an operation.
+// The owner normally receives it: updating its tracker keeps phase/progress writes and the worker
+// sequence in one CAS stream. A different control node falls back to the durable record; the
+// owner's next write merges that worker-only update.
+func (s *Server) applyWorker(ctx context.Context, id string, build func(*Operation) (WorkerHeartbeat, error), actor string) (WorkerHeartbeatAnswer, error) {
 	s.mu.Lock()
 	tr := s.running[id]
 	s.mu.Unlock()
 	if tr != nil {
-		worker, hold, err := tr.applyWorkerHeartbeat(req, actor(r))
+		op := tr.snapshot()
+		req, err := build(&op)
 		if err != nil {
-			fail(w, err)
-			return
+			return WorkerHeartbeatAnswer{}, err
 		}
-		writeJSON(w, http.StatusOK, WorkerHeartbeatAnswer{Worker: worker, Hold: hold})
-		return
-	}
-
-	for range 8 {
-		op, err := s.ops().Get(r.Context(), id)
+		worker, hold, err := tr.applyWorkerHeartbeat(req, actor)
 		if err != nil {
-			fail(w, err)
-			return
+			return WorkerHeartbeatAnswer{}, err
+		}
+		return WorkerHeartbeatAnswer{Worker: worker, Hold: hold}, nil
+	}
+	for range 8 {
+		op, err := s.ops().Get(ctx, id)
+		if err != nil {
+			return WorkerHeartbeatAnswer{}, err
 		}
 		if op == nil {
-			fail(w, fmt.Errorf("%w: operation %s", ErrUnknownOperation, id))
-			return
+			return WorkerHeartbeatAnswer{}, fmt.Errorf("%w: operation %s", ErrUnknownOperation, id)
 		}
-		worker, hold, err := s.nextWorker(op, req, actor(r))
+		req, err := build(op)
 		if err != nil {
-			fail(w, err)
-			return
+			return WorkerHeartbeatAnswer{}, err
+		}
+		worker, hold, err := s.nextWorker(op, req, actor)
+		if err != nil {
+			return WorkerHeartbeatAnswer{}, err
 		}
 		op.Worker = &worker
 		op.Sequence++
 		op.Updated = s.now().UTC()
-		if err = s.ops().Update(context.WithoutCancel(r.Context()), op); err == nil {
-			writeJSON(w, http.StatusOK, WorkerHeartbeatAnswer{Worker: worker, Hold: hold})
-			return
+		if err = s.ops().Update(context.WithoutCancel(ctx), op); err == nil {
+			return WorkerHeartbeatAnswer{Worker: worker, Hold: hold}, nil
 		}
 		if !errors.Is(err, ErrStaleSequence) {
-			fail(w, err)
-			return
+			return WorkerHeartbeatAnswer{}, err
 		}
 	}
-	fail(w, fmt.Errorf("%w: operation %s kept changing while its worker heartbeated", ErrUnavailable, id))
+	return WorkerHeartbeatAnswer{}, fmt.Errorf("%w: operation %s kept changing while its worker heartbeated", ErrUnavailable, id)
+}
+
+// syncWorker brings a tracker's copy of its worker session up to the durable record's, which a
+// heartbeat to another control node may have advanced: a resolution must follow the session's
+// latest sequence, or the owner's next write would merge it away.
+func (s *Server) syncWorker(ctx context.Context, id string) {
+	s.mu.Lock()
+	tr := s.running[id]
+	s.mu.Unlock()
+	if tr == nil {
+		return
+	}
+	stored, err := s.ops().Get(ctx, id)
+	if err != nil || stored == nil || stored.Worker == nil {
+		return
+	}
+	tr.mu.Lock()
+	if tr.op.Worker == nil || stored.Worker.Sequence > tr.op.Worker.Sequence {
+		w := *stored.Worker
+		tr.op.Worker = &w
+	}
+	tr.mu.Unlock()
+}
+
+// ResolveWorkerRequest is POST /v1/operations/{id}/resolve-worker: an operator's reconciliation
+// of an external mover whose worker session expired, or never enrolled, with work unresolved.
+// Session is the id `shunt operation show` prints for the record's worker; Attestation says how
+// the operator established that the worker's backend effects have ended.
+type ResolveWorkerRequest struct {
+	Session     string `json:"session"`
+	Attestation string `json:"attestation"`
+}
+
+// workerResolvable says why an external mover's record cannot be resolved now, or nil. A worker
+// still heartbeating ends itself; only a session that expired, is marked unresolved, or never
+// enrolled within its TTL is the operator's to resolve.
+func (s *Server) workerResolvable(op *Operation) error {
+	var args MoverRequest
+	if op.Kind != OpMover || json.Unmarshal(op.Args, &args) != nil || !args.External {
+		return refuse("operation %s is not an external mover; only an external mover's worker session is resolved", op.ID)
+	}
+	if op.Terminal() {
+		return refuse("operation %s has ended %s", op.ID, op.Status)
+	}
+	now := s.now()
+	switch w := op.Worker; {
+	case w == nil:
+		if now.Sub(op.Created) <= s.workerTTL() {
+			return refuse("operation %s's worker session has not enrolled yet; wait %s for it", op.ID, s.workerTTL())
+		}
+	case w.State == WorkerCompleted:
+		return refuse("worker session %s has completed; its operation ends with it", w.ID)
+	case w.State == WorkerActive && now.Sub(w.LastSeen) <= s.workerTTL():
+		return refuse("worker session %s is live (last heartbeat %s ago); it ends itself, or stop it and resolve it once it has expired", w.ID, now.Sub(w.LastSeen).Round(time.Millisecond))
+	}
+	return nil
+}
+
+// resolveWorker is POST /v1/operations/{id}/resolve-worker. The resolution is recorded on the
+// worker session with the actor and the attestation, and closes it: the mover's operation ends
+// failed (its copy did not finish), which frees the placement, and the evidence stays on the
+// record. It is refused for a worker that is still heartbeating.
+func (s *Server) resolveWorker(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req ResolveWorkerRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if !ValidWorkerSessionID(req.Session) {
+		fail(w, bad("session: want the worker session id `shunt operation show %s` prints", id))
+		return
+	}
+	if req.Attestation == "" || len(req.Attestation) > maxWorkerAttestation {
+		fail(w, bad("attestation: say how the worker's backend effects were established to have ended (1 to %d bytes)", maxWorkerAttestation))
+		return
+	}
+	who := actor(r)
+	s.syncWorker(r.Context(), id)
+	answer, err := s.applyWorker(r.Context(), id, func(op *Operation) (WorkerHeartbeat, error) {
+		if err := s.workerResolvable(op); err != nil {
+			return WorkerHeartbeat{}, err
+		}
+		seq := int64(1)
+		if op.Worker != nil {
+			seq = op.Worker.Sequence + 1
+		}
+		var gen int64
+		if op.Scope != nil {
+			gen = op.Scope.Generation
+		}
+		return WorkerHeartbeat{Session: req.Session, Identity: op.Identity, Generation: gen, Sequence: seq, Complete: true, Resolve: true,
+			Attestation: req.Attestation, Error: "worker session " + req.Session + " expired with its copy unfinished; resolved by " + who}, nil
+	}, who)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	s.info(who, "worker session resolved", "operation", id, "session", req.Session)
+	op, err := s.ops().Get(r.Context(), id)
+	if err != nil || op == nil {
+		writeJSON(w, http.StatusOK, WorkerHeartbeatAnswer{Worker: answer.Worker})
+		return
+	}
+	// A running owner ends the record at its next poll. One that is gone (its node restarted, or its
+	// liveness lapsed) never will: the record ends here, as the owner would have ended it.
+	if gone, gerr := s.ownerGone(r.Context(), op); gerr == nil && gone && !op.Terminal() {
+		if ended, eerr := s.endRecord(context.WithoutCancel(r.Context()), id, func(op *Operation) error {
+			if op.Worker == nil || op.Worker.State != WorkerCompleted {
+				return refuse("operation %s's worker session changed under the resolution; retry", id)
+			}
+			op.Status, op.Phase, op.Blockers, op.BlockerCount, op.AllowedActions = StatusFailed, PhaseDone, nil, 0, []string{}
+			op.Error = &Error{Code: "backend", Message: "external mover: " + op.Worker.Error}
+			if op.EffectState == "" {
+				op.EffectState = EffectNone
+			}
+			return nil
+		}); eerr == nil {
+			op = ended
+		}
+	}
+	writeJSON(w, http.StatusOK, op.Public())
 }
 
 func (tr *tracker) applyWorkerHeartbeat(req WorkerHeartbeat, actor string) (WorkerSession, bool, error) {
@@ -228,6 +360,18 @@ func (s *Server) runExternalMover(tr *tracker, key string, _ MoverRequest) (Move
 		if op == nil {
 			return MoverResult{}, fmt.Errorf("%w: operation %s", ErrUnknownOperation, tr.id())
 		}
+		if op.Terminal() || op.Node != s.node() || op.OwnerTerm != tr.snapshot().OwnerTerm {
+			tr.mu.Lock()
+			tr.lost = true
+			tr.mu.Unlock()
+			return MoverResult{}, tr.check()
+		}
+		// An operator can resolve the session once it is past its TTL (resolve-worker).
+		if s.workerResolvable(op) == nil {
+			tr.allow([]string{ActionResolveWorker})
+		} else {
+			tr.allow(nil)
+		}
 		worker := op.Worker
 		switch {
 		case worker == nil:
@@ -244,7 +388,7 @@ func (s *Server) runExternalMover(tr *tracker, key string, _ MoverRequest) (Move
 				Vanished: p.Vanished, Failed: p.Failed, Bytes: p.Bytes, Converged: p.Converged}, nil
 		case worker.State == WorkerUnresolved || s.now().Sub(worker.LastSeen) > s.workerTTL():
 			tr.blocked([]Blocker{{Code: BlockerWorkerUnresolved, Count: worker.Inflight + worker.Uncertain,
-				Message: fmt.Sprintf("worker session %s expired; resume and explicitly reconcile it before source cleanup", worker.ID)}})
+				Message: fmt.Sprintf("worker session %s expired with its work unresolved; once its backend effects are known to have ended, `shunt operation resolve-worker %s --session %s --attest <why>`", worker.ID, tr.id(), worker.ID)}})
 		case worker.Uncertain > 0:
 			tr.blocked([]Blocker{{Code: BlockerBackendOutcomeUnknown, Count: worker.Uncertain,
 				Message: fmt.Sprintf("worker session %s has backend effects whose outcome it did not learn", worker.ID)}})

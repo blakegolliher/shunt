@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { cancelOperation, listOperations, resumeOperation, unfinished } from '../api/client'
+import { cancelOperation, listOperations, resolveWorker, resumeOperation, unfinished } from '../api/client'
 import type { Operation } from '../api/client'
 import { Card } from '../components/Card'
 import { useStore } from '../store'
@@ -18,6 +18,13 @@ function Badge({ text, tone }: { text: string; tone?: string }) {
   return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold tracking-wide ${tone ?? 'border-ink-700 bg-ink-800 text-muted'}`}>{text}</span>
 }
 
+// workerSession is the external mover session an operation's record names: its worker's, or, for
+// a worker that never enrolled, the one its run was started with.
+function workerSession(op: Operation): string {
+  const fromArgs = op.args?.session
+  return op.worker?.id ?? (typeof fromArgs === 'string' ? fromArgs : '')
+}
+
 function scopeOf(op: Operation): string {
   return op.scope?.resource ?? (op.placement ? `placement:${op.placement}` : op.cluster ? `cluster:${op.cluster}` : '—')
 }
@@ -31,6 +38,7 @@ export function Operations() {
   const [error, setError] = useState('')
   const [selected, setSelected] = useState('')
   const [busy, setBusy] = useState(false)
+  const [attestation, setAttestation] = useState('')
   const fenceEvent = lastEvent?.type === 'fence' ? lastEvent.id : ''
   const act = async (fn: () => Promise<Operation>, done: (op: Operation) => string) => {
     setBusy(true)
@@ -76,7 +84,14 @@ export function Operations() {
           {current.blockers && current.blockers.length > 0 && <><dt className="text-muted">Blockers</dt><dd><ul>{current.blockers.map((b) => <li key={`${b.code}-${b.proxy_id ?? ''}`} className="font-mono text-xs">{b.code}{b.proxy_id ? ` ${b.proxy_id}` : ''}{b.message ? `: ${b.message}` : ''}</li>)}</ul></dd></>}
           {current.error && <><dt className="text-muted">Error</dt><dd role="alert" className="text-red-100">{current.error.code}: {current.error.message}</dd></>}
           {current.barrier && <><dt className="text-muted">Barrier</dt><dd className="text-xs">{current.barrier.kind} on <span className="font-mono">{current.barrier.scope}</span>{current.barrier.committed ? `, committed at version ${current.barrier.commit_version}` : current.barrier.hold_version ? `, held at version ${current.barrier.hold_version}, draining` : ', hold not written yet'}</dd></>}
-          <dt className="text-muted">Actions</dt><dd className="flex flex-wrap items-center gap-2 text-muted">{current.allowed_actions && current.allowed_actions.length > 0 ? current.allowed_actions.map((action) => <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : `${op.kind} cancelled; nothing changed`)} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
+          {current.worker && <><dt className="text-muted">Worker</dt><dd className="text-xs"><span className="font-mono">{current.worker.id}</span> {current.worker.state}, {current.worker.inflight ?? 0} in flight, {current.worker.uncertain ?? 0} uncertain{current.worker.resolved_by ? `; resolved by ${current.worker.resolved_by}: ${current.worker.attestation ?? ''}` : ''}</dd></>}
+          <dt className="text-muted">Actions</dt><dd className="flex flex-wrap items-center gap-2 text-muted">{current.allowed_actions && current.allowed_actions.length > 0 ? current.allowed_actions.map((action) => action === 'resolve-worker'
+            ? <form key={action} className="grid w-full gap-2" onSubmit={(event) => { event.preventDefault(); const session = workerSession(current); void act(() => resolveWorker(token, current.id, session, attestation.trim()), (op) => `worker session ${session} resolved; ${op.kind} ends and frees its bucket`).then(() => setAttestation('')) }}>
+              <label htmlFor="worker-attestation" className="text-xs text-muted">The worker session expired with its work unresolved. Once its process and backend requests are known to have ended, say how:</label>
+              <textarea id="worker-attestation" required value={attestation} onChange={(event) => setAttestation(event.target.value)} className="rounded-lg border border-ink-700 bg-ink-950 p-2 text-xs text-paper" rows={2} />
+              <button type="submit" disabled={busy || attestation.trim() === '' || workerSession(current) === ''} className="justify-self-start rounded-lg border border-red-500 px-3 py-1 text-xs font-semibold text-red-100">Resolve worker session</button>
+            </form>
+            : <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : `${op.kind} cancelled; nothing changed`)} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
           <dt className="text-muted">Actor</dt><dd className="font-mono text-xs">{current.actor}{current.node ? ` on ${current.node}` : ''}</dd>
           {current.request_id && <><dt className="text-muted">Request</dt><dd className="font-mono text-xs">{current.request_id}</dd></>}
         </dl>}
