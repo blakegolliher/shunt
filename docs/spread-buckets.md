@@ -16,9 +16,12 @@ any operator verb. The UI's Buckets screen does the same things; each section na
 - **Listings read every leg.** A listing takes as long as the slowest leg and fails if any leg is
   unreachable, since an answer without a leg would be silently incomplete.
 - **A leg down makes its share of the keys unavailable**, and every listing.
-- **Bucket-level requests** other than listing, HeadBucket and GetBucketLocation (versioning,
-  policy, lifecycle, DeleteBucket, ListMultipartUploads) answer `NotImplemented` on a spread
-  bucket: they would have to reach every leg.
+- **DeleteObjects** (batch delete) goes to every leg, and each key is answered by the leg that owns
+  it; during a move the move's source leg is sent it first (ADR-0018, "DeleteObjects on a spread
+  bucket"). A leg that fails the request fails it, and the client retries.
+- **Other bucket-level requests** than listing, HeadBucket, GetBucketLocation and DeleteObjects
+  (versioning, policy, lifecycle, DeleteBucket, ListMultipartUploads) answer `NotImplemented` on a
+  spread bucket: they would have to reach every leg.
 - **One move at a time per bucket.** Consolidating N legs is N−1 moves in sequence.
 
 ## Create one

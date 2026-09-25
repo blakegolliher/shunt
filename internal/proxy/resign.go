@@ -93,8 +93,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	if p.Spread() {
 		// A bucket spread over legs (ADR-0018 N2): a key's requests go to the leg that owns it, as a
-		// plain one-cluster bucket; listings merge every leg; a bucket-level request every leg answers
-		// alike goes to the first; any other would have to reach every leg, and is not supported yet.
+		// plain one-cluster bucket; listings merge every leg; DeleteObjects goes to every leg and
+		// answers each key from its owner; a bucket-level request every leg answers alike goes to the
+		// first; any other would have to reach every leg, and is not supported yet.
 		switch {
 		case info.Level == s3.LevelObject:
 			np, err := migrate.Narrow(p, info.Key)
@@ -109,6 +110,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		case info.Op == s3.OpHeadBucket || info.Op == s3.OpGetBucketLocation:
 			np := migrate.FirstLeg(p)
 			p = &np
+		case info.Op == s3.OpDeleteObjects:
+			h.spreadDeleteObjects(ctx, w, r, o, id, inBody, p, spreadRuntime{snap: snap, clusters: clusters})
+			return nil, false
 		default:
 			h.answer(w, r, o, s3.NotImplemented, fmt.Sprintf("%s is not supported on a bucket spread over %d backend buckets yet (ADR-0018).", info.Op, len(p.Legs)))
 			return nil, false

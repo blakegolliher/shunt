@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log/slog"
@@ -63,14 +65,16 @@ type fakeS3 struct {
 	vastAfter bool
 	cutList   int // > 0: listings promise a large Content-Length, send this many bytes, and die
 
-	ignoreINM     bool                 // accepts If-None-Match: * and overwrites anyway, as Garage 2.3.0 does
-	ignoreIfMatch bool                 // deletes whatever If-Match says, as a backend without conditional deletes does
-	noHistory     bool                 // keep no per-request record (seen, headers): long runs would hold every request
-	observe       func(backendEvent)   // called for every object request, with the lock held
-	before        func(*http.Request)  // called before a request is served, without the lock; set it under the lock
-	deleteStatus  int                  // > 0: every object DELETE fails with this status
-	mtime         map[string]time.Time // bucket/key -> when the object was last written
-	layout        map[string][][]byte  // bucket/key -> the parts it was written as, for a multipart object
+	ignoreINM     bool                // accepts If-None-Match: * and overwrites anyway, as Garage 2.3.0 does
+	ignoreIfMatch bool                // deletes whatever If-Match says, as a backend without conditional deletes does
+	noHistory     bool                // keep no per-request record (seen, headers): long runs would hold every request
+	observe       func(backendEvent)  // called for every object request, with the lock held
+	before        func(*http.Request) // called before a request is served, without the lock; set it under the lock
+	deleteStatus  int                 // > 0: every object DELETE fails with this status
+	// deleteObjectsStatus > 0: every DeleteObjects fails whole with this status.
+	deleteObjectsStatus int
+	mtime               map[string]time.Time // bucket/key -> when the object was last written
+	layout              map[string][][]byte  // bucket/key -> the parts it was written as, for a multipart object
 }
 
 // etagAt is the ETag the fake serves for one object: a multipart object carries the "-N" suffix S3
@@ -345,6 +349,37 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(f.buckets, bucket)
 		w.WriteHeader(http.StatusNoContent)
+	case key == "" && r.Method == http.MethodPost && q.Has("delete"):
+		// DeleteObjects, as S3 answers it: Content-MD5 required and checked, every named key
+		// reported deleted whether or not it existed, Quiet reporting errors only.
+		if f.deleteObjectsStatus > 0 {
+			f.fail(w, r, f.deleteObjectsStatus, "InternalError", bucket, "")
+			return
+		}
+		sum := md5.Sum(body) //nolint:gosec // G401: S3's Content-MD5
+		if r.Header.Get("Content-Md5") != base64.StdEncoding.EncodeToString(sum[:]) {
+			f.fail(w, r, 400, "InvalidDigest", bucket, "")
+			return
+		}
+		var req struct {
+			Quiet   bool `xml:"Quiet"`
+			Objects []struct {
+				Key string `xml:"Key"`
+			} `xml:"Object"`
+		}
+		if err := xml.Unmarshal(body, &req); err != nil || len(req.Objects) == 0 {
+			f.fail(w, r, 400, "MalformedXML", bucket, "")
+			return
+		}
+		_, _ = w.Write([]byte(`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`))
+		for _, o := range req.Objects {
+			delete(objs, o.Key)
+			f.wrote(bucket, o.Key)
+			if !req.Quiet {
+				fmt.Fprintf(w, `<Deleted><Key>%s</Key></Deleted>`, esc(o.Key))
+			}
+		}
+		_, _ = w.Write([]byte(`</DeleteResult>`))
 	case key == "" && r.Method == http.MethodHead:
 	case key == "" && q.Has("policy"):
 		_, _ = w.Write([]byte(`{"Version":"2012-10-17","Statement":[]}`))

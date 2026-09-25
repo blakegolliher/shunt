@@ -242,6 +242,11 @@ func createBody(cl *upstream.Cluster) []byte {
 // clusterDo sends a small request shunt originates itself (CreateBucket), signed with the
 // cluster's credentials, skipping endpoints that refuse the connection.
 func (h *Handler) clusterDo(ctx context.Context, cl *upstream.Cluster, method, path string, body []byte, o *outcome) (*http.Response, error) {
+	return h.clusterDoHeader(ctx, cl, method, path, body, nil, o)
+}
+
+// clusterDoHeader is clusterDo with extra headers, signed with the rest.
+func (h *Handler) clusterDoHeader(ctx context.Context, cl *upstream.Cluster, method, path string, body []byte, hdr http.Header, o *outcome) (*http.Response, error) {
 	sum := sha256.Sum256(body)
 	var lastErr error
 	for range cl.Endpoints {
@@ -252,6 +257,9 @@ func (h *Handler) clusterDo(ctx context.Context, cl *upstream.Cluster, method, p
 			return nil, err
 		}
 		req.Host = ep
+		for k, v := range hdr {
+			req.Header[k] = v
+		}
 		req.Header.Set("User-Agent", "")
 		req.Header.Set(telemetry.HeaderRequestID, o.rid)
 		appendVia(req.Header, h.Via)

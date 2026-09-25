@@ -56,6 +56,7 @@ traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bu
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
+- **2026-09-25, DeleteObjects on a spread bucket (ADR-0018 amended).** It answered `NotImplemented`, so warp, SDK batch deletes and `aws s3 rm --recursive` failed on a bucket spread over legs. The body, verified and bounded at 1 MiB, goes unchanged to every leg (the move's source first while a move is under way), and each key is answered by the leg that owns it. Proxy tests at rest and during a move fail without it; `FuzzParseDeleteResult` covers the answer parser. Confirmed with warp on the demo fleet.
 - **2026-09-25, resolve-worker is ordered by the record.** A worker heartbeat through a control
   node that does not run the mover moved the record past the owner's copy; `resolve-worker` on the
   owner then lost its compare-and-swap, the owner merged the older session over the resolution,
