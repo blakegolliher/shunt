@@ -89,7 +89,10 @@ A bucket spread over legs (ADR-0018 N2) has empty `primary` and `names` and a `l
 
 ### `GET /v1/placements/{tenant}/{bucket}`
 
-Returns `{"key", "placement", "clusters"}`: the placement as stored, plus the definitions of the clusters it names. `shunt migrate run` uses it to find what to copy and where. The definitions include `secret_ref`, never a secret.
+Returns `{"key", "placement", "clusters", "identity", "generation"}`: the placement as stored,
+the definitions of the clusters it names, and the lineage/generation an external mover session
+must bind. `shunt migrate run` uses it to find what to copy and where. The definitions include
+`secret_ref`, never a secret.
 
 ### `POST /v1/clusters`
 
@@ -252,6 +255,14 @@ A fenced change (see [The fleet](#the-fleet)); held when the ramp is below 1. En
 
 Sent by `shunt migrate run` every 1,000 objects and at the end of each pass. Refused if `source` and `primary` do not match the placement. Only counts and the cursor key are stored, in memory.
 
+Before copying, the CLI creates an external `mover` operation with a random session id and sends
+`POST /v1/operations/{id}/worker-heartbeat`. The heartbeat carries `session`, directory `identity`,
+placement `generation`, a strictly increasing `sequence`, and `inflight`/`uncertain` counts. A
+final heartbeat explicitly closes the clean session. The operation reserves the placement while
+the mover can still touch its source. If heartbeats stop for 5 seconds, it blocks as
+`worker_unresolved`; a later heartbeat cannot erase that interval unless it sets `resolve` with an
+operator attestation.
+
 ### `GET /v1/placements/{tenant}/{bucket}/mover-ledger[?limit=20]`
 
 Returns `{"entries": [...]}` from the append-only JSONL ledger on the control node that ran the
@@ -264,11 +275,15 @@ and can repeat the guarded mover there after failover.
 
 `{"window": "60s", "wait": "30s"}`
 
-A fenced change (see [The fleet](#the-fleet)). Enters `CUTOVER`, but only once both of these hold:
+A durable `mutations` barrier (see [The fleet](#the-fleet)). It closes and drains mutation
+admission before it enters `CUTOVER`, and only commits once all of these hold:
 - the placement is `MIGRATING` and its latest mover report is `converged` (a whole pass copied nothing and failed nothing);
-- the fallback-read counter for the bucket, summed over this proxy and every live member, does not move during `window`. Every member that was live at the start must report twice after the window ends; one that does not is refused by name, since a silent proxy is no evidence of quiet (ADR-0016).
+- no multipart upload remains open on the source (`multipart_open` otherwise);
+- the fallback-read counter for the bucket, summed over this proxy and every live member, does not move during `window`. Every member must report twice afterward from the same incarnation; a missing or restarted member is no evidence of quiet.
 
-The call blocks for the window. It records `{"at", "window", "fallback_reads"}` on the placement as `cutover`.
+The call records `{"at", "window", "fallback_reads"}` on the placement as `cutover`. A failed
+window is `202 blocked` with `old_requests`, not a rollback or a 409; it keeps measuring until it
+becomes quiet, or the operator cancels its precommit barrier.
 
 ### `POST /v1/placements/{tenant}/{bucket}/purge-source`
 
@@ -279,7 +294,12 @@ Deletes the source bucket, then returns the placement to `ACTIVE` on its primary
 - it carries `cutover` evidence;
 - a full listing of both buckets finds no source key that the primary lacks, each candidate confirmed by a HEAD that finds it absent on the primary and then present on the source. The refusal names the first 20 keys it finds.
 
-Once allowed, it aborts the source's in-progress multipart uploads, deletes every object and then the bucket, and applies `CUTOVER → ACTIVE`, which drops the source. It runs under an operation record whose `progress` counts the objects deleted.
+Once allowed, it installs a durable `source` barrier. That closes and drains source-dependent
+GET/LIST/copy-source work, delayed dual deletes and mover sessions before any destructive dispatch.
+Only then does it repeat the listing diff, abort the source's in-progress multipart uploads, delete
+every object and then the bucket, and atomically apply `CUTOVER → ACTIVE` while clearing the gate.
+It runs under an operation record whose `progress` counts the objects deleted. Cancellation is no
+longer offered once destructive dispatch has started.
 
 Returns `{"key", "source", "bucket", "objects_deleted", "uploads_aborted", "version", "operation"}`.
 
@@ -374,6 +394,7 @@ cluster or client secret; their secret-free response is recorded as `result`.
 | `sequence`, `owner_term` | how many times the record has been written; how many control-node owners it has had (incremented by resume) |
 | `allowed_actions`, `blockers`, `blocker_count` | `cancel` once a hold is durable and before it commits, `resume` after owner loss, and the complete named reasons a blocked operation waits |
 | `barrier` | the durable `id`, `scope`, gate `kind`, hold version and generation, and whether/where it committed; timestamps mark its hold, drain and commit boundaries |
+| `worker` | for an external mover: its session id, lineage/generation, heartbeat sequence, `active`/`unresolved`/`completed` state, bounded in-flight/uncertain counts and reconciliation evidence |
 | `phase` | where it is: `queued` (not started), `precondition` (waiting for every proxy to have the current version), `hold` (writing the hold), `drain` (the hold is durable; waiting for every gate), `commit` (writing the guarded change), `step` (a change needing no barrier), `settle` (the commit is written; waiting for every live proxy to have it), `mover`, `window`, `diff`, `purge`, or `done` |
 | `waiting_on` | the proxies the current phase waits for, by id, as they change |
 | `silent` | members past their lease reported while a committed version settles; silence never lets a precondition or drain barrier pass |
@@ -497,11 +518,11 @@ The cluster as `GET /v1/status` lists it, plus:
  "references": ["placements.default/data01"],
  "capabilities": {"conditional_write": {"value": true, "known": true}, "conditional_delete": {"value": false, "known": false}},
  "probe": {"reachable": true, "latency_ms": 3.2, "checked_at": "2026-09-22T12:00:00Z"},
- "secret": {"generation": "41", "installed": ["p1", "p2"], "pending": ["p3"], "silent": []}}
+ "secret": {"generation": "41", "installed": ["p1", "p2"], "pending": ["p3"], "silent": [], "held": ["p2"], "drained": false}}
 ```
 
 - `capabilities`: `known` is true when the definition states the capability (set by the operator, or measured by `expand`); `known: false` is the assumed default, which the UI marks as such.
-- `secret`: present when the cluster's secret is held by the control plane. `generation` is the directory version that last set it (a decimal string); `installed` lists live members reporting that generation, `pending` live members reporting an older one (or none), `silent` members whose lease has expired. Installed is not drained: in-flight requests may still sign with the previous secret.
+- `secret`: present when the cluster's secret is held by the control plane. `generation` is the directory version that last set it (a decimal string); `installed` lists live members reporting that generation, `pending` live members reporting an older one (or none), `silent` members whose lease has expired, and `held` live members whose retained request bundles can still sign with an older generation. `drained` becomes true only when pending, silent and held are all empty; keep the old backend key valid until then.
 - `probe`: one signed `ListBuckets` made for this answer, with a 2 s timeout; `error` says why it is not `reachable`.
 
 ### `GET /v1/placements/{tenant}/{bucket}/view`
@@ -585,6 +606,10 @@ raising the cap.
 ### `GET /v1/fleet/{id}`
 
 One proxy's install state (ADR-0021 D1): the member as `GET /v1/fleet` lists it, plus `{"directory", "current", "lineage", "behind", "backpressure", "secrets": [{"cluster", "want", "have", "current"}], "lease": {"granted", "seq", "seen", "age", "live"}, "problems": ["…"]}`. `lease` is the member's lease as the control plane grants it (T07): `granted` the TTL every heartbeat answer carries (nanoseconds), `seq` the last heartbeat recorded, `seen` when it arrived and `age` how long ago by the control node's clock, `live` whether the lease it renewed has expired. The member measures its own staleness from its send time, never from these; its own view is `/-/fleet`. `behind` is how many versions its requests are behind the directory (on the same lineage); `backpressure` is true when it has installed a newer version its requests do not use yet (more than eight retired runtime bundles held by long requests); `secrets` compares each control-held cluster secret's generation with the one the proxy signs with. `problems` says in words what is off: an unresolved incarnation (with the resolve command), retired, silent, another lineage, behind, backpressure, a restart cache that is not durable, a secret generation not installed, backend outcomes unknown in the running process, a retirement requested; empty when nothing is. 404 `not_found` for an unknown id. `shunt proxy show <id>`; the Control plane screen opens it from the proxy table.
+
+`secrets_held` is a bounded map of cluster name to retained request bundles that can still sign
+with an older secret generation. It is distinct from `secrets`: installation is not revocation-safe
+until the held counts reach zero.
 
 ### `POST /v1/fleet/{id}/retire`
 

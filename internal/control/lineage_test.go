@@ -162,7 +162,7 @@ func TestSecretStatus(t *testing.T) {
 	f := *d.Snapshot().File()
 	f.Generations = map[string]int64{"secret:vast01": 3}
 	ms := []Member{
-		{ID: "a", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}},
+		{ID: "a", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}, SecretsHeld: map[string]int64{"vast01": 1}},
 		{ID: "b", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "2"}},
 		{ID: "c", Live: false, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}},
 		{ID: "d", Live: true, Identity: lineageB, Secrets: map[string]string{"vast01": "9"}},
@@ -170,7 +170,8 @@ func TestSecretStatus(t *testing.T) {
 	s := &Server{Dir: d, Fleet: staticFleet{ms: ms}}
 	st := s.secretStatus(context.Background(), &f, "vast01")
 	if st == nil || st.Generation != "3" || len(st.Installed) != 1 || st.Installed[0] != "a" ||
-		len(st.Pending) != 2 || st.Pending[0] != "b" || st.Pending[1] != "d" || len(st.Silent) != 1 || st.Silent[0] != "c" {
+		len(st.Pending) != 2 || st.Pending[0] != "b" || st.Pending[1] != "d" || len(st.Silent) != 1 || st.Silent[0] != "c" ||
+		len(st.Held) != 1 || st.Held[0] != "a" || st.Drained {
 		t.Fatalf("secret status: %+v", st)
 	}
 	if s.secretStatus(context.Background(), &f, "untracked") != nil {

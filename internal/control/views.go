@@ -48,6 +48,8 @@ type SecretStatus struct {
 	Installed  []string `json:"installed"` // live members signing with this generation
 	Pending    []string `json:"pending"`   // live members still on an older one
 	Silent     []string `json:"silent"`    // members past their lease, not reporting
+	Held       []string `json:"held"`      // live members with requests still holding an older signer
+	Drained    bool     `json:"drained"`   // installed everywhere and no old signer can still be used
 }
 
 // secretStatus reads one cluster's secret generation across the fleet; nil when the directory
@@ -57,12 +59,16 @@ func (s *Server) secretStatus(ctx context.Context, f *directory.File, name strin
 	if gen == 0 {
 		return nil
 	}
-	st := &SecretStatus{Generation: strconv.FormatInt(gen, 10), Installed: []string{}, Pending: []string{}, Silent: []string{}}
+	st := &SecretStatus{Generation: strconv.FormatInt(gen, 10), Installed: []string{}, Pending: []string{}, Silent: []string{}, Held: []string{}}
 	ms, err := s.members(ctx)
 	if err != nil {
 		return st
 	}
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
+		if m.Retired() {
+			continue
+		}
 		have, _ := strconv.ParseInt(m.Secrets[name], 10, 64) //nolint:errcheck // absent or malformed counts as behind
 		switch {
 		case !m.Live:
@@ -72,7 +78,11 @@ func (s *Server) secretStatus(ctx context.Context, f *directory.File, name strin
 		default:
 			st.Pending = append(st.Pending, m.ID)
 		}
+		if m.Live && m.SecretsHeld[name] > 0 {
+			st.Held = append(st.Held, m.ID)
+		}
 	}
+	st.Drained = len(st.Pending) == 0 && len(st.Silent) == 0 && len(st.Held) == 0
 	return st
 }
 
@@ -200,7 +210,8 @@ func (s *Server) fenceStatus(ctx context.Context, p directory.Placement) FenceSt
 	if err != nil {
 		return fs
 	}
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		switch {
 		case !m.Live:
 			fs.Silent = append(fs.Silent, m.ID)

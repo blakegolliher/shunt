@@ -395,7 +395,7 @@ func (f *Fleet) Members(ctx context.Context) ([]control.Member, error) {
 			}
 			m := member(strings.TrimPrefix(key, kProxies))
 			m.Live, m.Applied, m.Seq, m.Started, m.Seen, m.FallbackReads = true, rec.Applied, rec.Seq, rec.Started, rec.Seen, rec.FallbackReads
-			m.Host, m.Version, m.Telemetry, m.Identity, m.Secrets, m.Durable = rec.Host, rec.Version, rec.Telemetry, rec.Identity, rec.Secrets, rec.Durable
+			m.Host, m.Version, m.Telemetry, m.Identity, m.Secrets, m.SecretsHeld, m.Durable = rec.Host, rec.Version, rec.Telemetry, rec.Identity, rec.Secrets, rec.SecretsHeld, rec.Durable
 			m.Installed, m.CacheError, m.Uncertain, m.Barriers = rec.Installed, rec.CacheError, rec.Uncertain, rec.Barriers
 			if !rec.Seen.IsZero() {
 				m.SinceSeen = now.Sub(rec.Seen)

@@ -89,11 +89,18 @@ a copied key could go stale. It refuses to start otherwise.
 
 The copy engine never runs on the proxy request path. `shunt migrate run` runs it in the CLI process,
 after asking the control API for the placement and cluster definitions and resolving their
-`secret_ref`s locally. The web UI starts the same engine as an operation on the control node; that
-node resolves the sealed cluster secrets it already owns and keeps its cursor and ledger under its
-data directory. In either form every pass is reported to the API, which is what `shunt status`, the
-migration screen, and `cutover` check. A control-node restart fails its running operation; repeat the
-mover safely, since its guards, cursor, and append-only ledger make the work resumable.
+`secret_ref`s locally. Before backend work it enrolls a random worker session in a durable mover
+operation, bound to the directory epoch and placement generation, and heartbeats while it runs.
+The operation reserves the placement until a final zero-in-flight heartbeat closes the session.
+If the CLI vanishes, the session expires as `worker_unresolved`; cutover and source destruction
+remain blocked until the same operation is resumed and the missing interval is explicitly
+reconciled. Ending a process is not itself proof that a dispatched backend request ended.
+
+The web UI starts the same engine as an operation on the control node; that node resolves the
+sealed cluster secrets it already owns and keeps its cursor and ledger under its data directory.
+In either form every pass is reported to the API, which is what `shunt status`, the migration
+screen, and `cutover` check. A control-node restart leaves its operation for reconciliation; repeat
+the mover safely, since its guards, cursor, and append-only ledger make the work resumable.
 
 ```sh
 shunt migrate run data --until-converged                   # passes until one copies nothing (max --max-passes 10)

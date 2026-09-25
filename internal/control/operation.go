@@ -152,6 +152,7 @@ type Operation struct {
 	Blockers       []Blocker       `json:"blockers,omitempty"`
 	BlockerCount   int             `json:"blocker_count,omitempty"`
 	Barrier        *BarrierState   `json:"barrier,omitempty"`
+	Worker         *WorkerSession  `json:"worker,omitempty"`
 	Phase          string          `json:"phase,omitempty"`
 	WaitingOn      []string        `json:"waiting_on,omitempty"`
 	Silent         []string        `json:"silent,omitempty"`
@@ -178,6 +179,10 @@ func (op *Operation) clone() *Operation {
 	if op.Barrier != nil {
 		b := *op.Barrier
 		c.Barrier = &b
+	}
+	if op.Worker != nil {
+		w := *op.Worker
+		c.Worker = &w
 	}
 	if op.Error != nil {
 		e := *op.Error
@@ -394,6 +399,21 @@ func (tr *tracker) put() {
 	tr.op.Sequence++
 	c := tr.op.clone()
 	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), c)
+	// Worker heartbeats are the one supported writer alongside an operation's owner. When one
+	// landed between this tracker's read and write, merge only that field and retry the owner's
+	// update over the new sequence. A changed owner/term remains a real takeover.
+	if errors.Is(err, ErrStaleSequence) {
+		stored, gerr := tr.s.ops().Get(context.WithoutCancel(tr.ctx), tr.op.ID)
+		if gerr == nil && stored != nil && stored.Node == tr.op.Node && stored.OwnerTerm == tr.op.OwnerTerm && !stored.Terminal() {
+			if stored.Worker != nil {
+				worker := *stored.Worker
+				tr.op.Worker = &worker
+			}
+			tr.op.Sequence = stored.Sequence + 1
+			c = tr.op.clone()
+			err = tr.s.ops().Update(context.WithoutCancel(tr.ctx), c)
+		}
+	}
 	switch {
 	case errors.Is(err, ErrStaleSequence):
 		tr.lost = true
@@ -689,6 +709,12 @@ func (s *Server) operate(tr *tracker, fn func(*tracker) (any, error)) <-chan out
 			}()
 			out.res, out.err = fn(tr)
 		}()
+		// A server shutdown is owner loss, not an operation failure. In particular, a durable
+		// hold must remain reserved for Sweep/resume rather than becoming terminal and leaving
+		// its directory barrier orphaned.
+		if out.err != nil && tr.ctx.Err() != nil && tr.barrierState() != nil {
+			out.err = errLost
+		}
 		tr.finish(out.res, out.err)
 		ch <- out
 	}()
@@ -784,6 +810,9 @@ func (s *Server) launch(actor string, req OperationRequest, async bool, meta req
 		}
 		if a.MaxPasses < 0 || a.MaxPasses > maxMoverPasses {
 			return nil, nil, bad("max_passes %d: want 1 through %d", a.MaxPasses, maxMoverPasses)
+		}
+		if _, err := parseWait(a.Wait); err != nil {
+			return nil, nil, err
 		}
 		key, err := s.placementKey(req.Placement)
 		if err != nil {

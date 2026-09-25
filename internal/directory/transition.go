@@ -105,6 +105,17 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	if t.Release {
 		return release(p, t.Barrier)
 	}
+	// A transition guarded by a standalone drain barrier (cutover or purge-source) may commit
+	// only while its own barrier is still installed. This is the directory-side half of the
+	// operation CAS: a concurrent cancellation that cleared the barrier wins, and the transition
+	// cannot land afterwards.
+	if t.Barrier != "" && !t.Hold && (p.Barrier == nil || p.Barrier.ID != t.Barrier) {
+		held := "no barrier"
+		if p.Barrier != nil {
+			held = "barrier " + p.Barrier.ID
+		}
+		return fail("the placement carries %s, not barrier %s", held, t.Barrier)
+	}
 	if !slices.Contains(States, t.To) {
 		return fail("unknown state %q; states are %s", t.To, strings.Join(States, ", "))
 	}
@@ -216,6 +227,9 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	}
 	if t.Complete || t.Hold {
 		np.Barrier = nil // a completed step's barrier is over; a new hold's is written below
+	}
+	if t.Barrier != "" && !t.Hold {
+		np.Barrier = nil // a standalone barrier ends atomically with its guarded transition
 	}
 	if t.Hold {
 		if t.Barrier != "" {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -51,6 +52,7 @@ type apiClient struct {
 	// id sends the same keys in the same order.
 	requestID string
 	mutations int
+	mu        sync.Mutex
 }
 
 func (o apiOptions) client() (*apiClient, error) {
@@ -89,8 +91,10 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	if method != http.MethodGet {
+		c.mu.Lock()
 		c.mutations++
 		req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("%s-%d", c.requestID, c.mutations))
+		c.mu.Unlock()
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

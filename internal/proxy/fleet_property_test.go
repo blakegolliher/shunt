@@ -196,6 +196,7 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
 	keeper.Served(mem.Snapshot())
 	mem.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }
+	mem.SecretsHeld = func() map[string]int64 { return rt.Stats().SecretsHeld }
 	mem.OnInstall = func(s *directory.Snapshot) {
 		if err := rt.Refresh(s, mem.Keys().Table(), set.Load()); err != nil {
 			t.Error(err)

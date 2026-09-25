@@ -55,7 +55,8 @@ func (s *Server) publishTelemetry(ms []Member) error {
 		return nil
 	}
 	in := make([]telemetry.MemberWindow, 0, len(ms))
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		in = append(in, telemetry.MemberWindow{ID: m.ID, Live: m.Live, Telemetry: m.Telemetry})
 	}
 	started := time.Now()

@@ -56,6 +56,10 @@ type Stats struct {
 	// Pending is the version of the newest bundle waiting for a retired one to drain, 0 when none.
 	// While it is set, installs are backpressured: the proxy serves Version.
 	Pending int64
+	// SecretsHeld counts retired bundles still held by requests whose signer generation for a
+	// cluster differs from the current bundle. A control-plane rotation may revoke the old key
+	// only after every member reports zero here.
+	SecretsHeld map[string]int64
 }
 
 // Publisher holds the current bundle. Acquire is an atomic load and a compare-and-swap, for every
@@ -72,13 +76,14 @@ type Publisher struct {
 	mu      sync.Mutex // serializes Publish and retirement
 	cur     atomic.Pointer[Bundle]
 	retired int
+	held    map[*Bundle]struct{}
 	pending *Bundle
 	limit   int
 }
 
 // NewPublisher returns a publisher holding b.
 func NewPublisher(b *Bundle) *Publisher {
-	p := &Publisher{limit: MaxRetired}
+	p := &Publisher{limit: MaxRetired, held: map[*Bundle]struct{}{}}
 	if b.Clusters != nil && !b.Clusters.Retain() {
 		panic("runtimecfg: the first bundle's cluster set is already released")
 	}
@@ -113,7 +118,15 @@ func (p *Publisher) Stats() Stats {
 }
 
 func (p *Publisher) statsLocked() Stats {
-	st := Stats{Version: p.cur.Load().Version(), Retired: p.retired}
+	cur := p.cur.Load()
+	st := Stats{Version: cur.Version(), Retired: p.retired, SecretsHeld: map[string]int64{}}
+	for old := range p.held {
+		for name := range cur.Snapshot.File().Clusters {
+			if old.Snapshot.File().Generation(directory.SecretResource(name)) != cur.Snapshot.File().Generation(directory.SecretResource(name)) {
+				st.SecretsHeld[name]++
+			}
+		}
+	}
 	if p.pending != nil {
 		st.Pending = p.pending.Version()
 	}
@@ -185,6 +198,7 @@ func (p *Publisher) swapLocked(b *Bundle) *Bundle {
 	}
 	old := p.cur.Swap(b)
 	p.retired++
+	p.held[old] = struct{}{}
 	p.observeLocked()
 	return old
 }
@@ -197,6 +211,7 @@ func (p *Publisher) drained(b *Bundle) {
 	}
 	p.mu.Lock()
 	p.retired--
+	delete(p.held, b)
 	var old, next *Bundle
 	if next = p.pending; next != nil {
 		p.pending = nil

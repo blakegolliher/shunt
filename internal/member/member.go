@@ -66,10 +66,13 @@ type Client struct {
 	// lags the installed one while installs are backpressured (ADR-0021 D1). Heartbeats report its
 	// version as applied, and its secret generations, so a fence never counts a version no request
 	// routes with yet. Unset: the installed snapshot.
-	Serving   func() *directory.Snapshot
-	Metrics   *telemetry.Metrics
-	Telemetry *telemetry.Collector
-	Now       func() time.Time
+	Serving func() *directory.Snapshot
+	// SecretsHeld reports retired runtime bundles whose requests can still sign with an older
+	// cluster secret generation. It is safety metadata in every heartbeat (ADR-0021 D2).
+	SecretsHeld func() map[string]int64
+	Metrics     *telemetry.Metrics
+	Telemetry   *telemetry.Collector
+	Now         func() time.Time
 
 	// installing serializes install: the poll, a heartbeat's fetch and a forwarded write each fetch
 	// on their own, and a slower older version must not be installed over a newer one.
@@ -447,6 +450,9 @@ func (c *Client) beat(ctx context.Context) error {
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
 		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File()),
 		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
+	if c.SecretsHeld != nil {
+		hb.SecretsHeld = c.SecretsHeld()
+	}
 	installedSnap := c.Snapshot()
 	if installed := installedSnap.Version(); installed > hb.Applied {
 		hb.Installed = installed

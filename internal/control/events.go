@@ -229,11 +229,13 @@ func (s *Server) fleetEvents(ms []Member) {
 	}
 	v := s.Dir.Snapshot().Version()
 	before := map[string]Member{}
-	for _, m := range prev {
-		before[m.ID] = m
+	for i := range prev {
+		m := &prev[i]
+		before[m.ID] = *m
 	}
 	seen := map[string]bool{}
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		seen[m.ID] = true
 		b, ok := before[m.ID]
 		switch {

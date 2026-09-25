@@ -15,6 +15,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/blakegolliher/shunt/internal/admission"
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 )
 
@@ -381,6 +382,127 @@ func TestLocalBarrierResumesAfterOwnerLoss(t *testing.T) {
 	p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
 	if p.Held() || p.Barrier != nil || p.Ramp == nil || p.Ramp.Ratio != 0.5 {
 		t.Fatalf("resumed ramp was not committed once: %+v", p)
+	}
+}
+
+func TestCutoverBarrierBlocksOpenSourceMultipartUpload(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{
+		Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true,
+	}, nil)
+
+	req, err := http.NewRequest(http.MethodPost, rg.vast01.srv.URL+"/data01/large?uploads", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create multipart upload: HTTP %d", resp.StatusCode)
+	}
+
+	var blocked Operation
+	if code, raw := rg.call(http.MethodPost, "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "0s", Wait: "0s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("cutover: want HTTP 202, got HTTP %d %s", code, raw)
+	}
+	if blocked.Status != StatusBlocked || !slices.ContainsFunc(blocked.Blockers, func(b Blocker) bool {
+		return b.Code == BlockerMultipartOpen && b.Count == 1
+	}) {
+		t.Fatalf("multipart cutover blocker: %+v", blocked)
+	}
+	var canceled Operation
+	rg.must(http.MethodPost, "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &canceled)
+	if canceled.Status != StatusCancelled {
+		t.Fatalf("cancel cutover: %+v", canceled)
+	}
+}
+
+func TestPurgeSourceBarrierDrainsLocalSourceWork(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.cutOver()
+	var dry PurgeDryRun
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Token == "" {
+		t.Fatalf("purge dry run: %+v", dry)
+	}
+
+	gates := admission.New()
+	previousInstall := rg.dir.OnInstall
+	rg.dir.OnInstall = func(snap *directory.Snapshot) {
+		closures, _ := admission.Barriers(snap)
+		gates.Apply(closures, false)
+		previousInstall(snap)
+	}
+	rg.ctl.LocalGates = gates
+	sleep, wake := wakingSleep()
+	rg.ctl.Sleep = sleep
+	token, _, ok := gates.Enter("acme/data01", admission.Source)
+	if !ok {
+		t.Fatal("source work was not admitted before the purge hold")
+	}
+
+	var blocked Operation
+	if code, raw := rg.call(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token, Wait: "0s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("purge: want HTTP 202, got HTTP %d %s", code, raw)
+	}
+	if blocked.Status != StatusBlocked || !slices.ContainsFunc(blocked.Blockers, func(b Blocker) bool {
+		return b.Code == BlockerOldRequests && b.ProxyID == "lab" && b.Count == 1
+	}) || blocked.Barrier == nil || blocked.Barrier.Kind != config.BarrierSource {
+		t.Fatalf("source drain blocker: %+v", blocked)
+	}
+	if ok, _ := rg.vast01.be.BucketExists("data01"); !ok {
+		t.Fatal("purge deleted the source before its source-dependent work drained")
+	}
+	token.Release(gates, admission.Definitive)
+	wake()
+	done := rg.await(blocked.ID)
+	if done.Status != StatusSucceeded || done.Barrier == nil || !done.Barrier.Committed {
+		t.Fatalf("purge after source drain: %+v", done)
+	}
+	if ok, _ := rg.vast01.be.BucketExists("data01"); ok {
+		t.Fatal("purge left the source bucket after the gate drained")
+	}
+}
+
+func TestPurgeDestructiveFailureKeepsReservationAndCannotCancel(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.cutOver()
+	var dry PurgeDryRun
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
+	if !dry.Allowed || dry.Token == "" {
+		t.Fatalf("purge dry run: %+v", dry)
+	}
+
+	listed := 0
+	rg.vast01.onList = func(string) {
+		listed++
+		if listed == 2 { // the diff repeated after the source barrier has drained
+			rg.vast01.reject = "AccessDenied"
+		}
+	}
+	sleep, wake := wakingSleep()
+	rg.ctl.Sleep = sleep
+	var blocked Operation
+	if code, raw := rg.call(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token, Wait: "0s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("purge: want HTTP 202, got HTTP %d %s", code, raw)
+	}
+	if blocked.Status != StatusBlocked || blocked.Barrier == nil || !blocked.Barrier.DispatchStarted ||
+		!slices.ContainsFunc(blocked.Blockers, func(b Blocker) bool { return b.Code == BlockerBackendOutcomeUnknown }) {
+		t.Fatalf("destructive purge blocker: %+v", blocked)
+	}
+	rg.answers(http.MethodPost, "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, http.StatusConflict, CodeNotCancellable)
+
+	rg.vast01.reject, rg.vast01.onList = "", nil
+	wake()
+	if done := rg.await(blocked.ID); done.Status != StatusSucceeded || done.Barrier == nil || !done.Barrier.Committed {
+		t.Fatalf("reconciled purge: %+v", done)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/blakegolliher/shunt/internal/auth"
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/upstream"
 )
@@ -128,6 +129,26 @@ func TestRetiredBound(t *testing.T) {
 	}
 	if last := seen[len(seen)-1]; last.Retired != 0 || last.Pending != 0 || last.Version != 21 {
 		t.Fatalf("observed last: %+v", last)
+	}
+}
+
+func TestSecretGenerationDrain(t *testing.T) {
+	makeBundle := func(version, generation int64) *Bundle {
+		f := &directory.File{Version: version, Identity: lineage, Clusters: map[string]config.Cluster{"vast01": {}},
+			Generations: map[string]int64{directory.SecretResource("vast01"): generation}}
+		return &Bundle{Snapshot: directory.NewSnapshot(f), Keys: auth.NewTable(nil), Clusters: upstream.NewRegistry(upstream.Options{}, nil).Load()}
+	}
+	p := NewPublisher(makeBundle(1, 1))
+	held := p.Acquire()
+	if err := p.Publish(makeBundle(2, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stats().SecretsHeld["vast01"]; got != 1 {
+		t.Fatalf("old secret held by %d bundles, want 1", got)
+	}
+	held.Release()
+	if got := p.Stats().SecretsHeld["vast01"]; got != 0 {
+		t.Fatalf("old secret still held by %d bundles after request ended", got)
 	}
 }
 

@@ -37,6 +37,10 @@ type BarrierState struct {
 	// cancellation is refused.
 	Committed     bool  `json:"committed,omitempty"`
 	CommitVersion int64 `json:"commit_version,omitempty"`
+	// DispatchStarted is the irreversible point of a destructive barrier such as purge-source.
+	// It is durable before the first backend delete, so cancellation cannot reopen admission while
+	// an owner (or a resumed owner) may still be deleting the source.
+	DispatchStarted bool `json:"dispatch_started,omitempty"`
 	// HeldAt, DrainedAt and CommittedAt are when each phase ended, for the duration metric.
 	HeldAt      time.Time `json:"held_at,omitzero"`
 	DrainedAt   time.Time `json:"drained_at,omitzero"`
@@ -116,15 +120,37 @@ func (s *Server) runBarrier(tr *tracker, b *barrier) error {
 			return err
 		}
 		start = s.now()
-		v, already, err := b.commit()
-		switch {
-		case errors.Is(err, errBarrierGone):
-			// Released by a cancellation between the last check and the write.
-			return errCanceled
-		case err != nil:
-			return err
-		case already:
-			s.info(tr.actor, "barrier commit found its change already written", "operation", tr.id(), "scope", b.scope)
+		var v int64
+		var already bool
+		var err error
+		for {
+			v, already, err = b.commit()
+			current := tr.barrierState()
+			switch {
+			case errors.Is(err, errBarrierGone):
+				// Released by a cancellation between the last check and the write.
+				return errCanceled
+			case err == nil:
+				tr.blocked(nil)
+				if already {
+					s.info(tr.actor, "barrier commit found its change already written", "operation", tr.id(), "scope", b.scope)
+				}
+			case current != nil && current.DispatchStarted:
+				// Destructive work may already have reached the backend. Ending the record would
+				// release its scope and strand the source hold. Keep the exact operation alive;
+				// its idempotent commit reconciles and retries from the remaining source state.
+				tr.blocked([]Blocker{{Code: BlockerBackendOutcomeUnknown, Message: err.Error()}})
+				if err = s.sleep(tr.ctx, s.fencePoll()); err != nil {
+					return fmt.Errorf("%w: reconciling destructive barrier commit: %w", ErrUnavailable, err)
+				}
+				if checkErr := tr.check(); checkErr != nil {
+					return checkErr
+				}
+				continue
+			default:
+				return err
+			}
+			break
 		}
 		st.Committed, st.CommitVersion, st.CommittedAt = true, v, s.now().UTC()
 		tr.setBarrier(st, nil)
@@ -280,7 +306,7 @@ func (s *Server) releaseHold(ctx context.Context, op *Operation, actor string) e
 		return s.Dir.SetPlacementReadOnly(ctx, tenant, bucket, false, false, id, actor)
 	case OpClusterReadOnly:
 		return s.Dir.SetClusterReadOnly(ctx, op.Cluster, false, false, id, actor)
-	case OpPurge:
+	case OpCutover, OpPurge:
 		return s.Dir.ClearBarrier(ctx, op.Barrier.Scope, id, actor)
 	}
 	return nil
@@ -314,6 +340,9 @@ func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	case op.Barrier.Committed:
 		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s committed its change at directory version %d; it settles, and a further change is a new operation", id, op.Barrier.CommitVersion)})
+		return
+	case op.Barrier.DispatchStarted:
+		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has started destructive backend work; it must be resumed to completion", id)})
 		return
 	case op.Kind == OpMover:
 		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: "a mover operation is stopped by stopping its worker; its record ends with the worker"})

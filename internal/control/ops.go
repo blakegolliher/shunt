@@ -993,58 +993,126 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
+	if p.State == directory.StateCutover && tr.barrierState() != nil {
+		return resultOf(key, directory.StateMigrating, p, f.Version), nil
+	}
 	if p.State != directory.StateMigrating {
 		return TransitionResult{}, refuse("%s is %s; cutover happens from MIGRATING", key, p.State)
 	}
-	if perr := s.precondition(tr); perr != nil {
-		return TransitionResult{}, perr
-	}
-	s.mu.Lock()
-	pr, reported := s.progress[key]
-	s.mu.Unlock()
 	pv := moving(p)
-	switch {
-	case !reported:
-		return TransitionResult{}, refuse("no mover has reported on %s to this proxy; run `shunt migrate run %s --until-converged` first", key, key)
-	case pr.Source != pv.ClusterOf(pv.Source) || pr.Primary != pv.ClusterOf(pv.Primary) || !pr.Converged:
-		return TransitionResult{}, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done)
+	if tr.barrierState() == nil {
+		if perr := s.precondition(tr); perr != nil {
+			return TransitionResult{}, perr
+		}
+		s.mu.Lock()
+		pr, reported := s.progress[key]
+		s.mu.Unlock()
+		switch {
+		case !reported:
+			return TransitionResult{}, refuse("no mover has reported on %s to this proxy; run `shunt migrate run %s --until-converged` first", key, key)
+		case pr.Source != pv.ClusterOf(pv.Source) || pr.Primary != pv.ClusterOf(pv.Primary) || !pr.Converged:
+			return TransitionResult{}, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done)
+		}
 	}
-	// The window counts fallback reads on this proxy and on every live member (ADR-0016).
-	before, beats, err := s.fleetFallbackReads(tr.ctx, key)
-	if err != nil {
+	var evidence *directory.CutoverEvidence
+	var res TransitionResult
+	tenant, bucket, _ := directory.SplitKey(key)
+	b := &barrier{scope: directory.PlacementResource(key), kind: config.BarrierMutations,
+		hold: func() (int64, error) {
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, err
+			}
+			cur := s.Dir.Snapshot().File()
+			cp, ok := cur.Placements[key]
+			if !ok {
+				return 0, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
+			}
+			if cp.Barrier != nil && cp.Barrier.ID == tr.id() {
+				return cur.Version, nil
+			}
+			if err := s.Dir.SetBarrier(tr.ctx, tenant, bucket, directory.Barrier{ID: tr.id(), Kind: config.BarrierMutations}, tr.actor); err != nil {
+				return 0, err
+			}
+			return s.Dir.Snapshot().Version(), nil
+		},
+		extra: func(ctx context.Context) ([]Blocker, error) {
+			cur, _, err := s.placementOf(key)
+			if err != nil {
+				return nil, err
+			}
+			mv := moving(cur)
+			n, err := s.uploadsInProgress(ctx, mv.ClusterOf(mv.Source), mv.Names[mv.Source], moveScope(cur))
+			if err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				return []Blocker{{Code: BlockerMultipartOpen, Count: int64(n), Message: fmt.Sprintf("the source still has %d multipart upload(s); cancel cutover to let them finish, or abort them before retrying", n)}}, nil
+			}
+			before, beats, err := s.fleetFallbackReads(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+			s.info(tr.actor, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before, "members", len(beats))
+			tr.phase(PhaseWindow)
+			seconds := int64(window / time.Second)
+			tr.progress(0, seconds, "seconds")
+			if sleepErr := s.sleep(ctx, window); sleepErr != nil {
+				return nil, sleepErr
+			}
+			tr.progress(seconds, seconds, "seconds")
+			missing, err := s.awaitReports(ctx, beats, wait)
+			if err != nil {
+				return nil, err
+			}
+			if len(missing) > 0 {
+				return []Blocker{{Code: BlockerProxyMissing, Count: int64(len(missing)), Message: fmt.Sprintf("proxies %s did not report from the same incarnation after the %s window", strings.Join(missing, ", "), window)}}, nil
+			}
+			after, _, err := s.fleetFallbackReads(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+			if after != before {
+				return []Blocker{{Code: BlockerOldRequests, Count: int64(after - before), Message: fmt.Sprintf("%v read(s) fell back to the source during the %s window; run the mover again", after-before, window)}}, nil
+			}
+			evidence = &directory.CutoverEvidence{At: s.now().UTC().Truncate(time.Second), Window: window, FallbackReads: after}
+			return nil, nil
+		},
+		commit: func() (int64, bool, error) {
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, false, err
+			}
+			cur := s.Dir.Snapshot().File()
+			cp, ok := cur.Placements[key]
+			if !ok {
+				return 0, false, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
+			}
+			if cp.State == directory.StateCutover {
+				res = resultOf(key, directory.StateMigrating, cp, cur.Version)
+				return cur.Version, true, nil
+			}
+			if cp.Barrier == nil || cp.Barrier.ID != tr.id() {
+				return 0, false, errBarrierGone
+			}
+			if evidence == nil {
+				return 0, false, fmt.Errorf("cutover evidence was not established")
+			}
+			r, err := s.transition(tr, key, cp, cur, directory.Transition{To: directory.StateCutover, Cutover: evidence, Barrier: tr.id()}, false, false)
+			if err != nil {
+				return 0, false, err
+			}
+			res = r
+			return r.Version, false, nil
+		}}
+	if err := s.runBarrier(tr, b); err != nil {
 		return TransitionResult{}, err
-	}
-	s.info(tr.actor, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before, "members", len(beats))
-	tr.phase(PhaseWindow)
-	seconds := int64(window / time.Second)
-	tr.progress(0, seconds, "seconds")
-	if serr := s.sleep(tr.ctx, window); serr != nil {
-		return TransitionResult{}, fmt.Errorf("%w: cutover window interrupted: %w", ErrUnavailable, serr)
-	}
-	tr.progress(seconds, seconds, "seconds")
-	silent, err := s.awaitReports(tr.ctx, beats, wait)
-	if err != nil {
-		return TransitionResult{}, fmt.Errorf("%w: cutover window interrupted: %w", ErrUnavailable, err)
-	}
-	if len(silent) > 0 {
-		return TransitionResult{}, refuse("proxies %s did not report after the %s window, so their reads are not evidence of quiet; run cutover again once they are back", strings.Join(silent, ", "), window)
-	}
-	after, _, err := s.fleetFallbackReads(tr.ctx, key)
-	if err != nil {
-		return TransitionResult{}, err
-	}
-	if after != before {
-		return TransitionResult{}, refuse("reads still fall back to the source of %s: %v fallback reads during the %s window; something the mover has not copied is still being read", key, after-before, window)
-	}
-	ev := &directory.CutoverEvidence{At: s.now().UTC().Truncate(time.Second), Window: window, FallbackReads: after}
-	tr.phase(PhaseStep)
-	res, err := s.transition(tr, key, p, f, directory.Transition{To: directory.StateCutover, Cutover: ev}, false, false)
-	if err != nil {
-		return res, err
 	}
 	s.settle(tr, &res, res.Version, wait)
 	res.Operation = tr.id()
-	s.logTransition(tr, "cutover", res, "window", window.String(), "fallback_reads", after)
+	fallbackReads := float64(0)
+	if evidence != nil {
+		fallbackReads = evidence.FallbackReads
+	}
+	s.logTransition(tr, "cutover", res, "window", window.String(), "fallback_reads", fallbackReads)
 	return res, nil
 }
 
@@ -1232,54 +1300,118 @@ func (s *Server) runPurge(tr *tracker, key string, req PurgeRequest) (PurgeResul
 	if err != nil {
 		return PurgeResult{}, err
 	}
-	// The cheap refusals first, so an operator hears about the state before the token; then the
-	// token's presence, before the fence and the listing diff are paid for; then its binding.
-	p, _, err := s.placementOf(key)
+	// The cheap refusals first, so an operator hears about the state before the token. On resume,
+	// the durable barrier proves those checks already passed; its source gate stays closed.
+	p, f, err := s.placementOf(key)
 	if err != nil {
 		return PurgeResult{}, err
+	}
+	if p.State == directory.StateActive && tr.barrierState() != nil {
+		return PurgeResult{Key: key, Version: f.Version, Operation: tr.id()}, nil
 	}
 	if serr := purgeState(key, p); serr != nil {
 		return PurgeResult{}, serr
 	}
-	if req.Token == "" {
+	if req.Token == "" && tr.barrierState() == nil {
 		return PurgeResult{}, s.checkToken("", "purge-source", [32]byte{})
 	}
 	plan, err := s.purgeChecks(tr, key, wait)
 	if err != nil {
 		return PurgeResult{}, err
 	}
-	if terr := s.checkToken(req.Token, "purge-source", purgeBinding(plan.f, plan.p)); terr != nil {
-		return PurgeResult{}, terr
-	}
-	p = plan.p
-	tr.phase(PhasePurge)
-	total := int64(plan.objects)
-	tr.progress(0, total, "objects")
-	progress := func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") }
-	var objects, uploads int
-	if plan.keep != nil {
-		objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.prefix, plan.keep, progress)
-	} else {
-		objects, uploads, err = plan.src.empty(tr.ctx, plan.srcBucket, progress)
-	}
-	if err != nil {
-		return PurgeResult{}, err
-	}
-	if plan.dropBucket {
-		if err := plan.src.deleteBucket(tr.ctx, plan.srcBucket); err != nil {
-			return PurgeResult{}, err
+	if tr.barrierState() == nil {
+		if terr := s.checkToken(req.Token, "purge-source", purgeBinding(plan.f, plan.p)); terr != nil {
+			return PurgeResult{}, terr
 		}
 	}
-	tr.phase(PhaseStep)
-	if _, err := s.transition(tr, key, p, plan.f, directory.Transition{To: directory.StateActive}, false, false); err != nil {
+	tenant, bucket, _ := directory.SplitKey(key)
+	var objects, uploads int
+	var version int64
+	b := &barrier{scope: directory.PlacementResource(key), kind: config.BarrierSource,
+		hold: func() (int64, error) {
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, err
+			}
+			cur := s.Dir.Snapshot().File()
+			cp := cur.Placements[key]
+			if cp.Barrier != nil && cp.Barrier.ID == tr.id() {
+				return cur.Version, nil
+			}
+			if err := s.Dir.SetBarrier(tr.ctx, tenant, bucket, directory.Barrier{ID: tr.id(), Kind: config.BarrierSource}, tr.actor); err != nil {
+				return 0, err
+			}
+			return s.Dir.Snapshot().Version(), nil
+		},
+		commit: func() (int64, bool, error) {
+			st := tr.barrierState()
+			if st == nil {
+				return 0, false, errBarrierGone
+			}
+			if !st.DispatchStarted {
+				st.DispatchStarted = true
+				tr.setBarrier(st, nil)
+				if err := tr.check(); err != nil {
+					return 0, false, err
+				}
+			}
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, false, err
+			}
+			cur := s.Dir.Snapshot().File()
+			cp, ok := cur.Placements[key]
+			if !ok {
+				return 0, false, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
+			}
+			if cp.State == directory.StateActive {
+				version = cur.Version
+				return version, true, nil
+			}
+			if cp.Barrier == nil || cp.Barrier.ID != tr.id() {
+				return 0, false, errBarrierGone
+			}
+			// Re-evaluate the diff after the source gate drained. The first check produced the
+			// confirmation; this one proves no retained source reader or mover changed the facts.
+			fresh, err := s.purgeChecks(tr, key, wait)
+			if err != nil {
+				return 0, false, err
+			}
+			plan = fresh
+			tr.phase(PhasePurge)
+			total := int64(plan.objects)
+			tr.progress(0, total, "objects")
+			progress := func(deleted int) { tr.progress(int64(deleted), max(total, int64(deleted)), "objects") }
+			if plan.keep != nil {
+				objects, uploads, err = plan.src.emptyRange(tr.ctx, plan.srcBucket, plan.prefix, plan.keep, progress)
+			} else {
+				objects, uploads, err = plan.src.empty(tr.ctx, plan.srcBucket, progress)
+			}
+			if err != nil {
+				return 0, false, err
+			}
+			if plan.dropBucket {
+				if deleteErr := plan.src.deleteBucket(tr.ctx, plan.srcBucket); deleteErr != nil {
+					return 0, false, deleteErr
+				}
+			}
+			tr.phase(PhaseCommit)
+			r, err := s.transition(tr, key, cp, cur, directory.Transition{To: directory.StateActive, Barrier: tr.id()}, false, false)
+			if err != nil {
+				return 0, false, err
+			}
+			version = r.Version
+			return version, false, nil
+		}}
+	if err := s.runBarrier(tr, b); err != nil {
 		return PurgeResult{}, err
 	}
 	s.forget(key)
-	v := s.Dir.Snapshot().Version()
-	pv := moving(p)
+	if version == 0 {
+		version = s.Dir.Snapshot().Version()
+	}
+	pv := moving(plan.p)
 	s.info(tr.actor, "source purged", "placement", key, "cluster", pv.ClusterOf(pv.Source), "bucket", plan.srcBucket, "objects_deleted", objects, "uploads_aborted", uploads,
-		"bucket_deleted", plan.dropBucket, "state", directory.StateActive, "primary", pv.ClusterOf(pv.Primary), "version", v)
-	return PurgeResult{Key: key, Source: pv.ClusterOf(pv.Source), Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, BucketDeleted: plan.dropBucket, Version: v, Operation: tr.id()}, nil
+		"bucket_deleted", plan.dropBucket, "state", directory.StateActive, "primary", pv.ClusterOf(pv.Primary), "version", version)
+	return PurgeResult{Key: key, Source: pv.ClusterOf(pv.Source), Bucket: plan.srcBucket, ObjectsDeleted: objects, UploadsAborted: uploads, BucketDeleted: plan.dropBucket, Version: version, Operation: tr.id()}, nil
 }
 
 // finish drops the source from a CUTOVER placement without touching its data.

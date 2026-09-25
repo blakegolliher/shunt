@@ -141,6 +141,14 @@
   },
   {
     "method": "POST",
+    "pattern": "/v1/operations/{id}/worker-heartbeat",
+    "verbs": [
+      "migrate run"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
     "pattern": "/v1/placements/{tenant}/{bucket}/create",
     "mutation": true
   },

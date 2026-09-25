@@ -52,8 +52,9 @@ func newProxyList() *cobra.Command {
 			_, _ = fmt.Fprintf(out, "directory version %d\n\n", fl.Version)
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "PROXY\tSTATE\tAPPLIED\tLAST HEARTBEAT")
-			for _, m := range fl.Members {
-				state, seen := memberState(m), ""
+			for i := range fl.Members {
+				m := &fl.Members[i]
+				state, seen := memberState(*m), ""
 				if !m.Seen.IsZero() {
 					seen = m.SinceSeen.Round(time.Second).String() + " ago" // the control node's clock, not this host's
 				} else {

@@ -19,6 +19,11 @@ type MoverRequest struct {
 	UntilConverged        bool `json:"until_converged,omitempty"`
 	MaxPasses             int  `json:"max_passes,omitempty"`
 	AcceptLostWriteWindow bool `json:"accept_lost_write_window,omitempty"`
+	// External enrolls an out-of-process mover under this operation. Session is drawn by the
+	// worker and bound to the operation's lineage and placement generation.
+	External bool   `json:"external,omitempty"`
+	Session  string `json:"session,omitempty"`
+	Wait     string `json:"wait,omitempty"`
 }
 
 // MoverRange is one bounded work range as shown by the UI. The current mover has one ordered
@@ -134,6 +139,12 @@ func (s *Server) checkMover(key string, req MoverRequest) error {
 	if !caps.ConditionalWriteOr(true) && !req.AcceptLostWriteWindow {
 		return refuse("%s", migrate.RefuseLostWriteWindow(key, dst))
 	}
+	if req.External {
+		if !ValidWorkerSessionID(req.Session) {
+			return bad("worker session %q: want 32 lowercase hexadecimal characters", req.Session)
+		}
+		return nil
+	}
 	if s.Mover == nil {
 		return fmt.Errorf("%w: this control node has no mover worker", ErrUnavailable)
 	}
@@ -151,6 +162,9 @@ func (s *Server) runMover(tr *tracker, key string, req MoverRequest) (MoverResul
 		req.MaxPasses = 1
 	}
 	tr.phase(PhaseMover)
+	if req.External {
+		return s.runExternalMover(tr, key, req)
+	}
 	return s.Mover(tr.ctx, key, req, func(p Progress) {
 		p.UpdatedAt = s.now().UTC()
 		if len(p.Ranges) == 0 {

@@ -160,6 +160,9 @@ type Heartbeat struct {
 	// strings: what it signs with since its last install (ADR-0021 D1). A cluster the control plane
 	// holds no secret for is absent.
 	Secrets map[string]string `json:"secrets,omitempty"`
+	// SecretsHeld counts retired runtime bundles still used by requests and carrying an older
+	// signer generation for each cluster. Zero/absent is the drain proof after rotation.
+	SecretsHeld map[string]int64 `json:"secrets_held,omitempty"`
 	// Barriers is the member's drain proof for every barrier in its installed directory
 	// (ADR-0021 D2): whether it has closed the barrier's gates, and how many requests are still
 	// out and how many backend outcomes it never learned through them. Bounded by barriers in
@@ -252,8 +255,9 @@ type Member struct {
 	Version       string             `json:"version,omitempty"` // the member's build
 	// Secrets is the secret generation of each cluster's signer on the member, from its last
 	// heartbeat (Heartbeat.Secrets).
-	Secrets   map[string]string `json:"secrets,omitempty"`
-	Telemetry *telemetry.Window `json:"telemetry,omitempty"`
+	Secrets     map[string]string `json:"secrets,omitempty"`
+	SecretsHeld map[string]int64  `json:"secrets_held,omitempty"`
+	Telemetry   *telemetry.Window `json:"telemetry,omitempty"`
 }
 
 // Has reports whether the member has installed version v of lineage id. A larger version from
@@ -371,7 +375,8 @@ func (s *Server) members(ctx context.Context) ([]Member, error) {
 	slices.SortFunc(ms, func(a, b Member) int { return strings.Compare(a.ID, b.ID) })
 	if s.Metrics != nil {
 		live := 0
-		for _, m := range ms {
+		for i := range ms {
+			m := &ms[i]
 			if m.Live {
 				live++
 			}
@@ -421,6 +426,12 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if hb.Uncertain < 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", "uncertain: want a non-negative count")
 		return
+	}
+	for name, held := range hb.SecretsHeld {
+		if name == "" || held < 0 || held > 4096 {
+			writeError(w, http.StatusBadRequest, "bad_request", "secrets_held: cluster names must be non-empty and counts between 0 and 4096")
+			return
+		}
 	}
 	if err := validateAcks(hb.Barriers); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -517,9 +528,10 @@ func (s *Server) answerMember(w http.ResponseWriter, r *http.Request, id string)
 		fail(w, err)
 		return
 	}
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		if m.ID == id {
-			writeJSON(w, http.StatusOK, MemberResult{Member: m, RetireRequested: m.RetireRequested})
+			writeJSON(w, http.StatusOK, MemberResult{Member: *m, RetireRequested: m.RetireRequested})
 			return
 		}
 	}
@@ -711,7 +723,12 @@ func waitingOn(ids []string) string {
 // fleetFallbackReads sums the fallback-read counter for key over this node and every live member,
 // as of each one's last heartbeat, and returns each live member's heartbeat sequence so a caller
 // can tell which have reported since.
-func (s *Server) fleetFallbackReads(ctx context.Context, key string) (total float64, seqs map[string]int64, err error) {
+type reportMark struct {
+	incarnation string
+	seq         int64
+}
+
+func (s *Server) fleetFallbackReads(ctx context.Context, key string) (total float64, seqs map[string]reportMark, err error) {
 	if s.Metrics != nil {
 		total = counters(s.Metrics.FallbackReads, key, "")[""]
 	}
@@ -719,35 +736,45 @@ func (s *Server) fleetFallbackReads(ctx context.Context, key string) (total floa
 	if err != nil {
 		return 0, nil, err
 	}
-	seqs = map[string]int64{}
-	for _, m := range ms {
+	seqs = map[string]reportMark{}
+	for i := range ms {
+		m := &ms[i]
 		if !m.Live {
 			continue
 		}
 		total += m.FallbackReads[key]
-		seqs[m.ID] = m.Seq
+		incarnation := ""
+		if m.Incarnation != nil {
+			incarnation = m.Incarnation.ID
+		}
+		seqs[m.ID] = reportMark{incarnation: incarnation, seq: m.Seq}
 	}
 	return total, seqs, nil
 }
 
 // awaitReports waits until every member in since has sent two more heartbeats: the second was put
 // together after the member had the answer to the first, so its counters are from after the call.
-func (s *Server) awaitReports(ctx context.Context, since map[string]int64, wait time.Duration) ([]string, error) {
+func (s *Server) awaitReports(ctx context.Context, since map[string]reportMark, wait time.Duration) ([]string, error) {
 	start := s.now()
 	for {
 		ms, err := s.members(ctx)
 		if err != nil {
 			return nil, err
 		}
-		seq := map[string]int64{}
-		for _, m := range ms {
+		seq := map[string]reportMark{}
+		for i := range ms {
+			m := &ms[i]
 			if m.Live {
-				seq[m.ID] = m.Seq
+				incarnation := ""
+				if m.Incarnation != nil {
+					incarnation = m.Incarnation.ID
+				}
+				seq[m.ID] = reportMark{incarnation: incarnation, seq: m.Seq}
 			}
 		}
 		var missing []string
-		for id, n := range since {
-			if cur, ok := seq[id]; !ok || cur < n+2 {
+		for id, mark := range since {
+			if cur, ok := seq[id]; !ok || cur.incarnation != mark.incarnation || cur.seq < mark.seq+2 {
 				missing = append(missing, id)
 			}
 		}

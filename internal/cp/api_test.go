@@ -392,10 +392,30 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	p2.reads.Store(3)
 	time.Sleep(150 * time.Millisecond)
 	go func() {
-		time.Sleep(100 * time.Millisecond)
-		p2.reads.Store(4) // a fallback read on p2 during the window
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ops, err := a.ops.List(context.Background(), "acme/data01", "", 10)
+			if err == nil {
+				for _, op := range ops {
+					if op.Kind == control.OpCutover && op.Phase == control.PhaseWindow {
+						p2.reads.Store(4) // a fallback read on p2 during the incarnation-bound window
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	}()
-	a.refused("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms"}, "still fall back")
+	var cutoverBlocked control.Operation
+	code, raw = a.call("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms", Wait: "500ms"}, &cutoverBlocked)
+	if code != http.StatusAccepted || cutoverBlocked.Status != control.StatusBlocked || !slices.ContainsFunc(cutoverBlocked.Blockers, func(b control.Blocker) bool { return b.Code == control.BlockerOldRequests }) {
+		t.Fatalf("cutover fallback blocker: HTTP %d %s", code, raw)
+	}
+	var cutoverCanceled control.Operation
+	a.must("POST", "/v1/operations/"+cutoverBlocked.ID+"/cancel", struct{}{}, &cutoverCanceled)
+	if cutoverCanceled.Status != control.StatusCancelled {
+		t.Fatalf("cancel cutover: %+v", cutoverCanceled)
+	}
 	time.Sleep(150 * time.Millisecond)
 	tr = control.TransitionResult{}
 	a.must("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "300ms"}, &tr)

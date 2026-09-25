@@ -85,6 +85,8 @@ type Server struct {
 	// LocalGates is a lab proxy's own admission accounting (ADR-0021 D2): with no members, the
 	// local proxy is what a barrier drains. nil on shunt-control, which serves no data.
 	LocalGates *admission.Gates
+	// WorkerTTL is how long an external mover heartbeat remains current. Zero uses 5 seconds.
+	WorkerTTL time.Duration
 
 	mu          sync.Mutex
 	progress    map[string]Progress // placement key → the mover's last report (in memory only)
@@ -633,9 +635,11 @@ func counters(vec *prometheus.CounterVec, bucket, label string) map[string]float
 // PlacementDetail is the answer to GET /v1/placements/{tenant}/{bucket}: what an out-of-process
 // mover needs to copy it.
 type PlacementDetail struct {
-	Key       string                    `json:"key"`
-	Placement directory.Placement       `json:"placement"`
-	Clusters  map[string]config.Cluster `json:"clusters"`
+	Key        string                    `json:"key"`
+	Placement  directory.Placement       `json:"placement"`
+	Clusters   map[string]config.Cluster `json:"clusters"`
+	Identity   directory.Identity        `json:"identity"`
+	Generation int64                     `json:"generation"`
 	// Secrets resolves the clusters' control: secret_refs, which only the control plane can, so a
 	// mover on another host can sign (ADR-0015). Empty on a lab proxy, whose refs are env:/file:.
 	Secrets map[string]string `json:"secrets,omitempty"`
@@ -646,7 +650,8 @@ func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	d := PlacementDetail{Key: key, Placement: p, Clusters: map[string]config.Cluster{}}
+	d := PlacementDetail{Key: key, Placement: p, Clusters: map[string]config.Cluster{}, Identity: f.Identity,
+		Generation: f.Generation(directory.PlacementResource(key))}
 	var secrets map[string]string
 	if s.ClusterSecrets != nil {
 		secrets = s.ClusterSecrets()

@@ -159,7 +159,8 @@ func newStatus() *cobra.Command {
 func printMembers(out io.Writer, ms []cp.MemberInfo) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "MEMBER\tPEER\tROLE\tSTATE")
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		role, state := "follower", "started"
 		if m.Leader {
 			role = "leader"
@@ -182,7 +183,8 @@ func printFleet(out io.Writer, ms []control.Member) {
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "PROXY\tSTATE\tAPPLIED\tLAST HEARTBEAT")
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		state, seen := "live", "-"
 		if !m.Live {
 			state = "SILENT"

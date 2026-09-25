@@ -347,14 +347,28 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 	if !pr.Converged {
 		t.Fatalf("a completed pass copying nothing is converged: %+v", pr)
 	}
-	rg.ctl.Sleep = func(context.Context, time.Duration) error {
-		rg.ctl.Metrics.FallbackReads.WithLabelValues("acme/data01").Inc()
+	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error {
+		if d == 5*time.Second {
+			rg.ctl.Metrics.FallbackReads.WithLabelValues("acme/data01").Inc()
+		}
 		return nil
 	}
-	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, "still fall back")
+	var blocked Operation
+	if code, raw := rg.call("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("cutover with fallback read: want HTTP 202, got HTTP %d %s", code, raw)
+	}
+	if blocked.Status != StatusBlocked || len(blocked.Blockers) != 1 || blocked.Blockers[0].Code != BlockerOldRequests || !slices.Contains(blocked.AllowedActions, ActionCancel) {
+		t.Fatalf("cutover with fallback read: %+v", blocked)
+	}
+	var canceled Operation
+	rg.must("POST", "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &canceled)
+	if canceled.Status != StatusCancelled {
+		t.Fatalf("canceled cutover: %+v", canceled)
+	}
+	waitNotRunning(t, rg.ctl, blocked.ID)
 	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error { rg.slept = append(rg.slept, d); return nil }
-	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, &tr)
-	if tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.Window != 5*time.Second || tr.Cutover.FallbackReads != 1 {
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, &tr)
+	if tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.Window != 5*time.Second || tr.Cutover.FallbackReads < 1 {
 		t.Fatalf("cutover: %+v", tr)
 	}
 

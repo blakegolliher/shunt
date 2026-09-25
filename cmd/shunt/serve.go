@@ -459,6 +459,7 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
 	keeper.Served(m.Snapshot())
 	m.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }
+	m.SecretsHeld = func() map[string]int64 { return rt.Stats().SecretsHeld }
 	m.OnInstall = func(s *directory.Snapshot) {
 		if err := rt.Refresh(s, m.Keys().Table(), registry.Load()); err != nil {
 			log.Error("runtime bundle not published", "err", err.Error())
