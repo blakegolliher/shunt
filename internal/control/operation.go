@@ -154,6 +154,7 @@ type Operation struct {
 	BlockerCount   int             `json:"blocker_count,omitempty"`
 	Barrier        *BarrierState   `json:"barrier,omitempty"`
 	Worker         *WorkerSession  `json:"worker,omitempty"`
+	Member         *JoinMember     `json:"member,omitempty"` // a join's learner, once added
 	Phase          string          `json:"phase,omitempty"`
 	WaitingOn      []string        `json:"waiting_on,omitempty"`
 	Silent         []string        `json:"silent,omitempty"`
@@ -180,6 +181,10 @@ func (op *Operation) clone() *Operation {
 	if op.Barrier != nil {
 		b := *op.Barrier
 		c.Barrier = &b
+	}
+	if op.Member != nil {
+		m := *op.Member
+		c.Member = &m
 	}
 	if op.Worker != nil {
 		w := *op.Worker
@@ -481,6 +486,14 @@ func (tr *tracker) put() {
 			tr.s.Log.Warn("operation record not written", "operation", tr.op.ID, "kind", tr.op.Kind, "err", err.Error())
 		}
 	}
+}
+
+// setMember puts a join's learner on its record, durably, before anything depends on it.
+func (tr *tracker) setMember(m *JoinMember) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.op.Member = m
+	tr.put()
 }
 
 func (tr *tracker) phase(p string) {
@@ -957,8 +970,20 @@ func (s *Server) launch(actor string, req OperationRequest, async bool, meta req
 		return start(s.placementOp(key), a, func(tr *tracker) (any, error) {
 			return s.runPlacementReadOnly(tr, key, a)
 		})
+	case OpControlJoin:
+		var a JoinRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if s.Members == nil {
+			return nil, nil, notFound("this server has no control-plane membership to join")
+		}
+		if err := checkJoin(&a); err != nil {
+			return nil, nil, err
+		}
+		return start(s.membersOp(), a, func(tr *tracker) (any, error) { return s.runJoin(tr, a) })
 	}
-	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only", req.Kind)
+	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only, control-join", req.Kind)
 }
 
 // serveOperation runs an action for its own route and answers with its outcome, as the route did
@@ -1090,7 +1115,7 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Terminal() || (resumable(op.Kind) && op.Barrier != nil) {
+		if op.Node != s.node() || op.Terminal() || carriesOn(op) {
 			continue
 		}
 		orphan(op, s.now().UTC(), "the control node running this operation restarted before it finished; repeat the step to complete it")
@@ -1117,7 +1142,7 @@ func Orphan(op *Operation, now time.Time, why string) { orphan(op, now, why) }
 func orphan(op *Operation, now time.Time, why string) {
 	op.Sequence++
 	op.Updated = now
-	if resumable(op.Kind) && op.Barrier != nil {
+	if carriesOn(op) {
 		op.Status = StatusBlocked
 		op.Blockers = []Blocker{{Code: BlockerOwnerLost, Message: why}}
 		op.BlockerCount = 1

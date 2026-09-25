@@ -619,8 +619,8 @@ func (s *Server) resumeOperation(w http.ResponseWriter, r *http.Request) {
 	case op.Terminal():
 		fail(w, refuse("operation %s has ended %s; a change is a new operation", id, op.Status))
 		return
-	case !resumable(op.Kind) || op.Barrier == nil:
-		fail(w, refuse("operation %s (%s) has no durable barrier to resume; repeat a short operation that lost its node", id, op.Kind))
+	case !carriesOn(op):
+		fail(w, refuse("operation %s (%s) has no durable state to resume from; repeat a short operation that lost its node", id, op.Kind))
 		return
 	}
 	if s.runs(id) {
@@ -667,6 +667,12 @@ func (s *Server) resumeOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 // resumable reports whether an operation of this kind can be carried on from its record.
+// carriesOn reports whether a record whose owner is gone is resumed rather than failed: a barrier
+// operation once its barrier is on the record, and a join, whose intent is on it from the start.
+func carriesOn(op *Operation) bool {
+	return (resumable(op.Kind) && op.Barrier != nil) || op.Kind == OpControlJoin
+}
+
 func resumable(kind string) bool {
 	switch kind {
 	case OpRamp, OpMigrate, OpPlacementReadOnly, OpClusterReadOnly, OpCutover, OpPurge:
@@ -715,6 +721,15 @@ func (s *Server) rerun(tr *tracker) (any, error) {
 			return nil, err
 		}
 		return s.runPurge(tr, op.Placement, a)
+	case OpControlJoin:
+		var a JoinRequest
+		if err := decodeArgs(op.Args, &a); err != nil {
+			return nil, err
+		}
+		if s.Members == nil {
+			return nil, refuse("operation %s is a control-plane join; this server has no membership to change", op.ID)
+		}
+		return s.runJoin(tr, a)
 	}
 	return nil, refuse("operation %s (%s) is not resumable", op.ID, op.Kind)
 }
@@ -729,7 +744,7 @@ func (s *Server) ResumeOwn(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Terminal() || !resumable(op.Kind) || op.Barrier == nil || s.runs(op.ID) {
+		if op.Node != s.node() || op.Terminal() || !carriesOn(op) || s.runs(op.ID) {
 			continue
 		}
 		fromNode, fromTerm := op.Node, op.OwnerTerm

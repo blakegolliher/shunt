@@ -3,33 +3,17 @@ package cp
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 )
 
 // The control plane's own routes, beside the control API (ADR-0015): the etcd lifecycle wrapped
 // so an operator never sees an etcd flag. Mounted by shunt-control under /v1/control/ on the
 // same listener and token as /v1/.
-
-// JoinRequest is `shunt-control join`: add a member and hand it what it needs to start.
-type JoinRequest struct {
-	Name    string `json:"name"`
-	PeerURL string `json:"peer_url"`
-}
-
-// JoinAnswer is what a joining node starts with. The data-encryption key crosses the control
-// channel here, which is why the channel must be marked plaintext until TLS lands.
-type JoinAnswer struct {
-	InitialCluster string `json:"initial_cluster"`
-	EncryptionKey  []byte `json:"encryption_key"`
-}
 
 // StatusAnswer is `shunt-control status` and GET /v1/control: the etcd cluster and the fleet in
 // one answer, with what a new node needs to join (ADR-0017).
@@ -66,6 +50,9 @@ type API struct {
 	Fleet   *Fleet
 	Cipher  *Cipher
 	Version string
+	// Control runs a join as an operation record (ADR-0021 D4): the routes below hand it the join
+	// and its bootstrap.
+	Control *control.Server
 	// Join is the join command line shunt-control renders from its own flags.
 	Join string
 }
@@ -76,7 +63,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/control", a.status)
 	mux.HandleFunc("GET /v1/control/{$}", a.status)
 	mux.HandleFunc("GET /v1/control/status", a.status)
-	mux.HandleFunc("POST /v1/control/members", a.join)
+	mux.HandleFunc("POST /v1/control/members", a.Control.ServeJoin)
+	mux.HandleFunc("POST /v1/control/joins/{id}/bootstrap", a.Control.ServeJoinBootstrap)
 	mux.HandleFunc("DELETE /v1/control/members/{name}", a.removeMember)
 	mux.HandleFunc("GET /v1/control/snapshot", a.snapshot)
 	mux.HandleFunc("POST /v1/control/defrag", a.defrag)
@@ -92,6 +80,7 @@ func Routes() []control.Route {
 		{Method: "GET", Pattern: "/v1/control/{$}", Verbs: status},
 		{Method: "GET", Pattern: "/v1/control/status", Verbs: status},
 		{Method: "POST", Pattern: "/v1/control/members", Verbs: []string{"join"}, Mutation: true},
+		{Method: "POST", Pattern: "/v1/control/joins/{id}/bootstrap", Verbs: []string{"join"}, Mutation: true},
 		{Method: "DELETE", Pattern: "/v1/control/members/{name}", Verbs: []string{"member remove"}, Mutation: true},
 		{Method: "GET", Pattern: "/v1/control/snapshot", Verbs: []string{"snapshot save"}},
 		{Method: "POST", Pattern: "/v1/control/defrag", Verbs: []string{"defrag"}, Mutation: true},
@@ -153,32 +142,6 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		ans.Fleet = fleet
 	}
 	writeJSON(w, http.StatusOK, ans)
-}
-
-func (a *API) join(w http.ResponseWriter, r *http.Request) {
-	var req JoinRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "request body: "+err.Error())
-		return
-	}
-	if !config.ValidProxyID(req.Name) {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("member name %q: want 1-64 letters, digits, '.', '_' or '-'", req.Name))
-		return
-	}
-	if u, err := url.Parse(req.PeerURL); err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("peer URL %q: want http://host:port", req.PeerURL))
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
-	defer cancel()
-	initial, err := a.Node.MemberAdd(ctx, req.Name, req.PeerURL)
-	if err != nil {
-		writeError(w, http.StatusConflict, "refused", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, JoinAnswer{InitialCluster: initial, EncryptionKey: a.Cipher.Key()})
 }
 
 func (a *API) removeMember(w http.ResponseWriter, r *http.Request) {

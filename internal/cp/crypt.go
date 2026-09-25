@@ -124,17 +124,52 @@ func WriteKey(dataDir string, key []byte) error {
 		return fmt.Errorf("data-encryption key: want 32 bytes, got %d", len(key))
 	}
 	path := filepath.Join(dataDir, keyFile)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // the node's own data directory
+	if cur, err := os.ReadFile(path); err == nil { //nolint:gosec // the node's own data directory
+		// A join that saved its bootstrap and stopped before etcd started writes it again.
+		if strings.TrimSpace(string(cur)) == hex.EncodeToString(key) {
+			return nil
+		}
+		return fmt.Errorf("%s holds a different data-encryption key: this data directory belongs to another cluster", path)
+	}
+	return WritePrivate(path, []byte(hex.EncodeToString(key)+"\n"))
+}
+
+// WritePrivate replaces path with data, readable by its owner alone (0600): a temporary file in the
+// same directory, fsynced, renamed over path, and the directory fsynced. A crash leaves the old file
+// or the new one, never a torn secret.
+func WritePrivate(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteString(hex.EncodeToString(key) + "\n"); err != nil {
-		_ = f.Close()
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }() // gone after the rename; left by a failure otherwise
+	if werr := writeSynced(tmp, data); werr != nil {
+		return werr
+	}
+	if rerr := os.Rename(name, path); rerr != nil {
+		return rerr
+	}
+	d, err := os.Open(dir) //nolint:gosec // the node's own data directory
+	if err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
+	defer d.Close() //nolint:errcheck // read-only handle; Sync's error is the one that matters
+	return d.Sync()
+}
+
+// writeSynced makes f private, writes data, syncs and closes it.
+func writeSynced(f *os.File, data []byte) error {
+	err := f.Chmod(0o600)
+	if err == nil {
+		_, err = f.Write(data)
 	}
-	return f.Close()
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

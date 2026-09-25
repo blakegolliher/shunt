@@ -75,6 +75,9 @@ type Server struct {
 	// ConfirmKey keys the confirmation tokens dry runs issue; every control node shares one.
 	// Empty: a random key for this process, so a lab's tokens die with it.
 	ConfirmKey []byte
+	// Members is the control plane's own etcd membership, which a join changes (ADR-0021 D4). nil:
+	// a lab proxy, which has none.
+	Members *Membership
 	// Mover runs the copy engine for a browser-started mover operation. It is installed at the
 	// process edge and never runs in a proxy request handler.
 	Mover MoverRunner

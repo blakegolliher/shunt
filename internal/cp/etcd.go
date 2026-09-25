@@ -17,6 +17,8 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
 	"go.uber.org/zap"
+
+	"github.com/blakegolliher/shunt/internal/control"
 )
 
 // The embedded etcd member (ADR-0015). shunt-control runs one per control node. There is no
@@ -114,7 +116,7 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 	ec.LogOutputs = []string{"stderr"}
 	// A member joining right after it was added can find the cluster's member list not yet
 	// settled ("incompatible with current running cluster"); it is a matter of seconds. It joins as
-	// a learner (MemberAdd), so the members it asks keep their quorum and can answer it.
+	// a learner (AddLearner), so the members it asks keep their quorum and can answer it.
 	var e *embed.Etcd
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -200,48 +202,43 @@ func (n *Node) Close() {
 // Err reports the member's fatal errors, if any.
 func (n *Node) Err() <-chan error { return n.e.Err() }
 
-// MemberAdd adds a member at peerURL as a learner and returns the initial-cluster string it must
-// start with. The name is the caller's; etcd learns it when the member starts. A learner does not
-// vote, so adding it leaves the quorum as it was: added as a voter, a second member would make the
-// first alone short of quorum, unable to answer the new member's own startup checks, and the join
-// would hang on them for seconds or fail ("incompatible with current running cluster"). The member
-// promotes itself once it has caught up (promote).
-func (n *Node) MemberAdd(ctx context.Context, name, peerURL string) (string, error) {
-	for _, m := range n.e.Server.Cluster().Members() {
-		if m.Name == name {
-			return "", fmt.Errorf("a member named %s already exists (peer %s); remove it first, or choose another name", name, strings.Join(m.PeerURLs, ","))
-		}
+// ListMembers is the member list, read linearizably: a membership change needs quorum, and a join
+// reconciles against it (ADR-0021 D4).
+func (n *Node) ListMembers(ctx context.Context) ([]control.EtcdMember, error) {
+	ml, err := n.cli.MemberList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("etcd member list: %w", err)
 	}
+	out := make([]control.EtcdMember, 0, len(ml.Members))
+	for _, m := range ml.Members {
+		out = append(out, control.EtcdMember{ID: m.ID, Name: m.Name, PeerURLs: m.PeerURLs, Learner: m.IsLearner})
+	}
+	return out, nil
+}
+
+// AddLearner adds a non-voting member at peerURL and returns its ID. A learner does not vote, so
+// adding it leaves the quorum as it was: added as a voter, a second member would make the first
+// alone short of quorum, unable to answer the new member's own startup checks. The member promotes
+// itself once it has caught up (promote). etcd refuses a second member with the same peer URL, which
+// is what lets a join retry an add whose answer was lost.
+func (n *Node) AddLearner(ctx context.Context, peerURL string) (uint64, error) {
 	// etcd refuses a membership change while a member it already has is not yet caught up
 	// ("unhealthy cluster"), which is the normal state for a few seconds after the previous join.
-	var resp *clientv3.MemberAddResponse
-	var err error
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		resp, err = n.cli.MemberAddAsLearner(ctx, []string{peerURL})
-		if err == nil || !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
-			break
+		resp, err := n.cli.MemberAddAsLearner(ctx, []string{peerURL})
+		if err == nil {
+			return resp.Member.ID, nil
+		}
+		if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
+			return 0, fmt.Errorf("etcd member add: %w", err)
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return 0, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("etcd member add: %w", err)
-	}
-	parts := make([]string, 0, len(resp.Members))
-	for _, m := range resp.Members {
-		mn := m.Name
-		if m.ID == resp.Member.ID {
-			mn = name // not started yet: etcd does not know its name
-		}
-		for _, u := range m.PeerURLs {
-			parts = append(parts, mn+"="+u)
-		}
-	}
-	return strings.Join(parts, ","), nil
 }
 
 // MemberInfo is one control node as `shunt-control member list` shows it.

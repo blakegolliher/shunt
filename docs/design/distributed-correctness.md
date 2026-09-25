@@ -576,6 +576,18 @@ warning if it cannot. This removed the intermittent `internal/cp` test failure
 remains for D4/T12 is everything durable below: the persisted join intent and its
 phases, reconciling a lost add response, resume and cancel, and removal by ID.
 
+**Landed (2026-09-25, H3a):** the durable join. A join is a `control-join` operation
+that reserves `control:members`, records phase `learner_add` before it asks for the
+learner, and puts the learner's member ID on the record before anything depends on
+it; a lost add answer is reconciled from the member list by normalized peer URL
+(etcd refuses a second member with the same peer URL, so a retried add can never
+make two). The record follows the node to its promotion, blocked on
+`member_not_started` and then `learner_catching_up`, and a lost owner leaves it
+resumable. The key moves to `POST /v1/control/joins/{id}/bootstrap` (no-store; on no
+record, event or URL). The joining node keeps `join.json` in its data directory,
+fsynced before each step, and resumes from it; `--resume <id>` carries on a join whose
+file was lost. Cancel and removal by ID (H3b, H3c) and observed health (H3d) remain.
+
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability
 checks. Serialize membership intents durably; at most one unfinished membership

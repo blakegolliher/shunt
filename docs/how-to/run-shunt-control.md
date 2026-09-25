@@ -31,8 +31,13 @@ shunt-control init --name c1 --data-dir /var/lib/shunt-control --peer-url http:/
   --api c1:9901 --token-ref file:/etc/shunt/control.token --plaintext
 ```
 
-Each further node joins through a running node's API, receives the cluster's member list and the
-key, and starts:
+Each further node joins through a running node's API. The join is an operation on the cluster
+(`shunt operation show <id>`, ADR-0021 D4): the node is added as a learner, fetches the member list
+and the key from the join's bootstrap, starts, and promotes itself to a voter once it has caught up.
+It records its progress in `--data-dir/join.json`, fsynced before each step, so a join interrupted
+anywhere (the network, the disk, the process) resumes when the same command runs again; `--resume
+<operation-id>` carries on a join whose `join.json` was lost. The data directory must be empty the
+first time:
 
 ```sh
 shunt-control join --name c2 --data-dir /var/lib/shunt-control --peer-url http://c2:2380 \

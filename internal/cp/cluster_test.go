@@ -45,11 +45,7 @@ func startCluster(t testing.TB, n int) *testCluster {
 		peer := fmt.Sprintf("http://127.0.0.1:%d", port)
 		cfg := NodeConfig{Name: name, DataDir: dir, PeerURL: peer, Log: log}
 		if i > 0 {
-			initial, err := tc.nodes[0].MemberAdd(ctx, name, peer)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg.InitialCluster, cfg.Existing = initial, true
+			cfg.InitialCluster, cfg.Existing = addLearner(ctx, t, tc.nodes[0], name, peer), true
 		}
 		node, err := Start(ctx, cfg)
 		if err != nil {
@@ -68,6 +64,31 @@ func startCluster(t testing.TB, n int) *testCluster {
 		}
 	})
 	return tc
+}
+
+// addLearner adds a learner at peer through node and returns the initial cluster it starts with,
+// as a join's bootstrap gives it.
+func addLearner(ctx context.Context, t testing.TB, node *Node, name, peer string) string {
+	t.Helper()
+	id, err := node.AddLearner(ctx, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := node.ListMembers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for _, m := range ms {
+		mn := m.Name
+		if m.ID == id {
+			mn = name
+		}
+		for _, u := range m.PeerURLs {
+			parts = append(parts, mn+"="+u)
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 // restart stops node i and starts it again on the same data directory and port.
@@ -106,8 +127,10 @@ func TestClusterFormsJoinsAndReports(t *testing.T) {
 			t.Errorf("%s sees leader %q, want %q (%v)", nd.Name(), s2.Leader, st.Leader, err)
 		}
 	}
-	if _, err := tc.nodes[0].MemberAdd(ctx, "c2", "http://127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Errorf("adding a member with a taken name: %v", err)
+	// etcd refuses a second member with a peer URL a member has: what lets a join retry an add
+	// whose answer was lost without ever making two members (ADR-0021 D4).
+	if _, err := tc.nodes[0].AddLearner(ctx, fmt.Sprintf("http://127.0.0.1:%d", tc.ports[1])); err == nil || !strings.Contains(err.Error(), "Peer URLs already exists") {
+		t.Errorf("adding a learner at a member's peer URL: %v", err)
 	}
 
 	// A member leaves; the two left keep quorum. The last member cannot be removed.
