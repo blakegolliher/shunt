@@ -1,4 +1,5 @@
 # e2e backends for the POC: Garage and two MinIOs. All are AGPL tools; they are run, never copied.
+# MinIO is built from its public source (minio.Dockerfile): its images are no longer public.
 # minio2 is a second, independent MinIO cluster (the UI demo moves buckets between the two).
 # Bring up with `make e2e-up` (generates the cert, waits for health, applies Garage's layout).
 services:
@@ -19,7 +20,8 @@ services:
       retries: 20
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    image: localhost/shunt-e2e-minio:RELEASE.2025-07-23T15-54-02Z
+    build: { context: ., dockerfile: minio.Dockerfile }
     container_name: shunt-e2e-minio
     command: server /data --console-address ":9001"
     environment:
@@ -32,13 +34,14 @@ services:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   minio2:
-    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    image: localhost/shunt-e2e-minio:RELEASE.2025-07-23T15-54-02Z
+    build: { context: ., dockerfile: minio.Dockerfile }
     container_name: shunt-e2e-minio2
     command: server /data --console-address ":9001"
     environment:
@@ -50,7 +53,7 @@ services:
       - "127.0.0.1:9100:9000"
       - "127.0.0.1:9101:9001"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 20

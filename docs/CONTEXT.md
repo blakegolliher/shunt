@@ -34,7 +34,7 @@ Claude Code reads this before every task and treats it as fact. Fill every line;
 |---|---|
 | Backend types in the first deployment (VAST / MinIO / AWS S3 / other) and how many of each | unknown (POC uses Garage + MinIO from test/e2e, plus two VAST clusters) |
 | AWS account and scratch bucket available for CI? env var names; region | unknown |
-| MinIO version and deployment shape (single node / distributed) for CI | `quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z`, single node, test/e2e/docker-compose.yml |
+| MinIO version and deployment shape (single node / distributed) for CI | `RELEASE.2025-07-23T15-54-02Z`, single node, built from its public source by test/e2e/minio.Dockerfile since MinIO withdrew its public images (2026-09-25); test/e2e/docker-compose.yml |
 | Control-store HA | Embedded etcd; three or five `shunt-control` members per ADR-0015. Production deployment/owner: unknown. No external Postgres. |
 | Tenant model: one tenant per customer? per team? how tenants get created and keyed | unknown (POC-3 keys by tenant with one tenant) |
 | Backend bucket naming rule you want (e.g. `<tenant>-<hash>-<bucket>`) and any length/charset constraints | `<tenant>-<4 hex>-<bucket>` (decided 2026-09-15, POC-3). The 4 hex are the first two bytes of SHA-256 over `tenant + "/" + bucket`, so the name is stable per pair and differs between tenants using the same bucket name; a retry after `BucketAlreadyExists` mixes an attempt counter into the hash. Lowercased, cut to 63 characters by shortening the bucket part, and always a valid S3 bucket name. `internal/directory.BackendName` |
