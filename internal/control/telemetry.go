@@ -44,6 +44,10 @@ type TelemetryPoint struct {
 	P999   int64             `json:"p999_us,omitempty"`
 	Max    int64             `json:"max_us,omitempty"`
 	Value  *float64          `json:"value,omitempty"`
+	// Cluster is the backend of a bucket scope's point; Code the status key of a
+	// status_per_second point.
+	Cluster string `json:"cluster,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 func (s *Server) publishTelemetry(ms []Member) error {
@@ -51,7 +55,8 @@ func (s *Server) publishTelemetry(ms []Member) error {
 		return nil
 	}
 	in := make([]telemetry.MemberWindow, 0, len(ms))
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		in = append(in, telemetry.MemberWindow{ID: m.ID, Live: m.Live, Telemetry: m.Telemetry})
 	}
 	started := time.Now()
@@ -108,7 +113,7 @@ func (s *Server) telemetryLatest(w http.ResponseWriter, _ *http.Request) {
 
 func validScope(v string) bool {
 	return v == "fleet" || strings.HasPrefix(v, "cluster:") && len(v) > len("cluster:") ||
-		strings.HasPrefix(v, "proxy:") && len(v) > len("proxy:")
+		strings.HasPrefix(v, "proxy:") && len(v) > len("proxy:") || strings.HasPrefix(v, "bucket:") && len(v) > len("bucket:")
 }
 
 func validSeries(v string) bool {
@@ -116,7 +121,7 @@ func validSeries(v string) bool {
 	case telemetry.SeriesClientTotal, telemetry.SeriesUpstreamTTFB, telemetry.SeriesUpstreamTotal, telemetry.SeriesProxyOverhead:
 		return true
 	case telemetry.SeriesRequestsPerSecond, telemetry.SeriesBytesInPerSecond, telemetry.SeriesBytesOutPerSecond,
-		telemetry.SeriesErrors0PerSecond, telemetry.SeriesErrors4xxPerSecond, telemetry.SeriesErrors5xxPerSecond:
+		telemetry.SeriesErrors0PerSecond, telemetry.SeriesErrors4xxPerSecond, telemetry.SeriesErrors5xxPerSecond, telemetry.SeriesNotFoundPerSecond, telemetry.SeriesStatusPerSecond:
 		return true
 	}
 	return false
@@ -193,7 +198,7 @@ func (s *Server) telemetrySeries(w http.ResponseWriter, r *http.Request) {
 		for _, point := range s.Telemetry.CounterSeries(scope, series, op, from, to) {
 			value := point.Value
 			points = append(points, TelemetryPoint{Start: point.Start, End: point.End, Series: point.Series,
-				Op: point.Op, Value: &value})
+				Op: point.Op, Value: &value, Cluster: point.Cluster, Code: point.Code})
 		}
 	}
 	if points == nil {

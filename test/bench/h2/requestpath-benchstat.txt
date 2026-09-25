@@ -1,0 +1,34 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/proxy
+cpu: AMD EPYC 7402P 24-Core Processor               
+                            │ requestpath-32819a2.txt │         requestpath-h2.txt         │
+                            │         sec/op          │   sec/op     vs base               │
+SmallGET-16                               343.9µ ± 4%   366.2µ ± 9%       ~ (p=0.160 n=12)
+PUT1MiB-16                                1.945m ± 7%   1.908m ± 6%       ~ (p=0.319 n=12)
+ResignSmallGET-16                         487.5µ ± 9%   481.5µ ± 7%       ~ (p=0.319 n=12)
+ResignSignedChunkPUT1MiB-16               5.008m ± 3%   4.940m ± 6%       ~ (p=0.630 n=12)
+geomean                                   1.130m        1.135m       +0.44%
+
+                            │ requestpath-32819a2.txt │         requestpath-h2.txt          │
+                            │          B/op           │     B/op      vs base               │
+SmallGET-16                              21.96Ki ± 3%   22.12Ki ± 2%       ~ (p=0.755 n=12)
+PUT1MiB-16                               58.50Ki ± 2%   59.15Ki ± 2%       ~ (p=0.178 n=12)
+ResignSmallGET-16                        34.90Ki ± 3%   35.31Ki ± 2%  +1.17% (p=0.045 n=12)
+ResignSignedChunkPUT1MiB-16              974.6Ki ± 1%   976.7Ki ± 1%       ~ (p=0.266 n=12)
+geomean                                  81.31Ki        81.95Ki       +0.80%
+
+                            │ requestpath-32819a2.txt │          requestpath-h2.txt          │
+                            │        allocs/op        │  allocs/op   vs base                 │
+SmallGET-16                                107.0 ± 0%    107.0 ± 0%       ~ (p=1.000 n=12) ¹
+PUT1MiB-16                                 179.0 ± 0%    180.0 ± 0%  +0.56% (p=0.000 n=12)
+ResignSmallGET-16                          240.0 ± 0%    241.0 ± 0%  +0.42% (p=0.000 n=12)
+ResignSignedChunkPUT1MiB-16               4.726k ± 0%   4.729k ± 0%  +0.06% (p=0.000 n=12)
+geomean                                    383.9         384.9       +0.26%
+¹ all samples are equal
+
+                            │ requestpath-32819a2.txt │         requestpath-h2.txt          │
+                            │           B/s           │     B/s       vs base               │
+PUT1MiB-16                               514.2Mi ± 7%   524.2Mi ± 5%       ~ (p=0.311 n=12)
+ResignSignedChunkPUT1MiB-16              199.7Mi ± 3%   202.4Mi ± 5%       ~ (p=0.630 n=12)
+geomean                                  320.4Mi        325.7Mi       +1.66%

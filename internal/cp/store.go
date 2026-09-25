@@ -45,6 +45,9 @@ const (
 	kPlacements  = prefix + "placements/"
 	kCredentials = prefix + "credentials/"
 	kChanges     = prefix + "changes/"
+	kSchema      = prefix + "schema"       // directory.SchemaVersion, decimal
+	kIdentity    = prefix + "identity"     // directory.Identity, JSON
+	kGenerations = prefix + "generations/" // <resource> → generation, decimal
 
 	// changeRetention is how many audit records stay in etcd; older ones are deleted by the write
 	// that makes them older. Export to object storage is deferred (docs/POC-6.md, P3c-2).
@@ -83,9 +86,12 @@ type Store struct {
 	cipher *Cipher
 	log    *slog.Logger
 	// Prepare, if set, is called with a candidate directory before a write is committed and with
-	// each version the watch installs: shunt-control builds its clusters with it. On a write, an
-	// error refuses the write; on the watch, it is logged and the version is installed anyway.
-	Prepare func(*directory.File) error
+	// each version the watch installs: shunt-control builds its clusters with it. resolve resolves
+	// the candidate's own secrets. On a write, an error refuses the write, and the candidate is
+	// never committed: the version goes live through the watch, like another node's write, so a
+	// failed compare-and-swap leaves the live clusters as they were. On the watch, commit runs just
+	// before the version is installed; an error is logged and the version is installed anyway.
+	Prepare func(f *directory.File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after every installed version.
 	OnInstall func(*directory.Snapshot)
 	// Now stamps placements and change records; defaults to time.Now.
@@ -93,10 +99,8 @@ type Store struct {
 
 	cur  atomic.Pointer[state]
 	snap atomic.Pointer[directory.Snapshot]
-	mu   sync.Mutex // guards cond and pending
+	mu   sync.Mutex // guards cond
 	cond *sync.Cond
-	// pending holds a candidate's secrets while Prepare builds its clusters (Resolve reads them).
-	pending map[string]string
 
 	ready  atomic.Bool
 	stop   context.CancelFunc
@@ -129,8 +133,35 @@ func (s *Store) Start(ctx context.Context) error {
 	}
 	wctx, cancel := context.WithCancel(context.Background())
 	s.stop = cancel
-	s.ready.Store(true)
 	go s.watch(wctx, rev)
+	if err := s.upgrade(ctx); err != nil {
+		cancel()
+		<-s.done
+		s.done, s.stop = make(chan struct{}), nil
+		return err
+	}
+	s.ready.Store(true)
+	return nil
+}
+
+// upgrade gives a schema-1 directory its identity (ADR-0021) with one ordinary write: a new version
+// carrying the schema and a new cluster id and epoch, and no resource change. Every node that
+// starts races to do it; the compare-and-swap lets one win, and the others see it by their watch.
+// An empty directory gets its identity with its first real write instead.
+func (s *Store) upgrade(ctx context.Context) error {
+	if st := s.cur.Load(); st.version == 0 || !st.file.Identity.IsZero() {
+		return nil
+	}
+	err := s.mutate(ctx, "shunt-control", "schema-upgrade", "", func(st *state) error {
+		if !st.file.Identity.IsZero() {
+			return errUnchanged // another node upgraded it first
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("upgrading the directory to schema %d: %w", directory.SchemaVersion, err)
+	}
+	s.log.Info("directory upgraded", "schema", directory.SchemaVersion, "cluster_id", s.cur.Load().file.Identity.ClusterID, "version", s.Version())
 	return nil
 }
 
@@ -170,10 +201,14 @@ func (s *Store) load(ctx context.Context) (int64, error) {
 		}
 	}
 	st.file.Version = st.version
+	if err := directory.CheckSchema(st.file.Schema); err != nil {
+		return 0, err
+	}
 	if err := directory.Validate(st.file); err != nil {
 		return 0, fmt.Errorf("the directory in etcd is invalid: %w", err)
 	}
-	_ = s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+	commit, _ := s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+	commit()
 	s.install(st)
 	return resp.Header.Revision, nil
 }
@@ -246,6 +281,37 @@ func (s *Store) apply(st *state, key string, value []byte, deleted bool) error {
 			return fmt.Errorf("credential %s: %w", ak, err)
 		}
 		st.creds[ak] = sigv4.Credential{AccessKey: ak, Secret: plain, Tenant: rec.Tenant, Buckets: rec.Buckets}
+	case key == kSchema:
+		if deleted {
+			st.file.Schema = 0
+			return nil
+		}
+		v, err := strconv.Atoi(string(value))
+		if err != nil {
+			return fmt.Errorf("directory schema %q: %w", value, err)
+		}
+		st.file.Schema = v
+	case key == kIdentity:
+		if deleted {
+			return errors.New("the directory identity key was deleted")
+		}
+		if err := json.Unmarshal(value, &st.file.Identity); err != nil {
+			return fmt.Errorf("directory identity: %w", err)
+		}
+	case strings.HasPrefix(key, kGenerations):
+		res := strings.TrimPrefix(key, kGenerations)
+		if deleted {
+			delete(st.file.Generations, res)
+			return nil
+		}
+		g, err := strconv.ParseInt(string(value), 10, 64)
+		if err != nil {
+			return fmt.Errorf("generation of %s %q: %w", res, value, err)
+		}
+		if st.file.Generations == nil {
+			st.file.Generations = map[string]int64{}
+		}
+		st.file.Generations[res] = g
 	case strings.HasPrefix(key, kChanges):
 		// audit records are written, never read back into the state
 	default:
@@ -254,23 +320,22 @@ func (s *Store) apply(st *state, key string, value []byte, deleted bool) error {
 	return nil
 }
 
-// prepare runs the Prepare hook with the candidate's secrets resolvable. onWrite: an error refuses.
-func (s *Store) prepare(st *state, onWrite bool) error {
+// prepare runs the Prepare hook on a candidate, its secrets resolved from the candidate alone, and
+// returns the candidate's commit. onWrite: an error refuses. Otherwise an error is logged and the
+// commit returned keeps the live clusters as they are.
+func (s *Store) prepare(st *state, onWrite bool) (commit func(), err error) {
 	if s.Prepare == nil {
-		return nil
+		return func() {}, nil
 	}
-	s.mu.Lock()
-	s.pending = st.secrets
-	s.mu.Unlock()
-	err := s.Prepare(st.file)
-	s.mu.Lock()
-	s.pending = nil
-	s.mu.Unlock()
-	if err != nil && !onWrite {
+	commit, err = s.Prepare(st.file, st.resolve)
+	if err != nil {
+		if onWrite {
+			return nil, err
+		}
 		s.log.Error("a directory version could not be prepared on this node; installed anyway", "version", st.version, "err", err.Error())
-		return nil
+		return func() {}, nil
 	}
-	return err
+	return commit, nil
 }
 
 func (s *Store) install(st *state) {
@@ -316,7 +381,8 @@ func (s *Store) watch(ctx context.Context, rev int64) {
 				s.log.Error("a directory version in etcd is invalid; this node keeps its last version", "version", st.version, "err", err.Error())
 				continue
 			}
-			_ = s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+			commit, _ := s.prepare(st, false) //nolint:errcheck // logged inside; the version is installed anyway
+			commit()
 			s.install(st)
 		}
 		if ctx.Err() != nil {
@@ -395,20 +461,16 @@ func (s *Store) WaitVersion(ctx context.Context, v int64) error {
 	return nil
 }
 
-// Resolve resolves a cluster's secret_ref: a control: ref from this store (a candidate's during a
-// write, the installed version's otherwise), anything else from the environment or a file. It is
-// the resolver shunt-control's cluster registry is built with.
-func (s *Store) Resolve(ref string) (string, error) {
+// Resolve resolves a cluster's secret_ref: a control: ref from the installed version, anything else
+// from the environment or a file. It is the resolver shunt-control's cluster registry is built with.
+func (s *Store) Resolve(ref string) (string, error) { return s.cur.Load().resolve(ref) }
+
+// resolve resolves a secret_ref against this state's secrets.
+func (st *state) resolve(ref string) (string, error) {
 	if !strings.HasPrefix(ref, SecretRefPrefix) {
 		return config.ResolveSecret(ref)
 	}
-	s.mu.Lock()
-	pending := s.pending
-	s.mu.Unlock()
-	if v, ok := pending[ref]; ok {
-		return v, nil
-	}
-	if v, ok := s.cur.Load().secrets[ref]; ok {
+	if v, ok := st.secrets[ref]; ok {
 		return v, nil
 	}
 	return "", fmt.Errorf("no secret is stored for %s (shunt cluster add stores one)", ref)
@@ -476,10 +538,27 @@ func (s *Store) mutate(ctx context.Context, actor, op, key string, fn func(st *s
 		}
 		next.version = cur.version + 1
 		next.file.Version = next.version
+		var rotated []string // a secret changes a cluster though its definition does not
+		for name := range next.file.Clusters {
+			if ref := SecretRefPrefix + name; next.secrets[ref] != cur.secrets[ref] {
+				rotated = append(rotated, directory.ClusterResource(name), directory.SecretResource(name))
+			}
+		}
+		if err := directory.Stamp(cur.file, next.file, rotated...); err != nil {
+			return err
+		}
+		for name := range next.file.Clusters {
+			if _, held := next.secrets[SecretRefPrefix+name]; !held {
+				// Only a secret this store holds has a generation to track.
+				delete(next.file.Generations, directory.SecretResource(name))
+			}
+		}
 		if err := directory.Validate(next.file); err != nil {
 			return err
 		}
-		if err := s.prepare(next, true); err != nil {
+		// The candidate is checked, not committed: the watch installs the version once it is in
+		// etcd, and prepares it again then.
+		if _, err := s.prepare(next, true); err != nil {
 			return err
 		}
 		ops, err := s.diff(cur, next)
@@ -594,6 +673,23 @@ func (s *Store) diff(cur, next *state) ([]clientv3.Op, error) {
 			ops = append(ops, clientv3.OpDelete(kPlacements+k))
 		}
 	}
+	if next.file.Schema != cur.file.Schema {
+		ops = append(ops, clientv3.OpPut(kSchema, strconv.Itoa(next.file.Schema)))
+	}
+	if next.file.Identity != cur.file.Identity {
+		b, _ := json.Marshal(next.file.Identity)
+		ops = append(ops, clientv3.OpPut(kIdentity, string(b)))
+	}
+	for res, g := range next.file.Generations {
+		if old, had := cur.file.Generations[res]; !had || old != g {
+			ops = append(ops, clientv3.OpPut(kGenerations+res, strconv.FormatInt(g, 10)))
+		}
+	}
+	for res := range cur.file.Generations {
+		if _, ok := next.file.Generations[res]; !ok {
+			ops = append(ops, clientv3.OpDelete(kGenerations+res))
+		}
+	}
 	for ak, c := range next.creds {
 		if old, had := cur.creds[ak]; had && same(old, c) {
 			continue
@@ -631,16 +727,41 @@ func (s *Store) SetState(ctx context.Context, tenant, bucket, from string, t dir
 }
 
 // SetPlacementReadOnly implements directory.Store.
-func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+func (s *Store) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, barrier, actor string) error {
 	return s.mutate(ctx, actor, "placement-read-only", directory.Key(tenant, bucket), func(st *state) error {
-		return st.file.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+		return st.file.SetPlacementReadOnly(tenant, bucket, readOnly, reject, barrier)
+	})
+}
+
+// SetBarrier implements directory.Store.
+func (s *Store) SetBarrier(ctx context.Context, tenant, bucket string, b directory.Barrier, actor string) error {
+	return s.mutate(ctx, actor, "set-barrier", directory.Key(tenant, bucket), func(st *state) error { return st.file.SetBarrier(tenant, bucket, b) })
+}
+
+// ClearBarrier implements directory.Store.
+func (s *Store) ClearBarrier(ctx context.Context, resource, id, actor string) error {
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		return s.mutate(ctx, actor, "clear-barrier", "clusters/"+name, func(st *state) error { return st.file.ClearClusterBarrier(name, id) })
+	}
+	key := strings.TrimPrefix(resource, "placement:")
+	tenant, bucket, ok := directory.SplitKey(key)
+	if !ok {
+		return fmt.Errorf("%w: %q is not a placement or cluster resource", directory.ErrNotFound, resource)
+	}
+	return s.mutate(ctx, actor, "clear-barrier", key, func(st *state) error { return st.file.ClearBarrier(tenant, bucket, id) })
+}
+
+// SetPlacementWatch implements directory.Store.
+func (s *Store) SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error {
+	return s.mutate(ctx, actor, "placement-watch", directory.Key(tenant, bucket), func(st *state) error {
+		return st.file.SetPlacementWatch(tenant, bucket, watch)
 	})
 }
 
 // SetClusterReadOnly implements directory.Store.
-func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+func (s *Store) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, barrier, actor string) error {
 	return s.mutate(ctx, actor, "cluster-read-only", "clusters/"+name, func(st *state) error {
-		return st.file.SetClusterReadOnly(name, readOnly, reject)
+		return st.file.SetClusterReadOnly(name, readOnly, reject, barrier)
 	})
 }
 

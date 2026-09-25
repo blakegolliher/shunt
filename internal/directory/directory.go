@@ -85,6 +85,14 @@ type Placement struct {
 	Created      time.Time         `yaml:"created,omitempty" json:"created,omitzero"`
 	ReadOnly     bool              `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	RejectWrites bool              `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
+	// Watch asks proxies for this bucket's traffic by backend cluster in telemetry, as they give it
+	// for every bucket spread over legs or moving; bounded per window (telemetry.MaxBucketsPerWindow).
+	Watch bool `yaml:"watch,omitempty" json:"watch,omitempty"`
+	// Barrier is the drain barrier of a change in progress on this placement (ADR-0021 D2): a held
+	// ramp step or a read-only change closes mutations, purge-source closes source-dependent work.
+	// Proxies close the gate it names on install and report the drain in their heartbeats; the
+	// control node clears it with the change's commit. At most one per placement.
+	Barrier *Barrier `yaml:"barrier,omitempty" json:"barrier,omitempty"`
 
 	// Schema v2 (ADR-0018, legs.go). Only a decoder sets these, and it converts them into the v1
 	// fields above before anything else sees the placement, so outside legs.go they are always
@@ -111,10 +119,17 @@ func (p *Placement) ClusterOf(role string) string {
 	return role
 }
 
+// Barrier is config.Barrier: a drain barrier on a placement or a cluster (ADR-0021 D2).
+type Barrier = config.Barrier
+
 func (p Placement) clone() Placement {
 	c := p
 	c.Names = maps.Clone(p.Names)
 	c.Ramp = v2ramp(p.Ramp)
+	if p.Barrier != nil {
+		b := *p.Barrier
+		c.Barrier = &b
+	}
 	if p.Cutover != nil {
 		ev := *p.Cutover
 		c.Cutover = &ev
@@ -135,6 +150,13 @@ func (p Placement) clone() Placement {
 // carry a higher version is rejected.
 type File struct {
 	Version int64 `yaml:"version" json:"version"`
+	// Schema is the schema the directory was written with (SchemaVersion); 0 is schema 1.
+	Schema int `yaml:"schema,omitempty" json:"schema,omitempty"`
+	// Identity is the directory's lineage; zero until the first write under schema 2.
+	Identity Identity `yaml:"identity,omitempty" json:"identity,omitzero"`
+	// Generations maps each resource (PlacementResource, ClusterResource, TenantResource) to the
+	// version of the write that last changed it. Stamp keeps it.
+	Generations map[string]int64 `yaml:"generations,omitempty" json:"generations,omitempty"`
 	// Clusters are the backends placements route to (docs/DESIGN.md §1.5: control-plane state).
 	// Credentials are secret_refs only; a secret never lives in this file.
 	Clusters   map[string]config.Cluster `yaml:"clusters,omitempty" json:"clusters"`
@@ -143,7 +165,8 @@ type File struct {
 }
 
 func (f *File) clone() *File {
-	c := &File{Version: f.Version, Clusters: make(map[string]config.Cluster, len(f.Clusters)), Tenants: maps.Clone(f.Tenants),
+	c := &File{Version: f.Version, Schema: f.Schema, Identity: f.Identity, Generations: maps.Clone(f.Generations),
+		Clusters: make(map[string]config.Cluster, len(f.Clusters)), Tenants: maps.Clone(f.Tenants),
 		Placements: make(map[string]Placement, len(f.Placements))}
 	for name := range f.Clusters {
 		cl := f.Clusters[name]
@@ -248,10 +271,17 @@ type Store interface {
 	Sync(ctx context.Context) error
 	// SetState applies a transition if the placement is still in state from.
 	SetState(ctx context.Context, tenant, bucket, from string, t Transition, actor string) error
-	// SetPlacementReadOnly changes a placement's fleet-fenced maintenance switch.
-	SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error
-	// SetClusterReadOnly changes a backend's fleet-fenced maintenance switch.
-	SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error
+	// SetPlacementReadOnly changes a placement's maintenance switch; barrier, switching it on, is
+	// the drain barrier written with it (ADR-0021 D2).
+	SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, barrier, actor string) error
+	// SetPlacementWatch asks for, or stops, the placement's per-backend traffic telemetry.
+	SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error
+	// SetClusterReadOnly changes a backend's maintenance switch, with its barrier when switching on.
+	SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, barrier, actor string) error
+	// SetBarrier writes a drain barrier on a placement carrying none; ClearBarrier removes the one
+	// named from a placement (PlacementResource) or a cluster (ClusterResource), and only that one.
+	SetBarrier(ctx context.Context, tenant, bucket string, b Barrier, actor string) error
+	ClearBarrier(ctx context.Context, resource, id, actor string) error
 	// Adopt takes over an existing backend bucket as an ACTIVE placement.
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.
@@ -347,3 +377,50 @@ func (s *Snapshot) Buckets(tenant string) []string { return s.buckets[tenant] }
 
 // File returns a deep copy of the directory contents.
 func (s *Snapshot) File() *File { return s.file.clone() }
+
+// Identity is the snapshot's directory lineage, without File's deep copy: heartbeats and barrier
+// polls read it on every round, and at 100,000 placements a copy costs about 130 ms.
+func (s *Snapshot) Identity() Identity { return s.file.Identity }
+
+// Generation is the generation of a resource in the snapshot's directory (File.Generation).
+func (s *Snapshot) Generation(resource string) int64 { return s.file.Generation(resource) }
+
+// EachPlacement calls fn for every placement until it returns false. The placement must not be
+// modified. It is what a caller that would otherwise clone the whole directory to read it uses.
+func (s *Snapshot) EachPlacement(fn func(key string, p *Placement) bool) {
+	for k, p := range s.byKey {
+		if !fn(Key(k.tenant, k.bucket), p) {
+			return
+		}
+	}
+}
+
+// EachCluster calls fn for every cluster until it returns false.
+func (s *Snapshot) EachCluster(fn func(name string, c *config.Cluster) bool) {
+	for name := range s.file.Clusters {
+		c := s.file.Clusters[name]
+		if !fn(name, &c) {
+			return
+		}
+	}
+}
+
+// EachPlacement calls fn for every placement until it returns false, as Snapshot.EachPlacement.
+func (f *File) EachPlacement(fn func(key string, p *Placement) bool) {
+	for k := range f.Placements {
+		p := f.Placements[k]
+		if !fn(k, &p) {
+			return
+		}
+	}
+}
+
+// EachCluster calls fn for every cluster until it returns false, as Snapshot.EachCluster.
+func (f *File) EachCluster(fn func(name string, c *config.Cluster) bool) {
+	for name := range f.Clusters {
+		c := f.Clusters[name]
+		if !fn(name, &c) {
+			return
+		}
+	}
+}

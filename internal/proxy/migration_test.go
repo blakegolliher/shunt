@@ -5,6 +5,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/md5" //nolint:gosec // G501: S3's Content-MD5
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
@@ -562,10 +564,12 @@ func BenchmarkMigratingDeleteObjects1000Keys(b *testing.B) {
 	}
 	body.WriteString(`</Delete>`)
 	payload := []byte(body.String())
+	sum := md5.Sum(payload) //nolint:gosec // G401: S3's Content-MD5, which DeleteObjects requires
+	hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:])}
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for b.Loop() {
-		if r := m.acme(b, "POST", "/data?delete", payload); r.StatusCode != 200 {
+		if r := m.send(b, "POST", "/data?delete", "", payload, acmeAK, acmeSK, hdr); r.StatusCode != 200 {
 			b.Fatalf("DeleteObjects: %d %s", r.StatusCode, r.body)
 		}
 	}

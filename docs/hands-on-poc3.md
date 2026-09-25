@@ -146,11 +146,11 @@ And per request, in `test/e2e/data/shunt-mixed.access.jsonl`:
 The client does nothing in this section. Quiesce the bucket first: POC-3 has no dual writes, so a write during the copy would be lost.
 
 ```console
-$ ./bin/shunt directory set-state e2e-a/alpha CUTOVER $CFG
+$ ./bin/shunt directory set-state --offline e2e-a/alpha CUTOVER $CFG
 shunt: directory: illegal transition ACTIVE -> CUTOVER: allowed from ACTIVE: RAMPING, MIGRATING
 
 $ minio s3 mb s3://e2e-a-moved-alpha
-$ ./bin/shunt directory set-state e2e-a/alpha MIGRATING --to minio --name e2e-a-moved-alpha --actor demo $CFG
+$ ./bin/shunt directory set-state --offline e2e-a/alpha MIGRATING --to minio --name e2e-a-moved-alpha --actor demo $CFG
 e2e-a/alpha: ACTIVE -> MIGRATING (directory version 7)
 ```
 
@@ -174,9 +174,9 @@ $ garage s3 sync s3://e2e-a-5428-alpha /tmp/move --quiet
 $ minio  s3 sync /tmp/move s3://e2e-a-moved-alpha --quiet
   copied 2 objects
 
-$ ./bin/shunt directory set-state e2e-a/alpha CUTOVER --actor demo $CFG
+$ ./bin/shunt directory set-state --offline e2e-a/alpha CUTOVER --actor demo $CFG
 e2e-a/alpha: MIGRATING -> CUTOVER (directory version 8)
-$ ./bin/shunt directory set-state e2e-a/alpha ACTIVE --actor demo $CFG
+$ ./bin/shunt directory set-state --offline e2e-a/alpha ACTIVE --actor demo $CFG
 e2e-a/alpha: CUTOVER -> ACTIVE (directory version 9)
 ```
 

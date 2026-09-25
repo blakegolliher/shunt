@@ -145,6 +145,17 @@ Code entry points: `internal/cp/etcd.go`, `internal/cp/store.go`,
    Execute the manual visual checklist and API/CLI workflows on the same fleet.
 5. Rehearse controlled protocol handover, owner crashes and cold restore before
    enabling production mutations. Update ADR/status only with actual results.
+6. Fold the Audit screen into Operations (decided 2026-09-25, after the H2 manual
+   UI pass). Operations are the requests: intent, lifecycle, blockers, actions.
+   Audit is the directory's history: one change record per version, before and
+   after. For a normal step the two repeat each other on screen, but only the
+   change records show exactly what each version changed and the writes no
+   operation made (CreateBucket/DeleteBucket through a proxy, `--offline`
+   directory writes). Keep the records and drop Audit as a peer screen: stamp
+   each change record with the operation id that wrote it, show an operation's
+   versions as before/after diffs in its detail, and keep a "Directory history"
+   view under Operations for changes with no operation. `GET /v1/audit` stays
+   (API and CLI parity); ADR-0017 is amended when this lands.
 
 ## 2. Required regression matrix
 
@@ -236,9 +247,19 @@ implemented reference. Do not mark a known pending gate green.
 
 ## 5. Definition of done
 
-- [ ] H0 protocol/operation foundation complete; controlled upgrade documented.
-- [ ] H1 atomic snapshot/credential/cache paths pass T01–T04 and parity gates.
-- [ ] H2 drain/lease/maintenance paths pass T05–T09 and worker/fleet gates.
+- [x] H0 protocol/operation foundation complete; controlled upgrade documented. *Passed
+      2026-09-24 (ADR-0021; docs/bench/h0.md): `make fleet` and `make walkthrough` green on the H0
+      code, and a manual acceptance pass on `make demo-ui` over 0.0.0.0, the Operations screen
+      included, that took a bucket from two MinIO legs through a third backend and consolidation to
+      removing both MinIOs. There is no controlled upgrade: no fleet is deployed, and a newer
+      schema is refused. Deferred by design: resume and cancel actions and owner terms (H2),
+      required If-Generation (H5), string-typed identity versions (read models, H5).*
+- [x] H1 atomic snapshot/credential/cache paths pass T01–T04 and parity gates (2026-09-24; docs/bench/h1.md).
+- [x] H2 drain/lease/maintenance paths pass T05–T09 and worker/fleet gates. *Passed 2026-09-25
+      (docs/bench/h2.md): file and etcd paths, `make fleet` with the H2 flow, `make walkthrough`,
+      a 10-minute partition and owner-crash soak with the version-only negative control, and a
+      manual UI pass. T14 and T19 stay open for their other phases: the soak does not cover
+      cutover, purge, multipart or copy under crashes, and two 1,000-proxy costs are carried.*
 - [ ] H3 resumable membership/observed health pass T12–T13 on real etcd.
 - [ ] H4 restore/reconciliation passes T10–T11 with data newer than backup.
 - [ ] H5 truthful operations/drafts/events pass T15–T18 and visual acceptance.

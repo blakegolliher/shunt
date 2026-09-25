@@ -47,6 +47,16 @@ S3 workload. Existing backend capability checks remain release requirements.
 
 ### Identity
 
+**Landed (2026-09-24, H0a):** `directory.Identity` (`cluster_id`, `epoch`), drawn by the first
+write under schema 2 and stored in the same transaction as the version (`/shunt/v1/identity`, and
+in the lab file); a node starting on schema-1 data upgrades it with one ordinary write. Resource
+generations are the version of the write that last changed each placement, cluster or tenant
+(`directory.Stamp`); a cluster's secret-only change counts. Unchanged resources stay unstamped
+(generation 0) so the upgrade is one bounded transaction. The directory poll, the heartbeat, the
+member cache and the fence carry and compare the identity (`checkLineage`, `Member.Has`); the
+wire keeps the numeric `version` for now, and the string-typed `identity.version` of the contracts
+arrives with the typed read models (H0d).
+
 Persist a random `cluster_id` at initial creation and a random `epoch` for each
 recovery lineage. Snapshot `version` increases within one epoch. Placement and
 cluster `generation` increase on changes to that resource. Secret generations
@@ -67,6 +77,35 @@ The file backend creates and persists its own identity; a file import that
 replaces an existing lineage requires the recovery path, not a version reset.
 
 ### Durable intent
+
+**Landed (2026-09-24, H0b):** `Operations.Create` writes a record and its scope reservation in one
+atomic step, comparing the directory identity and the scope's generation; `Update` is a
+compare-and-swap on the record's sequence, and a terminal write releases the scope in the same
+step. Placement operations name the clusters they touch; a cluster operation conflicts with them
+and they with it (on etcd, a reservation revision key closes the race between a cluster
+operation's read and its transaction). The etcd store and the lab's in-memory store pass one
+contract (`internal/control/opstest`). Unfinished and uncertain records survive the history
+limit. Every placement and cluster mutation route runs under a record, replacing the per-node step
+mutex. Owners keep a liveness key; a lost owner's record is ended `failed` with effect `uncertain`
+and its scope released, which is weaker than the reconciliation below: until H2, repeating the
+step is what completes a hold it left. Deferred: owner terms, idempotency keys and capacity (H0c),
+multi-scope child operations, and the file-backend durable envelope (dropped, ADR-0021).
+
+**Landed (2026-09-24, H0c):** `Idempotency-Key` is required on every request that creates an
+operation record. The key is indexed by epoch, actor and key (`/shunt/ops-idem/`) in the same
+transaction as the record; the record stores a keyed digest (HMAC under the shared confirmation
+key) of kind, scope and canonical body, which a retry must match, and the API never answers it.
+A retry gets the same record or the route's first answer; another intent gets 409
+`idempotency_conflict`. Ended keyed records stay seven days past the history limit. An optional
+`If-Generation` sets the scope's expected generation; making it required arrives with the draft
+work of H5. `--operation-capacity` (default 256) answers 429 `operation_capacity` before any
+effect. The CLI numbers its keys from a per-command `--request-id`.
+
+**Landed (2026-09-24, H0d):** refusals carry `retryable`; `shunt operation list|show|wait`
+(wait exits 3 at its timeout with the operation unfinished) and the web UI's Operations screen
+read the same records; `resume` and `cancel` arrive with the barriers (H2). The direct file writes
+`shunt directory set-state` and `set-default` now need `--offline`, since they go around the
+records, reservations and fence.
 
 Extend the existing Operations seam rather than add a second job framework.
 Each safety-sensitive operation contains:
@@ -93,7 +132,9 @@ the file implementation uses its single writer and an atomically replaced
 durable operation/transition record. Extend existing seams with explicit
 transactional methods where needed; independent `Put` calls are insufficient.
 
-For the file backend, keep directory state, scope reservations and minimal
+**Amended 2026-09-24 (ADR-0021):** the file backend stays a single-writer lab
+backend in its current format; etcd carries the transaction contract, and the
+envelope below is not built. For the file backend, keep directory state, scope reservations and minimal
 unfinished-operation state in one authoritative durable envelope, replaced with
 fsync/rename under the existing writer lock. History/read models may be derived
 separately. Two independent YAML/JSON renames are not one transaction. The
@@ -136,6 +177,80 @@ until that old activity is known to have ended. An owner lease is coordination,
 not a backend fencing token.
 
 ## 3. D1 — atomic runtime installation and credential rotation
+
+**Landed (2026-09-24, on `1-to-n-bucket-support`):** T01, T02 and T03 in their pre-H0 form
+(ADR-0021, "Decisions taken 2026-09-24"). Member installs are serialized and monotonic
+(`internal/member`, `install`). `Prepare` hooks take a candidate-local resolver and return a
+commit that runs only for an installed version (`internal/upstream`, `Registry.Prepare` and
+`Candidate.Commit`; `internal/cp`, `Store.prepare`; `internal/directory`, `FileDir`). A
+secret-only rotation builds a new signer over the old transport. What remains for H1 is
+everything below about one coherent bundle, generations, retained-bundle limits and the cache.
+
+**Landed (2026-09-24, H1a):** the runtime bundle. `internal/runtimecfg` publishes one immutable
+`Bundle` (directory snapshot, client key table, cluster set); a resign-mode request loads it once
+before authentication and verifies, routes and signs from it alone, and `Publish` refuses an older
+version or another lineage. The member publishes one per install from `OnInstall`, under its
+install lock; the lab proxy on each directory install and each key-file change. `auth.Table` is an
+immutable snapshot of the key store. A test publishes a rotated-secret bundle while a request is
+authenticating and shows that request signing with the secret of the bundle it took; its negative
+control (reading the clusters again after authentication) signs both requests with the new secret.
+
+**Landed (2026-09-24, H1b):** secret generations. A rotation stamps `secret:<name>` with the
+directory version that changed it, beside `cluster:<name>` (an endpoint-only edit moves the
+cluster generation, not the secret's); a removed cluster or one no longer holding a control secret
+loses its secret generation. The registry reuses a cluster only when its definition, secret and
+secret generation are all unchanged, so a re-set to the same secret still counts as a rotation.
+Each member reports `secrets` (cluster → generation it signs with) in its heartbeat, and the
+cluster view answers `secret`: the generation, which live members have installed it, which are
+pending on an older one, and which are silent. Installed is not drained: a request that took the
+old bundle may still sign with the old secret until it finishes (H2 is the drain barrier).
+
+**Landed (2026-09-24, H1c):** resource lifetimes and the retained-bundle bound. A request acquires
+its bundle (a counted reference) in `ServeHTTP` and releases it when the handler returns, response
+body included; the publisher lets go of a bundle only after the next one is current, so acquire
+and retirement interlock through the count with no lock on the request path. A committed cluster
+`Set` is counted by the registry and by each bundle on it, and each transport by the sets that use
+it: the last release closes a retired transport's idle connections, so a secret-only rotation, which
+shares the transport, closes nothing, and a request on a replaced set keeps its connections to the
+end. Preparing a candidate takes no reference (its new transports never dialed), so a dropped
+candidate holds nothing. At most `MaxRetired` (8) replaced bundles may be held; past that an install
+becomes the pending bundle (a newer one replaces it) and is published when a held one drains. New
+requests keep the served version meanwhile, the member's heartbeat reports that served version and
+its secret generations as `applied`, so a fence waits, and `shunt_install_backpressure` and
+`shunt_runtime_bundles_retired` show it. Nothing cuts a request short. There are no transport
+health loops yet (P3a), so none needs sharing.
+
+**Landed (2026-09-24, H1d):** the restart cache. The member writes an envelope (cache schema,
+fleet protocol, proxy ID, identity, version, SHA-256 of the directory as written) to a 0600
+temporary file, fsyncs it, renames it and fsyncs the directory, after the install lock is let go.
+Writes are serialized and a version older than one already attempted is skipped, so the cache only
+moves forward. A failure at any stage keeps the in-memory version and the last durable file (no
+temporary file stays), counts `shunt_directory_cache_failures_total{stage}`, and is reported:
+`/-/fleet` shows `durable` and `cache_error`, the heartbeat carries `durable`, and the Control
+plane screen's proxy table shows Durable beside Applied. A cache that is torn, altered, oversized
+(64 MiB, checked before decoding), of another schema or protocol, another proxy's, or without
+identity is ignored and the proxy starts empty. T04's fault tests fail each stage and restart.
+Incarnation lifecycle metadata, and refusing a restart from a cache older than an acknowledged
+barrier, come with incarnations and barriers in H2.
+
+**Landed (2026-09-24, H1e):** rotation and install diagnostics on every interface. `POST
+/v1/clusters/{name}/credentials` (`shunt cluster credentials`, the cluster detail's Credentials
+form) replaces a cluster's secret, or access key and secret, and nothing else; it shares cluster
+add's credential check, so a wrong pair is refused with the old secret in place, runs under a
+`cluster-credentials` operation, and answers the secret generation it started. `GET
+/v1/fleet/{id}` (`shunt proxy show`, a click on a proxy in the Control plane screen) reports one
+proxy's served, installed and durable versions, its secret generations against the control
+plane's, and the problems in words; the heartbeat carries `installed` (while backpressured) and
+`cache_error` for it. `old_generation_drained` is the D2 barrier's to prove; until H2 the UI and
+CLI say that installed is not drained.
+
+**Landed (2026-09-24, H1f); H1 passed:** docs/bench/h1.md. The data path is statistically
+unchanged against the last pre-H1 commit; a request's bundle acquire costs 37 ns under sixteen-way
+contention. A member install of 1,000 placements is 20 % slower (+2.4 ms), the durable cache's
+directory fsync and checksummed envelope, off the request path and outside the install lock. A
+100,000-placement install takes 854 ms and 224 MiB of transient allocation. Fifty secret-only
+rotations with requests between them open one backend connection; the negative control opens
+fifty. `make fleet` and `make walkthrough` passed on the H1 build.
 
 ### Runtime bundle and installation
 
@@ -222,6 +337,14 @@ it starts stale and cannot renew or acknowledge anything. A retired identity's
 cache cannot be used for offline restart.
 
 ## 4. D2 — admission, drain barriers and server leases
+
+**Landed (2026-09-25, H2a–H2f); H2 passed:** docs/bench/h2.md. Local admission gates, proxy
+incarnations with attested resolution, heartbeat drain proofs and server-granted leases, durable
+barriers with resume and precommit cancel, and cutover, purge, movers and credential drain
+through them. H2f changed three things this section specified: a mutation sent whole runs to the
+backend's answer when its client leaves; cutover watches its quiet window before its hold, with
+writes flowing, and re-checks it under the closed gate; forget keeps the incarnations it proved
+ended. ADR-0021, "Decisions taken 2026-09-25", has each with its regression test.
 
 ### Local admission
 
@@ -339,6 +462,11 @@ GUI. Credential revocation barriers also drain all requests using the old signer
 including reads, while ordinary rotation can report installation progress first.
 
 ### Lease algorithm
+
+**Landed (2026-09-24):** T07 without identity. The lease runs from the monotonic send time for
+`min(server grant, local lease_ttl)`, the answer echoes `seq`, and a zero grant, an older or
+mismatched answer, a version behind the proxy's, or a late answer renews nothing
+(`internal/member`, `renew`). Epoch checks wait for H0.
 
 Each heartbeat has a monotonically increasing sequence and carries incarnation,
 identity and protocol capability. At monotonic send time `t0`, record the request.
@@ -577,6 +705,11 @@ alerts for a stuck hold, uncertain backend effects, expired health data and an
 incomplete recovery; a stale ACTIVE proxy alone does not make liveness fail.
 
 ## 9. Upgrade, rollback and remaining limits
+
+**Amended 2026-09-24 (ADR-0021):** no protocol-1 fleet is deployed, so the mixed-version
+machinery below (capabilities in registration, the controlled handover, the rollout flag, T18)
+is not built. Protocol 2 replaces protocol 1, and a binary that cannot read protocol-2 state
+refuses to start. The paragraphs on rollback after protocol-2 state is written still apply.
 
 Introduce `protocol: 2` plus named capabilities (`atomic_runtime`,
 `drain_barrier`, `epoch_identity`, `server_lease`) in registration and status.

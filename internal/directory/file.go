@@ -41,8 +41,10 @@ type FileDir struct {
 	// Prepare, if set, is called with a validated file before it is installed, on a reload and
 	// on a write. An error rejects the file: a reload keeps the last good version, a write is
 	// refused before anything reaches disk. The proxy uses it to build the clusters a new file
-	// names before any request can route to them.
-	Prepare func(*File) error
+	// names before any request can route to them. resolve is nil here: a file's secret refs
+	// resolve from the environment or a file. commit is called only once the file is on disk,
+	// just before it is installed; a candidate whose write fails is dropped uncommitted.
+	Prepare func(f *File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after a new version is installed by a reload or a write.
 	OnInstall func(*Snapshot)
 
@@ -182,9 +184,11 @@ func (d *FileDir) Reload() (bool, error) {
 		return false, fmt.Errorf("%w: %s has version %d, loaded version is %d; keeping version %d", errStaleVersion, d.path, f.Version, cur, cur)
 	}
 	if d.Prepare != nil {
-		if perr := d.Prepare(f); perr != nil {
+		commit, perr := d.Prepare(f, nil)
+		if perr != nil {
 			return false, fmt.Errorf("directory: reload of %s rejected, keeping version %d: %w", d.path, cur, perr)
 		}
+		commit()
 	}
 	d.install(f, data, st)
 	if d.OnInstall != nil {
@@ -219,18 +223,41 @@ func (d *FileDir) SetState(ctx context.Context, tenant, bucket, from string, t T
 	return d.mutate(ctx, actor, "set-state", Key(tenant, bucket), func(f *File) error { return f.SetState(tenant, bucket, from, t) })
 }
 
+// SetPlacementWatch implements Store.
+func (d *FileDir) SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error {
+	return d.mutate(ctx, actor, "set-watch", Key(tenant, bucket), func(f *File) error { return f.SetPlacementWatch(tenant, bucket, watch) })
+}
+
 // SetPlacementReadOnly implements Store.
-func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, actor string) error {
+func (d *FileDir) SetPlacementReadOnly(ctx context.Context, tenant, bucket string, readOnly, reject bool, barrier, actor string) error {
 	return d.mutate(ctx, actor, "placement-read-only", Key(tenant, bucket), func(f *File) error {
-		return f.SetPlacementReadOnly(tenant, bucket, readOnly, reject)
+		return f.SetPlacementReadOnly(tenant, bucket, readOnly, reject, barrier)
 	})
 }
 
 // SetClusterReadOnly implements Store.
-func (d *FileDir) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, actor string) error {
+func (d *FileDir) SetClusterReadOnly(ctx context.Context, name string, readOnly, reject bool, barrier, actor string) error {
 	return d.mutate(ctx, actor, "cluster-read-only", clusterKey(name), func(f *File) error {
-		return f.SetClusterReadOnly(name, readOnly, reject)
+		return f.SetClusterReadOnly(name, readOnly, reject, barrier)
 	})
+}
+
+// SetBarrier implements Store.
+func (d *FileDir) SetBarrier(ctx context.Context, tenant, bucket string, b Barrier, actor string) error {
+	return d.mutate(ctx, actor, "set-barrier", Key(tenant, bucket), func(f *File) error { return f.SetBarrier(tenant, bucket, b) })
+}
+
+// ClearBarrier implements Store.
+func (d *FileDir) ClearBarrier(ctx context.Context, resource, id, actor string) error {
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		return d.mutate(ctx, actor, "clear-barrier", clusterKey(name), func(f *File) error { return f.ClearClusterBarrier(name, id) })
+	}
+	key := strings.TrimPrefix(resource, "placement:")
+	tenant, bucket, ok := SplitKey(key)
+	if !ok {
+		return fmt.Errorf("%w: %q is not a placement or cluster resource", ErrNotFound, resource)
+	}
+	return d.mutate(ctx, actor, "clear-barrier", key, func(f *File) error { return f.ClearBarrier(tenant, bucket, id) })
 }
 
 // PutCluster implements Store. The proxy's Prepare hook builds the cluster (and resolves its
@@ -310,6 +337,7 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 	if f.Placements == nil {
 		f.Placements = map[string]Placement{}
 	}
+	prev := f.clone()
 	change := Change{Actor: actor, Op: op, Key: k}
 	clusterName, isCluster := strings.CutPrefix(k, "clusters/")
 	if p, ok := f.Placements[k]; ok && !isCluster {
@@ -323,13 +351,19 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 		return ferr
 	}
 	f.Version++
+	if serr := Stamp(prev, f); serr != nil {
+		return serr
+	}
 	if verr := validate(f); verr != nil {
 		return verr
 	}
+	commit := func() {}
 	if d.Prepare != nil {
-		if perr := d.Prepare(f); perr != nil {
+		c, perr := d.Prepare(f, nil)
+		if perr != nil {
 			return perr
 		}
+		commit = c
 	}
 	out, err := marshal(f)
 	if err != nil {
@@ -339,6 +373,7 @@ func (d *FileDir) mutate(ctx context.Context, actor, op, k string, fn func(*File
 		return classifyWrite(err)
 	}
 	st, _ := os.Stat(d.path)
+	commit()
 	d.install(f, out, st)
 	if d.OnInstall != nil {
 		d.OnInstall(d.snap.Load())

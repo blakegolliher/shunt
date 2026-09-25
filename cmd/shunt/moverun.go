@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -53,7 +57,7 @@ func newMigrateRun() *cobra.Command {
 					return err
 				}
 			}
-			dir := &directory.File{Clusters: map[string]config.Cluster{}, Placements: map[string]directory.Placement{}}
+			dir := &directory.File{Clusters: map[string]config.Cluster{}, Placements: map[string]directory.Placement{}, Generations: map[string]int64{}}
 			secrets := map[string]string{}
 			for _, key := range keys {
 				path, perr := placementPath(key)
@@ -65,6 +69,12 @@ func newMigrateRun() *cobra.Command {
 					return fmt.Errorf("%s: %w", key, callErr)
 				}
 				dir.Placements[d.Key] = d.Placement
+				if dir.Identity.IsZero() {
+					dir.Identity = d.Identity
+				} else if dir.Identity != d.Identity {
+					return fmt.Errorf("%s: the control API changed directory lineage while the mover was preparing", key)
+				}
+				dir.Generations[directory.PlacementResource(d.Key)] = d.Generation
 				maps.Copy(dir.Clusters, d.Clusters)
 				maps.Copy(secrets, d.Secrets)
 			}
@@ -112,7 +122,57 @@ func movingOff(ctx context.Context, api *apiClient, cluster string) ([]string, e
 func runMover(cmd *cobra.Command, api *apiClient, dir *directory.File, secrets map[string]string, one, from string,
 	paths moverPaths, dryRun, untilConverged bool, maxPasses int, accept bool,
 ) error {
-	_, err := mover.Run(cmd.Context(), dir, secrets, mover.Options{
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+	var sessions []externalMoverSession
+	if !dryRun {
+		keys := []string{one}
+		if one == "" {
+			keys = make([]string, 0, len(dir.Placements))
+			for key := range dir.Placements {
+				keys = append(keys, key)
+			}
+		}
+		for _, key := range keys {
+			session, err := startExternalMover(ctx, api, dir, key, untilConverged, maxPasses, accept)
+			if err != nil {
+				return err
+			}
+			sessions = append(sessions, session)
+			if err := heartbeatMovers(ctx, api, sessions[len(sessions)-1:], false, ""); err != nil {
+				return err
+			}
+		}
+	}
+
+	finish := make(chan string)
+	leaseDone := make(chan error, 1)
+	if len(sessions) > 0 {
+		go func() {
+			tick := time.NewTicker(time.Second)
+			defer tick.Stop()
+			var leaseErr error
+			for {
+				select {
+				case message := <-finish:
+					finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 5*time.Second)
+					err := heartbeatMovers(finalCtx, api, sessions, true, message)
+					finalCancel()
+					leaseDone <- errors.Join(leaseErr, err)
+					return
+				case <-tick.C:
+					if leaseErr == nil {
+						if err := heartbeatMovers(ctx, api, sessions, false, ""); err != nil {
+							leaseErr = err
+							cancel() // a mover without a current authority lease starts no more backend work
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	_, err := mover.Run(ctx, dir, secrets, mover.Options{
 		Key: one, From: from, AcceptLostWriteWindow: accept, DryRun: dryRun,
 		UntilConverged: untilConverged, MaxPasses: maxPasses,
 		Paths:  mover.Paths{CursorDir: paths.cursorDir, LedgerDir: paths.ledgerDir, LedgerBucket: paths.ledgerBucket},
@@ -127,5 +187,94 @@ func runMover(cmd *cobra.Command, api *apiClient, dir *directory.File, secrets m
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "   progress report to the control API failed: %v\n", callErr)
 		}
 	})
-	return err
+	if len(sessions) == 0 {
+		return err
+	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	finish <- message
+	leaseErr := <-leaseDone
+	if err != nil || leaseErr != nil {
+		return errors.Join(err, leaseErr)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 5*time.Second)
+	waitErr := waitExternalMovers(waitCtx, api, sessions)
+	waitCancel()
+	return waitErr
+}
+
+type externalMoverSession struct {
+	key, operation, session string
+	identity                directory.Identity
+	generation              int64
+	sequence                int64
+}
+
+func startExternalMover(ctx context.Context, api *apiClient, dir *directory.File, key string, until bool, maxPasses int, accept bool) (externalMoverSession, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return externalMoverSession{}, err
+	}
+	session := hex.EncodeToString(raw[:])
+	args := control.MoverRequest{UntilConverged: until, MaxPasses: maxPasses, AcceptLostWriteWindow: accept,
+		External: true, Session: session, Wait: "0s"}
+	var op control.Operation
+	err := api.call(ctx, http.MethodPost, "/v1/operations", control.OperationRequest{Kind: control.OpMover, Placement: key, Args: argsOf(args)}, &op)
+	if err != nil {
+		return externalMoverSession{}, err
+	}
+	return externalMoverSession{key: key, operation: op.ID, session: session, identity: dir.Identity,
+		generation: dir.Generation(directory.PlacementResource(key))}, nil
+}
+
+func heartbeatMovers(ctx context.Context, api *apiClient, sessions []externalMoverSession, complete bool, message string) error {
+	for i := range sessions {
+		s := &sessions[i]
+		s.sequence++
+		req := control.WorkerHeartbeat{Session: s.session, Identity: s.identity, Generation: s.generation,
+			Sequence: s.sequence, Inflight: 1, Complete: complete, Error: message}
+		if complete {
+			req.Inflight = 0
+			if message != "" {
+				req.Complete = false
+				req.Uncertain = 1 // an error after dispatch is not proof the backend did nothing
+			}
+		}
+		var answer control.WorkerHeartbeatAnswer
+		if err := api.call(ctx, http.MethodPost, "/v1/operations/"+s.operation+"/worker-heartbeat", req, &answer); err != nil {
+			return fmt.Errorf("worker session %s: %w", s.session, err)
+		}
+		if answer.Hold {
+			return fmt.Errorf("worker session %s: the placement entered a source hold", s.session)
+		}
+	}
+	return nil
+}
+
+func waitExternalMovers(ctx context.Context, api *apiClient, sessions []externalMoverSession) error {
+	for _, session := range sessions {
+		for {
+			var op control.Operation
+			if err := api.call(ctx, http.MethodGet, "/v1/operations/"+session.operation, nil, &op); err != nil {
+				return err
+			}
+			if op.Terminal() {
+				if op.Status != control.StatusSucceeded {
+					if op.Error != nil {
+						return fmt.Errorf("worker operation %s: %s", op.ID, op.Error.Message)
+					}
+					return fmt.Errorf("worker operation %s ended %s", op.ID, op.Status)
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("worker operation %s did not finish: %w", op.ID, ctx.Err())
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+	}
+	return nil
 }

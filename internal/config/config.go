@@ -129,6 +129,9 @@ type Cluster struct {
 	// retryable default (503 + Retry-After) to a fail-fast 403.
 	ReadOnly     bool `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	RejectWrites bool `yaml:"reject_writes,omitempty" json:"reject_writes,omitempty"`
+	// Barrier is the drain barrier of a cluster read-only change in progress (ADR-0021 D2): every
+	// placement with a bucket on the cluster closes its mutations until it is cleared.
+	Barrier *Barrier `yaml:"barrier,omitempty" json:"barrier,omitempty"`
 }
 
 // Capabilities is the hand-written capability profile of a cluster, filled from `shunt probe`

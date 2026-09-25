@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +33,50 @@ const (
 	SeriesErrors0PerSecond   = "errors_0_per_second"   // SeriesErrors0PerSecond counts requests with no response status.
 	SeriesErrors4xxPerSecond = "errors_4xx_per_second" // SeriesErrors4xxPerSecond counts client-error responses.
 	SeriesErrors5xxPerSecond = "errors_5xx_per_second" // SeriesErrors5xxPerSecond counts server-error responses.
+	// SeriesNotFoundPerSecond counts reads answered 404: a HEAD or GET of a key or bucket that is
+	// not there is an answer, not a failure, so it is kept out of errors_4xx_per_second.
+	SeriesNotFoundPerSecond = "not_found_per_second"
+	// SeriesStatusPerSecond is the non-2xx responses by status: one point per status key seen in a
+	// window, named by ScalarPoint.Code (StatusKey).
+	SeriesStatusPerSecond = "status_per_second"
 )
+
+// notFound is the Errors key of a read answered 404 (SeriesNotFoundPerSecond).
+const notFound = "not_found"
+
+// trackedStatus are the codes counted on their own; any other 4xx or 5xx counts as "4xx" or "5xx".
+// The set is fixed, so a window carries at most len(trackedStatus)+4 status keys.
+var trackedStatus = map[int]bool{400: true, 403: true, 404: true, 405: true, 409: true, 411: true, 412: true, 416: true, 429: true,
+	500: true, 501: true, 502: true, 503: true, 504: true}
+
+// StatusKey is the Errors key a response counts under: "0" for no response, "not_found" for a read
+// or listing answered 404, the code itself for a tracked code, else "4xx" or "5xx".
+func StatusKey(status int, op OpClass) string {
+	switch {
+	case status == 0:
+		return "0"
+	case status == 404 && (op == OpRead || op == OpList):
+		return notFound
+	case trackedStatus[status]:
+		return strconv.Itoa(status)
+	case status >= 500:
+		return "5xx"
+	}
+	return "4xx"
+}
+
+// statusClass is the class a status key belongs to: "0", "4xx", "5xx", or "" for a read's 404.
+func statusClass(key string) string {
+	switch {
+	case key == "0":
+		return "0"
+	case key == notFound:
+		return ""
+	case strings.HasPrefix(key, "5"):
+		return "5xx"
+	}
+	return "4xx"
+}
 
 // OpClass is the bounded operation dimension carried in window telemetry.
 type OpClass string
@@ -110,6 +154,26 @@ type MigrationCounter struct {
 	Reads  map[string]int64 `json:"reads,omitempty"`  // target_hit | fallback_source | miss
 }
 
+// BucketCounter is one placement's exact traffic on one backend cluster in a completed window.
+// Only placements spread over legs, moving, or watched are counted (ObserveBucket), and at most
+// MaxBucketsPerWindow of them per window: bucket is not a global telemetry label.
+type BucketCounter struct {
+	Bucket   string           `json:"bucket"`
+	Cluster  string           `json:"cluster"`
+	Requests int64            `json:"requests"`
+	BytesIn  int64            `json:"bytes_in"`
+	BytesOut int64            `json:"bytes_out"`
+	Errors   map[string]int64 `json:"errors,omitempty"`
+}
+
+// MaxBucketsPerWindow bounds the placements one proxy window counts by backend; traffic of any
+// further placement is summed under OtherBuckets. It keeps a dense heartbeat within its 1 MiB cap
+// (control.TestHeartbeatPayloadBound).
+const MaxBucketsPerWindow = 32
+
+// OtherBuckets is the bucket name the counters of placements past MaxBucketsPerWindow are summed under.
+const OtherBuckets = "(other)"
+
 // Window is the last completed telemetry window carried by a proxy heartbeat.
 type Window struct {
 	Start      time.Time          `json:"start"`
@@ -117,6 +181,7 @@ type Window struct {
 	Sketches   []Sketch           `json:"sketches"`
 	Counters   []WindowCounter    `json:"counters"`
 	Migrations []MigrationCounter `json:"migrations,omitempty"`
+	Buckets    []BucketCounter    `json:"buckets,omitempty"`
 }
 
 type sketchKey struct {
@@ -129,6 +194,8 @@ type counterKey struct {
 	op      OpClass
 }
 
+type bucketKey struct{ bucket, cluster string }
+
 // Collector owns only the current raw sketches and one encoded completed window. Histograms are
 // allocated lazily on the first observation of a tuple.
 type Collector struct {
@@ -137,6 +204,8 @@ type Collector struct {
 	sketches   map[sketchKey]*hdrhistogram.Histogram
 	counters   map[counterKey]*WindowCounter
 	migrations map[string]*MigrationCounter
+	buckets    map[bucketKey]*BucketCounter
+	seen       map[string]bool // placements with their own bucket counters this window
 	last       *Window
 }
 
@@ -156,7 +225,7 @@ func (c *Collector) rotateLocked(now time.Time) {
 	if !start.After(c.start) {
 		return
 	}
-	if len(c.sketches) > 0 || len(c.migrations) > 0 {
+	if len(c.sketches) > 0 || len(c.migrations) > 0 || len(c.buckets) > 0 {
 		w := &Window{Start: c.start, End: c.start.Add(WindowDuration)}
 		keys := make([]sketchKey, 0, len(c.sketches))
 		for k := range c.sketches {
@@ -198,9 +267,20 @@ func (c *Collector) rotateLocked(now time.Time) {
 			v.Reads = maps.Clone(v.Reads)
 			w.Migrations = append(w.Migrations, v)
 		}
+		bucketKeys := slices.SortedFunc(maps.Keys(c.buckets), func(a, b bucketKey) int {
+			if n := strings.Compare(a.bucket, b.bucket); n != 0 {
+				return n
+			}
+			return strings.Compare(a.cluster, b.cluster)
+		})
+		for _, k := range bucketKeys {
+			v := *c.buckets[k]
+			v.Errors = cloneErrors(v.Errors)
+			w.Buckets = append(w.Buckets, v)
+		}
 		c.last = w
 	}
-	c.start, c.sketches, c.counters, c.migrations = start, nil, nil, nil
+	c.start, c.sketches, c.counters, c.migrations, c.buckets, c.seen = start, nil, nil, nil, nil, nil
 }
 
 func cloneErrors(in map[string]int64) map[string]int64 {
@@ -281,7 +361,47 @@ func (c *Collector) Observe(o Observation) {
 		if count.Errors == nil {
 			count.Errors = map[string]int64{}
 		}
-		count.Errors[StatusClass(o.Status)]++
+		count.Errors[StatusKey(o.Status, op)]++
+	}
+}
+
+// ObserveBucket counts one completed request against its placement and backend cluster: for a
+// placement spread over legs, moving, or watched, so an operator sees how its traffic splits over
+// its backends. Past MaxBucketsPerWindow placements in a window, the rest count under OtherBuckets.
+func (c *Collector) ObserveBucket(o Observation, bucket string) {
+	if o.At.IsZero() {
+		o.At = time.Now()
+	}
+	if o.Cluster == "" {
+		o.Cluster = "none"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rotateLocked(o.At)
+	if c.buckets == nil {
+		c.buckets, c.seen = map[bucketKey]*BucketCounter{}, map[string]bool{}
+	}
+	if !c.seen[bucket] {
+		if len(c.seen) >= MaxBucketsPerWindow {
+			bucket = OtherBuckets
+		} else {
+			c.seen[bucket] = true
+		}
+	}
+	k := bucketKey{bucket: bucket, cluster: o.Cluster}
+	v := c.buckets[k]
+	if v == nil {
+		v = &BucketCounter{Bucket: bucket, Cluster: o.Cluster}
+		c.buckets[k] = v
+	}
+	v.Requests++
+	v.BytesIn += o.BytesIn
+	v.BytesOut += o.BytesOut
+	if o.Status == 0 || o.Status >= 400 {
+		if v.Errors == nil {
+			v.Errors = map[string]int64{}
+		}
+		v.Errors[StatusKey(o.Status, OperationClass(o.Operation))]++
 	}
 }
 
@@ -404,7 +524,7 @@ func (s *Store) Ingest(members []MemberWindow) ([]time.Time, error) {
 		if m.Live {
 			live[m.ID] = true
 		}
-		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 && len(m.Telemetry.Migrations) == 0 {
+		if m.Telemetry == nil || len(m.Telemetry.Sketches) == 0 && len(m.Telemetry.Migrations) == 0 && len(m.Telemetry.Buckets) == 0 {
 			continue
 		}
 		start := m.Telemetry.Start.UnixNano()
@@ -513,9 +633,11 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 		h map[summaryKey]*hdrhistogram.Histogram
 		c map[OpClass]*WindowCounter
 		m map[string]*MigrationCounter
+		b map[string]*WindowCounter // a bucket scope's counters by backend cluster
 	}
 	newRaw := func() *rawScope {
-		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}, m: map[string]*MigrationCounter{}}
+		return &rawScope{h: map[summaryKey]*hdrhistogram.Histogram{}, c: map[OpClass]*WindowCounter{}, m: map[string]*MigrationCounter{},
+			b: map[string]*WindowCounter{}}
 	}
 	raw := map[string]*rawScope{}
 	get := func(scope string) *rawScope {
@@ -585,6 +707,12 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 			m.Reads = maps.Clone(m.Reads)
 			sw.Migrations = append(sw.Migrations, m)
 		}
+		// A bucket scope keeps its counters apart by backend cluster: that split is what it is for.
+		for _, cluster := range slices.Sorted(maps.Keys(r.b)) {
+			c := *r.b[cluster]
+			c.Errors = cloneErrors(c.Errors)
+			sw.Counters = append(sw.Counters, c)
+		}
 		return sw
 	}
 	// A proxy scope is reduced and released one proxy at a time. Keeping one raw histogram per
@@ -620,6 +748,20 @@ func mergeWindows(windows map[string]*Window) ([]ScopeWindow, error) {
 		for _, migration := range w.Migrations {
 			addMigration(get("fleet").m, migration)
 			addMigration(proxyRaw.m, migration)
+		}
+		for _, b := range w.Buckets {
+			dst := get("bucket:" + b.Bucket).b
+			d := dst[b.Cluster]
+			if d == nil {
+				d = &WindowCounter{Op: OpAll, Cluster: b.Cluster, Errors: map[string]int64{}}
+				dst[b.Cluster] = d
+			}
+			d.Requests += b.Requests
+			d.BytesIn += b.BytesIn
+			d.BytesOut += b.BytesOut
+			for k, v := range b.Errors {
+				d.Errors[k] += v
+			}
 		}
 		out = append(out, finalize("proxy:"+proxy, proxyRaw))
 	}
@@ -685,6 +827,12 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 			if seconds <= 0 {
 				continue
 			}
+			if series == SeriesStatusPerSecond {
+				for _, key := range slices.Sorted(maps.Keys(c.Errors)) {
+					out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Cluster: c.Cluster, Code: key, Value: float64(c.Errors[key]) / seconds})
+				}
+				continue
+			}
 			var total int64
 			switch series {
 			case SeriesRequestsPerSecond:
@@ -693,16 +841,19 @@ func (s *Store) CounterSeries(scope, series string, op OpClass, from, to time.Ti
 				total = c.BytesIn
 			case SeriesBytesOutPerSecond:
 				total = c.BytesOut
-			case SeriesErrors0PerSecond:
-				total = c.Errors["0"]
-			case SeriesErrors4xxPerSecond:
-				total = c.Errors["4xx"]
-			case SeriesErrors5xxPerSecond:
-				total = c.Errors["5xx"]
+			case SeriesErrors0PerSecond, SeriesErrors4xxPerSecond, SeriesErrors5xxPerSecond:
+				class := strings.TrimSuffix(strings.TrimPrefix(series, "errors_"), "_per_second")
+				for key, n := range c.Errors {
+					if statusClass(key) == class {
+						total += n
+					}
+				}
+			case SeriesNotFoundPerSecond:
+				total = c.Errors[notFound]
 			default:
 				continue
 			}
-			out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Value: float64(total) / seconds})
+			out = append(out, ScalarPoint{Start: w.Start, End: w.End, Series: series, Op: op, Cluster: c.Cluster, Value: float64(total) / seconds})
 		}
 	}
 	return out
@@ -721,5 +872,10 @@ type ScalarPoint struct {
 	End    time.Time `json:"end"`
 	Series string    `json:"series"`
 	Op     OpClass   `json:"op"`
-	Value  float64   `json:"value"`
+	// Cluster is the backend cluster of a point in a bucket scope, which answers one point per
+	// cluster each window; empty elsewhere.
+	Cluster string `json:"cluster,omitempty"`
+	// Code is the status key of a status_per_second point (StatusKey).
+	Code  string  `json:"code,omitempty"`
+	Value float64 `json:"value"`
 }

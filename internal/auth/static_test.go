@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 )
 
@@ -228,5 +229,35 @@ func TestRemoveDropsAKey(t *testing.T) {
 	}
 	if c, err := again.Lookup(context.Background(), "REAL"); err != nil || c.Secret != "real" {
 		t.Fatalf("the key that stays: %+v, %v", c, err)
+	}
+}
+
+// A table taken from the store is a snapshot: keys replaced afterwards do not reach it, and the
+// store says so through OnChange, with the new table.
+func TestTableIsASnapshot(t *testing.T) {
+	s := NewEmpty()
+	s.Replace([]sigv4.Credential{{AccessKey: "A", Secret: "a", Tenant: "t"}})
+	before := s.Table()
+	var changed []int
+	s.OnChange = func(tb Table) { changed = append(changed, tb.Len()) }
+	s.Replace([]sigv4.Credential{{AccessKey: "B", Secret: "b"}, {AccessKey: "C", Secret: "c"}})
+	if _, err := before.Lookup(context.Background(), "A"); err != nil {
+		t.Fatalf("the earlier table lost A: %v", err)
+	}
+	if _, err := before.Lookup(context.Background(), "B"); err == nil {
+		t.Fatal("the earlier table sees a key replaced in afterwards")
+	}
+	after := s.Table()
+	if c, err := after.Lookup(context.Background(), "B"); err != nil || c.Tenant != directory.DefaultTenant {
+		t.Fatalf("the new table: %+v %v", c, err)
+	}
+	if len(changed) != 1 || changed[0] != 2 {
+		t.Fatalf("OnChange calls %v, want one with the 2-key table", changed)
+	}
+	if n := NewTable([]sigv4.Credential{{AccessKey: "X", Secret: "x"}}).Len(); n != 1 {
+		t.Fatalf("NewTable len %d", n)
+	}
+	if _, err := (Table{}).Lookup(context.Background(), "X"); err == nil {
+		t.Fatal("the zero table found a key")
 	}
 }

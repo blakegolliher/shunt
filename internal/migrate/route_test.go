@@ -24,6 +24,45 @@ func TestEveryOpHasAClass(t *testing.T) {
 	}
 }
 
+// Every operation the classifier knows has a definite answer to whether it mutates, and the answer
+// agrees with what its name says it does (ADR-0021 D2: the gate accounting is complete against the
+// classifier). The oracle is the operation's name, read apart from its routing class.
+func TestEveryOpHasAGateDecision(t *testing.T) {
+	for _, op := range s3.Ops() {
+		name := op.String()
+		var method string
+		switch {
+		case strings.HasPrefix(name, "Get"), strings.HasPrefix(name, "List"), strings.HasPrefix(name, "Head"), name == "SelectObjectContent":
+			method = "GET"
+		case strings.HasPrefix(name, "Delete"), strings.HasPrefix(name, "Abort"):
+			method = "DELETE"
+		case strings.HasPrefix(name, "Put"), strings.HasPrefix(name, "Create"), strings.HasPrefix(name, "Copy"), strings.HasPrefix(name, "Upload"), strings.HasPrefix(name, "Write"):
+			method = "PUT"
+		case strings.HasPrefix(name, "Post"), strings.HasPrefix(name, "Complete"), strings.HasPrefix(name, "Restore"):
+			method = "POST"
+		case name == "Preflight":
+			method = "OPTIONS"
+		case name == "Unknown":
+			continue // decided by the method alone, below
+		default:
+			t.Errorf("%s: the test's name oracle does not cover it; extend it", name)
+			continue
+		}
+		reads := method == "GET" || method == "OPTIONS"
+		if got := Mutates(op, method); got == reads {
+			t.Errorf("Mutates(%s, %s) = %v", name, method, got)
+		}
+	}
+	for method, want := range map[string]bool{"GET": false, "HEAD": false, "OPTIONS": false, "PUT": true, "POST": true, "DELETE": true, "PATCH": true} {
+		if Mutates(s3.OpUnknown, method) != want {
+			t.Errorf("an unknown operation with method %s: want mutates %v", method, want)
+		}
+	}
+	if Mutates(s3.OpListParts, "GET") || !Mutates(s3.OpUploadPart, "PUT") || !Mutates(s3.OpCompleteMultipartUpload, "POST") {
+		t.Error("a multipart part or completion mutates; listing parts does not")
+	}
+}
+
 func ramping(ratio float64, prefixes ...string) *directory.Placement {
 	return &directory.Placement{State: directory.StateRamping, Primary: "target", Source: "src",
 		Ramp: &directory.Ramp{Hash: directory.RampHash, Ratio: ratio, Prefixes: prefixes}}

@@ -267,6 +267,13 @@ func validateClusters(e *errs, prefix string, clusters map[string]Cluster) {
 		if cl.Region == "" {
 			e.add(k+".region", "required")
 		}
+		if cl.Barrier != nil {
+			if err := cl.Barrier.Validate(); err != nil {
+				e.add(k+".barrier", "%v", err)
+			} else if cl.Barrier.Kind != BarrierMutations {
+				e.add(k+".barrier.kind", "a cluster barrier closes mutations; got %q", cl.Barrier.Kind)
+			}
+		}
 		if e.oneOf(k+".endpoint_mode", cl.EndpointMode, endpointModes) {
 			switch cl.EndpointMode {
 			case "static":

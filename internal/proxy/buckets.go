@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
@@ -148,6 +149,9 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	actor := "proxy:" + o.accessKey
 	dctx := context.WithoutCancel(ctx) // a claimed row must be released even if the client leaves
+	if tok, _, ok := h.Gates.Enter(directory.Key(o.tenant, bucket), admission.Mutations); ok {
+		o.tok = tok // a bucket that is being made carries no barrier yet; counted all the same
+	}
 
 	for attempt := 0; attempt < createAttempts; attempt++ {
 		name := directory.BackendName(o.tenant, bucket, attempt)
@@ -175,6 +179,7 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 		o.backend = name
 		resp, err := h.clusterDo(ctx, cl, http.MethodPut, "/"+name, createBody(cl), o)
 		if err != nil {
+			o.uncertain = dispatched(err, nil, 0)
 			h.releaseRow(dctx, o, bucket, actor, "backend request failed: "+err.Error())
 			h.upstreamError(w, r, o, err)
 			return
@@ -237,6 +242,11 @@ func createBody(cl *upstream.Cluster) []byte {
 // clusterDo sends a small request shunt originates itself (CreateBucket), signed with the
 // cluster's credentials, skipping endpoints that refuse the connection.
 func (h *Handler) clusterDo(ctx context.Context, cl *upstream.Cluster, method, path string, body []byte, o *outcome) (*http.Response, error) {
+	return h.clusterDoHeader(ctx, cl, method, path, body, nil, o)
+}
+
+// clusterDoHeader is clusterDo with extra headers, signed with the rest.
+func (h *Handler) clusterDoHeader(ctx context.Context, cl *upstream.Cluster, method, path string, body []byte, hdr http.Header, o *outcome) (*http.Response, error) {
 	sum := sha256.Sum256(body)
 	var lastErr error
 	for range cl.Endpoints {
@@ -247,6 +257,9 @@ func (h *Handler) clusterDo(ctx context.Context, cl *upstream.Cluster, method, p
 			return nil, err
 		}
 		req.Host = ep
+		for k, v := range hdr {
+			req.Header[k] = v
+		}
 		req.Header.Set("User-Agent", "")
 		req.Header.Set(telemetry.HeaderRequestID, o.rid)
 		appendVia(req.Header, h.Via)
@@ -380,6 +393,7 @@ func (h *Handler) deleteOnSource(ctx context.Context, o *outcome, p *prepared) s
 	side := &outcome{rid: o.rid, info: o.info, tm: &timings{}}
 	resp, err := h.roundTrip(context.WithoutCancel(ctx), side, p, p.other, p.otherBackend, nil)
 	if err != nil {
+		o.srcUncertain = dispatched(err, nil, 0) // a delete sent whole and unanswered may have landed
 		if h.Log != nil {
 			h.Log.Error("delete did not reach the migration source; the object can come back when the mover copies it (ADR-0004)",
 				"request_id", o.rid, "bucket", p.bucketKey, "source", p.other.Name, "backend_bucket", p.otherBackend, "err", err.Error())

@@ -117,7 +117,7 @@ export function StoreProvider({ children }: PropsWithChildren) {
             if (event.type === 'reset' || event.type === 'directory' || event.type === 'fleet' || event.type === 'fence') void refresh()
             if (event.type === 'fence' && typeof event.data === 'object' && event.data !== null) {
               const record = event.data as { status?: string; kind?: string; error?: string }
-              if (record.status === 'succeeded' || record.status === 'failed' || record.status === 'refused') {
+              if (record.status === 'succeeded' || record.status === 'failed' || record.status === 'cancelled') {
                 notify(record.error || `${record.kind ?? 'operation'} ${record.status}`, record.status === 'succeeded' ? 'success' : 'danger')
               }
             }

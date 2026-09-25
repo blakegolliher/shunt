@@ -12,8 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/s3/xmlrw"
 	"github.com/blakegolliher/shunt/internal/sigv4"
@@ -30,9 +32,11 @@ type Handler struct {
 	// routed by its placement in Dir to one of Clusters under that cluster's backend bucket name,
 	// and re-signed with the cluster's credentials. Rewrite (off by kill_switches.xml_rewrite_disable) rewrites the
 	// response echoes of backend names, endpoints, and uploadIds (ADR-0006).
-	Mode      Mode
-	Store     sigv4.CredentialStore
-	Clusters  *upstream.Registry
+	Mode Mode
+	// Runtime is the resign-mode runtime bundle (ADR-0021 D1): a request takes one bundle before
+	// it authenticates, and its keys, placements and clusters are that bundle's to its end. Dir is
+	// only for writes (a bucket's create and delete), never read on the request path.
+	Runtime   *runtimecfg.Publisher
 	Dir       directory.Directory
 	Rewrite   bool
 	ClockSkew time.Duration
@@ -53,6 +57,10 @@ type Handler struct {
 	// and deletes on a moving bucket are then refused. nil: this proxy is its own control node and
 	// is never stale.
 	Stale func() bool
+	// Gates is the proxy's admission accounting (ADR-0021 D2): every mutation and every request
+	// that depends on a moving bucket's source takes a token from the bucket's gate, and a drain
+	// barrier closes it. nil: everything is admitted and nothing counted (passthrough, tests).
+	Gates *admission.Gates
 
 	pool    *bufPool   // body copy buffers
 	scratch *bufPool   // rewritten-response scratch (ADR-0006)
@@ -94,6 +102,15 @@ type outcome struct {
 	clusterType string
 	backend     string // backend bucket name (resign mode)
 	fromSource  bool   // the answer came from a migration's source role, not its primary
+	// perBucket is the placement key when telemetry counts this bucket by backend cluster: it is
+	// spread over legs, moving, or watched (telemetry.Collector.ObserveBucket).
+	perBucket string
+	// tok and src are the admission tokens the request holds (ADR-0021 D2): a mutation's, and a
+	// source-dependent request's. uncertain and srcUncertain say the backend's outcome through
+	// each was never learned.
+	tok, src     admission.Token
+	uncertain    bool
+	srcUncertain bool
 }
 
 // prepared is a request ready to send: the cluster, a builder that produces the upstream request
@@ -163,10 +180,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Metrics.Inflight.WithLabelValues(op).Inc()
 	defer h.Metrics.Inflight.WithLabelValues(op).Dec()
 	defer h.finish(r, o)
+	// Held to the end of the handler, response body included: a mutation's backend outcome is
+	// known only once its response has arrived, and a drain barrier waits for exactly that.
+	defer o.releaseTokens(h.Gates)
 
+	// A mutation is not cut off when its client goes away (ADR-0021, 2026-09-25): once the backend
+	// has the whole request, only its answer tells whether the change landed, and an outcome this
+	// proxy never learns blocks every later barrier on the bucket for the life of the process. A
+	// client that leaves mid-body still stops the request, since its body read fails and a short
+	// body is never committed. The proxy's own deadlines below still apply.
+	parent := r.Context()
+	if migrate.Mutates(o.info.Op, r.Method) {
+		parent = context.WithoutCancel(parent)
+	}
 	// Deadline class (docs/DESIGN.md §2.8): metadata ops get a total deadline, data ops an
 	// idle-progress watchdog that cancels the upstream request when nothing moves.
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var wd *watchdog
 	if o.info.Op.IsData() {
@@ -186,8 +215,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var p *prepared
 	if h.Mode == ModeResign {
+		// Held to the end of the handler, response body included: its cluster set, and so the
+		// transport this request's connection returns to, stays open until then.
+		rt := h.Runtime.Acquire()
+		defer rt.Release()
 		var ok bool
-		if p, ok = h.prepareResign(ctx, w, r, o, inBody); !ok {
+		if p, ok = h.prepareResign(ctx, w, r, o, inBody, rt); !ok {
 			return // shunt answered: auth failure, synthesized response, or a refusal
 		}
 	} else {
@@ -209,6 +242,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		o.bytesIn = inBody.count()
 	}
 	if err != nil {
+		o.uncertain = dispatched(err, inBody, r.ContentLength)
 		var berr *buildError
 		if errors.As(err, &berr) {
 			o.status = http.StatusBadRequest
@@ -226,8 +260,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				reason = sigv4.ReasonTrailer
 			}
 			h.Metrics.AuthFailures.WithLabelValues(string(reason)).Inc()
+			o.uncertain = false // the client's body was bad: the upstream request ended short of whole
 			if p.plan.decoder.DataRead() >= p.plan.decodedLen && p.plan.decodedLen > 0 {
 				h.compensate("trailer", r, o, derr.Error())
+				o.uncertain = true // every decoded byte went upstream: the backend may have committed
 			}
 			o.status = derr.Status
 			o.err = "auth: " + string(reason)
@@ -515,9 +551,13 @@ func (h *Handler) finish(r *http.Request, o *outcome) {
 		upstreamTotal = o.tLast.Sub(tWrote)
 	}
 	if h.Telemetry != nil {
-		h.Telemetry.Observe(telemetry.Observation{At: time.Now(), Operation: op, Cluster: o.cluster,
+		obs := telemetry.Observation{At: time.Now(), Operation: op, Cluster: o.cluster,
 			Status: o.status, BytesIn: o.bytesIn, BytesOut: o.bytesOut, ClientTotal: total,
-			UpstreamTTFB: ttfb, UpstreamTotal: upstreamTotal})
+			UpstreamTTFB: ttfb, UpstreamTotal: upstreamTotal}
+		h.Telemetry.Observe(obs)
+		if o.perBucket != "" {
+			h.Telemetry.ObserveBucket(obs, o.perBucket)
+		}
 	}
 	tlsVer := ""
 	if r.TLS != nil {

@@ -75,6 +75,7 @@ func validate(f *File) error {
 	if f.Version < 0 {
 		e.add("version", "must not be negative")
 	}
+	validateLineage(&e, f)
 	if err := config.ValidateClusters("clusters", clusters); err != nil {
 		e = append(e, err)
 	}
@@ -136,6 +137,7 @@ func validatePlacement(e *errs, f *File, clusters map[string]config.Cluster, pk 
 	if p.Cutover != nil && p.State != StateCutover {
 		e.add(k+".cutover", "only allowed in state CUTOVER")
 	}
+	validateBarrier(e, k, p)
 	switch {
 	case migrating && p.Source == "":
 		e.add(k+".source", "required in state %s", p.State)
@@ -223,6 +225,7 @@ func validateSpread(e *errs, clusters map[string]config.Cluster, k, pk string, p
 	if p.Move != nil {
 		validateRamp(e, k+".move", p.State, p.Move.Ramp)
 	}
+	validateBarrier(e, k, p)
 	if p.Primary != "" || p.Source != "" || p.Names != nil || p.Ramp != nil || p.Cutover != nil {
 		e.add(k, "a placement spread over legs names its buckets in legs, not in primary, source, names, ramp or cutover")
 	}
@@ -292,4 +295,20 @@ func validRampHashName(s string) bool {
 		}
 	}
 	return true
+}
+
+// validateBarrier checks a placement's drain barrier (ADR-0021 D2): a source barrier closes
+// source-dependent work, which only a CUTOVER placement about to lose its source has.
+func validateBarrier(e *errs, k string, p Placement) {
+	b := p.Barrier
+	if b == nil {
+		return
+	}
+	if err := b.Validate(); err != nil {
+		e.add(k+".barrier", "%v", err)
+		return
+	}
+	if b.Kind == config.BarrierSource && p.State != StateCutover {
+		e.add(k+".barrier.kind", "a source barrier is only written on a placement in CUTOVER; the placement is %s", p.State)
+	}
 }

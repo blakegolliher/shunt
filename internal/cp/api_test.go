@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +26,7 @@ import (
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
@@ -89,7 +93,13 @@ func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.D
 	store := New(tc.nodes[i].Client(), c, slog.New(slog.DiscardHandler))
 	registry := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, store.Resolve)
 	t.Cleanup(registry.Close)
-	store.Prepare = func(f *directory.File) error { _, _, err := registry.Apply(f.Clusters); return err }
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
+	}
 	events := control.NewEvents(256)
 	store.OnInstall = events.Directory
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -100,6 +110,7 @@ func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.D
 	t.Cleanup(store.Close)
 	n := &node{t: t, store: store, events: events}
 	ops := NewOperations(tc.nodes[i].Client())
+	ops.Node = fmt.Sprintf("c%d", i+1)
 	ops.OnChange = func(op control.Operation) {
 		events.Fence(op)
 		n.hookMu.Lock()
@@ -117,7 +128,7 @@ func startNode(t *testing.T, tc *testCluster, i int, key []byte, leaseTTL time.D
 	fleet.DropMargin = 500 * time.Millisecond
 	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: telemetry.NewMetrics(), Log: slog.New(slog.DiscardHandler),
 		Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, FencePoll: 20 * time.Millisecond,
-		Ops: ops, Node: fmt.Sprintf("c%d", i+1), Events: events, ConfirmKey: c.Derive("confirm")}
+		Ops: ops, Node: ops.Node, Events: events, ConfirmKey: c.Derive("confirm")}
 	api := httptest.NewServer(ctl.Handler())
 	t.Cleanup(api.Close)
 	n.api, n.ctl, n.fleet, n.ops = api, ctl, fleet, ops
@@ -131,6 +142,9 @@ func (n *node) call(method, path string, body, out any) (int, string) {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req, _ := http.NewRequest(method, n.api.URL+path, &buf)
+	if method != http.MethodGet {
+		req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("test-%d", nodeKeys.Add(1)))
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		n.t.Fatal(err)
@@ -145,6 +159,8 @@ func (n *node) call(method, path string, body, out any) (int, string) {
 	}
 	return resp.StatusCode, raw.String()
 }
+
+var nodeKeys atomic.Int64
 
 func (n *node) must(method, path string, body, out any) {
 	n.t.Helper()
@@ -163,20 +179,25 @@ func (n *node) refused(method, path string, body any, want string) {
 
 // member is a simulated proxy: it heartbeats to a node with the version it says it has installed.
 type member struct {
-	id      string
-	node    *node
-	applied atomic.Int64
-	follow  atomic.Bool // report the node's current version
-	seq     atomic.Int64
-	stop    chan struct{}
-	reads   atomic.Int64 // fallback reads it reports for data01
+	id          string
+	incarnation string
+	node        *node
+	applied     atomic.Int64
+	follow      atomic.Bool // report the node's current version
+	seq         atomic.Int64
+	stop        chan struct{}
+	done        chan struct{}
+	reads       atomic.Int64 // fallback reads it reports for data01
+	noAck       atomic.Bool  // install versions but acknowledge no barrier: a drain that cannot finish
+	gates       *admission.Gates
 }
 
 func startMember(t *testing.T, n *node, id string, interval time.Duration) *member {
 	t.Helper()
-	m := &member{id: id, node: n, stop: make(chan struct{})}
+	m := &member{id: id, node: n, stop: make(chan struct{}), done: make(chan struct{}), incarnation: fmt.Sprintf("%032x", time.Now().UnixNano()), gates: admission.New()}
 	m.follow.Store(true)
 	go func() {
+		defer close(m.done)
 		tick := time.NewTicker(interval)
 		defer tick.Stop()
 		for {
@@ -194,10 +215,18 @@ func startMember(t *testing.T, n *node, id string, interval time.Duration) *memb
 }
 
 func (m *member) beat() {
+	snap := m.node.store.Snapshot()
 	if m.follow.Load() {
-		m.applied.Store(m.node.store.Version())
+		closures, _ := admission.Barriers(snap)
+		m.gates.Apply(closures, false)
+		m.applied.Store(snap.Version())
 	}
-	hb := control.Heartbeat{Seq: m.seq.Add(1), Applied: m.applied.Load(), FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
+	acks := m.gates.Acks(snap)
+	if m.noAck.Load() {
+		acks = nil
+	}
+	hb := control.Heartbeat{Protocol: control.Protocol, Identity: m.node.store.Snapshot().File().Identity, Seq: m.seq.Add(1), Applied: m.applied.Load(),
+		Durable: m.applied.Load(), Incarnation: m.incarnation, Barriers: acks, FallbackReads: map[string]float64{"acme/data01": float64(m.reads.Load())}}
 	m.node.call(http.MethodPost, "/v1/fleet/"+m.id+"/heartbeat", hb, nil) //nolint:errcheck // a member that cannot reach the node just misses a beat
 }
 
@@ -207,6 +236,7 @@ func (m *member) pause() {
 	default:
 		close(m.stop)
 	}
+	<-m.done
 }
 
 func placement(t *testing.T, n *node) directory.Placement {
@@ -259,8 +289,15 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	if dir.Version != b.store.Version() || dir.Secrets["control:vast01"] != "s1" || len(dir.Credentials) != 1 || dir.Credentials[0].Secret != "cs" || len(dir.Placements) != 1 {
 		t.Fatalf("directory payload: version %d secrets %v creds %+v placements %d", dir.Version, dir.Secrets, dir.Credentials, len(dir.Placements))
 	}
-	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms", dir.Version), nil, nil); code != http.StatusNotModified {
+	if dir.Identity.Validate() != nil || dir.Identity != a.store.Snapshot().File().Identity {
+		t.Fatalf("directory payload identity %+v", dir.Identity)
+	}
+	lineage := "&cluster_id=" + dir.Identity.ClusterID + "&epoch=" + dir.Identity.Epoch
+	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms%s", dir.Version, lineage), nil, nil); code != http.StatusNotModified {
 		t.Fatalf("long-poll at the current version: %d", code)
+	}
+	if code, _ := b.call("GET", fmt.Sprintf("/v1/directory?since=%d&wait=100ms", dir.Version), nil, nil); code != http.StatusBadRequest {
+		t.Fatalf("long-poll with a version and no lineage: %d, want 400", code)
 	}
 
 	// Two members, heartbeating to different nodes. A ramp step is held until both have it.
@@ -275,14 +312,32 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 		t.Fatalf("node b after the step: %+v", p.Ramp)
 	}
 
-	// p3 stops installing: the next step's hold cannot reach it and is released, then the
-	// precondition refuses until p3 catches up.
+	// p3 stops installing: the next step stays blocked with its durable hold until it is
+	// canceled. Cancellation releases only this operation's hold and restores the old ratio.
 	p3.follow.Store(false)
-	a.refused("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 0.8, Wait: "1s"}, "did not reach every proxy within 1s, waiting on p3")
-	if p := placement(t, a); p.Held() || p.Ramp.Ratio != 0.5 {
-		t.Fatalf("after a released hold: %+v", p.Ramp)
+	var blocked control.Operation
+	if code, raw := a.call("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 0.8, Wait: "1s"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("blocked ramp: want 202, got %d %s", code, raw)
 	}
-	a.refused("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 0.8, Wait: "300ms"}, "is not on every proxy yet, waiting on p3")
+	if blocked.Status != control.StatusBlocked || blocked.Phase != control.PhaseDrain || len(blocked.Blockers) != 1 || blocked.Blockers[0].Code != control.BlockerInstallPending || blocked.Blockers[0].ProxyID != "p3" {
+		t.Fatalf("blocked ramp record: %+v", blocked)
+	}
+	if p := placement(t, a); !p.Held() || p.Ramp.Ratio != 0.5 || p.Barrier == nil || p.Barrier.ID != blocked.ID {
+		t.Fatalf("durable hold: %+v", p)
+	}
+	var blockers control.BlockerPage
+	a.must("GET", "/v1/operations/"+blocked.ID+"/blockers", nil, &blockers)
+	if !blockers.Complete || len(blockers.Blockers) != 1 || blockers.Blockers[0].ProxyID != "p3" {
+		t.Fatalf("blocker page: %+v", blockers)
+	}
+	var canceled control.Operation
+	a.must("POST", "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &canceled)
+	if canceled.Status != control.StatusCancelled || canceled.EffectState != control.EffectNone {
+		t.Fatalf("canceled ramp: %+v", canceled)
+	}
+	if p := placement(t, a); p.Held() || p.Ramp.Ratio != 0.5 {
+		t.Fatalf("after cancellation: %+v", p.Ramp)
+	}
 	p3.follow.Store(true)
 	tr = control.TransitionResult{}
 	a.must("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 0.8}, &tr)
@@ -290,7 +345,8 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 		t.Fatalf("after p3 caught up: %+v", tr)
 	}
 
-	// p3 goes silent: a later step goes ahead without it and says so.
+	// p3 goes silent: a later step remains blocked because silence proves neither drain nor
+	// retirement. Cancel it, resolve the stopped incarnation, then forget the member.
 	p3.pause()
 	time.Sleep(2500 * time.Millisecond) // lease 1s + margin 500ms, and etcd's whole-second lease
 	var fl control.FleetStatus
@@ -298,10 +354,44 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	if len(fl.Members) != 2 || fl.Members[1].ID != "p3" || fl.Members[1].Live {
 		t.Fatalf("fleet with p3 silent: %+v", fl.Members)
 	}
-	tr = control.TransitionResult{}
-	b.must("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 1}, &tr)
-	if len(tr.Silent) != 1 || tr.Silent[0] != "p3" || tr.Proxies != 1 {
-		t.Fatalf("step with a silent member: %+v", tr)
+	blocked = control.Operation{}
+	if code, raw := b.call("POST", "/v1/placements/acme/data01/ramp", control.RampRequest{Ratio: 1, Wait: "300ms"}, &blocked); code != http.StatusAccepted {
+		t.Fatalf("ramp with a silent member: want 202, got %d %s", code, raw)
+	}
+	if blocked.Status != control.StatusBlocked || len(blocked.Blockers) != 1 || blocked.Blockers[0].Code != control.BlockerProxyMissing || blocked.Blockers[0].ProxyID != "p3" {
+		t.Fatalf("silent member blockers: %+v", blocked)
+	}
+	// Blocked in its precondition, the step has written nothing: it can be canceled (defect 6 of
+	// the H2 review), which frees the bucket for the next operation.
+	if blocked.Barrier != nil || !slices.Equal(blocked.AllowedActions, []string{control.ActionCancel}) {
+		t.Fatalf("a step blocked in its precondition: %+v", blocked)
+	}
+	var preCanceled control.Operation
+	b.must("POST", "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &preCanceled)
+	if preCanceled.Status != control.StatusCancelled || preCanceled.EffectState != control.EffectNone {
+		t.Fatalf("cancel in the precondition: %+v", preCanceled)
+	}
+	if p := placement(t, b); p.Held() || p.Ramp == nil || p.Ramp.Ratio != 0.8 {
+		t.Fatalf("a step canceled in its precondition changed the placement: %+v", p)
+	}
+	b.refused("DELETE", "/v1/fleet/p2", nil, "is live")
+	b.refused("DELETE", "/v1/fleet/p3", nil, "did not retire cleanly")
+	b.must("POST", "/v1/fleet/p3/resolve", control.ResolveRequest{Incarnation: p3.incarnation, Attestation: "test host stopped; no backend work in flight"}, nil)
+	b.must("DELETE", "/v1/fleet/p3", nil, nil)
+	var next control.Operation
+	if code, raw := b.call("POST", "/v1/operations", control.OperationRequest{Kind: control.OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":1,"wait":"300ms"}`)}, &next); code != http.StatusAccepted {
+		t.Fatalf("a step after the canceled one: %d %s", code, raw)
+	}
+	var completed *control.Operation
+	waitFor(t, 5*time.Second, "the next step did not complete after p3 was forgotten", func() bool {
+		completed, _ = b.ops.Get(context.Background(), next.ID)
+		return completed != nil && completed.Terminal()
+	})
+	if completed.Status != control.StatusSucceeded || json.Unmarshal(completed.Result, &tr) != nil {
+		t.Fatalf("step after resolving the silent member: %+v", completed)
+	}
+	if tr.Ratio != 1 || tr.Proxies != 1 {
+		t.Fatalf("step after resolving the silent member: %+v", tr)
 	}
 
 	// migrate start at ratio 1 moves no writes: no hold, even on a node whose copy of the directory
@@ -315,10 +405,39 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	p2.reads.Store(3)
 	time.Sleep(150 * time.Millisecond)
 	go func() {
-		time.Sleep(100 * time.Millisecond)
-		p2.reads.Store(4) // a fallback read on p2 during the window
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ops, err := a.ops.List(context.Background(), "acme/data01", "", 10)
+			if err == nil {
+				for _, op := range ops {
+					if op.Kind == control.OpCutover && op.Phase == control.PhaseWindow {
+						p2.reads.Store(4) // a fallback read on p2 during the incarnation-bound window
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	}()
-	a.refused("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms"}, "still fall back")
+	// The window runs before the hold, with writes flowing; the record is followed until the
+	// window's verdict is on it rather than timed by the wait. A read that fell back refuses the
+	// cutover with nothing held.
+	var cutoverRefused control.Operation
+	code, raw := a.call("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms", Wait: "0s"}, &cutoverRefused)
+	if code != http.StatusAccepted {
+		t.Fatalf("cutover: HTTP %d %s", code, raw)
+	}
+	waitFor(t, 15*time.Second, "the cutover window's refusal", func() bool {
+		op, _ := a.ops.Get(context.Background(), cutoverRefused.ID)
+		if op == nil || !op.Terminal() {
+			return false
+		}
+		cutoverRefused = *op
+		return true
+	})
+	if cutoverRefused.Status != control.StatusFailed || cutoverRefused.Error == nil || !strings.Contains(cutoverRefused.Error.Message, "fell back to the source during the 400ms window") || cutoverRefused.Barrier != nil {
+		t.Fatalf("cutover with a fallback read in its window: %+v %+v", cutoverRefused, cutoverRefused.Error)
+	}
 	time.Sleep(150 * time.Millisecond)
 	tr = control.TransitionResult{}
 	a.must("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "300ms"}, &tr)
@@ -326,12 +445,9 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 		t.Fatalf("cutover: %+v %+v", tr, tr.Cutover)
 	}
 
-	// A bucket's first step waits for the silent member by name, until it is forgotten.
+	// A bucket's first step now counts only the remaining member.
 	b.must("POST", "/v1/placements/acme/logs/adopt", control.AdoptRequest{Cluster: "vast01"}, nil)
 	b.must("POST", "/v1/placements/acme/logs/expand", control.ExpandRequest{To: "vast02", Name: "logs"}, nil)
-	b.refused("POST", "/v1/placements/acme/logs/ramp", control.RampRequest{Ratio: 0.5, Wait: "300ms"}, "waiting on p3")
-	b.refused("DELETE", "/v1/fleet/p2", nil, "is live")
-	b.must("DELETE", "/v1/fleet/p3", nil, nil)
 	tr = control.TransitionResult{}
 	b.must("POST", "/v1/placements/acme/logs/ramp", control.RampRequest{Ratio: 0.5}, &tr)
 	if !tr.Held || tr.Proxies != 1 {
@@ -401,7 +517,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	if code, raw := a.call("POST", "/v1/operations", control.OperationRequest{Kind: control.OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":0.8,"wait":"8s"}`)}, &started); code != http.StatusAccepted {
 		t.Fatalf("POST /v1/operations: %d %s", code, raw)
 	}
-	if started.ID == "" || started.Status != control.StatusRunning {
+	if started.ID == "" || started.Terminal() {
 		t.Fatalf("started: %+v", started)
 	}
 	waitFor(t, 5*time.Second, "node b did not see the hold waiting on p2", func() bool {
@@ -409,7 +525,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 		if code, _ := b.call("GET", "/v1/operations/"+started.ID, nil, &op); code != http.StatusOK {
 			return false
 		}
-		return op.Status == control.StatusRunning && op.Phase == control.PhaseHold && len(op.WaitingOn) == 1 && op.WaitingOn[0] == "p2"
+		return op.Status == control.StatusBlocked && op.Phase == control.PhaseDrain && len(op.Blockers) == 1 && op.Blockers[0].ProxyID == "p2"
 	})
 	deadline := time.After(5 * time.Second)
 	sawHold := false
@@ -417,7 +533,7 @@ func TestOperationsAcrossNodes(t *testing.T) {
 		select {
 		case ev := <-fence:
 			var fe control.FenceEvent
-			if ev.Type == "fence" && json.Unmarshal(ev.Data, &fe) == nil && fe.Operation == started.ID && fe.Phase == control.PhaseHold && len(fe.WaitingOn) == 1 {
+			if ev.Type == "fence" && json.Unmarshal(ev.Data, &fe) == nil && fe.Operation == started.ID && fe.Status == control.StatusBlocked && fe.Phase == control.PhaseDrain {
 				sawHold = true
 			}
 		case <-deadline:
@@ -445,17 +561,22 @@ func TestOperationsAcrossNodes(t *testing.T) {
 		t.Fatalf("listing on b: %+v", list.Operations)
 	}
 
-	// A record a node was running when it stopped is closed as failed when the node is back.
-	orphan := &control.Operation{ID: "0000000000001-abcdef", Kind: control.OpRamp, Placement: "acme/data01", Node: "c1", Status: control.StatusRunning, Phase: control.PhaseHold}
-	if err := a.ops.Put(context.Background(), orphan); err != nil {
+	// A durable barrier whose owner is gone stays blocked and resumable instead of being failed.
+	orphan := &control.Operation{ID: "0000000000001-abcdef", Kind: control.OpRamp, Placement: "acme/data01", Node: "ghost", Status: control.StatusRunning, Phase: control.PhaseDrain, Sequence: 1,
+		Barrier: &control.BarrierState{ID: "0000000000001-abcdef", Scope: directory.PlacementResource("acme/data01"), Kind: config.BarrierMutations, HoldVersion: a.store.Version()}}
+	if err := a.ops.Create(context.Background(), orphan); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.ctl.FailOrphans(context.Background()); err != nil {
+	waitFor(t, 5*time.Second, "node b did not index the orphan operation", func() bool {
+		ops, err := b.ops.List(context.Background(), "", "", 100)
+		return err == nil && slices.ContainsFunc(ops, func(op *control.Operation) bool { return op.ID == orphan.ID })
+	})
+	if err := b.ctl.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	var failed control.Operation
 	a.must("GET", "/v1/operations/"+orphan.ID, nil, &failed)
-	if failed.Status != control.StatusFailed || failed.Error == nil || failed.Error.Code != "unavailable" {
+	if failed.Status != control.StatusBlocked || len(failed.Blockers) != 1 || failed.Blockers[0].Code != control.BlockerOwnerLost || !slices.Contains(failed.AllowedActions, control.ActionResume) {
 		t.Fatalf("the orphan: %+v", failed)
 	}
 
@@ -477,6 +598,228 @@ func TestOperationsAcrossNodes(t *testing.T) {
 	older, err := b.store.Changes(context.Background(), changes[2].Version, 2)
 	if err != nil || len(older) != 2 || older[0].Version != changes[2].Version {
 		t.Fatalf("paging the changes: %+v %v", older, err)
+	}
+}
+
+// T09. A barrier record outlives its control-node owner. Another node marks the lost owner,
+// resumes the same operation and commits it once the proxy drain proof arrives; a cancellation
+// after that commit is refused.
+func TestBarrierOwnerLossResumeOnEtcd(t *testing.T) {
+	tc := startCluster(t, 2)
+	key := make([]byte, 32)
+	key[7] = 11
+	a, b := startNode(t, tc, 0, key, time.Second), startNode(t, tc, 1, key, time.Second)
+	ownerCtx, stopOwner := context.WithCancel(context.Background())
+	a.ctl.Ctx = ownerCtx
+	src := fakeS3(t)
+	cw := true
+	def := config.Cluster{Type: "minio", Scheme: "http", Region: "us-east-1", Endpoints: []string{strings.TrimPrefix(src.URL, "http://")},
+		Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}, Capabilities: config.Capabilities{ConditionalWrite: &cw}}
+	a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast01", Cluster: def, Secret: "s1"}, nil)
+	a.must("POST", "/v1/placements/acme/data01/adopt", control.AdoptRequest{Cluster: "vast01"}, nil)
+	p2 := startMember(t, a, "p2", 20*time.Millisecond)
+	p2.follow.Store(false)
+
+	var started control.Operation
+	req := control.OperationRequest{Kind: control.OpClusterReadOnly, Cluster: "vast01", Args: json.RawMessage(`{"read_only":true,"wait":"0s"}`)}
+	if code, raw := a.call("POST", "/v1/operations", req, &started); code != http.StatusAccepted {
+		t.Fatalf("starting read-only: %d %s", code, raw)
+	}
+	waitFor(t, 5*time.Second, "read-only did not block on p2", func() bool {
+		op, _ := a.ops.Get(context.Background(), started.ID)
+		return op != nil && op.Status == control.StatusBlocked && op.Barrier != nil && len(op.Blockers) == 1 && op.Blockers[0].ProxyID == "p2"
+	})
+
+	var ownerChanged bool
+	for range 20 {
+		owned, err := a.ops.Get(context.Background(), started.ID)
+		if err != nil || owned == nil {
+			t.Fatalf("reading owned operation: %+v %v", owned, err)
+		}
+		owned.Node = "ghost"
+		owned.Sequence++
+		err = a.ops.Update(context.Background(), owned)
+		if err == nil {
+			ownerChanged = true
+			break
+		}
+		if !errors.Is(err, control.ErrStaleSequence) {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !ownerChanged {
+		t.Fatal("the running operation did not yield its record for the owner-loss simulation")
+	}
+	stopOwner()
+	waitFor(t, 5*time.Second, "node b did not index the owner change", func() bool {
+		ops, err := b.ops.List(context.Background(), "", "", 100)
+		return err == nil && slices.ContainsFunc(ops, func(op *control.Operation) bool { return op.ID == started.ID && op.Node == "ghost" })
+	})
+	if err := b.ctl.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the lost owner was not recorded", func() bool {
+		op, _ := b.ops.Get(context.Background(), started.ID)
+		return op != nil && op.Status == control.StatusBlocked && len(op.Blockers) == 1 && op.Blockers[0].Code == control.BlockerOwnerLost && slices.Contains(op.AllowedActions, control.ActionResume)
+	})
+
+	p2.follow.Store(true)
+	var resumed control.Operation
+	if code, raw := b.call("POST", "/v1/operations/"+started.ID+"/resume", struct{}{}, &resumed); code != http.StatusAccepted {
+		t.Fatalf("resuming on node b: %d %s", code, raw)
+	}
+	var done *control.Operation
+	waitFor(t, 8*time.Second, "the resumed barrier did not finish", func() bool {
+		done, _ = b.ops.Get(context.Background(), started.ID)
+		return done != nil && done.Terminal()
+	})
+	if done.Status != control.StatusSucceeded || done.Node != "c2" || done.OwnerTerm != 1 || done.Barrier == nil || !done.Barrier.Committed {
+		t.Fatalf("resumed barrier: %+v", done)
+	}
+	cl := b.store.Snapshot().File().Clusters["vast01"]
+	if !cl.ReadOnly || cl.Barrier != nil {
+		t.Fatalf("read-only commit: %+v", cl)
+	}
+	code, raw := b.call("POST", "/v1/operations/"+started.ID+"/cancel", struct{}{}, nil)
+	var apiErr control.Error
+	_ = json.Unmarshal([]byte(raw), &apiErr)
+	if code != http.StatusConflict || apiErr.Code != control.CodeNotCancellable {
+		t.Fatalf("cancel after commit: %d %s", code, raw)
+	}
+}
+
+// Defect 1 of the H2 review on etcd, for every barrier kind whose commit clears its barrier: the
+// owner's commit reached the directory, the owner was lost before its record said Committed, and
+// a resume on another control node must find the commit rather than drain forever for an ack no
+// proxy can send.
+func TestResumeAfterLostCommitRecordOnEtcd(t *testing.T) {
+	type kind struct {
+		name   string
+		req    control.OperationRequest
+		commit func(t *testing.T, n *node, id string)
+		check  func(t *testing.T, n *node)
+	}
+	step := func(tr directory.Transition) func(t *testing.T, n *node, id string) {
+		return func(t *testing.T, n *node, id string) {
+			tr.Complete, tr.Barrier = true, id
+			if err := n.store.SetState(context.Background(), "acme", "data01", placement(t, n).State, tr, "owner"); err != nil {
+				t.Fatalf("the owner's commit: %v", err)
+			}
+		}
+	}
+	clear := func(scope string) func(t *testing.T, n *node, id string) {
+		return func(t *testing.T, n *node, id string) {
+			if err := n.store.ClearBarrier(context.Background(), scope, id, "owner"); err != nil {
+				t.Fatalf("the owner's commit: %v", err)
+			}
+		}
+	}
+	kinds := []kind{
+		{"ramp", control.OperationRequest{Kind: control.OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":0.5,"wait":"0s"}`)},
+			step(directory.Transition{To: directory.StateRamping, Ratio: 0.5}),
+			func(t *testing.T, n *node) {
+				if p := placement(t, n); p.Held() || p.Barrier != nil || p.Ramp == nil || p.Ramp.Ratio != 0.5 {
+					t.Fatalf("ramp: %+v", p)
+				}
+			}},
+		{"migrate", control.OperationRequest{Kind: control.OpMigrate, Placement: "acme/data01", Args: json.RawMessage(`{"wait":"0s"}`)},
+			step(directory.Transition{To: directory.StateMigrating}),
+			func(t *testing.T, n *node) {
+				if p := placement(t, n); p.State != directory.StateMigrating || p.Barrier != nil {
+					t.Fatalf("migrate: %+v", p)
+				}
+			}},
+		{"placement-read-only", control.OperationRequest{Kind: control.OpPlacementReadOnly, Placement: "acme/data01", Args: json.RawMessage(`{"read_only":true,"wait":"0s"}`)},
+			clear(directory.PlacementResource("acme/data01")),
+			func(t *testing.T, n *node) {
+				if p := placement(t, n); !p.ReadOnly || p.Barrier != nil {
+					t.Fatalf("placement read-only: %+v", p)
+				}
+			}},
+		{"cluster-read-only", control.OperationRequest{Kind: control.OpClusterReadOnly, Cluster: "vast01", Args: json.RawMessage(`{"read_only":true,"wait":"0s"}`)},
+			clear(directory.ClusterResource("vast01")),
+			func(t *testing.T, n *node) {
+				if c := n.store.Snapshot().File().Clusters["vast01"]; !c.ReadOnly || c.Barrier != nil {
+					t.Fatalf("cluster read-only: %+v", c)
+				}
+			}},
+	}
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			tc := startCluster(t, 2)
+			key := make([]byte, 32)
+			key[5] = 13
+			a, b := startNode(t, tc, 0, key, time.Second), startNode(t, tc, 1, key, time.Second)
+			ownerCtx, stopOwner := context.WithCancel(context.Background())
+			a.ctl.Ctx = ownerCtx
+			src, dst := fakeS3(t), fakeS3(t)
+			cw := true
+			def := func(srv *httptest.Server, name string) config.Cluster {
+				return config.Cluster{Type: "minio", Scheme: "http", Region: "us-east-1", Endpoints: []string{strings.TrimPrefix(srv.URL, "http://")},
+					Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:" + name}, Capabilities: config.Capabilities{ConditionalWrite: &cw}}
+			}
+			a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast01", Cluster: def(src, "vast01"), Secret: "s1"}, nil)
+			a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast02", Cluster: def(dst, "vast02"), Secret: "s2"}, nil)
+			a.must("POST", "/v1/placements/acme/data01/adopt", control.AdoptRequest{Cluster: "vast01"}, nil)
+			a.must("POST", "/v1/placements/acme/data01/expand", control.ExpandRequest{To: "vast02", Create: true}, nil)
+			p2 := startMember(t, a, "p2", 20*time.Millisecond)
+			p2.noAck.Store(true)
+
+			var started control.Operation
+			if code, raw := a.call("POST", "/v1/operations", k.req, &started); code != http.StatusAccepted {
+				t.Fatalf("starting %s: %d %s", k.name, code, raw)
+			}
+			waitFor(t, 5*time.Second, k.name+" did not block in its drain", func() bool {
+				op, _ := a.ops.Get(context.Background(), started.ID)
+				return op != nil && op.Status == control.StatusBlocked && op.Barrier != nil && op.Barrier.HoldVersion > 0 && op.Phase == control.PhaseDrain
+			})
+			var lost bool
+			for range 20 {
+				owned, err := a.ops.Get(context.Background(), started.ID)
+				if err != nil || owned == nil {
+					t.Fatalf("reading owned operation: %+v %v", owned, err)
+				}
+				owned.Node = "ghost"
+				owned.Sequence++
+				if err = a.ops.Update(context.Background(), owned); err == nil {
+					lost = true
+					break
+				}
+				if !errors.Is(err, control.ErrStaleSequence) {
+					t.Fatal(err)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !lost {
+				t.Fatal("the running operation did not yield its record")
+			}
+			stopOwner()
+			k.commit(t, a, started.ID)
+			waitFor(t, 5*time.Second, "node b did not index the owner change", func() bool {
+				op, err := b.ops.Get(context.Background(), started.ID)
+				return err == nil && op != nil && op.Node == "ghost"
+			})
+			if err := b.ctl.Sweep(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var resumed control.Operation
+			if code, raw := b.call("POST", "/v1/operations/"+started.ID+"/resume", struct{}{}, &resumed); code != http.StatusAccepted {
+				t.Fatalf("resuming on node b: %d %s", code, raw)
+			}
+			var done *control.Operation
+			waitFor(t, 8*time.Second, "the resumed "+k.name+" did not finish", func() bool {
+				done, _ = b.ops.Get(context.Background(), started.ID)
+				return done != nil && done.Terminal()
+			})
+			if done.Status != control.StatusSucceeded || done.Node != "c2" || done.Barrier == nil || !done.Barrier.Committed {
+				t.Fatalf("resumed %s: %+v", k.name, done)
+			}
+			if err := b.store.Sync(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			k.check(t, b)
+		})
 	}
 }
 
@@ -514,5 +857,35 @@ func TestRouteTable(t *testing.T) {
 		if (r.Method == "POST" || r.Method == "DELETE") != r.Mutation {
 			t.Errorf("route %s: mutation %v does not match its method", k, r.Mutation)
 		}
+	}
+}
+
+// A credential rotation on the control plane starts a secret generation: the version it landed in,
+// which the cluster view reports, and the control plane holds the new secret. The cluster's own
+// generation moves with it (H0a: its credentials are part of the cluster an operation expects).
+func TestRotateCredentialsOnEtcd(t *testing.T) {
+	tc := startCluster(t, 1)
+	a := startNode(t, tc, 0, make([]byte, 32), time.Second)
+	src := fakeS3(t)
+	def := config.Cluster{Type: "minio", Scheme: "http", Region: "us-east-1", Endpoints: []string{strings.TrimPrefix(src.URL, "http://")},
+		Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}
+	a.must("POST", "/v1/clusters", control.ClusterRequest{Name: "vast01", Cluster: def, Secret: "s1"}, nil)
+
+	var out control.CredentialsResult
+	a.must("POST", "/v1/clusters/vast01/credentials", control.CredentialsRequest{Secret: "s2"}, &out)
+	if out.Generation != strconv.FormatInt(out.Version, 10) || out.Cluster.SecretRef != "control:vast01" {
+		t.Fatalf("rotation: %+v", out)
+	}
+	waitFor(t, 5*time.Second, "the rotation installed on the node", func() bool { return a.store.Snapshot().Version() >= out.Version })
+	if s := a.store.ClusterSecrets()["control:vast01"]; s != "s2" {
+		t.Fatalf("the control plane holds %q, want s2", s)
+	}
+	if g := a.store.Snapshot().File().Generation(directory.ClusterResource("vast01")); g != out.Version {
+		t.Fatalf("cluster generation %d after the rotation, want %d", g, out.Version)
+	}
+	var view control.ClusterView
+	a.must("GET", "/v1/clusters/vast01/view", nil, &view)
+	if view.Secret == nil || view.Secret.Generation != out.Generation {
+		t.Fatalf("cluster view secret: %+v, want generation %s", view.Secret, out.Generation)
 	}
 }

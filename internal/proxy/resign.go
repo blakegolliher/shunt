@@ -12,8 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
+	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/migrate"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -36,9 +39,11 @@ var refusedOps = map[s3.Op]bool{
 
 // prepareResign verifies the client, resolves the placement, and prepares the upstream request
 // for the cluster the placement routes to. It returns false when shunt has already answered.
-func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, inBody *progressReader) (*prepared, bool) {
+// rt is the request's bundle: the keys that verify the client, the placement that routes it and
+// the clusters that sign it come from one published version (ADR-0021 D1).
+func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *http.Request, o *outcome, inBody *progressReader, rt *runtimecfg.Bundle) (*prepared, bool) {
 	t0 := time.Now()
-	id, aerr := sigv4.Verify(ctx, r, h.Store, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
+	id, aerr := sigv4.Verify(ctx, r, rt.Keys, time.Now(), sigv4.Options{ClockSkew: h.ClockSkew, RequireHash: true})
 	if aerr != nil {
 		h.Metrics.AuthFailures.WithLabelValues(string(aerr.Reason)).Inc()
 		o.status = aerr.Err.Status
@@ -53,8 +58,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	h.Metrics.AuthDuration.WithLabelValues(mode).Observe(time.Since(t0).Seconds())
 	o.tenant, o.accessKey = id.Credential.Tenant, id.Credential.AccessKey
 	info := o.info
-	snap := h.Dir.Snapshot()
-	clusters := h.Clusters.Load() // live since POC-5; the pointers this request takes stay valid to its end
+	snap, clusters := rt.Snapshot, rt.Clusters
 
 	switch {
 	case info.Level == s3.LevelService && info.Op == s3.OpListBuckets:
@@ -76,6 +80,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		h.answer(w, r, o, s3.NoSuchBucket, "")
 		return nil, false
 	}
+	if p.Spread() || p.State != directory.StateActive || p.Watch {
+		o.perBucket = directory.Key(o.tenant, info.Bucket)
+	}
 	if !ownerMatches(r.Header, "X-Amz-Expected-Bucket-Owner", o.tenant) || !ownerMatches(r.Header, "X-Amz-Source-Expected-Bucket-Owner", o.tenant) {
 		h.answer(w, r, o, s3.AccessDenied, "")
 		return nil, false
@@ -86,8 +93,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	if p.Spread() {
 		// A bucket spread over legs (ADR-0018 N2): a key's requests go to the leg that owns it, as a
-		// plain one-cluster bucket; listings merge every leg; a bucket-level request every leg answers
-		// alike goes to the first; any other would have to reach every leg, and is not supported yet.
+		// plain one-cluster bucket; listings merge every leg; DeleteObjects goes to every leg and
+		// answers each key from its owner; a bucket-level request every leg answers alike goes to the
+		// first; any other would have to reach every leg, and is not supported yet.
 		switch {
 		case info.Level == s3.LevelObject:
 			np, err := migrate.Narrow(p, info.Key)
@@ -102,6 +110,9 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 		case info.Op == s3.OpHeadBucket || info.Op == s3.OpGetBucketLocation:
 			np := migrate.FirstLeg(p)
 			p = &np
+		case info.Op == s3.OpDeleteObjects:
+			h.spreadDeleteObjects(ctx, w, r, o, id, inBody, p, spreadRuntime{snap: snap, clusters: clusters})
+			return nil, false
 		default:
 			h.answer(w, r, o, s3.NotImplemented, fmt.Sprintf("%s is not supported on a bucket spread over %d backend buckets yet (ADR-0018).", info.Op, len(p.Legs)))
 			return nil, false
@@ -115,11 +126,19 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// Where this request goes (docs/DESIGN.md §2.5, ADR-0004). An uploadId, resolved below, wins:
 	// a multipart upload only exists on the cluster that issued its id.
 	class := migrate.Class(info.Op)
-	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	mutating := migrate.Mutates(info.Op, r.Method)
 	if p.ReadOnly && mutating {
 		h.refuseReadOnly(w, r, o, info.Bucket, "placement-read-only", "This bucket is read-only for maintenance.", p.RejectWrites)
 		return nil, false
 	}
+	// A drain barrier on the bucket in the directory this request routes by (ADR-0021 D2): its
+	// mutations pause while a change that moves them is written everywhere; the gate below is
+	// the same rule for a barrier installed since this request took its bundle.
+	if mutating && p.Barrier != nil && p.Barrier.Kind == config.BarrierMutations {
+		h.refuseWrite(w, r, o, info.Bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+		return nil, false
+	}
+	sourceClosed := p.Barrier != nil && p.Barrier.Kind == config.BarrierSource
 	route, err := migrate.Decide(p, class, info.Key)
 	if err != nil {
 		if h.Log != nil {
@@ -166,10 +185,48 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			check = append(check, p.ClusterOf(p.Source))
 		}
 		for _, name := range check {
-			if c, found := snap.Cluster(name); found && c.ReadOnly {
+			c, found := snap.Cluster(name)
+			if found && c.ReadOnly {
 				h.refuseReadOnly(w, r, o, info.Bucket, "cluster-read-only", "Backend cluster "+name+" is read-only for maintenance.", c.RejectWrites)
 				return nil, false
 			}
+			if found && c.Barrier != nil {
+				h.refuseWrite(w, r, o, info.Bucket, "barrier", "Backend cluster "+name+"'s writes pause while a change to it reaches every proxy. Retry shortly.")
+				return nil, false
+			}
+		}
+	}
+	// The bucket's gates (ADR-0021 D2). A mutation takes a token that is given back with the
+	// backend's outcome; a request that may touch a moving bucket's source takes one too. A
+	// closed mutations gate refuses; a closed source gate means the source is on its way out
+	// (purge-source): a read or listing goes on without it, and a delete that needs it pauses.
+	bucketKey := directory.Key(o.tenant, info.Bucket)
+	if mutating {
+		tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
+		if !admitted {
+			if h.Log != nil {
+				h.Log.Debug("mutation refused at the gate", "request_id", o.rid, "bucket", bucketKey, "barrier", barrier)
+			}
+			h.refuseWrite(w, r, o, info.Bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+			return nil, false
+		}
+		o.tok = tok
+	}
+	if route.Fallback || route.Both || route.Merge {
+		if !sourceClosed {
+			src, _, admitted := h.Gates.Enter(bucketKey, admission.Source)
+			o.src, sourceClosed = src, !admitted
+		}
+		if sourceClosed {
+			if route.Both {
+				// A delete pauses while the source is closed (ADR-0021, the DELETE rule of
+				// 2026-09-24): its source leg cannot be sent, and a primary-only delete would
+				// leave the source holding a key the primary lacks, which purge-source's
+				// re-diff must refuse. The hold is short; the client retries after it.
+				h.refuseWrite(w, r, o, info.Bucket, "source_closed", "This bucket's deletes pause while its migration source is removed. Retry shortly.")
+				return nil, false
+			}
+			route.Fallback, route.Merge = false, false
 		}
 	}
 	cl, ok := clusters.Get(clusterName)
@@ -227,7 +284,16 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			return nil, false
 		case plan != nil:
 			// The source is on another cluster, or on a bucket whose objects are split across two:
-			// no backend can do this copy, so shunt streams it (ADR-0014).
+			// no backend can do this copy, so shunt streams it (ADR-0014). A copy that reads a
+			// moving bucket's source depends on it, and stops when the source is on its way out.
+			if plan.sourceKey != "" {
+				src, _, ok := h.Gates.Enter(plan.sourceKey, admission.Source)
+				if !ok {
+					h.answer(w, r, o, s3.ServiceUnavailable, "The source bucket of this copy is being changed. Retry shortly.")
+					return nil, false
+				}
+				o.src = src
+			}
 			h.streamCopy(ctx, w, r, o, plan, cl, backend, cond)
 			return nil, false
 		}

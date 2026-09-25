@@ -42,7 +42,18 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/fleet/{id}",
+    "verbs": [
+      "proxy show"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/operations",
+    "verbs": [
+      "operation list"
+    ],
     "mutation": false
   },
   {
@@ -54,7 +65,17 @@
       "cutover",
       "purge-source",
       "migrate finish",
-      "cluster remove"
+      "cluster remove",
+      "operation show",
+      "operation wait"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/operations/{id}/blockers",
+    "verbs": [
+      "operation show"
     ],
     "mutation": false
   },
@@ -104,6 +125,38 @@
   },
   {
     "method": "POST",
+    "pattern": "/v1/operations/{id}/resume",
+    "verbs": [
+      "operation resume"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations/{id}/cancel",
+    "verbs": [
+      "operation cancel"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations/{id}/worker-heartbeat",
+    "verbs": [
+      "migrate run"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations/{id}/resolve-worker",
+    "verbs": [
+      "operation resolve-worker"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
     "pattern": "/v1/placements/{tenant}/{bucket}/create",
     "mutation": true
   },
@@ -133,6 +186,14 @@
     "pattern": "/v1/clusters/probe",
     "verbs": [
       "cluster add"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/clusters/{name}/credentials",
+    "verbs": [
+      "cluster credentials"
     ],
     "mutation": true
   },
@@ -210,6 +271,14 @@
   },
   {
     "method": "POST",
+    "pattern": "/v1/placements/{tenant}/{bucket}/watch",
+    "verbs": [
+      "watch"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
     "pattern": "/v1/placements/{tenant}/{bucket}/ramp",
     "verbs": [
       "ramp"
@@ -276,6 +345,22 @@
   {
     "method": "POST",
     "pattern": "/v1/fleet/{id}/heartbeat",
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/fleet/{id}/retire",
+    "verbs": [
+      "proxy retire"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/fleet/{id}/resolve",
+    "verbs": [
+      "proxy resolve"
+    ],
     "mutation": true
   },
   {

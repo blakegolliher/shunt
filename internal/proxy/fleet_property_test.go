@@ -15,11 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/cp"
 	"github.com/blakegolliher/shunt/internal/cp/cptest"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/member"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -117,7 +119,13 @@ func newFleetRun(t *testing.T, lag time.Duration) *fleetRun {
 	store := cp.New(node.Client(), c, slog.New(slog.DiscardHandler))
 	registry := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, store.Resolve)
 	t.Cleanup(registry.Close)
-	store.Prepare = func(f *directory.File) error { _, _, err := registry.Apply(f.Clusters); return err }
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := store.Start(ctx); err != nil {
@@ -172,12 +180,28 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 		Interval: 40 * time.Millisecond, LeaseTTL: 200 * time.Millisecond, LongPoll: 500 * time.Millisecond}, slog.New(slog.DiscardHandler))
 	set := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, mem.Resolve)
 	t.Cleanup(set.Close)
-	mem.Prepare = func(f *directory.File) error {
+	mem.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
 		if lag > 0 {
 			time.Sleep(lag)
 		}
-		_, _, err := set.Apply(f.Clusters)
-		return err
+		cand, err := set.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
+	}
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: mem.Snapshot(), Keys: mem.Keys().Table(), Clusters: set.Load()})
+	keeper := &GateKeeper{Gates: admission.New()}
+	mem.Gates = keeper.Gates
+	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
+	keeper.Served(mem.Snapshot())
+	mem.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }
+	mem.SecretsHeld = func() map[string]int64 { return rt.Stats().SecretsHeld }
+	mem.OnInstall = func(s *directory.Snapshot) {
+		if err := rt.Refresh(s, mem.Keys().Table(), set.Load()); err != nil {
+			t.Error(err)
+		}
+		keeper.Installed(s)
 	}
 	if err := mem.Load(); err != nil {
 		t.Fatal(err)
@@ -191,7 +215,7 @@ func (fr *fleetRun) startProxy(t *testing.T, name string, lag time.Duration) fle
 	}
 	go mem.Run(ctx)
 	h := New(Handler{
-		Mode: ModeResign, Store: mem.Keys(), Clusters: set, Dir: mem, Rewrite: true, Stale: mem.Stale,
+		Mode: ModeResign, Runtime: rt, Gates: keeper.Gates, Dir: mem, Rewrite: true, Stale: mem.Stale,
 		Domains: s3.NewDomains([]string{"*.shunt.example.com"}), Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil),
 		Slow: telemetry.NewSlowRing(10, time.Hour), IdleTimeout: 2 * time.Second, MetadataTimeout: 5 * time.Second, Via: "1.1 shunt/test",
 	}, 64<<10)
@@ -308,7 +332,13 @@ var fleetRatios = []float64{0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1}
 
 func (fr *fleetRun) post(path string, body any) (int, string) {
 	data, _ := json.Marshal(body)
-	resp, err := http.Post(fr.api.URL+path, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, fr.api.URL+path, bytes.NewReader(data))
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("fleet-%d", fleetKeys.Add(1)))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, err.Error()
 	}
@@ -316,6 +346,37 @@ func (fr *fleetRun) post(path string, body any) (int, string) {
 	out, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(out)
 }
+
+func (fr *fleetRun) waitOperation(id string, timeout time.Duration) (control.Operation, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		resp, err := http.Get(fr.api.URL + "/v1/operations/" + id) //nolint:gosec // test server URL
+		if err != nil {
+			return control.Operation{}, err
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return control.Operation{}, readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return control.Operation{}, fmt.Errorf("get operation %s: %d %s", id, resp.StatusCode, body)
+		}
+		var op control.Operation
+		if err := json.Unmarshal(body, &op); err != nil {
+			return control.Operation{}, err
+		}
+		if op.Terminal() {
+			return op, nil
+		}
+		if time.Now().After(deadline) {
+			return op, fmt.Errorf("operation %s remained %s in phase %s with blockers %+v", id, op.Status, op.Phase, op.Blockers)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+var fleetKeys atomic.Int64
 
 func TestFleetStepsKeepTheClientsView(t *testing.T) { fleetSteps(t, nil, false, false) }
 
@@ -391,7 +452,7 @@ func fleetSteps(t *testing.T, rg *directory.HashRange, sameCluster, scoped bool)
 	cut := &fr.cut // set: B is severed from the control plane, its heartbeats and polls fail
 
 	held := 0
-	fr.run(t, 8*time.Second, func(stop <-chan struct{}) {
+	fr.run(t, 15*time.Second, func(stop <-chan struct{}) {
 		pause := func(d time.Duration) bool {
 			select {
 			case <-stop:
@@ -426,21 +487,51 @@ func fleetSteps(t *testing.T, rg *directory.HashRange, sameCluster, scoped bool)
 					req.Scope, req.To, req.Name = fleetScope, "minio", "acme-9000-data"
 				}
 			}
-			code, body := fr.post("/v1/placements/acme/data/ramp", req)
-			if code != http.StatusOK {
-				t.Errorf("ramp %v: %d %s", ratio, code, body)
-				return
-			}
 			var res control.TransitionResult
-			_ = json.Unmarshal([]byte(body), &res)
+			code, body := fr.post("/v1/placements/acme/data/ramp", req)
+			if i == 3 {
+				// Silence is a blocker now: the control plane cannot prove that B stopped serving
+				// the old route. Reconnect it, let the durable operation finish the same barrier,
+				// and keep exercising the fleet through the transition.
+				cut.Store(false)
+				if code != http.StatusAccepted {
+					t.Errorf("ramp %v with B partitioned: %d %s, want 202 blocked", ratio, code, body)
+					return
+				}
+				var op control.Operation
+				if err := json.Unmarshal([]byte(body), &op); err != nil {
+					t.Errorf("ramp %v blocked response: %v", ratio, err)
+					return
+				}
+				if len(op.Blockers) != 1 || op.Blockers[0].Code != control.BlockerProxyMissing || op.Blockers[0].ProxyID != "proxy-B" {
+					t.Errorf("ramp %v with B partitioned: blockers %+v, want proxy_missing B", ratio, op.Blockers)
+					return
+				}
+				ended, err := fr.waitOperation(op.ID, 5*time.Second)
+				if err != nil {
+					t.Errorf("ramp %v after B reconnected: %v", ratio, err)
+					return
+				}
+				if ended.Status != control.StatusSucceeded {
+					t.Errorf("ramp %v after B reconnected: operation %+v", ratio, ended)
+					return
+				}
+				if err := json.Unmarshal(ended.Result, &res); err != nil {
+					t.Errorf("ramp %v result: %v", ratio, err)
+					return
+				}
+			} else {
+				if code != http.StatusOK {
+					t.Errorf("ramp %v: %d %s", ratio, code, body)
+					return
+				}
+				if err := json.Unmarshal([]byte(body), &res); err != nil {
+					t.Errorf("ramp %v result: %v", ratio, err)
+					return
+				}
+			}
 			if res.Held {
 				held++
-			}
-			if i == 3 {
-				if len(res.Silent) != 1 {
-					t.Errorf("ramp %v with B's lease lapsed: want B silent, got %+v", ratio, res)
-				}
-				cut.Store(false)
 			}
 		}
 		if !pause(250 * time.Millisecond) {

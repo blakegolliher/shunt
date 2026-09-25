@@ -1,0 +1,232 @@
+package control
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/blakegolliher/shunt/internal/admission"
+	"github.com/blakegolliher/shunt/internal/directory"
+)
+
+// staticFleet is a fleet table whose members are what the test says.
+type staticFleet struct{ ms []Member }
+
+func (f staticFleet) Heartbeat(context.Context, string, Heartbeat) (Grant, error) {
+	return Grant{LeaseTTL: time.Second}, nil
+}
+func (f staticFleet) Members(context.Context) ([]Member, error)                     { return f.ms, nil }
+func (f staticFleet) Retire(context.Context, string, string, int64) error           { return nil }
+func (f staticFleet) RequestRetire(context.Context, string) error                   { return nil }
+func (f staticFleet) Resolve(context.Context, string, string, string, string) error { return nil }
+func (f staticFleet) Forget(context.Context, string) error                          { return nil }
+
+var (
+	lineageA = directory.Identity{ClusterID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: "11111111111111111111111111111111"}
+	lineageB = directory.Identity{ClusterID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: "22222222222222222222222222222222"}
+)
+
+// lineageDir is a file directory at version 3 of lineage A.
+func lineageDir(t *testing.T) *directory.FileDir {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "directory.yaml")
+	body := "version: 3\nschema: 2\nidentity:\n  cluster_id: " + lineageA.ClusterID + "\n  epoch: " + lineageA.Epoch + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := directory.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// A member that outlived a restore reports a larger version from another epoch. A version-only
+// fence counts it as having every version up to that one; the lineage-aware fence waits for it
+// (ADR-0021, the negative regression H0 requires).
+func TestFenceCountsOnlyTheCurrentLineage(t *testing.T) {
+	d := lineageDir(t)
+	survivor := Member{ID: "old", Live: true, Identity: lineageB, Applied: 40}
+	current := Member{ID: "new", Live: true, Identity: lineageA, Applied: 3}
+	s := &Server{Dir: d, Fleet: staticFleet{ms: []Member{survivor, current}}, FencePoll: time.Millisecond}
+	tr := &tracker{s: s, ctx: context.Background()}
+	v := d.Snapshot().Version()
+
+	// The negative control: comparing versions alone, the survivor has v.
+	if survivor.Applied < v {
+		t.Fatal("the negative control is broken: the survivor must look ahead by version")
+	}
+	waiting, err := s.fenceRound(tr, v, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(waiting) != 1 || waiting[0] != "old" {
+		t.Fatalf("waiting on %v; want only the member on another epoch", waiting)
+	}
+	if fs := s.fenceStatus(context.Background(), directory.Placement{}); len(fs.WaitingOn) != 1 || fs.WaitingOn[0] != "old" {
+		t.Fatalf("fence status waiting on %v; want the member on another epoch", fs.WaitingOn)
+	}
+}
+
+// The directory long-poll answers 304 only on the caller's own lineage; a heartbeat from another
+// lineage, or in another protocol, gets no lease.
+func TestDirectoryAndHeartbeatRefuseAnotherLineage(t *testing.T) {
+	d := lineageDir(t)
+	s := &Server{Dir: d, Fleet: staticFleet{}, FencePoll: time.Millisecond}
+	h := s.Handler()
+	get := func(q string) (int, Error) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/directory?"+q, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		h.ServeHTTP(rec, req)
+		var e Error
+		_ = json.Unmarshal(rec.Body.Bytes(), &e)
+		return rec.Code, e
+	}
+	cases := []struct {
+		q    string
+		code int
+		err  string
+	}{
+		{"since=3&cluster_id=" + lineageA.ClusterID + "&epoch=" + lineageA.Epoch, http.StatusNotModified, ""},
+		{"since=0", http.StatusOK, ""},
+		{"since=3", http.StatusBadRequest, "bad_request"},
+		{"since=40&cluster_id=" + lineageB.ClusterID + "&epoch=" + lineageB.Epoch, http.StatusConflict, CodeEpochMismatch},
+		{"since=1&cluster_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&epoch=" + lineageA.Epoch, http.StatusConflict, CodeClusterMismatch},
+		{"since=9&cluster_id=" + lineageA.ClusterID + "&epoch=" + lineageA.Epoch, http.StatusConflict, CodeResyncRequired},
+		{"since=1&cluster_id=nothex&epoch=x", http.StatusBadRequest, "bad_request"},
+	}
+	for _, c := range cases {
+		code, e := get(c.q)
+		if code != c.code || e.Code != c.err {
+			t.Errorf("GET /v1/directory?%s: %d %q, want %d %q", c.q, code, e.Code, c.code, c.err)
+		}
+		if c.code == http.StatusConflict && (e.CurrentIdentity == nil || *e.CurrentIdentity != lineageA) {
+			t.Errorf("GET /v1/directory?%s: current identity %v, want lineage A", c.q, e.CurrentIdentity)
+		}
+	}
+
+	beat := func(hb Heartbeat) (int, string) {
+		b, _ := json.Marshal(hb)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/fleet/p1/heartbeat", strings.NewReader(string(b)))
+		req.RemoteAddr = "127.0.0.1:1234"
+		h.ServeHTTP(rec, req)
+		var e Error
+		_ = json.Unmarshal(rec.Body.Bytes(), &e)
+		return rec.Code, e.Code
+	}
+	inc := "0123456789abcdef0123456789abcdef"
+	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc}); code != http.StatusOK {
+		t.Errorf("a heartbeat on the current lineage: %d %s", code, e)
+	}
+	if code, e := beat(Heartbeat{Protocol: Protocol, Identity: lineageB, Applied: 40, Incarnation: inc}); code != http.StatusConflict || e != CodeEpochMismatch {
+		t.Errorf("a heartbeat from another epoch: %d %s", code, e)
+	}
+	if code, e := beat(Heartbeat{Protocol: 1, Identity: lineageA, Applied: 3, Incarnation: inc}); code != http.StatusBadRequest || e != CodeProtocol {
+		t.Errorf("a protocol-1 heartbeat: %d %s", code, e)
+	}
+	// T20: malformed identities never reach the fleet table.
+	for _, bad := range []Heartbeat{
+		{Protocol: Protocol, Identity: lineageA, Applied: 3},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: "short"},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Uncertain: -1},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: inc, State: IncarnationUnclean}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Previous: &Incarnation{ID: "fedcba9876543210fedcba9876543210", State: "active"}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "placement:a/b", Kind: "elsewhere"}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "object:a/b/k", Kind: "mutations"}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: []admission.Ack{{ID: "op", Scope: "placement:a/b", Kind: "mutations", Inflight: -1}}},
+		{Protocol: Protocol, Identity: lineageA, Applied: 3, Incarnation: inc, Barriers: make([]admission.Ack, MaxBarrierAcks+1)},
+	} {
+		if code, e := beat(bad); code != http.StatusBadRequest || e != "bad_request" {
+			t.Errorf("a heartbeat with a malformed incarnation (%+v): %d %s", bad, code, e)
+		}
+	}
+	if err := checkLineage(d.Snapshot(), lineageB, 1); !errors.As(err, new(*lineageError)) {
+		t.Errorf("checkLineage across epochs: %v", err)
+	}
+}
+
+// A cluster's secret rotation reads as installed on the live members whose signer has its
+// generation, pending on those still behind, and silent on those past their lease.
+func TestSecretStatus(t *testing.T) {
+	d := lineageDir(t)
+	f := *d.Snapshot().File()
+	f.Generations = map[string]int64{"secret:vast01": 3}
+	ms := []Member{
+		{ID: "a", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}, SecretsHeld: map[string]int64{"vast01": 1}},
+		{ID: "b", Live: true, Identity: lineageA, Secrets: map[string]string{"vast01": "2"}},
+		{ID: "c", Live: false, Identity: lineageA, Secrets: map[string]string{"vast01": "3"}},
+		{ID: "d", Live: true, Identity: lineageB, Secrets: map[string]string{"vast01": "9"}},
+	}
+	s := &Server{Dir: d, Fleet: staticFleet{ms: ms}}
+	st := s.secretStatus(context.Background(), &f, "vast01")
+	if st == nil || st.Generation != "3" || len(st.Installed) != 1 || st.Installed[0] != "a" ||
+		len(st.Pending) != 2 || st.Pending[0] != "b" || st.Pending[1] != "d" || len(st.Silent) != 1 || st.Silent[0] != "c" ||
+		len(st.Held) != 1 || st.Held[0] != "a" || st.Drained {
+		t.Fatalf("secret status: %+v", st)
+	}
+	if s.secretStatus(context.Background(), &f, "untracked") != nil {
+		t.Fatal("a cluster with no secret generation has a status")
+	}
+}
+
+// GET /v1/fleet/{id} says what is off with one proxy's install: behind, backpressured, on another
+// lineage, a cache that is not durable, a secret generation not installed; nothing for a proxy
+// that is current.
+func TestProxyDiagnostics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "directory.yaml")
+	body := "version: 7\nschema: 2\nidentity:\n  cluster_id: " + lineageA.ClusterID + "\n  epoch: " + lineageA.Epoch + "\n" +
+		"generations:\n  secret:vast01: 6\n" +
+		"clusters:\n  vast01:\n    type: s3\n    scheme: http\n    region: r\n    endpoints: [\"127.0.0.1:1\"]\n    credentials:\n      access_key: AK\n      secret_ref: control:vast01\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := directory.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	ms := []Member{
+		{ID: "ok", Live: true, Identity: lineageA, Applied: 7, Durable: 7, Secrets: map[string]string{"vast01": "6"}, Seq: 41, Seen: seen, SinceSeen: 700 * time.Millisecond},
+		{ID: "slow", Live: true, Identity: lineageA, Applied: 5, Installed: 7, Durable: 4, CacheError: "version 5 not durable: fsync: disk", Secrets: map[string]string{"vast01": "3"}},
+		{ID: "restored", Live: true, Identity: lineageB, Applied: 9, Durable: 9, Secrets: map[string]string{"vast01": "9"}},
+	}
+	h := (&Server{Dir: d, Fleet: staticFleet{ms: ms}, LeaseTTL: 3 * time.Second}).Handler()
+	get := func(id string) (int, ProxyDiagnostics) {
+		req := httptest.NewRequest("GET", "/v1/fleet/"+id, nil)
+		req.RemoteAddr = "127.0.0.1:1"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out ProxyDiagnostics
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	if code, ok := get("ok"); code != http.StatusOK || len(ok.Problems) != 0 || !ok.Lineage || ok.Behind != 0 || len(ok.Secrets) != 1 || !ok.Secrets[0].Current ||
+		ok.Lease.Granted != 3*time.Second || ok.Lease.Seq != 41 || !ok.Lease.Seen.Equal(seen) || ok.Lease.Age != 700*time.Millisecond || !ok.Lease.Live {
+		t.Fatalf("a current proxy: %d %+v lease %+v", code, ok, ok.Lease)
+	}
+	_, slow := get("slow")
+	if slow.Behind != 2 || !slow.Backpressure || len(slow.Secrets) != 1 || slow.Secrets[0].Current {
+		t.Fatalf("a slow proxy: %+v", slow)
+	}
+	for _, want := range []string{"behind: its requests use version 5", "install backpressure: version 7 is installed", "restart cache not durable: version 5", "cluster vast01: signs with secret generation \"3\""} {
+		if !slices.ContainsFunc(slow.Problems, func(p string) bool { return strings.Contains(p, want) }) {
+			t.Errorf("slow proxy problems %q lack %q", slow.Problems, want)
+		}
+	}
+	if _, rs := get("restored"); rs.Lineage || rs.Behind != 0 || len(rs.Problems) != 2 || !strings.Contains(rs.Problems[0], "another lineage") {
+		t.Fatalf("a proxy on another lineage: %+v", rs)
+	}
+	if code, _ := get("nope"); code != http.StatusNotFound {
+		t.Fatalf("an unknown proxy: %d", code)
+	}
+}

@@ -35,6 +35,7 @@ type nodeOptions struct {
 	plaintext bool
 	leaseTTL  time.Duration
 	logFormat string
+	capacity  int
 }
 
 func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
@@ -48,6 +49,7 @@ func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
 	f.BoolVar(&o.plaintext, "plaintext", false, "serve the API over plain http on a non-loopback address: secrets and client keys then cross the network in the clear (TLS is deferred, ADR-0015); required unless --api is loopback")
 	f.DurationVar(&o.leaseTTL, "lease-ttl", 10*time.Second, "how long a proxy's lease lasts without a heartbeat before it refuses writes on moving buckets")
 	f.StringVar(&o.logFormat, "log-format", "auto", "json | console | auto")
+	f.IntVar(&o.capacity, "operation-capacity", control.DefaultCapacity, "how many operator operations may be unfinished at once; past it a new one answers 429 operation_capacity, while status stays available (ADR-0021)")
 	_ = cmd.MarkFlagRequired("data-dir")
 	_ = cmd.MarkFlagRequired("peer-url")
 }
@@ -55,6 +57,9 @@ func addNodeFlags(cmd *cobra.Command, o *nodeOptions) {
 func (o *nodeOptions) check() error {
 	if !config.ValidProxyID(o.name) {
 		return fmt.Errorf("--name %q: want 1-64 letters, digits, '.', '_' or '-'", o.name)
+	}
+	if o.capacity < 1 {
+		return fmt.Errorf("--operation-capacity %d: want at least 1", o.capacity)
 	}
 	host, _, err := net.SplitHostPort(o.api)
 	if err != nil {
@@ -194,26 +199,30 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	store.OnInstall = events.Directory
 	ops := cp.NewOperations(node.Client())
 	ops.OnChange = events.Fence
+	ops.Node = o.name // its liveness key: another node ends this node's operations if it is lost
+	ops.Capacity = o.capacity
 	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
 	telemetryStore := telemetry.NewStore(o.leaseTTL)
 	moverDir := filepath.Join(o.dataDir, "mover")
 	worker := control.MoverWorker{Snapshot: func() *directory.File { return store.Snapshot().File() }, Secrets: store.ClusterSecrets,
 		CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
-	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, ClusterSecrets: store.ClusterSecrets, Token: token,
+	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, LeaseTTL: o.leaseTTL, ClusterSecrets: store.ClusterSecrets, Token: token,
 		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"),
 		Mover: worker.Run, MoverLedger: worker.Ledger}
-	store.Prepare = func(f *directory.File) error {
-		added, removed, aerr := registry.Apply(f.Clusters)
+	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, aerr := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 		if aerr != nil {
-			return aerr
+			return nil, aerr
 		}
-		for _, name := range added {
-			log.Info("cluster ready", "cluster", name)
-		}
-		for _, name := range removed {
-			log.Info("cluster removed", "cluster", name)
-		}
-		return nil
+		return func() {
+			added, removed := cand.Commit()
+			for _, name := range added {
+				log.Info("cluster ready", "cluster", name)
+			}
+			for _, name := range removed {
+				log.Info("cluster removed", "cluster", name)
+			}
+		}, nil
 	}
 	// The store loads once there is quorum; until then /v1/ answers 503 and status says so. A
 	// node restarting alone after an outage must serve its API for the operator to see that. The
@@ -234,6 +243,9 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 				if err = ops.Start(sctx); err == nil {
 					if ferr := ctl.FailOrphans(sctx); ferr != nil {
 						log.Warn("operation records left running by the last stop could not all be closed", "err", ferr.Error())
+					}
+					if rerr := ctl.ResumeOwn(sctx); rerr != nil {
+						log.Warn("barrier operations left running by the last stop could not all be resumed", "err", rerr.Error())
 					}
 				}
 			}
@@ -280,6 +292,11 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		case <-tick.C:
 			if err := ctl.PublishFleet(ctx); err != nil && ctx.Err() == nil {
 				log.Warn("fleet unreadable", "err", err.Error())
+			}
+			if store.Ready() {
+				if err := ctl.Sweep(ctx); err != nil && ctx.Err() == nil {
+					log.Warn("operation records unreadable", "err", err.Error())
+				}
 			}
 		}
 	}
@@ -370,4 +387,10 @@ func newLogger(format string, plaintext bool, stderr io.Writer) *slog.Logger {
 		log = log.With("control_api", "PLAINTEXT http (--plaintext; secrets and client keys cross the network in the clear)")
 	}
 	return log
+}
+
+// secretGeneration reads each cluster's secret generation from a directory version, for the
+// signers the registry builds from it (ADR-0021 D1).
+func secretGeneration(f *directory.File) func(string) int64 {
+	return func(name string) int64 { return f.Generation(directory.SecretResource(name)) }
 }

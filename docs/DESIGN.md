@@ -2,13 +2,14 @@
 
 Name: **shunt** — to divert traffic onto another track without stopping it. Binary `shunt`, module `github.com/blakegolliher/shunt`, metric prefix `shunt_`.
 
-**Distributed correctness proposal (2026-09-24):**
+**Distributed correctness (2026-09-24):**
 [ADR-0021](adr/0021-distributed-correctness.md) and the
 [implementation plan](prompts/distributed-hardening.md) specify fixes for runtime
 installation, request draining, restore recovery, control membership and operator
-state. They are proposed, not shipped; §12 and ADR-0015 remain the implemented
-substrate. The proposal explicitly identifies the ADR-0016 guarantees that need
-stronger drain and recovery semantics.
+state. H0–H2 have landed (coherent installation, local admission and drain
+barriers, incarnations and leases; docs/bench/h1.md, docs/bench/h2.md); H3–H5
+(membership, restore recovery, operator workflow) are proposed. Where §12 or
+ADR-0015/0016 disagree with ADR-0021's landed parts, ADR-0021 holds.
 
 v2 changes from v1: TLS is userspace `crypto/tls` on both sides; no kTLS, no NIC offload, no sockmap, no hardware assumptions anywhere. See `docs/validation-report.md` for every assumption checked and every correction made.
 
@@ -215,7 +216,7 @@ Cert hot-reload via `GetCertificate` reading an atomically-swapped pair; SNI map
 
 ### 2.10 Simplicity rules (these go into `CLAUDE.md` verbatim)
 
-- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `status`, `verify`, `client`, `step-out`, `proxy`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
+- Two binaries. `shunt` (the proxy) with subcommands `serve`, `cluster`, `tenant`, `adopt`, `expand`, `ramp`, `migrate`, `cutover`, `purge-source`, `readonly`, `status`, `verify`, `client`, `step-out`, `proxy`, `operation`, `watch`, `tier run`, `restore worker`, `directory`, `probe`, `check-config`, `doctor`, `version` (the operator verbs call the control API, ADR-0008); `shunt-control` (the control plane, Phase 3c).
 - Standard library first. Every dependency has one line in `docs/deps.md` saying why the stdlib wasn't enough.
 - No interface with a single implementation, except two named seams: `CredentialStore` and `Directory`.
 - No middleware framework, no DI container, no plugin system. One handler, one pipeline, explicit calls.

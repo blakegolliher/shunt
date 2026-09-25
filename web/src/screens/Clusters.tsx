@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, setClusterReadOnly } from '../api/client'
+import { addCluster, getClusterView, getTelemetrySeries, probeCluster, removeCluster, removeClusterDryRun, rotateCredentials, setClusterReadOnly, setTenantDefault } from '../api/client'
 import type { ClusterInput, ClusterProbeResult, ClusterStatus, ClusterView, RemoveDryRun } from '../api/client'
 import { Card } from '../components/Card'
 import { Drawer } from '../components/Drawer'
@@ -36,6 +36,8 @@ export function Clusters() {
   const [history, setHistory] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
   const [removal, setRemoval] = useState<RemoveDryRun | null>(null)
+  const [newDefault, setNewDefault] = useState<Record<string, string>>({}) // tenant → the cluster chosen to replace this one as its default
+  const [rotation, setRotation] = useState({ accessKey: '', secret: '' }) // the credentials form in the cluster detail; an empty access key keeps the current one
 
   useEffect(() => {
     let live = true
@@ -51,9 +53,9 @@ export function Clusters() {
 
   const currentInput = useMemo(() => JSON.stringify(clusterInput(form)), [form])
   const update = <K extends keyof FormState>(key: K, value: FormState[K]) => { setForm((old) => ({ ...old, [key]: value })); setProbe(null) }
-  const act = async (fn: () => Promise<unknown>, success: string) => {
+  const act = async (fn: () => Promise<unknown>, success: string, tone: 'success' | 'neutral' = 'success') => {
     setBusy(true)
-    try { await fn(); notify(success); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
+    try { await fn(); notify(success, tone); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
   }
 
   const onProbe = async () => {
@@ -66,6 +68,18 @@ export function Clusters() {
     if (await act(() => addCluster(token, clusterInput(form)), `Cluster ${form.name} added`)) { setAdding(false); setForm(emptyForm); setProbe(null) }
   }
   const detail = selected ? views[selected] : undefined
+  const onRotate = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!detail || !rotation.secret) return
+    const accessKey = rotation.accessKey.trim()
+    let generation = ''
+    const ok = await act(async () => { generation = (await rotateCredentials(token, detail.name, { access_key: accessKey && accessKey !== detail.access_key ? accessKey : undefined, secret: rotation.secret })).generation ?? '' },
+      `Credentials of ${detail.name} rotated`)
+    if (ok) {
+      setRotation({ accessKey: '', secret: '' })
+      if (generation) notify(`Secret generation ${generation} is installing on the proxies; keep the old backend key valid until it is installed everywhere and older requests have ended`)
+    }
+  }
 
   return <div className="space-y-5">
     <Card eyebrow="Backends" title="Clusters" action={<button type="button" onClick={() => setAdding(true)} className="rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white hover:bg-ember-500">Add cluster</button>}>
@@ -86,12 +100,33 @@ export function Clusters() {
       </form>
     </Drawer>
 
-    <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Cluster detail" onClose={() => { setSelected(null); setHistory([]); setRemoval(null) }}>
+    <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Cluster detail" onClose={() => { setSelected(null); setHistory([]); setRemoval(null); setRotation({ accessKey: '', secret: '' }) }}>
       {detail ? <div className="space-y-6">
         <div className="grid grid-cols-2 gap-3 text-sm"><div><p className="text-muted">Endpoint</p><p className="mt-1 font-mono">{detail.scheme}://{detail.endpoints.join(', ')}</p></div><div><p className="text-muted">Health history</p><Sparkline values={history.length ? history : [detail.probe.latency_ms]} label={`${detail.name} latency history`} /></div></div>
         <Card title="Capability profile"><dl className="grid gap-3 text-sm">{Object.entries(detail.capabilities).map(([name, value]) => <div key={name} className="flex justify-between"><dt className="text-muted">{name.replaceAll('_', ' ')}</dt><dd>{String(value.value)} · {value.known ? 'measured' : 'assumed'}</dd></div>)}</dl></Card>
-        <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => <li key={ref} className="font-mono">{ref}</li>)}</ul> : <p className="text-sm text-muted">Nothing references this cluster.</p>}</Card>
-        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => void act(() => setClusterReadOnly(token, detail.name, !detail.read_only), `Cluster ${detail.name} is ${detail.read_only ? 'writable' : 'read-only'}`)} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { setBusy(true); void removeClusterDryRun(token, detail.name).then(setRemoval).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')).finally(() => setBusy(false)) }} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white">Remove cluster</button></div>
+        {detail.secret && <Card title="Secret" eyebrow={`generation ${detail.secret.generation}`}>
+          <p className="text-sm">{detail.secret.drained ? <span className="text-emerald-300">Rotation drained. The previous backend key may be revoked.</span> : detail.secret.pending.length === 0 && detail.secret.silent.length === 0 && (detail.secret.held?.length ?? 0) === 0 ? <span className="text-emerald-300">Every proxy signs with this secret.</span> : <span className="text-amber-200">Rotation installing: {detail.secret.pending.length} {detail.secret.pending.length === 1 ? 'proxy' : 'proxies'} still on an older secret{detail.secret.held?.length ? `, ${detail.secret.held.length} holding old signers` : ''}{detail.secret.silent.length ? `, ${detail.secret.silent.length} silent` : ''}.</span>}</p>
+          <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs"><dt className="text-muted">Installed</dt><dd className="font-mono">{detail.secret.installed.join(', ') || '—'}</dd><dt className="text-muted">Pending</dt><dd className="font-mono">{detail.secret.pending.join(', ') || '—'}</dd><dt className="text-muted">Holding old</dt><dd className="font-mono">{detail.secret.held?.join(', ') || '—'}</dd><dt className="text-muted">Silent</dt><dd className="font-mono">{detail.secret.silent.join(', ') || '—'}</dd></dl>
+          <p className="mt-3 text-xs text-muted">Keep the old backend key valid until this says drained. Installation alone does not end requests that already hold the old signer.</p>
+        </Card>}
+        <Card title="Credentials" eyebrow={`access key ${detail.access_key}`}>
+          <form onSubmit={(event) => void onRotate(event)} className="grid gap-3">
+            <label className="text-sm font-medium">New access key <span className="text-muted">(leave empty to keep {detail.access_key})</span><input value={rotation.accessKey} onChange={(event) => setRotation((old) => ({ ...old, accessKey: event.target.value }))} className={inputClass} autoComplete="off" /></label>
+            <label className="text-sm font-medium">New secret key<input type="password" value={rotation.secret} onChange={(event) => setRotation((old) => ({ ...old, secret: event.target.value }))} className={inputClass} autoComplete="new-password" /></label>
+            <p className="text-xs text-muted">shunt checks the new pair with one signed request before anything changes; a wrong pair is refused and the old credentials stay. It never revokes a backend key.</p>
+            <button type="submit" disabled={busy || !rotation.secret} className="justify-self-start rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold disabled:opacity-50">Rotate credentials</button>
+          </form>
+        </Card>
+        <Card title="Dependent placements">{detail.references?.length ? <ul className="grid gap-2 text-sm">{detail.references.map((ref) => {
+          // A tenant defaulting to this cluster blocks its removal; the fix is here, not on another screen.
+          const tenant = /^tenants\.(.+)\.default_cluster$/.exec(ref)?.[1]
+          const others = clusters.filter((c) => c.name !== detail.name)
+          if (!tenant) return <li key={ref} className="font-mono">{ref}</li>
+          const choice = newDefault[tenant] ?? others[0]?.name ?? ''
+          return <li key={ref}><span className="font-mono">{ref}</span><span className="mt-1 block text-xs text-muted">New buckets of tenant {tenant} are created on {detail.name}.</span>{others.length > 0 && <div className="mt-2 flex flex-wrap items-center gap-2"><select aria-label={`New default cluster for tenant ${tenant}`} value={choice} onChange={(event) => setNewDefault((old) => ({ ...old, [tenant]: event.target.value }))} className="rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm">{others.map((c) => <option key={c.name}>{c.name}</option>)}</select><button type="button" disabled={busy || !choice} onClick={() => void act(() => setTenantDefault(token, tenant, choice), `${choice} is now tenant ${tenant}'s default cluster`).then((ok) => { if (ok) setRemoval(null) })} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Make it tenant {tenant}'s default</button></div>}</li>
+        })}</ul> : <p className="text-sm text-muted">Nothing references this cluster.</p>}</Card>
+        {detail.read_only && <p className={`text-sm ${detail.barrier ? 'text-amber-200' : 'text-emerald-300'}`}>{detail.barrier ? 'Read-only requested: effective once every proxy has drained the writes it admitted before.' : 'Read-only is effective on every proxy.'}</p>}
+        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy || Boolean(detail.barrier)} onClick={() => void act(() => setClusterReadOnly(token, detail.name, !detail.read_only), detail.read_only ? `Cluster ${detail.name}: writable again once every proxy has it` : `Cluster ${detail.name}: read-only requested; effective once every proxy has drained its writes`, 'neutral')} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { setBusy(true); void removeClusterDryRun(token, detail.name).then(setRemoval).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')).finally(() => setBusy(false)) }} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white">Remove cluster</button></div>
         {removal && <div className="rounded-lg border border-red-600/60 bg-red-950/20 p-4 text-sm"><p className="font-semibold">Dry run</p><p className="mt-2 text-red-100">{removal.allowed ? `Will remove ${removal.name} and ${removal.secret_files} stored secret file(s).` : removal.reason}</p>{removal.allowed && removal.token && <button type="button" className="mt-4 rounded-lg bg-red-600 px-4 py-2 font-semibold text-white" disabled={busy} onClick={() => void act(() => removeCluster(token, detail.name, removal.token ?? ''), `Cluster ${detail.name} removed`).then((ok) => { if (ok) { setSelected(null); setRemoval(null) } })}>Confirm removal</button>}</div>}
       </div> : <p className="text-muted">Loading cluster detail…</p>}
     </Drawer>

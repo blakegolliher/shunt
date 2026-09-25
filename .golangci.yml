@@ -44,9 +44,12 @@ linters:
         - hugeParam
       settings:
         rangeValCopy:
-          # control.Member is 136 bytes since host and version joined it (ADR-0017); the loops
-          # over the fleet copy one per proxy, bounded by proxies, not by requests.
-          sizeThreshold: 160
+          # control.Member is 288 bytes since host and version (ADR-0017), its directory identity,
+          # secret generations, install state (durable, installed, cache error; ADR-0021 D1),
+          # incarnations (current, unresolved, retire request, uncertain count) and barrier
+          # acknowledgements (ADR-0021 D2) joined it; the loops over the fleet copy one per proxy,
+          # bounded by proxies, not by requests.
+          sizeThreshold: 296
     gosec:
       excludes:
         # G304: check-config opens the file path the operator passed on the command line; that is its job.

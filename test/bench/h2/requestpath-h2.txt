@@ -1,0 +1,54 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/proxy
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkSmallGET-16                    	    5878	    404282 ns/op	   22868 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6122	    383684 ns/op	   22300 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6154	    389434 ns/op	   22616 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6310	    374219 ns/op	   22676 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    7321	    333654 ns/op	   22879 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6567	    354778 ns/op	   22290 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6786	    370678 ns/op	   22104 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    8772	    372493 ns/op	   22929 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6814	    342568 ns/op	   23137 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6834	    324089 ns/op	   21951 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6525	    361777 ns/op	   23449 B/op	     107 allocs/op
+BenchmarkSmallGET-16                    	    6440	    332041 ns/op	   22553 B/op	     107 allocs/op
+BenchmarkPUT1MiB-16                     	    1248	   1986610 ns/op	 527.82 MB/s	   62183 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1262	   2176263 ns/op	 481.82 MB/s	   62530 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1425	   1907627 ns/op	 549.68 MB/s	   60794 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1365	   1905868 ns/op	 550.18 MB/s	   59396 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                     	    1395	   1857326 ns/op	 564.56 MB/s	   60509 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1272	   1857345 ns/op	 564.56 MB/s	   60620 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1411	   2014950 ns/op	 520.40 MB/s	   60914 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1248	   1750115 ns/op	 599.15 MB/s	   59559 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1321	   1907484 ns/op	 549.72 MB/s	   59768 B/op	     179 allocs/op
+BenchmarkPUT1MiB-16                     	    1024	   2080551 ns/op	 503.99 MB/s	   60254 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1177	   1952498 ns/op	 537.04 MB/s	   60173 B/op	     180 allocs/op
+BenchmarkPUT1MiB-16                     	    1363	   1859959 ns/op	 563.76 MB/s	   61960 B/op	     180 allocs/op
+BenchmarkResignSmallGET-16              	    4182	    482488 ns/op	   36046 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5007	    439246 ns/op	   36125 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5787	    509343 ns/op	   37015 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5958	    480578 ns/op	   35655 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    4978	    471746 ns/op	   35934 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5275	    468029 ns/op	   36068 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    4342	    501701 ns/op	   36194 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    4664	    482911 ns/op	   37300 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5386	    449063 ns/op	   37149 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    5796	    447411 ns/op	   36122 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    4744	    484938 ns/op	   36558 B/op	     241 allocs/op
+BenchmarkResignSmallGET-16              	    4168	    485989 ns/op	   36267 B/op	     241 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     496	   4955426 ns/op	 211.60 MB/s	 1011169 B/op	    4730 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     428	   5522045 ns/op	 189.89 MB/s	  996304 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     400	   5150236 ns/op	 203.60 MB/s	  991548 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     490	   5285824 ns/op	 198.38 MB/s	  998627 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     488	   4866513 ns/op	 215.47 MB/s	  991745 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     486	   4715487 ns/op	 222.37 MB/s	  999957 B/op	    4728 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     536	   4706872 ns/op	 222.78 MB/s	 1001570 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     512	   4925400 ns/op	 212.89 MB/s	  997873 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     439	   4896933 ns/op	 214.13 MB/s	 1009077 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     422	   4976650 ns/op	 210.70 MB/s	 1005506 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     490	   4815970 ns/op	 217.73 MB/s	 1001118 B/op	    4729 allocs/op
+BenchmarkResignSignedChunkPUT1MiB-16    	     457	   5222400 ns/op	 200.78 MB/s	 1000226 B/op	    4729 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/proxy	116.208s

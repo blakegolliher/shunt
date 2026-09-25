@@ -5,8 +5,17 @@ Referenced from `docs/DESIGN.md` §12. Supersedes §1.5 where they differ: Postg
 **Proposed hardening:** [ADR-0021](../adr/0021-distributed-correctness.md) and
 [distributed correctness](distributed-correctness.md) address gaps in the
 implemented version fence, runtime installation, recovery and membership. The
-proposal is not implemented; use its [delivery plan](../prompts/distributed-hardening.md)
-for the next correctness work, including required API/CLI/GUI and test coverage.
+proposal was not implemented when this note was written (2026-09-24); use its
+[delivery plan](../prompts/distributed-hardening.md) for the next correctness work, including
+required API/CLI/GUI and test coverage.
+
+**Amended by ADR-0021 (H2, 2026-09-25).** H2 implemented ADR-0021 D2. Where §12.6 and §12.9 below
+say that a hold which does not commit within the wait is released, that a fence waits only for
+live proxies, that a silent proxy is dropped when its lease ends, or that `shunt proxy forget`
+discharges a member, they are superseded: every registered member takes part in every barrier, a
+silent one is `proxy_missing`, a timed-out wait leaves the operation blocked with its hold, and
+forget is refused while any incarnation of the member is unresolved. The operator procedure is
+[docs/fleet.md](../fleet.md).
 
 ## 12.0 Where this sits
 
@@ -115,6 +124,9 @@ target-then-source on every proxy that has R1. R2, once R1 is committed, moves t
 proxy writes a moving key to the target while another writes it to the source, and a proxy on R0
 reading such a key source-only is still right. A hold that does not commit within the wait is
 released (R1 undone), so a step happens everywhere or nowhere. With one proxy nothing is held.
+*Amended by ADR-0021 (H2, 2026-09-25):* a hold is no longer released when the wait runs out; the
+operation stays blocked with its hold until every member has drained it, or an operator cancels it
+before the commit. One proxy holds and drains too.
 
 *Reconciliation with the code as it stands (superseded by the amendment above; kept for the
 record).* This sequence assumes reads narrow to the write rule,
@@ -138,6 +150,9 @@ partitioned before it still sees the bucket ACTIVE and writes every key to the s
 round that takes a bucket out of ACTIVE waits for every **member**, live or not, until it answers
 or is forgotten (`shunt proxy forget`), and membership must outlive the lease: in etcd that is a
 membership record beside the leased `/proxies/<id>` key, not the leased key alone.
+*Amended by ADR-0021 (H2, 2026-09-25):* every fence round, not only the first, waits for every
+member; a member is discharged only by a clean retirement, or by an operator's attested resolution
+of its stopped incarnation followed by forget.
 
 **Fleet-wide decisions.** Cutover windows, ramp holds, and convergence read counters carried on every live proxy's heartbeat, aggregated by the control node that runs the check. The counters exist only for non-ACTIVE placements, so heartbeat size is bounded by migrations in flight, not by buckets. Prometheus remains the dashboard and alerting path; it is never the decision path.
 
@@ -171,6 +186,6 @@ Requirements the runbook states plainly: three nodes on separate failure domains
 
 - Two-phase ramp: with two proxies where one lags by a revision, no key is written to one side and read source-only on the other. A model-checked test with a deliberately stale proxy. *(File-backend form done in POC-6: `internal/proxy/fleet_property_test.go`, with a negative control that must fail without the fence; P3c reruns it against etcd.)*
 - Stale mode: a proxy whose lease is revoked mid-migration refuses transitional writes and serves ACTIVE placements; on reconnect it acks and resumes. *(Done in POC-6 for the file backend: the property test partitions a member mid-migration; `make fleet` does it with SIGSTOP. A reconnecting proxy renews only once it has installed the current version, ADR-0016.)*
-- Fence: a ramp change never advances to phase 2 while any live proxy lags; a proxy whose lease expires is dropped from the fence and lands in stale mode.
+- Fence: a ramp change never advances to phase 2 while any live proxy lags; a proxy whose lease expires is dropped from the fence and lands in stale mode. *(Amended by ADR-0021, H2, 2026-09-25: a proxy whose lease expires is not dropped; it blocks the barrier as `proxy_missing`.)*
 - Quorum loss: kill two of three control nodes under load; data-path error rate on ACTIVE placements stays zero; transitional placements see only 503s with `Retry-After`; recovery restores everything with no operator action.
 - Mover claims: two movers on the same migration never copy conflicting content; a mover killed mid-range is taken over within one lease TTL.

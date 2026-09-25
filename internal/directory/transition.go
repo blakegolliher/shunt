@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/blakegolliher/shunt/internal/config"
 )
 
 // Transition is a requested state change for one placement.
@@ -26,6 +28,11 @@ type Transition struct {
 	// write happens: a hold released concurrently must not be completed, or the step would move
 	// writes that no proxy held.
 	Complete bool
+	// Barrier is the id of the drain barrier a held step writes on the placement (ADR-0021 D2):
+	// the operation's. Every proxy closes the placement's mutations while it is there. Empty, a
+	// hold refuses only the writes of the keys it moves, as before H2; the control node always
+	// names one.
+	Barrier string
 	// Range, leaving ACTIVE, moves only the keys whose hash it holds (ADR-0018 N3): from the leg that
 	// owns them to the target, which becomes a new leg unless one is on that cluster already. Later
 	// steps of the move name it again or not at all.
@@ -96,7 +103,18 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		return applyMove(p, t)
 	}
 	if t.Release {
-		return release(p)
+		return release(p, t.Barrier)
+	}
+	// A transition guarded by a standalone drain barrier (cutover or purge-source) may commit
+	// only while its own barrier is still installed. This is the directory-side half of the
+	// operation CAS: a concurrent cancellation that cleared the barrier wins, and the transition
+	// cannot land afterwards.
+	if t.Barrier != "" && !t.Hold && (p.Barrier == nil || p.Barrier.ID != t.Barrier) {
+		held := "no barrier"
+		if p.Barrier != nil {
+			held = "barrier " + p.Barrier.ID
+		}
+		return fail("the placement carries %s, not barrier %s", held, t.Barrier)
 	}
 	if !slices.Contains(States, t.To) {
 		return fail("unknown state %q; states are %s", t.To, strings.Join(States, ", "))
@@ -205,9 +223,18 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		if p.Source != p.Primary && p.Source != p.Cold {
 			delete(np.Names, p.Source)
 		}
-		np.Source, np.Cutover = "", nil
+		np.Source, np.Cutover, np.Barrier = "", nil, nil // purge-source's source barrier ends with the source
+	}
+	if t.Complete || t.Hold {
+		np.Barrier = nil // a completed step's barrier is over; a new hold's is written below
+	}
+	if t.Barrier != "" && !t.Hold {
+		np.Barrier = nil // a standalone barrier ends atomically with its guarded transition
 	}
 	if t.Hold {
+		if t.Barrier != "" {
+			np.Barrier = &Barrier{ID: t.Barrier, Kind: config.BarrierMutations}
+		}
 		// Keep the ramp in force (none, leaving ACTIVE) and record the step as its hold.
 		base := Ramp{Hash: RampHash}
 		if p.State == StateRamping && p.Ramp != nil {
@@ -224,12 +251,21 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	return np, nil
 }
 
-// release undoes a held step (Transition.Release, ADR-0016).
-func release(p Placement) (Placement, error) {
+// release undoes a held step (Transition.Release, ADR-0016). barrier, when given, must be the
+// hold's: a cancellation releases its own operation's hold, never another's (ADR-0021 D2).
+func release(p Placement, barrier string) (Placement, error) {
 	if p.State != StateRamping || p.Ramp == nil || p.Ramp.Hold == nil {
 		return p, &TransitionError{From: p.State, To: p.State, Reason: "there is no held step to release"}
 	}
+	if barrier != "" && (p.Barrier == nil || p.Barrier.ID != barrier) {
+		held := "no barrier"
+		if p.Barrier != nil {
+			held = "barrier " + p.Barrier.ID
+		}
+		return p, &TransitionError{From: p.State, To: p.State, Reason: fmt.Sprintf("the held step carries %s, not %s; another operation's hold is not released", held, barrier)}
+	}
 	np := p.clone()
+	np.Barrier = nil
 	if p.Ramp.Ratio == 0 && len(p.Ramp.Prefixes) == 0 {
 		// Held from ACTIVE: nothing was ever routed to the target. Back to ACTIVE, target recorded.
 		np.State, np.Primary, np.Source, np.Target, np.Ramp = StateActive, p.Source, "", p.Primary, nil

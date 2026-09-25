@@ -5,11 +5,11 @@ import type { TelemetryPoint } from '../api/client'
 import { Card } from '../components/Card'
 import { Stat } from '../components/Stat'
 import { useStore } from '../store'
-import { latencyChartData, scalarChartData } from '../telemetryData'
+import { byCluster, latencyChartData, scalarChartData, statusSeries } from '../telemetryData'
 
 const latencySeries = ['client_total', 'upstream_ttfb', 'upstream_total', 'proxy_overhead'] as const
-const scalarSeries = ['requests_per_second', 'bytes_in_per_second', 'bytes_out_per_second', 'errors_0_per_second', 'errors_4xx_per_second', 'errors_5xx_per_second'] as const
-const colors = ['#F08A4B', '#E06A1F', '#CC5500', '#F2ECE6']
+const scalarSeries = ['requests_per_second', 'bytes_in_per_second', 'bytes_out_per_second'] as const
+const colors = ['#F08A4B', '#4BA3F0', '#7BC96F', '#E0C04B', '#C06AE0', '#E0605A', '#5AD1C8', '#F2ECE6', '#CC5500', '#9A928B']
 const inputClass = 'rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-sm text-paper'
 
 function latest(points: TelemetryPoint[], field: 'p99_us' | 'value') {
@@ -57,6 +57,13 @@ export function Telemetry() {
   const [compareA, setCompareA] = useState('')
   const [compareB, setCompareB] = useState('')
   const [comparison, setComparison] = useState<Record<string, TelemetryPoint[]>>({})
+  const [backends, setBackends] = useState<Record<string, TelemetryPoint[]>>({})
+  const [statuses, setStatuses] = useState<TelemetryPoint[]>([])
+  const bucketOptions = useMemo(() => (directory?.placements ?? []).filter((p) => p.per_bucket_telemetry).map((p) => p.key), [directory])
+  const [bucketChoice, setBucketChoice] = useState('')
+  const [bucketMetric, setBucketMetric] = useState<'requests_per_second' | 'bytes_in_per_second' | 'bytes_out_per_second'>('requests_per_second')
+  const [bucketPoints, setBucketPoints] = useState<TelemetryPoint[]>([])
+  const bucketKey = bucketOptions.includes(bucketChoice) ? bucketChoice : bucketOptions[0] ?? ''
   const [error, setError] = useState('')
   const telemetryEvent = lastEvent?.type === 'telemetry' ? lastEvent.id : ''
   const effectiveScope = scopes.includes(scope) ? scope : 'fleet'
@@ -74,6 +81,13 @@ export function Telemetry() {
       const names = [...latencySeries, ...scalarSeries]
       const values = await Promise.all(names.map((name) => fetchOne(effectiveScope, name)))
       setSeries(Object.fromEntries(names.map((name, index) => [name, values[index]])))
+      setStatuses(await fetchOne(effectiveScope, 'status_per_second'))
+      if (bucketKey) {
+        const query = new URLSearchParams({ scope: `bucket:${bucketKey}`, series: bucketMetric, op: 'all', from: from.toISOString(), to: to.toISOString() })
+        setBucketPoints((await getTelemetrySeries(token, query)).points)
+      } else setBucketPoints([])
+      const perCluster = await Promise.all(clusters.map((name) => fetchOne(`cluster:${name}`, 'requests_per_second')))
+      setBackends(Object.fromEntries(clusters.map((name, index) => [name, perCluster[index]])))
       if (effectiveCompareA && effectiveCompareB) {
         const [a, b] = await Promise.all([fetchOne(`cluster:${effectiveCompareA}`, 'client_total'), fetchOne(`cluster:${effectiveCompareB}`, 'client_total')])
         setComparison({ [effectiveCompareA]: a, [effectiveCompareB]: b })
@@ -82,7 +96,7 @@ export function Telemetry() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     }
-  }, [effectiveCompareA, effectiveCompareB, effectiveScope, minutes, op, token])
+  }, [bucketKey, bucketMetric, clusters, effectiveCompareA, effectiveCompareB, effectiveScope, minutes, op, token])
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0)
@@ -91,13 +105,24 @@ export function Telemetry() {
 
   const requestData = scalarChartData(series, ['requests_per_second'])
   const throughputData = scalarChartData(series, ['bytes_in_per_second', 'bytes_out_per_second'])
-  const errorData = scalarChartData(series, ['errors_0_per_second', 'errors_4xx_per_second', 'errors_5xx_per_second'])
+  const status = statusSeries(statuses)
+  const bucket = byCluster(bucketPoints)
+  const bucketData = scalarChartData(bucket.series, bucket.names)
+  const bucketNow = bucket.names.map((name) => ({ name, value: latest(bucket.series[name] ?? [], 'value') }))
+  const bucketTotal = bucketNow.reduce((sum, b) => sum + b.value, 0)
+  const bucketShare = bucketTotal > 0 ? bucketNow.map((b) => `${b.name} ${Math.round((b.value / bucketTotal) * 100)}%`).join(' · ') : 'no traffic in the last window'
+  const statusData = scalarChartData(status.series, status.names)
+  const backendData = scalarChartData(backends, clusters)
+  const backendNow = clusters.map((name) => ({ name, value: latest(backends[name] ?? [], 'value') }))
+  const backendTotal = backendNow.reduce((sum, b) => sum + b.value, 0)
+  const backendShare = backendTotal > 0 ? backendNow.map((b) => `${b.name} ${Math.round((b.value / backendTotal) * 100)}%`).join(' · ') : 'no requests in the last window'
   const compareData = useMemo(() => {
     const named: Record<string, TelemetryPoint[]> = {}
     for (const [name, points] of Object.entries(comparison)) named[name] = points.map((point) => ({ ...point, value: point.p99_us ?? 0 }))
     return scalarChartData(named, Object.keys(named))
   }, [comparison])
   const compareNames = Object.keys(comparison)
+  const idle = compareNames.filter((name) => (comparison[name] ?? []).length === 0)
   const clusterP99 = compareNames.map((name) => `${name} ${micros(latest(comparison[name], 'p99_us'))}`).join(' · ') || 'choose two clusters'
 
   return <div className="space-y-5">
@@ -112,8 +137,17 @@ export function Telemetry() {
 
     <Card eyebrow="Microseconds from the API" title="Latency percentiles"><div className="grid gap-4 xl:grid-cols-2">{latencySeries.map((name) => <LatencyChart key={name} name={name} points={series[name] ?? []} />)}</div></Card>
 
-    <Card eyebrow="Status class" title="Error rate"><ScalarChart label="Error rate by status class" data={errorData} names={['errors_0_per_second', 'errors_4xx_per_second', 'errors_5xx_per_second']} /></Card>
+    <Card eyebrow={`${op} · requests per second`} title="Traffic by backend" action={<span className="text-xs text-muted">{backendShare}</span>}><ScalarChart label="Requests per second by backend cluster" data={backendData} names={clusters} /></Card>
 
-    <Card eyebrow="Ramp hold judgment" title="Cluster comparison"><div className="mb-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-muted">First cluster<select aria-label="First comparison cluster" value={effectiveCompareA} onChange={(event) => setCompareA(event.target.value)} className={`mt-2 w-full ${inputClass}`}>{clusters.map((name) => <option key={name}>{name}</option>)}</select></label><label className="text-sm text-muted">Second cluster<select aria-label="Second comparison cluster" value={effectiveCompareB} onChange={(event) => setCompareB(event.target.value)} className={`mt-2 w-full ${inputClass}`}>{clusters.map((name) => <option key={name}>{name}</option>)}</select></label></div><ScalarChart label="Client total p99 cluster comparison" data={compareData} names={compareNames} /></Card>
+    <Card eyebrow="Per bucket · by backend" title="Bucket traffic" action={<span className="text-xs text-muted">{bucketKey ? bucketShare : ''}</span>}>
+      {bucketOptions.length === 0 ? <p className="text-sm text-muted">No bucket is counted by backend yet. Buckets spread over legs or moving are counted automatically; watch any other from its detail on Buckets, or with shunt watch.</p> : <>
+        <div className="mb-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-muted">Bucket<select aria-label="Bucket for traffic by backend" value={bucketKey} onChange={(event) => setBucketChoice(event.target.value)} className={`mt-2 w-full ${inputClass}`}>{bucketOptions.map((key) => <option key={key}>{key}</option>)}</select></label><label className="text-sm text-muted">Measure<select aria-label="Bucket traffic measure" value={bucketMetric} onChange={(event) => setBucketMetric(event.target.value as typeof bucketMetric)} className={`mt-2 w-full ${inputClass}`}><option value="requests_per_second">requests per second</option><option value="bytes_in_per_second">bytes in per second</option><option value="bytes_out_per_second">bytes out per second</option></select></label></div>
+        <ScalarChart label={`${bucketKey} ${bucketMetric} by backend cluster`} data={bucketData} names={bucket.names} />
+      </>}
+    </Card>
+
+    <Card eyebrow={`${effectiveScope} · ${op} · per second`} title="Responses by status"><p className="mb-3 text-xs text-muted">Every response that was not a success, by status: one line per code the scope answered. A read answered 404 (a HEAD or GET of a key that is not there) is an answer, not an error, and has its own line; codes outside 400, 403, 404, 405, 409, 411, 412, 416, 429, 500–504 count as other 4xx or other 5xx.</p>{statuses.length === 0 ? <p className="text-sm text-muted">No error responses in this window.</p> : <ScalarChart label="Responses by status code" data={statusData} names={status.names} />}</Card>
+
+    <Card eyebrow="Ramp hold judgment" title="Cluster comparison"><div className="mb-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-muted">First cluster<select aria-label="First comparison cluster" value={effectiveCompareA} onChange={(event) => setCompareA(event.target.value)} className={`mt-2 w-full ${inputClass}`}>{clusters.map((name) => <option key={name}>{name}</option>)}</select></label><label className="text-sm text-muted">Second cluster<select aria-label="Second comparison cluster" value={effectiveCompareB} onChange={(event) => setCompareB(event.target.value)} className={`mt-2 w-full ${inputClass}`}>{clusters.map((name) => <option key={name}>{name}</option>)}</select></label></div>{idle.length > 0 && <p className="mb-3 text-sm text-muted">No traffic reached {idle.join(' or ')} in this window, so there is nothing to compare yet: a ramp sends writes there only for keys it has moved.</p>}<ScalarChart label="Client total p99 cluster comparison" data={compareData} names={compareNames} /></Card>
   </div>
 }

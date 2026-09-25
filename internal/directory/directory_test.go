@@ -102,19 +102,19 @@ func active(primary string) Placement {
 
 func TestReadOnlyMutations(t *testing.T) {
 	f := &File{Clusters: map[string]config.Cluster{"one": {}}, Placements: map[string]Placement{"acme/data": active("one")}}
-	if err := f.SetPlacementReadOnly("acme", "data", true, false); err != nil {
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if p := f.Placements["acme/data"]; !p.ReadOnly || p.RejectWrites {
 		t.Fatalf("placement flags: %+v", p)
 	}
-	if err := f.SetClusterReadOnly("one", true, true); err != nil {
+	if err := f.SetClusterReadOnly("one", true, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	if c := f.Clusters["one"]; !c.ReadOnly || !c.RejectWrites {
 		t.Fatalf("cluster flags: %+v", c)
 	}
-	if err := f.SetPlacementReadOnly("acme", "data", false, true); err != nil {
+	if err := f.SetPlacementReadOnly("acme", "data", false, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	if p := f.Placements["acme/data"]; p.ReadOnly || p.RejectWrites {
@@ -779,6 +779,42 @@ func TestAdoptExpandAndCutoverEvidence(t *testing.T) {
 	}
 }
 
+// T02 on the file backend: a candidate whose write never reaches disk is never committed, so
+// what it prepared (the proxy's clusters) never goes live.
+func TestPrepareIsNotCommittedWhenTheWriteFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	ctx := context.Background()
+	path := writeDir(t, 1)
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prepared, committed []int64
+	d.Prepare = func(f *File, _ func(string) (string, error)) (func(), error) {
+		prepared = append(prepared, f.Version)
+		return func() { committed = append(committed, f.Version) }, nil
+	}
+	if err := d.Create(ctx, "acme", "data", "garage", "acme-0000-data", "t"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := d.Create(ctx, "acme", "more", "garage", "acme-0000-more", "t"); err == nil {
+		t.Fatal("a write into a read-only directory succeeded")
+	}
+	if len(prepared) != 2 || len(committed) != 1 || committed[0] != 2 {
+		t.Fatalf("prepared %v, committed %v: want 2 and 3 prepared, only 2 committed", prepared, committed)
+	}
+	if d.Snapshot().Version() != 2 {
+		t.Fatalf("installed version %d after a failed write", d.Snapshot().Version())
+	}
+}
+
 // Prepare runs before a version is installed and can refuse it; OnInstall runs after, on writes
 // and reloads alike.
 func TestPrepareAndOnInstallHooks(t *testing.T) {
@@ -791,11 +827,11 @@ func TestPrepareAndOnInstallHooks(t *testing.T) {
 	var installed []int64
 	d.OnInstall = func(s *Snapshot) { installed = append(installed, s.Version()) }
 	refuse := errors.New("cannot build cluster")
-	d.Prepare = func(f *File) error {
+	d.Prepare = func(f *File, _ func(string) (string, error)) (func(), error) {
 		if _, ok := f.Clusters["broken"]; ok {
-			return refuse
+			return nil, refuse
 		}
-		return nil
+		return func() {}, nil
 	}
 	broken := config.Cluster{Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"10.0.0.9:80"}, Credentials: config.Credentials{AccessKey: "A", SecretRef: "env:NOPE"}}
 	if err := d.PutCluster(ctx, "broken", broken, "", "t"); !errors.Is(err, refuse) {
@@ -952,5 +988,88 @@ func TestClearTarget(t *testing.T) {
 	}
 	if err := f.ClearTarget("acme", "gone"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("clear of a missing placement: %v", err)
+	}
+}
+
+// Defect 3 of the H2 review: switching read-only off with a barrier id is the release of that
+// barrier's hold (a cancellation before its commit), and is refused once the hold is gone. A
+// commit that cleared the barrier left read-only in force; a late release must not undo it.
+func TestReadOnlyReleaseComparesBarrier(t *testing.T) {
+	f := &File{Clusters: map[string]config.Cluster{"one": {}}, Placements: map[string]Placement{"acme/data": active("one")}}
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, "op-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-2"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release of another barrier's hold: %v", err)
+	}
+	if err := f.ClearBarrier("acme", "data", "op-1"); err != nil { // op-1's commit
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-1"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release after the commit: %v", err)
+	}
+	if p := f.Placements["acme/data"]; !p.ReadOnly || p.Barrier != nil {
+		t.Fatalf("a committed placement read-only was undone: %+v", p)
+	}
+	if err := f.SetClusterReadOnly("one", true, false, "op-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.ClearClusterBarrier("one", "op-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetClusterReadOnly("one", false, false, "op-3"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := f.Clusters["one"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
+	}
+	// The release of a hold still in place, and the plain switch off, work as before.
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", true, false, "op-4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetPlacementReadOnly("acme", "data", false, false, "op-4"); err != nil {
+		t.Fatalf("release of the hold in place: %v", err)
+	}
+	if p := f.Placements["acme/data"]; p.ReadOnly || p.Barrier != nil {
+		t.Fatalf("released placement: %+v", p)
+	}
+}
+
+// The same through the file store's writes.
+func TestFileDirReadOnlyReleaseComparesBarrier(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(writeDir(t, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(ctx, "acme", "data", "garage", "acme-1234-data", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetPlacementReadOnly(ctx, "acme", "data", true, false, "op-1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearBarrier(ctx, PlacementResource("acme/data"), "op-1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetPlacementReadOnly(ctx, "acme", "data", false, false, "op-1", "test"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release after the commit: %v", err)
+	}
+	if p, _ := d.Snapshot().Lookup("acme", "data"); !p.ReadOnly {
+		t.Fatalf("a committed read-only was undone: %+v", p)
+	}
+	if err := d.SetClusterReadOnly(ctx, "garage", true, false, "op-2", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearBarrier(ctx, ClusterResource("garage"), "op-2", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetClusterReadOnly(ctx, "garage", false, false, "op-2", "test"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := d.Snapshot().File().Clusters["garage"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
 	}
 }

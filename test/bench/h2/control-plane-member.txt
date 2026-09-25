@@ -1,0 +1,84 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkCacheWrite-16                  	     224	   5212422 ns/op	    2295 B/op	      23 allocs/op
+BenchmarkCacheWrite-16                  	     238	   4781240 ns/op	    2043 B/op	      22 allocs/op
+BenchmarkCacheWrite-16                  	     261	   5066596 ns/op	    2035 B/op	      22 allocs/op
+BenchmarkCacheWrite-16                  	     204	   5612955 ns/op	    2047 B/op	      22 allocs/op
+BenchmarkCacheWrite-16                  	     240	   4729218 ns/op	    2038 B/op	      22 allocs/op
+BenchmarkCacheWrite-16                  	     249	   4718046 ns/op	    2026 B/op	      22 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2695	    562152 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  198016 B/op	      70 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2373	    503540 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  198041 B/op	      70 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2979	    526113 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  197968 B/op	      70 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2276	    514980 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  198473 B/op	      70 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2330	    495456 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  198046 B/op	      70 allocs/op
+BenchmarkHeartbeatMarshal-16            	    2654	    588108 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  198012 B/op	      70 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     698	   1830371 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709496 B/op	     399 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     588	   1984182 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709723 B/op	     400 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     672	   1802108 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709647 B/op	     400 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     688	   1749120 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709434 B/op	     399 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     712	   1773161 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709592 B/op	     400 allocs/op
+BenchmarkHeartbeatUnmarshal-16          	     705	   1581516 ns/op	       153.1 bytes/ack	    192653 bytes/heartbeat	     15727 safety-bytes	    176926 telemetry-bytes	  709552 B/op	     399 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     333	   3735647 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  641723 B/op	      11 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     307	   4192634 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  642558 B/op	      11 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     301	   4037059 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  642668 B/op	      11 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     261	   4221481 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  656846 B/op	      11 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     266	   4015305 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  656359 B/op	      11 allocs/op
+BenchmarkHeartbeatSafetyAtMaxAcks-16    	     310	   3770968 ns/op	       153.0 bytes/ack	    627115 bytes/heartbeat	    627115 safety-bytes	         0 telemetry-bytes	  642423 B/op	      11 allocs/op
+BenchmarkCapTelemetryKept-16            	     504	   2318060 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	 1021081 B/op	     342 allocs/op
+BenchmarkCapTelemetryKept-16            	     582	   2154462 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	 1006465 B/op	     341 allocs/op
+BenchmarkCapTelemetryKept-16            	     574	   2429011 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	 1006833 B/op	     341 allocs/op
+BenchmarkCapTelemetryKept-16            	     483	   2445714 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	 1001159 B/op	     341 allocs/op
+BenchmarkCapTelemetryKept-16            	     444	   2267187 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	 1003074 B/op	     341 allocs/op
+BenchmarkCapTelemetryKept-16            	     511	   2299991 ns/op	       153.1 bytes/ack	    972332 bytes/heartbeat	     15727 safety-bytes	       264.0 sketches	    956605 telemetry-bytes	  999972 B/op	     341 allocs/op
+BenchmarkCapTelemetryDropped-16         	     537	   2356616 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1109033 B/op	     372 allocs/op
+BenchmarkCapTelemetryDropped-16         	     523	   2382906 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1100007 B/op	     372 allocs/op
+BenchmarkCapTelemetryDropped-16         	     564	   2529349 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1097777 B/op	     372 allocs/op
+BenchmarkCapTelemetryDropped-16         	     526	   2205177 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1089852 B/op	     371 allocs/op
+BenchmarkCapTelemetryDropped-16         	     523	   2365858 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1089928 B/op	     371 allocs/op
+BenchmarkCapTelemetryDropped-16         	     518	   2434278 ns/op	       153.1 bytes/ack	   1058963 bytes/heartbeat	     15727 safety-bytes	   1043236 telemetry-bytes	 1120559 B/op	     372 allocs/op
+BenchmarkBeat/placements=1000-16        	     649	   1543903 ns/op	     14735 bytes/heartbeat	  168582 B/op	    1446 allocs/op
+BenchmarkBeat/placements=1000-16        	     776	   1581735 ns/op	     14735 bytes/heartbeat	  170625 B/op	    1446 allocs/op
+BenchmarkBeat/placements=1000-16        	     788	   1825571 ns/op	     14735 bytes/heartbeat	  171836 B/op	    1447 allocs/op
+BenchmarkBeat/placements=1000-16        	     626	   1608026 ns/op	     14735 bytes/heartbeat	  169450 B/op	    1446 allocs/op
+BenchmarkBeat/placements=1000-16        	     598	   1820146 ns/op	     14735 bytes/heartbeat	  169814 B/op	    1446 allocs/op
+BenchmarkBeat/placements=1000-16        	     634	   1877813 ns/op	     14735 bytes/heartbeat	  169615 B/op	    1447 allocs/op
+BenchmarkBeat/placements=100000-16      	      50	  27718127 ns/op	     14734 bytes/heartbeat	 2521854 B/op	  100436 allocs/op
+BenchmarkBeat/placements=100000-16      	      38	  28543327 ns/op	     14734 bytes/heartbeat	 2529226 B/op	  100438 allocs/op
+BenchmarkBeat/placements=100000-16      	      49	  34884241 ns/op	     14734 bytes/heartbeat	 2524343 B/op	  100437 allocs/op
+BenchmarkBeat/placements=100000-16      	      40	  31486832 ns/op	     14734 bytes/heartbeat	 2519315 B/op	  100435 allocs/op
+BenchmarkBeat/placements=100000-16      	      46	  32832159 ns/op	     14734 bytes/heartbeat	 2524586 B/op	  100436 allocs/op
+BenchmarkBeat/placements=100000-16      	      39	  29268488 ns/op	     14734 bytes/heartbeat	 2526143 B/op	  100437 allocs/op
+BenchmarkStaleParallel-16               	240675735	         4.452 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16               	273212550	         4.328 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16               	269240085	         4.514 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16               	242773311	         4.379 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16               	263405517	         4.384 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStaleParallel-16               	269932851	         4.315 ns/op	       0 B/op	       0 allocs/op
+BenchmarkInstall-16                     	      81	  12608573 ns/op	 1829706 B/op	   15126 allocs/op
+BenchmarkInstall-16                     	     100	  13482073 ns/op	 1834481 B/op	   15121 allocs/op
+BenchmarkInstall-16                     	     100	  15900291 ns/op	 1810731 B/op	   15119 allocs/op
+BenchmarkInstall-16                     	      80	  15612390 ns/op	 1871974 B/op	   15124 allocs/op
+BenchmarkInstall-16                     	      98	  16914621 ns/op	 1827051 B/op	   15121 allocs/op
+BenchmarkInstall-16                     	      66	  15298744 ns/op	 1831068 B/op	   15121 allocs/op
+BenchmarkInstall100k-16                 	       2	 755809511 ns/op	209921080 B/op	 1500954 allocs/op
+BenchmarkInstall100k-16                 	       2	 744833710 ns/op	209922292 B/op	 1500955 allocs/op
+BenchmarkInstall100k-16                 	       2	 760080303 ns/op	209921136 B/op	 1500954 allocs/op
+BenchmarkInstall100k-16                 	       2	 808826040 ns/op	183786676 B/op	 1500928 allocs/op
+BenchmarkInstall100k-16                 	       2	 800471184 ns/op	209921088 B/op	 1500954 allocs/op
+BenchmarkInstall100k-16                 	       2	 682709528 ns/op	209918756 B/op	 1500952 allocs/op
+BenchmarkDirectoryDecode100k-16         	       3	 444127793 ns/op	   9400442 bytes/snapshot	105422338 B/op	  801284 allocs/op
+BenchmarkDirectoryDecode100k-16         	       2	 587062967 ns/op	   9400442 bytes/snapshot	105422684 B/op	  801249 allocs/op
+BenchmarkDirectoryDecode100k-16         	       3	 411766838 ns/op	   9400442 bytes/snapshot	105423677 B/op	  801251 allocs/op
+BenchmarkDirectoryDecode100k-16         	       3	 426048438 ns/op	   9400442 bytes/snapshot	105425293 B/op	  801253 allocs/op
+BenchmarkDirectoryDecode100k-16         	       3	 412060882 ns/op	   9400442 bytes/snapshot	105435741 B/op	  801270 allocs/op
+BenchmarkDirectoryDecode100k-16         	       2	 550851707 ns/op	   9400442 bytes/snapshot	105425356 B/op	  801254 allocs/op
+BenchmarkCacheDecode100k-16             	       3	 411854014 ns/op	   9400688 bytes/snapshot	114811234 B/op	  801232 allocs/op
+BenchmarkCacheDecode100k-16             	       3	 391292581 ns/op	   9400688 bytes/snapshot	114811232 B/op	  801232 allocs/op
+BenchmarkCacheDecode100k-16             	       2	 511337331 ns/op	   9400688 bytes/snapshot	114820068 B/op	  801246 allocs/op
+BenchmarkCacheDecode100k-16             	       3	 424460432 ns/op	   9400688 bytes/snapshot	114809544 B/op	  801230 allocs/op
+BenchmarkCacheDecode100k-16             	       3	 461253125 ns/op	   9400688 bytes/snapshot	114812984 B/op	  801235 allocs/op
+BenchmarkCacheDecode100k-16             	       3	 424114925 ns/op	   9400688 bytes/snapshot	114811290 B/op	  801233 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	115.366s

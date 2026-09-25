@@ -19,10 +19,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/s3"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -51,8 +53,10 @@ type Server struct {
 	// ClusterSecrets resolves the cluster secret_refs only the control plane can (control:<name>),
 	// for GET /v1/directory and the mover. nil: every ref resolves on the reader's own host.
 	ClusterSecrets func() map[string]string
-	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab.
-	Fleet Fleet
+	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab. LeaseTTL is the grant
+	// every heartbeat answer carries, for the diagnostics.
+	Fleet    Fleet
+	LeaseTTL time.Duration
 	// FencePoll is how often a fenced change re-reads the fleet; default 100ms.
 	FencePoll time.Duration
 	Log       *slog.Logger
@@ -78,12 +82,17 @@ type Server struct {
 	MoverLedger MoverLedgerReader
 	// Ctx is the server's lifetime: operations run on it, never on a request's. nil: Background.
 	Ctx context.Context
+	// LocalGates is a lab proxy's own admission accounting (ADR-0021 D2): with no members, the
+	// local proxy is what a barrier drains. nil on shunt-control, which serves no data.
+	LocalGates *admission.Gates
+	// WorkerTTL is how long an external mover heartbeat remains current. Zero uses 5 seconds.
+	WorkerTTL time.Duration
 
 	mu          sync.Mutex
 	progress    map[string]Progress // placement key → the mover's last report (in memory only)
+	running     map[string]*tracker // the operations this node is running now
 	prevFleet   []Member            // the fleet as of the last PublishFleet, for fleet events
 	fleetSeeded bool
-	steps       sync.Map // placement key → *sync.Mutex: one fenced step per bucket at a time
 	opsOnce     sync.Once
 	defaultOps  *MemOperations
 	confirmOnce sync.Once
@@ -175,6 +184,18 @@ func pathKey(r *http.Request) string {
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// CurrentIdentity is the control plane's directory lineage, on a lineage refusal.
+	CurrentIdentity *directory.Identity `json:"current_identity,omitempty"`
+	// OperationID is the unfinished operation in the way, on operation_conflict.
+	OperationID string `json:"operation_id,omitempty"`
+	// CurrentGeneration is the resource's generation now, on generation_conflict: a decimal string.
+	CurrentGeneration string `json:"current_generation,omitempty"`
+	// Retryable says whether the same request may succeed later unchanged: the control plane was
+	// unavailable, at capacity, or another operation held the scope. Retry with the same
+	// Idempotency-Key.
+	Retryable bool `json:"retryable"`
+	// Blockers name what stands in the way, on retirement_unproven.
+	Blockers []Blocker `json:"blockers,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -186,7 +207,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, Error{Code: code, Message: msg})
+	writeJSON(w, status, Error{Code: code, Message: msg, Retryable: retryable(code)})
 }
 
 // badRequest is a malformed body or argument; it answers 400.
@@ -226,8 +247,30 @@ func errorOf(err error) (int, Error) {
 		ref *refusal
 		te  *directory.TransitionError
 		ce  *config.Error
+		le  *lineageError
+		sb  *ScopeBusyError
+		ge  *GenerationError
+		ic  *IdempotencyConflictError
+		ce2 *CapacityError
+		cd  *codedError
+		re  *RetirementError
 	)
 	switch {
+	case errors.As(err, &re):
+		return http.StatusConflict, Error{Code: CodeRetirementUnproven, Message: err.Error(), Blockers: re.Blockers()}
+	case errors.As(err, &cd):
+		return cd.status, Error{Code: cd.code, Message: err.Error()}
+	case errors.As(err, &ic):
+		return http.StatusConflict, Error{Code: CodeIdempotencyConflict, Message: err.Error(), OperationID: ic.Owner}
+	case errors.As(err, &ce2):
+		return http.StatusTooManyRequests, Error{Code: CodeOperationCapacity, Message: err.Error()}
+	case errors.As(err, &sb):
+		return http.StatusConflict, Error{Code: CodeOperationConflict, Message: err.Error(), OperationID: sb.Owner}
+	case errors.As(err, &ge):
+		return http.StatusConflict, Error{Code: CodeGenerationConflict, Message: err.Error(), CurrentGeneration: strconv.FormatInt(ge.Current, 10)}
+	case errors.As(err, &le):
+		cur := le.cur
+		return http.StatusConflict, Error{Code: le.code, Message: err.Error(), CurrentIdentity: &cur}
 	case errors.As(err, &br):
 		return http.StatusBadRequest, Error{Code: "bad_request", Message: err.Error()}
 	case errors.As(err, &ref), errors.Is(err, directory.ErrInUse), errors.Is(err, directory.ErrRefused), errors.As(err, &te):
@@ -245,10 +288,29 @@ func errorOf(err error) (int, Error) {
 	}
 }
 
+// ErrorCode is the API error code err answers with.
+func ErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	_, e := errorOf(err)
+	return e.Code
+}
+
 // fail maps an error to its HTTP answer.
 func fail(w http.ResponseWriter, err error) {
 	status, e := errorOf(err)
+	e.Retryable = retryable(e.Code)
 	writeJSON(w, status, e)
+}
+
+// retryable reports whether a refusal with this code may pass later unchanged.
+func retryable(code string) bool {
+	switch code {
+	case "unavailable", CodeOperationCapacity, CodeOperationConflict, CodeResyncRequired:
+		return true
+	}
+	return false
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -289,6 +351,9 @@ type ClusterStatus struct {
 	References             []string `json:"references,omitempty"`
 	ReadOnly               bool     `json:"read_only"`
 	RejectWrites           bool     `json:"reject_writes"`
+	// Barrier is the drain barrier of a change in progress on the cluster (ADR-0021 D2): a
+	// read-only switch that is desired but not yet effective.
+	Barrier *directory.Barrier `json:"barrier,omitempty"`
 }
 
 // PlacementStatus is one placement with the migration signals an operator watches.
@@ -310,6 +375,13 @@ type PlacementStatus struct {
 	Mover           *Progress                  `json:"mover,omitempty"`
 	ReadOnly        bool                       `json:"read_only"`
 	RejectWrites    bool                       `json:"reject_writes"`
+	// Barrier is the drain barrier of a change in progress on the placement (ADR-0021 D2): a held
+	// step, a read-only switch desired but not yet effective, or a purge closing the source.
+	Barrier *directory.Barrier `json:"barrier,omitempty"`
+	// Watch: an operator asked for this bucket's traffic by backend in telemetry. Spread and
+	// moving buckets have it anyway; PerBucket says whether proxies count it now.
+	Watch     bool `json:"watch,omitempty"`
+	PerBucket bool `json:"per_bucket_telemetry"`
 	// Legs are the backend buckets of a bucket spread over legs (ADR-0018 N2), in key-space order;
 	// Primary and Names are empty then.
 	Legs []LegStatus `json:"legs,omitempty"`
@@ -466,8 +538,9 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 	// migration shows the move as one; Legs and Move say which part (ADR-0018 N3).
 	p := moving(pl)
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.ClusterOf(p.Primary), Target: p.Target, Names: p.Names,
-		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites,
-		Cutover: p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
+		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites, Barrier: pl.Barrier, Watch: pl.Watch,
+		PerBucket: pl.Spread() || pl.State != directory.StateActive || pl.Watch,
+		Cutover:   p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Source != "" {
 		ps.Source = p.ClusterOf(p.Source)
 	}
@@ -562,9 +635,11 @@ func counters(vec *prometheus.CounterVec, bucket, label string) map[string]float
 // PlacementDetail is the answer to GET /v1/placements/{tenant}/{bucket}: what an out-of-process
 // mover needs to copy it.
 type PlacementDetail struct {
-	Key       string                    `json:"key"`
-	Placement directory.Placement       `json:"placement"`
-	Clusters  map[string]config.Cluster `json:"clusters"`
+	Key        string                    `json:"key"`
+	Placement  directory.Placement       `json:"placement"`
+	Clusters   map[string]config.Cluster `json:"clusters"`
+	Identity   directory.Identity        `json:"identity"`
+	Generation int64                     `json:"generation"`
 	// Secrets resolves the clusters' control: secret_refs, which only the control plane can, so a
 	// mover on another host can sign (ADR-0015). Empty on a lab proxy, whose refs are env:/file:.
 	Secrets map[string]string `json:"secrets,omitempty"`
@@ -575,7 +650,8 @@ func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	d := PlacementDetail{Key: key, Placement: p, Clusters: map[string]config.Cluster{}}
+	d := PlacementDetail{Key: key, Placement: p, Clusters: map[string]config.Cluster{}, Identity: f.Identity,
+		Generation: f.Generation(directory.PlacementResource(key))}
 	var secrets map[string]string
 	if s.ClusterSecrets != nil {
 		secrets = s.ClusterSecrets()
@@ -636,6 +712,19 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("cluster name %q: use lowercase letters, digits, - and _", req.Name))
 		return
 	}
+	if !s.writeCluster(w, r, &req) {
+		return
+	}
+	c, _ := s.Dir.Snapshot().Cluster(req.Name)
+	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
+		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)})
+}
+
+// writeCluster stores req's secret, checks the cluster's credentials against it and writes the
+// definition, answering the error itself when it returns false: cluster add and credential
+// rotation share it, so a rotation is refused exactly as an add with the same pair would be.
+func (s *Server) writeCluster(w http.ResponseWriter, r *http.Request, req *ClusterRequest) bool {
 	stored, secret := "", ""
 	if req.Secret != "" && s.SecretsDir == "" {
 		// The store keeps secrets itself (internal/cp): encrypted, named by a control: ref.
@@ -645,7 +734,7 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		path, err := s.storeSecret(req.Name, req.Secret)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "unavailable", "storing the secret: "+err.Error())
-			return
+			return false
 		}
 		stored = path
 		req.Cluster.Credentials.SecretRef = "file:" + path
@@ -666,7 +755,7 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 	if msg != "" {
 		discard()
 		writeError(w, http.StatusConflict, "refused", msg)
-		return
+		return false
 	}
 	if inferType {
 		req.Cluster.Type = typeFromServer(server)
@@ -675,28 +764,84 @@ func (s *Server) putCluster(w http.ResponseWriter, r *http.Request) {
 		discard()
 		if errors.Is(err, directory.ErrSecretInline) {
 			writeError(w, http.StatusConflict, "refused", "this shunt has no secrets directory (directory.secrets_dir) and its directory file carries only secret_refs; give the cluster a --secret-ref instead")
-			return
+			return false
 		}
 		var ce *config.Error
 		if errors.As(err, &ce) || strings.Contains(err.Error(), "clusters.") {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
-			return
+			return false
 		}
 		if !isDirectoryError(err) {
 			// Prepare refused it: the proxy could not build the cluster, usually an unresolvable secret_ref.
 			writeError(w, http.StatusConflict, "refused", "the proxy cannot use this cluster: "+err.Error())
-			return
+			return false
 		}
 		fail(w, err)
-		return
+		return false
 	}
 	if stored != "" {
 		s.dropSecrets(req.Name, stored)
 	}
-	c, _ := s.Dir.Snapshot().Cluster(req.Name)
-	writeJSON(w, http.StatusOK, ClusterStatus{Name: req.Name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
+	return true
+}
+
+// CredentialsRequest is POST /v1/clusters/{name}/credentials: a new secret for the cluster's
+// access key, or a new access key with its secret. Exactly one of Secret and SecretRef is given;
+// the rest of the definition is kept.
+type CredentialsRequest struct {
+	AccessKey string `json:"access_key,omitempty"`
+	Secret    string `json:"secret,omitempty"`
+	SecretRef string `json:"secret_ref,omitempty"`
+}
+
+// CredentialsResult is the rotation's answer: the directory version it landed in and the secret
+// generation it started, which GET /v1/clusters/{name}/view's secret reports proxies installing.
+// Generation is empty for a secret this control plane does not hold (an env: or file: ref).
+type CredentialsResult struct {
+	Name       string        `json:"name"`
+	Version    int64         `json:"version"`
+	Generation string        `json:"generation,omitempty"`
+	Cluster    ClusterStatus `json:"cluster"`
+}
+
+// rotateCredentials replaces a cluster's credentials and nothing else (ADR-0021 D1). The new pair
+// is checked with one signed ListBuckets first; a request that already took the old bundle may
+// still finish with the old secret, so the backend keeps it valid until the new generation is
+// installed everywhere and those requests have ended.
+func (s *Server) rotateCredentials(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req CredentialsRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if (req.Secret == "") == (req.SecretRef == "") {
+		writeError(w, http.StatusBadRequest, "bad_request", "give exactly one of secret and secret_ref")
+		return
+	}
+	def, ok := s.Dir.Snapshot().Cluster(name)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "no cluster "+name)
+		return
+	}
+	if req.AccessKey != "" {
+		def.Credentials.AccessKey = req.AccessKey
+	}
+	if req.SecretRef != "" {
+		def.Credentials.SecretRef = req.SecretRef
+	}
+	creq := ClusterRequest{Name: name, Cluster: def, Secret: req.Secret}
+	if !s.writeCluster(w, r, &creq) {
+		return
+	}
+	snap := s.Dir.Snapshot()
+	c, _ := snap.Cluster(name)
+	out := CredentialsResult{Name: name, Version: snap.Version(), Cluster: ClusterStatus{Name: name, Type: c.Type, Scheme: c.Scheme, Region: c.Region, Endpoints: c.Endpoints,
 		AccessKey: c.Credentials.AccessKey, SecretRef: c.Credentials.SecretRef,
-		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)})
+		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false)}}
+	if g := snap.File().Generation(directory.SecretResource(name)); g != 0 {
+		out.Generation = strconv.FormatInt(g, 10)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ClusterProbeResult is the non-mutating preflight used by the add-cluster drawer. Reachability
@@ -878,6 +1023,28 @@ func (s *Server) setTenantDefault(w http.ResponseWriter, r *http.Request) {
 	v := s.Dir.Snapshot().Version()
 	s.info(actor(r), "tenant default changed", "tenant", tenant, "default_cluster", req.Cluster, "version", v)
 	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "default_cluster": req.Cluster, "version": v})
+}
+
+// WatchRequest is POST /v1/placements/{tenant}/{bucket}/watch.
+type WatchRequest struct {
+	Watch bool `json:"watch"`
+}
+
+// placementWatch asks proxies for, or stops, a bucket's traffic by backend cluster in telemetry.
+func (s *Server) placementWatch(w http.ResponseWriter, r *http.Request) {
+	var req WatchRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	tenant, bucket := r.PathValue("tenant"), r.PathValue("bucket")
+	if err := s.Dir.SetPlacementWatch(r.Context(), tenant, bucket, req.Watch, actor(r)); err != nil {
+		fail(w, err)
+		return
+	}
+	v := s.Dir.Snapshot().Version()
+	key := directory.Key(tenant, bucket)
+	s.info(actor(r), "bucket watch changed", "placement", key, "watch", req.Watch, "version", v)
+	writeJSON(w, http.StatusOK, map[string]any{"key": key, "watch": req.Watch, "version": v})
 }
 
 // backendFor returns the live cluster a placement role names.

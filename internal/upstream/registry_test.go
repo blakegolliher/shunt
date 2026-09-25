@@ -66,6 +66,106 @@ func TestRegistryAddsReusesReplacesAndRemoves(t *testing.T) {
 	}
 }
 
+// T03: a secret-only rotation, the secret_ref unchanged, signs new requests with the new secret
+// over the same connection pool, while a request that loaded the old set keeps the old secret.
+func TestRegistrySecretOnlyRotation(t *testing.T) {
+	var mu sync.Mutex
+	secret := "old"
+	r := NewRegistry(Options{}, func(string) (string, error) { mu.Lock(); defer mu.Unlock(); return secret, nil })
+	defs := map[string]config.Cluster{"vast01": regCluster("10.0.0.1:80", "control:vast01")}
+	if _, _, err := r.Apply(defs); err != nil {
+		t.Fatal(err)
+	}
+	held, _ := r.Load().Get("vast01") // a request in flight
+	mu.Lock()
+	secret = "new"
+	mu.Unlock()
+	added, removed, err := r.Apply(defs)
+	if err != nil || len(added) != 1 || added[0] != "vast01" || len(removed) != 0 {
+		t.Fatalf("rotation: added %v removed %v err %v", added, removed, err)
+	}
+	now, _ := r.Load().Get("vast01")
+	if now.Creds.Secret != "new" {
+		t.Fatalf("new requests sign with %q, want the rotated secret", now.Creds.Secret)
+	}
+	if held.Creds.Secret != "old" {
+		t.Errorf("the request in flight now signs with %q; it must keep the secret it started with", held.Creds.Secret)
+	}
+	if now.Transport != held.Transport {
+		t.Error("a secret-only rotation must keep the connection pool")
+	}
+	if again, _, _ := r.Apply(defs); len(again) != 0 {
+		t.Errorf("an unchanged definition and secret was rebuilt: %v", again)
+	}
+	if same, _ := r.Load().Get("vast01"); same != now {
+		t.Error("an unchanged cluster must keep its *Cluster")
+	}
+}
+
+// A secret generation that moved is a rotation even with the same secret string: a new signer,
+// carrying the generation, over the same transport.
+func TestRegistrySecretGeneration(t *testing.T) {
+	r := NewRegistry(Options{}, func(string) (string, error) { return "same", nil })
+	defs := map[string]config.Cluster{"vast01": regCluster("10.0.0.1:80", "control:vast01")}
+	gen := int64(4)
+	byGen := func(string) int64 { return gen }
+	c, err := r.PrepareWith(defs, nil, byGen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Commit()
+	first, _ := r.Load().Get("vast01")
+	if first.SecretGeneration != 4 {
+		t.Fatalf("generation %d, want 4", first.SecretGeneration)
+	}
+	gen = 9
+	if c, err = r.PrepareWith(defs, nil, byGen); err != nil {
+		t.Fatal(err)
+	}
+	if added, _ := c.Commit(); len(added) != 1 {
+		t.Fatalf("a moved generation was not a change: %v", added)
+	}
+	second, _ := r.Load().Get("vast01")
+	if second == first || second.SecretGeneration != 9 || second.Transport != first.Transport {
+		t.Fatalf("after the rotation: new signer %v, generation %d, same transport %v", second != first, second.SecretGeneration, second.Transport == first.Transport)
+	}
+}
+
+// T02 at the registry: a prepared candidate is not live, resolves its secrets with its own
+// resolver, and changes nothing if it is never committed.
+func TestRegistryCandidateIsNotLiveUntilCommitted(t *testing.T) {
+	r := NewRegistry(Options{}, func(string) (string, error) { return "live", nil })
+	if _, _, err := r.Apply(map[string]config.Cluster{"vast01": regCluster("10.0.0.1:80", "control:vast01")}); err != nil {
+		t.Fatal(err)
+	}
+	before := r.Load()
+	next := map[string]config.Cluster{"vast01": regCluster("10.0.0.1:80", "control:vast01"), "vast02": regCluster("10.0.0.2:80", "control:vast02")}
+	candidate := func(string) (string, error) { return "candidate", nil }
+	if _, err := r.Prepare(next, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if r.Load() != before {
+		t.Fatal("a prepared candidate went live before Commit")
+	}
+	if cl, _ := r.Load().Get("vast01"); cl.Creds.Secret != "live" {
+		t.Fatalf("the live cluster signs with %q after an uncommitted candidate", cl.Creds.Secret)
+	}
+	c, err := r.Prepare(next, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, removed := c.Commit()
+	if len(added) != 2 || len(removed) != 0 {
+		t.Fatalf("commit: added %v removed %v", added, removed)
+	}
+	if cl, _ := r.Load().Get("vast01"); cl.Creds.Secret != "candidate" {
+		t.Fatalf("after Commit vast01 signs with %q", cl.Creds.Secret)
+	}
+	if _, ok := r.Load().Get("vast02"); !ok {
+		t.Fatal("vast02 missing after Commit")
+	}
+}
+
 // Requests load the set while Apply swaps it; -race proves the swap is safe.
 func TestRegistrySwapUnderLoad(t *testing.T) {
 	r := NewRegistry(Options{}, func(string) (string, error) { return "s", nil })

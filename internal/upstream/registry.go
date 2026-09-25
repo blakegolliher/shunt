@@ -27,7 +27,9 @@ type Registry struct {
 // NewRegistry returns a Registry holding no clusters. resolve turns a secret_ref into the secret.
 func NewRegistry(o Options, resolve func(ref string) (string, error)) *Registry {
 	r := &Registry{opts: o, resolve: resolve, defs: map[string]config.Cluster{}}
-	r.cur.Store(&Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: []string{}})
+	empty := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: []string{}}
+	empty.retainPools()
+	r.cur.Store(empty)
 	return r
 }
 
@@ -65,50 +67,102 @@ func (r *Registry) BuildWith(name string, def config.Cluster, secret string) (*C
 	return cl, nil
 }
 
-// Apply makes clusters the live set. A cluster whose definition is unchanged keeps its *Cluster,
-// transport and pooled connections; a new or changed one is built and its secret resolved. Nothing
-// is swapped if any cluster fails, so a definition the proxy cannot sign for never goes live.
-// Clusters that dropped out, or were replaced, have their idle connections closed after the swap.
-// It returns the names added (new or changed) and removed.
+// Apply makes clusters the live set: Prepare with the registry's own resolver, then Commit.
 func (r *Registry) Apply(clusters map[string]config.Cluster) (added, removed []string, err error) {
+	c, err := r.Prepare(clusters, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	added, removed = c.Commit()
+	return added, removed, nil
+}
+
+// Candidate is a Set that Prepare built and nothing serves from yet. Commit makes it live; a
+// candidate that is never committed is dropped, and the live set is as it was. Preparing takes no
+// references: a dropped candidate's new transports never dialed, so they hold nothing to close.
+type Candidate struct {
+	r     *Registry
+	next  *Set
+	defs  map[string]config.Cluster
+	added []string
+}
+
+// Prepare builds the Set clusters describe without making it live. A cluster whose definition
+// and secret are unchanged keeps its *Cluster, transport and pooled connections; one whose secret
+// alone changed gets a new *Cluster that signs with the new secret and shares the old transport;
+// a new or otherwise changed one is built. resolve turns a secret_ref into the secret for this
+// candidate only (nil: the registry's own resolver), so a candidate's secrets never reach the live
+// set before Commit. Any cluster failing fails the whole candidate.
+func (r *Registry) Prepare(clusters map[string]config.Cluster, resolve func(ref string) (string, error)) (*Candidate, error) {
+	return r.PrepareWith(clusters, resolve, nil)
+}
+
+// PrepareWith is Prepare with each cluster's secret generation (Cluster.SecretGeneration) from
+// generation; nil leaves them 0. A cluster whose secret generation moved is a rotation even when the
+// secret string did not change: its signer is rebuilt over the same transport.
+func (r *Registry) PrepareWith(clusters map[string]config.Cluster, resolve func(ref string) (string, error), generation func(name string) int64) (*Candidate, error) {
+	if resolve == nil {
+		resolve = r.resolve
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old := r.cur.Load()
-	next := &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: make([]string, 0, len(clusters))}
-	var built []*Cluster
-	fail := func(e error) ([]string, []string, error) {
-		for _, c := range built {
-			c.Close()
-		}
-		return nil, nil, e
-	}
+	c := &Candidate{r: r, next: &Set{byName: map[string]*Cluster{}, byID: map[string]*Cluster{}, names: make([]string, 0, len(clusters))}, defs: maps.Clone(clusters)}
 	for _, name := range slices.Sorted(maps.Keys(clusters)) {
 		def := clusters[name]
-		cl, reuse := old.byName[name]
-		if !reuse || !reflect.DeepEqual(r.defs[name], def) {
-			cl, err = r.Build(name, def)
+		var secret string
+		if resolve != nil {
+			s, err := resolve(def.Credentials.SecretRef)
 			if err != nil {
-				return fail(err)
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
 			}
-			built = append(built, cl)
-			added = append(added, name)
+			secret = s
 		}
-		if other, dup := next.byID[cl.ID]; dup {
-			return fail(fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID))
+		var gen int64
+		if generation != nil {
+			gen = generation(name)
 		}
-		next.byName[name], next.byID[cl.ID] = cl, cl
-		next.names = append(next.names, name)
-	}
-	r.cur.Store(next)
-	r.defs = maps.Clone(clusters)
-	for name, cl := range old.byName {
-		if now, ok := next.byName[name]; !ok || now != cl {
-			if !ok {
-				removed = append(removed, name)
+		cl, ok := old.byName[name]
+		switch {
+		case ok && reflect.DeepEqual(r.defs[name], def) && cl.Creds.Secret == secret && cl.SecretGeneration == gen:
+		case ok && reflect.DeepEqual(r.defs[name], def):
+			cl = cl.withSecret(secret, gen)
+			c.added = append(c.added, name)
+		default:
+			var err error
+			if cl, err = New(name, def, r.opts); err != nil {
+				return nil, fmt.Errorf("cluster %s: %w", name, err)
 			}
-			cl.Close()
+			cl.Creds.Secret, cl.SecretGeneration = secret, gen
+			c.added = append(c.added, name)
+		}
+		if other, dup := c.next.byID[cl.ID]; dup {
+			return nil, fmt.Errorf("clusters %s and %s derive the same id %s; rename one", other.Name, name, cl.ID)
+		}
+		c.next.byName[name], c.next.byID[cl.ID] = cl, cl
+		c.next.names = append(c.next.names, name)
+	}
+	return c, nil
+}
+
+// Commit makes the candidate the live set and returns the names added (new or changed) and
+// removed. The registry lets go of the old set: a transport only it used has its idle connections
+// closed once no runtime bundle holds that set either, so a request that loaded the old set keeps
+// its *Cluster pointers, secrets and connections to the end.
+func (c *Candidate) Commit() (added, removed []string) {
+	r := c.r
+	r.mu.Lock()
+	old := r.cur.Load()
+	c.next.retainPools()
+	r.cur.Store(c.next)
+	r.defs = c.defs
+	r.mu.Unlock()
+	for name := range old.byName {
+		if _, ok := c.next.byName[name]; !ok {
+			removed = append(removed, name)
 		}
 	}
+	old.Release()
 	slices.Sort(removed)
-	return added, removed, nil
+	return c.added, removed
 }

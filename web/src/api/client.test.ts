@@ -1,4 +1,4 @@
-import { parseSSEFrame } from './client'
+import { newRequestKey, parseSSEFrame, startOperation, unfinished } from './client'
 
 test('parses authenticated stream frames without putting the token in a URL', () => {
   expect(parseSSEFrame('id: node:7\nevent: fleet\ndata: {"id":"proxy-a","event":"live"}')).toEqual({
@@ -10,4 +10,36 @@ test('parses authenticated stream frames without putting the token in a URL', ()
 
 test('keeps forward-compatible text event data', () => {
   expect(parseSSEFrame('event: future\ndata: plain text')).toMatchObject({ type: 'future', data: 'plain text' })
+})
+
+test('treats pending, running and blocked operations as unfinished', () => {
+  for (const status of ['pending', 'running', 'blocked'] as const) expect(unfinished({ status })).toBe(true)
+  for (const status of ['succeeded', 'failed', 'cancelled'] as const) expect(unfinished({ status })).toBe(false)
+  expect(unfinished(null)).toBe(false)
+})
+
+test('sends every change with its own Idempotency-Key and every read without one', async () => {
+  const seen: (string | null)[] = []
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+    seen.push(new Headers(init?.headers).get('Idempotency-Key'))
+    return Response.json({ id: 'op', status: 'pending' }, { status: 202 })
+  })
+  await startOperation('t', 'ramp', 'acme/data', { ratio: 0.5 })
+  await startOperation('t', 'ramp', 'acme/data', { ratio: 0.5 })
+  expect(seen[0]).toMatch(/^[0-9a-f]{32}$/)
+  expect(seen[1]).not.toBe(seen[0])
+  vi.restoreAllMocks()
+})
+
+test('makes request keys without crypto.randomUUID, which an insecure context (plain http from another host) lacks', () => {
+  const randomUUID = crypto.randomUUID
+  Object.defineProperty(crypto, 'randomUUID', { value: undefined, configurable: true })
+  try {
+    const a = newRequestKey()
+    const b = newRequestKey()
+    expect(a).toMatch(/^[0-9a-f]{32}$/)
+    expect(b).not.toBe(a)
+  } finally {
+    Object.defineProperty(crypto, 'randomUUID', { value: randomUUID, configurable: true })
+  }
 })

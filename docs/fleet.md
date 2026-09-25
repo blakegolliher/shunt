@@ -41,8 +41,17 @@ a member loads its cache, registers with one heartbeat before it serves anything
 `fleet member` with its id.
 
 ```sh
-shunt proxy list --api http://c1:9901     # members, the version each has installed, live or SILENT
+shunt proxy list --api http://c1:9901     # members, the version each has installed: live, SILENT, retiring, retired, UNRESOLVED(n)
+shunt proxy show proxy-b --api http://c1:9901   # one member: lease, incarnation, backend outcomes unknown, what is off
 ```
+
+Each process of a member is an **incarnation**: a random id written to `cache_dir` before it
+serves. Stopping a member with SIGTERM, or `shunt proxy retire <id>`, **retires** it: it stops
+accepting requests, waits up to `proxy.drain_timeout` for those in flight, records a clean
+retirement with the control plane and exits. A retired member counts out of every step. A process
+that ends any other way (a crash, `kill -9`, a lost host), or that retires with a backend outcome
+it never learned, is **unresolved**, and every step waits on it until an operator resolves it
+([docs/runbooks/crashed-proxy.md](runbooks/crashed-proxy.md)).
 
 ## Where the state lives
 
@@ -51,8 +60,9 @@ shunt proxy list --api http://c1:9901     # members, the version each has instal
 | Directory (clusters, tenants, placements) | etcd, one key per record | `GET /v1/directory`, long-polled |
 | Client keys | etcd, secrets sealed | the same answer, in the clear over the control channel |
 | Cluster secrets | etcd, sealed; ref `control:<cluster>` | the same answer |
-| Fleet membership and liveness | etcd: a record per member, a leased key per heartbeat | — |
-| A proxy's last directory | its own `cache_dir` (0700) | — |
+| Fleet membership, incarnations and liveness | etcd: a record per member, a leased key per heartbeat | — |
+| Operation records, with their holds and blockers | etcd, one key per operation | — |
+| A proxy's last directory and incarnation marker | its own `cache_dir` (0700) | — |
 
 `shunt cluster add` with a typed secret, `adopt --keys` and `client add` therefore reach every
 proxy from one command. The mover (`shunt migrate run`) gets the cluster secrets from the control
@@ -60,31 +70,90 @@ plane too, so it runs on any host that can reach the API.
 
 ## What changes while a bucket moves
 
-With one proxy, nothing: every command answers as in the README. With members:
+The rules are ADR-0021's (H2). With one proxy they apply to that proxy alone: a step still pauses
+the bucket's writes until the requests admitted under the old routing have ended. With members:
 
-- **Each step waits for every proxy.** `ramp`, `migrate start` and `cutover` answer once every live
-  member has installed the change, and say `in effect on every live proxy`. One that has not
-  within `--wait` (default 30s) is named (`PENDING: not yet installed on proxy-c`), and the next
-  step on that bucket is refused until it has. Each step runs as an operation record on the
-  control plane (`POST /v1/operations`, ADR-0017): the CLI polls it every 250 ms and prints the
-  outcome, so a step outlives a dropped connection, and a `--wait` the CLI gives up on prints the
-  record's id to follow with `GET /v1/operations/<id>` on any control node.
-- **The keys a step moves pause their writes for a moment.** Two proxies must never send the same
-  key to different clusters, so a step that moves writes is written twice: first as a hold, where
-  writes to the keys it moves answer `503` with `Retry-After: 1` (every SDK and aws-cli retries),
-  then, once every member has the hold, as the step itself. About two heartbeats per step, only
-  for the keys that step moves; reads never pause. If the hold cannot reach every member, it is
-  undone and the command is refused: nothing changed.
-- **A bucket's first step waits for every member, even a silent one.** A proxy cut off before the
-  first step still thinks the bucket is not moving and would write every key to the old cluster.
-  Check `shunt proxy list` first. A proxy that is gone for good: `shunt proxy forget <id>` (refused
-  while it is live; one that comes back re-joins by itself).
-- **Cutover counts every proxy's fallback reads,** and refuses if a member stops reporting during
-  the window.
+- **Every step waits for every member.** `ramp`, `migrate start`, `cutover`, `purge-source` and
+  `readonly` each run as an operation record on the control plane (`POST /v1/operations`,
+  ADR-0017): the CLI polls it every 250 ms and prints the outcome, so a step outlives a dropped
+  connection. A step first waits until every registered member has the current directory version.
+  A silent member is not skipped: its process may still route by the old directory, so it is a
+  named blocker, `proxy_missing`, for as long as it is silent. Only a member that retired cleanly
+  counts out. Check `shunt proxy list` before a step. A second step on a bucket while one is
+  unfinished answers `operation_conflict` naming it, from any control node.
+- **A step pauses the bucket's writes for a moment.** Two proxies must never send the same key to
+  different clusters, and a write admitted under the old routing must end before the new routing
+  takes effect. So a step that moves writes is written twice. First a hold: every proxy installs
+  it and closes the bucket's mutations, so writes and deletes answer `503` with `Retry-After: 1`
+  (every SDK and aws-cli retries). Then, once every proxy reports its gate closed, nothing it
+  admitted before still out, no backend outcome unknown, and the hold in its restart cache, the
+  step itself. On a healthy fleet that is about two heartbeats plus the longest write in flight;
+  reads never pause. The CLI says `the keys this step moves paused their writes until every proxy
+  had it`.
+- **After the commit** the CLI says `in effect on every live proxy` once every live member has
+  installed the step within `--wait` (default 30s). One that has not is named (`PENDING: not yet
+  installed on proxy-c`), and one that fell silent after the drain is listed (`silent, not waited
+  for: proxy-c`). The step is in force either way: such a member refuses writes to the moving
+  bucket on its own until it has it. The next step on the bucket waits for it in its precondition.
+- **Cutover watches its quiet window before it holds the bucket.** Writes flow during `--window`.
+  A read that falls back in it, or a live member that does not report twice afterwards from the
+  same process, refuses the cutover with nothing held. Then cutover holds the bucket like any step,
+  and under the closed gate checks that the source has no open multipart upload and that every
+  proxy that watched the window reports twice more, from the same process, with the fallback count
+  unchanged. If not, it blocks (`multipart_open`, `old_requests`, `proxy_missing`) with the
+  bucket's writes paused: cancel it, deal with the cause, and cut over again
+  ([docs/runbooks/blocked-operation.md](runbooks/blocked-operation.md)). A cutover resumed after
+  its control node was lost watches a new window under the hold, with writes paused.
+- **Purge-source pauses the bucket's deletes.** Its hold closes the source: while every proxy drains
+  its reads of the source and the listing diff is taken again, a DELETE answers 503 with
+  `Retry-After` rather than reach the primary alone.
+
+## When a step is blocked
+
+A wait is how long the CLI watches, not a safety timeout. When the CLI stops watching an
+unfinished step it exits 3 and says where the operation stands:
+
+```
+shunt: data: operation 1790323451234-3f2a1c is still blocked (phase drain); waiting on proxy_missing proxy-c; it keeps running: `shunt operation wait 1790323451234-3f2a1c` follows it, `shunt operation cancel 1790323451234-3f2a1c` releases its hold and changes nothing
+```
+
+The cancel hint appears only while the operation offers `cancel`. `ramp`, `migrate start`,
+`readonly`, `cluster readonly` and `purge-source` watch for `--wait` (default 30s); `cutover` for
+its window plus `--wait`. Interrupting the CLI does not stop the operation either. Nothing is
+released, rolled back or called done when the CLI stops: the hold stays, the record stays `blocked`
+on every control node, and the step carries on by itself once its blockers clear. Then, in this
+order:
+
+1. **Inspect.** `shunt operation show <id>` lists each blocker by code and proxy, and the actions
+   the record allows (`actions: resume, cancel`). `shunt proxy list` and `shunt proxy show <proxy>`
+   say what the named member is doing.
+2. **Restore the member if you can.** A silent member that comes back acknowledges the hold, drains,
+   and the step goes on ([docs/runbooks/lagging-proxy.md](runbooks/lagging-proxy.md)).
+3. **Retire a member you can reach** and want out: `shunt proxy retire <id> --wait 2m`.
+4. **Resolve a crashed or unreachable member's incarnation** only after its backend effects are
+   reconciled: `shunt proxy resolve <id> --incarnation <inc> --attest "<how you know>"`
+   ([docs/runbooks/crashed-proxy.md](runbooks/crashed-proxy.md)).
+5. **Forget only with retirement proof.** `shunt proxy forget <id>` is refused while the member is
+   live, and with `retirement_unproven` while any incarnation of it is unresolved.
+6. **Resume an owner-lost operation** on a live control node: `shunt operation resume <id>`.
+7. **Cancel only while the record offers `cancel`:** `shunt operation cancel <id>` releases that
+   operation's own hold and ends it `cancelled`, with the routing as it was before. Once the change
+   is being committed, or purge-source has started deleting, cancel answers `not_cancellable`.
+
+Each blocker code and what clears it: [docs/runbooks/blocked-operation.md](runbooks/blocked-operation.md).
+
+**An uncertain backend outcome is expensive.** A proxy that never learns how a mutation ended (the
+backend had the whole request, then the proxy's own idle or metadata deadline expired, or the
+connection broke, before an answer came) counts it for the life of its process. Every later step
+on that bucket then blocks on `backend_outcome_unknown` until the proxy is retired and its
+incarnation resolved with an attestation. A client that disconnects does not cause this: once the
+backend has the whole request, the proxy waits for its answer, bounded by its own deadlines
+(`proxy.idle_timeout`, `proxy.metadata_timeout`).
 
 ## When a proxy loses the control plane
 
-A member whose heartbeat has not been answered for `lease_ttl` is **stale**. It keeps serving
+A member whose lease has run out is **stale**: a lease runs from a heartbeat's send time for the
+shorter of the control plane's grant and the member's own `lease_ttl`. It keeps serving
 reads, and writes to buckets that are not moving; it refuses writes and deletes on moving buckets
 with `503` + `Retry-After`, and reads those buckets from the new cluster first (it may have missed
 a step). It becomes fresh again only once it has installed the version the control plane has. Its
@@ -93,12 +162,23 @@ and draining them all would take the data path down with it. Alert on `shunt_fle
 and on `shunt_fleet_members{state="silent"}` (control nodes) instead. `/-/fleet` on a member shows
 its state.
 
-While the control plane has no quorum, no step can be taken, clients keep working on every bucket
-that is not moving, and moving buckets refuse writes until it is back. A proxy that restarts
-meanwhile serves ACTIVE buckets from its cache, stale, and re-joins when a node answers.
+While the control plane has no quorum, clients keep working on every bucket that is not moving,
+from each proxy's last installed directory, and moving buckets refuse writes until it is back. A
+proxy that restarts meanwhile serves ACTIVE buckets from its cache, stale, and re-joins when a node
+answers. That is the promise for ACTIVE buckets, and nothing about blocked steps weakens it
+([docs/runbooks/quorum-loss.md](runbooks/quorum-loss.md)).
 
-If a control node stops in the middle of a step, the keys that step moves keep answering 503:
-`shunt status` shows `held→<ratio>`, and running the same step again finishes it.
+Migration progress is a different matter. No step can be taken without quorum, and no step goes
+ahead while a member, or the control node running it, is missing: it blocks, as above.
+
+If a control node stops in the middle of a step, the bucket's writes keep answering 503 (`shunt
+status` shows `held→<ratio>` for a ramp step). The node resumes its own operations when it
+restarts. If it does not come back, another node marks the record `blocked` on `owner_lost` once the
+node's liveness lapses, and `shunt operation resume <id> --api <live node>` carries it on from the
+phase it reached. Running the same step again answers `operation_conflict` naming that operation.
+
+A lab proxy with no members keeps its operation records in memory: when it restarts, it releases
+the holds its previous process left and fails their records, and the step is repeated.
 
 ## Limits of this form
 

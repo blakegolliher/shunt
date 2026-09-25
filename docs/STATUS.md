@@ -26,9 +26,50 @@ do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) pro
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
-All H0–H5 slices are pending. New endpoints/commands in those documents are design
+H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25; H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
+that fails when its fix is reverted: T01 (monotonic member installs), T02 (a refused or
+uncommitted candidate changes no live secret, key or cluster, on the member, the control node
+and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease
+follows the server's grant from the send time). Decided the same day: no protocol-1 fleet is
+deployed, so protocol 2 replaces it with no handover; the file backend stays lab-only and etcd
+carries the transaction contract (ADR-0021). H0a landed the same day: a directory identity
+(`cluster_id`, `epoch`) and per-resource generations, written in the same transaction as the
+version; schema-1 data upgraded in place when a node starts; the directory poll, heartbeat, member
+cache and fence compare lineage, with a negative regression proving a version-only fence counts a
+member that outlived a restore. H0b landed next: operation records reserve their placement or
+cluster scope atomically with their creation (checked against generation and identity), are
+written by sequence, and release the scope when they end; every placement and cluster mutation
+route runs under one, so a second step on a bucket is refused with `operation_conflict` rather
+than queued. One contract test runs against both the etcd and the lab store. H0c followed: every
+request that creates an operation needs an `Idempotency-Key`, and a retry runs nothing twice;
+`If-Generation` refuses a request made against a moved placement or cluster; a capacity limit
+answers 429. H0d: refusals say whether they are `retryable`; `shunt operation list|show|wait`
+and the web UI's Operations screen read the records; `shunt directory set-state|set-default`
+write around the control API and now need `--offline`. H0e: the eight proposed metric families are
+catalogued ahead of their code, the lease read on the request path is lock-free, and the
+benchmarks show the data path statistically unchanged against the commit before this work, with a
+control-plane baseline for H1–H5 (docs/bench/h0.md). H0 passed on 2026-09-24: `make fleet` and
+`make walkthrough` green, and a manual acceptance pass of the web UI on `make demo-ui` (a bucket
+spread over two MinIOs, moved onto a third backend, consolidated, and both MinIOs removed). That
+pass found and fixed eight UI and telemetry bugs, and added per-code status charts and per-bucket
+traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations, reported per member and per cluster), H1c (counted bundles, sets and transports; at most eight retired bundles, then installs back up), H1d (a checksummed, fsynced restart cache, durable reported apart from applied), H1e (`cluster credentials` and `proxy show` on API, CLI and UI) and H1f (docs/bench/h1.md: data path unchanged, a member install +20 % for the durable cache, transport reuse measured on the wire); `make fleet` and `make walkthrough` passed on the H1 build. H2 passed on 2026-09-25: H2a (admission gates on the proxy, drain barriers in the directory), H2b (proxy incarnations, retirement and attested resolution), H2c (heartbeats carry the drain proof; server-granted leases), H2d (durable barriers; blocked operations resume or cancel), H2e (cutover, movers, purge and credential drain through their gates), the review fixes, and H2f (acceptance: docs/bench/h2.md). H2f fixed six things the slices' tests had not caught (ADR-0021, decisions of 2026-09-25): a client disconnect made a mutation's outcome uncertain, which blocked every later step on the bucket; cutover paused writes for its whole quiet window; a step orphaned before its first write was recorded uncertain and kept offering cancel; forget lost the resolution of a killed process, so a restart revived it as unresolved; `operation wait` printed blockers of an ended record; and the heartbeat's size check left out the fallback counts. `--wait` is now the CLI's deadline, as the contract says. Heartbeats and barrier polls no longer copy the directory (a control-node heartbeat at 100,000 placements: 259 ms → 1.2 ms). Data path unchanged; a healthy barrier commits at p99 2.0 s against the 5 s target. `make fleet` (with a new H2 section and a barrier-latency section), `make walkthrough`, a 10-minute partition/owner-crash soak (`make soak`, 0 violations in 1.28 M operations), the property test, fuzz, race, lint, the UI gates and a manual UI pass on `make demo-ui` passed on the H2f build. Carried to T19: a barrier poll reads every member's whole record (0.2–0.8 s at 1,000 proxies), and heartbeat apply runs just under 1,000 a second on one etcd node. H3 is next. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
+
+- **2026-09-25, DeleteObjects on a spread bucket (ADR-0018 amended).** It answered `NotImplemented`, so warp, SDK batch deletes and `aws s3 rm --recursive` failed on a bucket spread over legs. The body, verified and bounded at 1 MiB, goes unchanged to every leg (the move's source first while a move is under way), and each key is answered by the leg that owns it. Proxy tests at rest and during a move fail without it; `FuzzParseDeleteResult` covers the answer parser. Confirmed with warp on the demo fleet.
+- **2026-09-25, resolve-worker is ordered by the record.** A worker heartbeat through a control
+  node that does not run the mover moved the record past the owner's copy; `resolve-worker` on the
+  owner then lost its compare-and-swap, the owner merged the older session over the resolution,
+  and the request answered 200 with nothing recorded. Every worker-session write is now a
+  compare-and-swap on the durable record, re-read and checked again on a lost swap, so a worker
+  that heartbeats meanwhile is live and the resolution is refused; the owner takes the session
+  from the record and keeps its record under repeated heartbeats; a completed session and an
+  ended record take only an exact repeat, so a late heartbeat cannot undo an attested resolution.
+  The regression runs on two nodes over embedded etcd and on a shared store, and fails on
+  `9761192`. The Operations screen keeps an attestation with the record it was typed for, clears
+  it on success and keeps it on a failed request. `make walkthrough` stops at `ramp 1.0` on
+  `backend_outcome_unknown` on this build and on `9761192` alike (process-lifetime uncertain
+  counts, H2f); `make fleet` was not run, its ports being held by a running `make demo-ui`.
 
 ### Previously recorded implementation work
 

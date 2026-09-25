@@ -153,7 +153,8 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   conditional writes and both ends of a copy take the paths they always have.
 - **Listings** merge every leg (ADR-0019). HeadBucket and GetBucketLocation go to the first leg. Any
   other bucket-level request, DeleteBucket, versioning, policy, lifecycle and ListMultipartUploads
-  among them, answers `NotImplemented`: it would have to reach every leg.
+  among them, answers `NotImplemented`: it would have to reach every leg. (DeleteObjects was among
+  them until 2026-09-25; see "DeleteObjects on a spread bucket" below.)
 - **Upload ids keep their cluster prefix.** With one leg per cluster the prefix names the leg, so the
   leg-prefixed ids planned for N2 wait for N3, which allows two legs on one cluster.
 - **Step-out** reports a spread bucket as a blocker: its keys have to be in one leg first (N3).
@@ -268,6 +269,36 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   consolidate, retire, step out, from the CLI and the UI.
 - **Proof:** a CLI test drives a spread bucket through adopt --spread, status --all, a move by
   leg and status during it; UI tests for the bar's geometry and the hash-range positions.
+
+## DeleteObjects on a spread bucket (amended 2026-09-25)
+
+A spread bucket answered DeleteObjects with `NotImplemented`, as every bucket-level request other
+than listing, HeadBucket and GetBucketLocation. Clients delete in batches (warp, the SDKs' batch
+delete, `aws s3 rm --recursive`), so a spread bucket could not be emptied or churned. DeleteObjects
+now reaches every leg:
+
+- **The body goes unchanged to every leg** (`directory.ListingLegs(p, "")`: the legs that own keys,
+  and a move's two legs). It is read once, verified (a hex `x-amz-content-sha256` is checked by
+  shunt, since each leg's request is signed again; signed chunks by the decoder), and bounded at
+  1 MiB, the same bound ADR-0004 set for a migration's dual delete: S3 allows 1000 keys. Sending it
+  unchanged keeps the client's `Content-MD5` or checksum valid; shunt computes a `Content-MD5` only
+  when the client sent neither. A leg deletes the keys it holds and reports the rest deleted, as S3
+  does, so a stray copy on a leg that does not own its key goes too.
+- **Order during a move:** the move's source leg is sent the request first, every other leg after,
+  in parallel: the order a single DELETE of a moving key takes (ADR-0004 race 1).
+- **The answer** takes each key's `Deleted` or `Error` entry from the leg that owns it (for a key in
+  the move, the destination), in one `DeleteResult`. A leg other than the move's source that fails
+  the whole request fails it (its keys' outcomes are unknown; a 4xx every leg would give, such as
+  `MalformedXML`, is relayed); a source leg that fails is logged and counted
+  (`shunt_migration_dual_delete_total{outcome="source_failed"}`), as a dual delete's is.
+- **Admission** is a delete's: the placement's read-only and barrier checks, each leg's cluster's,
+  a mutations token, and while a move is under way a source token; a held move step, a closed
+  source gate (purge-source) or a stale proxy pause the whole request with 503 and `Retry-After`.
+
+Rejected: splitting the body per owner. Each leg would get only its keys, at the cost of
+re-encoding the body and computing a new `Content-MD5` for it, so the client's integrity check
+would no longer cover what the backend received; and the answer still has to be merged. With at
+most 32 legs and 1000 keys, sending every leg the whole list is bounded.
 
 ## Open questions
 

@@ -88,16 +88,35 @@ func TestDirectoryGetAndValidate(t *testing.T) {
 	}
 }
 
+// The direct file writes are refused without --offline: they go around the control API's
+// operation records, scope reservations and fence (ADR-0021), and the file is left as it was.
+func TestDirectoryWritesNeedOffline(t *testing.T) {
+	cfg, dirPath, _ := directoryRig(t)
+	before, _ := os.ReadFile(dirPath)
+	for _, args := range [][]string{
+		{"directory", "set-state", "acme/data", "RAMPING", "--to", "minio", "--name", "x", "--ratio", "0.1", "-c", cfg},
+		{"directory", "set-default", "acme", "minio", "-c", cfg},
+	} {
+		_, _, err := run(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "--offline") || !strings.Contains(err.Error(), "refused") {
+			t.Errorf("%v without --offline: %v", args[:2], err)
+		}
+	}
+	if after, _ := os.ReadFile(dirPath); string(after) != string(before) {
+		t.Fatal("a refused direct write changed the directory file")
+	}
+}
+
 func TestDirectorySetStateRefusesIllegalTransitions(t *testing.T) {
 	cfg, dirPath, be := directoryRig(t)
 	before, _ := os.ReadFile(dirPath)
 	for _, to := range []string{"CUTOVER", "ACTIVE"} {
-		_, _, err := run(t, "directory", "set-state", "acme/data", to, "-c", cfg)
+		_, _, err := run(t, "directory", "set-state", "--offline", "acme/data", to, "-c", cfg)
 		if err == nil || !strings.Contains(err.Error(), "ACTIVE -> "+to) {
 			t.Fatalf("ACTIVE -> %s: %v", to, err)
 		}
 	}
-	if _, _, err := run(t, "directory", "set-state", "acme/data", "MIGRATING", "-c", cfg); err == nil || !strings.Contains(err.Error(), "required") {
+	if _, _, err := run(t, "directory", "set-state", "--offline", "acme/data", "MIGRATING", "-c", cfg); err == nil || !strings.Contains(err.Error(), "required") {
 		t.Fatalf("leaving ACTIVE without --to: %v", err)
 	}
 	after, _ := os.ReadFile(dirPath)
@@ -111,7 +130,7 @@ func TestDirectorySetStateVersioningRefusal(t *testing.T) {
 	before, _ := os.ReadFile(dirPath)
 	for _, status := range []string{"Enabled", "Suspended", "403"} {
 		be.status = status
-		_, _, err := run(t, "directory", "set-state", "acme/data", "MIGRATING", "--to", "minio", "--name", "acme-2222-data", "-c", cfg)
+		_, _, err := run(t, "directory", "set-state", "--offline", "acme/data", "MIGRATING", "--to", "minio", "--name", "acme-2222-data", "-c", cfg)
 		if err == nil || !strings.Contains(err.Error(), "refused") {
 			t.Fatalf("versioning %s: %v", status, err)
 		}
@@ -124,7 +143,7 @@ func TestDirectorySetStateVersioningRefusal(t *testing.T) {
 	}
 	be.status = ""
 	be.buckets, be.auth = nil, nil
-	out, _, err := run(t, "directory", "set-state", "acme/data", "RAMPING", "--to", "minio", "--name", "acme-2222-data", "--prefix", "2026-09/", "--actor", "test", "-c", cfg)
+	out, _, err := run(t, "directory", "set-state", "--offline", "acme/data", "RAMPING", "--to", "minio", "--name", "acme-2222-data", "--prefix", "2026-09/", "--actor", "test", "-c", cfg)
 	if err != nil || !strings.Contains(out, "ACTIVE -> RAMPING (directory version 2)") {
 		t.Fatalf("unversioned ramp: %v\n%s", err, out)
 	}
@@ -134,7 +153,7 @@ func TestDirectorySetStateVersioningRefusal(t *testing.T) {
 	if !strings.Contains(be.auth[0], "Credential=GARAGEKEY/") || !strings.Contains(be.auth[0], "/garage/s3/") || !strings.Contains(be.auth[1], "Credential=MINIOKEY/") {
 		t.Fatalf("versioning checks not signed with each cluster's key and region: %v", be.auth)
 	}
-	out, _, err = run(t, "directory", "set-state", "acme/data", "MIGRATING", "-c", cfg)
+	out, _, err = run(t, "directory", "set-state", "--offline", "acme/data", "MIGRATING", "-c", cfg)
 	if err != nil || !strings.Contains(out, "RAMPING -> MIGRATING") {
 		t.Fatalf("ramp to migrating: %v\n%s", err, out)
 	}

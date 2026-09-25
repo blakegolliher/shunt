@@ -107,6 +107,13 @@ test('the ramp slider keeps its setting across live reloads', async () => {
   view.ratio = 0.5 // the step applied: the slider follows the server once
   await reloads()
   expect(screen.getByText(/Traffic ratio: 50% to target/)).toHaveTextContent('(applied 50%)')
+  // The track is always 0–100%, so 50% applied draws at the middle, not at the left end.
+  const slider = screen.getByLabelText('Traffic ratio')
+  expect(slider).toHaveAttribute('min', '0')
+  expect(slider).toHaveAttribute('max', '1')
+  expect(slider).toHaveValue('0.5')
+  fireEvent.change(slider, { target: { value: '0.2' } }) // a ramp only grows: a drag below the applied ratio stops there
+  expect(screen.getByText(/Traffic ratio: 50% to target/)).toBeInTheDocument()
 
   view.state = 'MIGRATING'
   view.ratio = undefined

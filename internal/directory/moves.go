@@ -22,6 +22,10 @@ func (p *Placement) MoveView() Placement {
 		Names:       map[string]string{m.From: from.Bucket, m.To: to.Bucket},
 		LegClusters: map[string]string{m.From: from.Cluster, m.To: to.Cluster},
 		Ramp:        v2ramp(m.Ramp), Cutover: v2cutover(m.Cutover), Created: p.Created, ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites}
+	if p.Barrier != nil {
+		b := *p.Barrier
+		v.Barrier = &b
+	}
 	if v.Ramp != nil {
 		rg := m.Range
 		v.Ramp.Range = &rg
@@ -60,6 +64,7 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 		return p, err
 	}
 	np := p.clone()
+	np.Barrier = nv.Barrier // the step's hold writes it, its completion or release clears it
 	switch {
 	case nv.State == StateActive && t.Release:
 		// The held first step never reached every proxy: nothing was routed to the destination, so
@@ -201,7 +206,7 @@ func startMove(p Placement, t Transition) (Placement, error) {
 	if err != nil {
 		return p, err
 	}
-	np.State = nv.State
+	np.State, np.Barrier = nv.State, nv.Barrier
 	np.Move = &Move{Scope: t.Scope, Range: rg, From: src, To: dst, Ramp: nv.Ramp, Cutover: nv.Cutover}
 	if np.Move.Ramp != nil {
 		r := rg

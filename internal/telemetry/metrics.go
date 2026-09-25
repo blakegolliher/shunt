@@ -38,7 +38,33 @@ type Metrics struct {
 	FleetStale     prometheus.Gauge     // shunt_fleet_stale
 	FenceWait      prometheus.Histogram // shunt_fleet_fence_wait_seconds
 	TelemetryMerge prometheus.Histogram // shunt_telemetry_merge_seconds
+
+	// The runtime bundle (ADR-0021 D1), resign mode.
+	BundlesRetired      prometheus.Gauge // shunt_runtime_bundles_retired
+	InstallBackpressure prometheus.Gauge // shunt_install_backpressure
+	// The restart cache (ADR-0021 D1), fleet members.
+	CacheFailures *prometheus.CounterVec // shunt_directory_cache_failures_total{stage}
+
+	// Drain barriers and leases (ADR-0021 D2). LeaseGrantErrors is a member's; the rest are the
+	// control plane's.
+	LeaseGrantErrors       *prometheus.CounterVec   // shunt_lease_grant_errors_total{reason}
+	BarrierDuration        *prometheus.HistogramVec // shunt_barrier_duration_seconds{phase}
+	BarrierBlockers        *prometheus.GaugeVec     // shunt_barrier_blockers{code}
+	UnresolvedIncarnations prometheus.Gauge         // shunt_fleet_unresolved_incarnations
+	Operations             *prometheus.GaugeVec     // shunt_operations{status,effect}
 }
+
+// barrierBuckets is 10 ms … 1 h, log-spaced, 16 buckets.
+var barrierBuckets = func() []float64 {
+	const n = 16
+	lo, hi := math.Log(0.01), math.Log(3600)
+	out := make([]float64, n)
+	for i := range out {
+		v := math.Exp(lo + (hi-lo)*float64(i)/float64(n-1))
+		out[i] = math.Round(v*1e6) / 1e6
+	}
+	return out
+}()
 
 // durationBuckets is 1 ms … 60 s, log-spaced, 16 buckets (docs/telemetry-catalog.md).
 var durationBuckets = func() []float64 {
@@ -135,11 +161,37 @@ func NewMetrics() *Metrics {
 			Name: "shunt_telemetry_merge_seconds", Help: "Control node: time to decode and merge one completed fleet telemetry window.",
 			Buckets: prometheus.ExponentialBuckets(10e-6, 2.15443469, 16),
 		}),
+		BundlesRetired: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_runtime_bundles_retired", Help: "Replaced runtime bundles a request still holds (at most 8).",
+		}),
+		InstallBackpressure: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_install_backpressure", Help: "1 while an installed directory version waits for a retired runtime bundle to drain.",
+		}),
+		CacheFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_directory_cache_failures_total", Help: "Member: restart-cache writes that failed, by stage; the version is not durable.",
+		}, []string{"stage"}),
+		LeaseGrantErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "shunt_lease_grant_errors_total", Help: "Member: heartbeats whose answer granted no lease, by why.",
+		}, []string{"reason"}),
+		BarrierDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "shunt_barrier_duration_seconds", Help: "Control plane: time a drain barrier spent in each phase.",
+			Buckets: barrierBuckets,
+		}, []string{"phase"}),
+		BarrierBlockers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_barrier_blockers", Help: "Control plane: blockers now holding open barriers, by code.",
+		}, []string{"code"}),
+		UnresolvedIncarnations: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "shunt_fleet_unresolved_incarnations", Help: "Control plane: proxy incarnations that ended without a clean retirement and still block barriers.",
+		}),
+		Operations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_operations", Help: "Control plane: unfinished operations, and ended ones whose effect is uncertain.",
+		}, []string{"status", "effect"}),
 	}
 	reg.MustRegister(m.RequestsTotal, m.RequestDuration, m.UpstreamTTFB, m.BytesIn, m.BytesOut, m.Inflight,
 		m.AuthFailures, m.AuthDuration, m.Compensation,
 		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
-		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge,
+		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge, m.BundlesRetired, m.InstallBackpressure,
+		m.CacheFailures, m.LeaseGrantErrors, m.BarrierDuration, m.BarrierBlockers, m.UnresolvedIncarnations, m.Operations,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

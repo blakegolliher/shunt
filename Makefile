@@ -40,7 +40,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough demo-ui demo-ui-down s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough demo-ui demo-ui-down s3diff s3diff-mixed s3clean bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -89,6 +89,18 @@ property: build ## POC-4 migration property test (PROPERTY_TIME, default 2m; PRO
 	  $(if $(PROPERTY_SEED),SHUNT_PROPERTY_SEED=$(PROPERTY_SEED)) $(if $(PROPERTY_GUARD),SHUNT_PROPERTY_GUARD=$(PROPERTY_GUARD)) $(if $(PROPERTY_WITHDRAW),SHUNT_PROPERTY_WITHDRAW=$(PROPERTY_WITHDRAW)) \
 	  $(GO) test ./internal/proxy -run TestMigrationPreservesTheClientsView -count=1 -timeout $(PROPERTY_TIMEOUT) -v > $$dir/go-test.log 2>&1; \
 	rc=$$?; echo "property run exited $$rc; record in $$dir"; exit $$rc
+
+# The H2 acceptance soak (docs/prompts/distributed-hardening.md §3) records like property: the
+# whole run in test/property/runs/<timestamp>/ (go-test.log, never filtered; git.txt; the goroutine
+# profiles goroutines-warm.txt and goroutines-end.txt). SOAK_SEED passes through when set.
+soak: build ## H2 fleet soak: partitions and control-node crashes under the model workload (SOAK_TIME, default 10m; SOAK_SEED; SOAK_TIMEOUT)
+	@set -uo pipefail; \
+	dir=$(CURDIR)/test/property/runs/$$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $$dir; \
+	{ git rev-parse HEAD; git status --porcelain; } > $$dir/git.txt 2>&1; \
+	echo "soak run $(SOAK_TIME): full output in $$dir/go-test.log"; \
+	SHUNT_SOAK_RUN_DIR=$$dir SHUNT_SOAK_DURATION=$(SOAK_TIME) $(if $(SOAK_SEED),SHUNT_SOAK_SEED=$(SOAK_SEED)) \
+	  $(GO) test ./internal/proxy -run '^TestFleetSoak$$' -count=1 -timeout $(SOAK_TIMEOUT) -v > $$dir/go-test.log 2>&1; \
+	rc=$$?; echo "soak run exited $$rc; record in $$dir"; exit $$rc
 
 bench: ## run all benchmarks, write test/bench/new.txt
 	@mkdir -p test/bench
@@ -164,6 +176,8 @@ run-minio: build ## run shunt in front of the e2e MinIO (foreground)
 # VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY exported and `make run-vast-resign`.
 PROPERTY_TIME    ?= 2m
 PROPERTY_TIMEOUT ?= 20m
+SOAK_TIME        ?= 10m
+SOAK_TIMEOUT     ?= 60m
 BACKEND      ?= garage
 MODE         ?= passthrough
 VAST_ENDPOINT ?= https://vast.example.com:443
@@ -197,6 +211,12 @@ s3diff-mixed: ## POC-3: mixed-backend differential test through one shunt (needs
 s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio|vast MODE=passthrough|resign)
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
 	  $(GO) run ./test/s3diff -mode $(MODE) -region $(S3_REGION) $(S3_BACKEND_ARGS) $(S3DIFF_ARGS)
+
+s3clean: ## empty BUCKET through shunt on :8443 (BACKEND, MODE as for s3diff; CLEAN_ARGS adds flags, e.g. -versions -uploads -delete-bucket)
+	@test -n "$(BUCKET)" || { echo "s3clean: set BUCKET=<name>"; exit 2; }
+	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
+	  $(GO) run ./test/s3clean -bucket $(BUCKET) \
+	  $(if $(filter resign,$(MODE)),-access-key-env SHUNT_ACCESS_KEY -secret-key-env SHUNT_SECRET,-region $(S3_REGION)) $(CLEAN_ARGS)
 
 bench-e2e: ## direct vs via bench (BACKEND=garage|minio MODE=passthrough|resign), prints a markdown table
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \

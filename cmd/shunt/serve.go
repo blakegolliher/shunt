@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/blakegolliher/shunt/internal/admin"
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
@@ -27,6 +28,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/listener"
 	"github.com/blakegolliher/shunt/internal/member"
 	"github.com/blakegolliher/shunt/internal/proxy"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/telemetry"
 	"github.com/blakegolliher/shunt/internal/upstream"
@@ -130,14 +132,14 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	case cfg.Control.Member():
 		// A fleet member (ADR-0015): the directory, the client keys and the cluster secrets come
 		// from shunt-control, and nothing on this host is shared with another.
-		m, registry, err := startMember(ctx, cfg, metrics, log)
+		m, registry, rt, gates, err := startMember(ctx, cfg, metrics, log)
 		if err != nil {
 			return err
 		}
 		defer registry.Close()
 		mem = m
 		m.Telemetry = windows
-		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir, hcfg.Stale = proxy.ModeResign, m.Keys(), registry, m, m.Stale
+		hcfg.Mode, hcfg.Runtime, hcfg.Dir, hcfg.Stale, hcfg.Gates = proxy.ModeResign, rt, m, m.Stale, gates
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = !cfg.KillSwitches.XMLRewriteDisable, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
 		publishRouteState(metrics, m.Snapshot())
 	case cfg.Auth.Mode == "resign":
@@ -158,43 +160,65 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		defer registry.Close()
 		rewrite := !cfg.KillSwitches.XMLRewriteDisable
 		started := false
-		applyClusters := func(f *directory.File) error {
-			before := registry.Load()
-			added, removed, aerr := registry.Apply(f.Clusters)
+		applyClusters := func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+			cand, aerr := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 			if aerr != nil {
 				log.Error("directory version refused: a cluster could not be built", "version", f.Version, "err", aerr.Error())
-				return aerr
+				return nil, aerr
 			}
-			for _, name := range added {
-				cl, _ := registry.Load().Get(name)
-				event := "cluster added"
-				switch _, existed := before.Get(name); {
-				case !started:
-					event = "cluster ready"
-				case existed:
-					event = "cluster updated"
+			return func() {
+				before := registry.Load()
+				added, removed := cand.Commit()
+				for _, name := range added {
+					cl, _ := registry.Load().Get(name)
+					event := "cluster added"
+					switch _, existed := before.Get(name); {
+					case !started:
+						event = "cluster ready"
+					case existed:
+						event = "cluster updated"
+					}
+					logCluster(log, event, cl, f.Clusters[name], rewrite)
 				}
-				logCluster(log, event, cl, f.Clusters[name], rewrite)
-			}
-			started = true
-			for _, name := range removed {
-				log.Info("cluster removed", "cluster", name)
-			}
-			return nil
+				started = true
+				for _, name := range removed {
+					log.Info("cluster removed", "cluster", name)
+				}
+			}, nil
 		}
-		if applyErr := applyClusters(dir.Snapshot().File()); applyErr != nil {
+		commit, applyErr := applyClusters(dir.Snapshot().File(), nil)
+		if applyErr != nil {
 			return applyErr
 		}
+		commit()
 		dir.Prepare = applyClusters
 		events := control.NewEvents(0)
+		// The runtime bundle follows the directory, the key file and the registry: after an install
+		// the registry has committed that version's clusters, and a key change keeps the directory.
+		rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: store.Table(), Clusters: registry.Load()})
+		rt.Observe = observeBundles(metrics, log)
+		// The admission gates follow the directory (ADR-0021 D2): closed on install of a version
+		// carrying a barrier, opened once requests route by the version without it.
+		keeper := &proxy.GateKeeper{Gates: admission.New()}
+		rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
+		keeper.Served(dir.Snapshot())
+		keeper.Installed(dir.Snapshot())
+		republish := func(s *directory.Snapshot, keys auth.Table) {
+			if perr := rt.Refresh(s, keys, registry.Load()); perr != nil {
+				log.Error("runtime bundle not published", "err", perr.Error())
+			}
+		}
+		store.OnChange = func(t auth.Table) { republish(dir.Snapshot(), t) }
 		dir.OnInstall = func(s *directory.Snapshot) {
+			republish(s, store.Table())
+			keeper.Installed(s)
 			publishRouteState(metrics, s)
 			warnUnknownRampHashes(log, s)
 			events.Directory(s)
 		}
 		events.Directory(dir.Snapshot()) // the baseline: the first write is the first event
 		warnUnknownRampHashes(log, dir.Snapshot())
-		hcfg.Mode, hcfg.Store, hcfg.Clusters, hcfg.Dir = proxy.ModeResign, store, registry, dir
+		hcfg.Mode, hcfg.Runtime, hcfg.Dir, hcfg.Gates = proxy.ModeResign, rt, dir, keeper.Gates
 		hcfg.Rewrite, hcfg.ClockSkew, hcfg.DebugRoute = rewrite, cfg.Auth.ClockSkew, cfg.Features.DebugRouteHeader
 		if hcfg.DebugRoute {
 			log.Warn("features.debug_route_header is on: any client sending X-Shunt-Debug: 1 learns which cluster served it (ADR-0006 amendment); for labs")
@@ -206,9 +230,9 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 		worker := control.MoverWorker{Snapshot: func() *directory.File { return dir.Snapshot().File() },
 			CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
 		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{},
-			Ops: &control.MemOperations{OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx,
-			Mover: worker.Run, MoverLedger: worker.Ledger}
-		warnHeldSteps(log, dir.Snapshot())
+			Ops: &control.MemOperations{Dir: dir, OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx,
+			Mover: worker.Run, MoverLedger: worker.Ledger, LocalGates: keeper.Gates}
+		releaseOrphanHolds(ctx, log, dir)
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
 				return fmt.Errorf("admin.control_token_ref: %w", err)
@@ -248,8 +272,15 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 	if ctl != nil {
 		adm.Mount("/v1/", ctl.Handler())
 	}
+	retire := make(chan struct{}, 1)
 	if mem != nil {
 		adm.Mount("/-/fleet", mem)
+		mem.OnRetire = func() {
+			select {
+			case retire <- struct{}{}:
+			default:
+			}
+		}
 		mctx, stop := context.WithCancel(ctx)
 		defer stop()
 		go mem.Run(mctx)
@@ -282,6 +313,9 @@ wait:
 		case s := <-sig:
 			log.Info("signal received, draining", "signal", s.String(), "timeout", cfg.Proxy.DrainTimeout.String())
 			break wait
+		case <-retire:
+			log.Info("retirement requested by the control plane, draining", "timeout", cfg.Proxy.DrainTimeout.String())
+			break wait
 		case <-ctx.Done():
 			log.Info("context done, draining")
 			break wait
@@ -302,31 +336,74 @@ wait:
 	adm.Drain()
 	dctx, cancel := context.WithTimeout(context.Background(), cfg.Proxy.DrainTimeout)
 	defer cancel()
+	cut := int64(0)
 	if err := srv.Shutdown(dctx); err != nil {
 		log.Warn("drain deadline hit; closing remaining connections", "err", err)
 		_ = srv.Close()
+		cut = h.Gates.Inflight() // requests cut short: their backend outcomes are never learned
+	}
+	if mem != nil {
+		// A clean retirement (ADR-0021 D2): admission has stopped and every request has ended, so
+		// the control plane can count this process out of every barrier. A count of outcomes
+		// never learned makes it unclean, and an operator resolves it once the backend is quiet.
+		// A request cut short can be counted twice: once in cut, and again in Uncertain if its
+		// handler has already returned its token as uncertain by the time this reads it. The sum
+		// only decides clean against unclean and is shown for the operator's reconciliation, so
+		// over-counting is the safe side; under-counting would call a live effect drained.
+		uncertain := h.Gates.Uncertain() + cut
+		rctx, rcancel := context.WithTimeout(context.Background(), cfg.Proxy.DrainTimeout)
+		if err := mem.Retire(rctx, uncertain); err != nil {
+			log.Warn("retirement not recorded by the control plane; the next process of this proxy reports it", "err", err.Error())
+		}
+		rcancel()
 	}
 	_ = admSrv.Shutdown(dctx)
 	log.Info("stopped")
 	return nil
 }
 
-// warnHeldSteps names every bucket with a held ramp step at startup: a control node that stopped
-// between a hold and its completion leaves the held keys answering 503 until the step is repeated
-// (ADR-0016).
-func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
-	f := snap.File()
+// releaseOrphanHolds releases, at a lab's startup, every hold and barrier left by an operation of
+// a previous process: a lab keeps its operation records in memory, so nothing can resume them,
+// and with no members the hold protected nothing that outlives the process. A fleet's control
+// node keeps its records and resumes them instead (ResumeOwn).
+func releaseOrphanHolds(ctx context.Context, log *slog.Logger, dir *directory.FileDir) {
+	f := dir.Snapshot().File()
 	for _, key := range slices.Sorted(maps.Keys(f.Placements)) {
-		if p := f.Placements[key]; p.Held() {
-			log.Warn("a ramp step was left held by an interrupted call: writes to the keys it moves answer 503 until it is repeated",
-				"placement", key, "ratio", p.Ramp.Ratio, "hold_ratio", p.Ramp.Hold.Ratio, "hold_prefixes", p.Ramp.Hold.Prefixes)
+		p := f.Placements[key]
+		tenant, bucket, _ := directory.SplitKey(key)
+		barrier := ""
+		if p.Barrier != nil {
+			barrier = p.Barrier.ID
+		}
+		switch {
+		case p.Held():
+			if err := dir.SetState(ctx, tenant, bucket, directory.StateRamping, directory.Transition{Release: true, Barrier: barrier}, "shunt serve"); err != nil {
+				log.Error("a ramp step left held by a previous process could not be released; writes to the keys it moves answer 503", "placement", key, "err", err.Error())
+				continue
+			}
+			log.Warn("a ramp step left held by a previous process was released: repeat the step", "placement", key, "barrier", barrier)
+		case p.Barrier != nil:
+			if err := dir.ClearBarrier(ctx, directory.PlacementResource(key), barrier, "shunt serve"); err != nil {
+				log.Error("a barrier left by a previous process could not be cleared", "placement", key, "barrier", barrier, "err", err.Error())
+				continue
+			}
+			log.Warn("a barrier left by a previous process was cleared: repeat the change", "placement", key, "barrier", barrier)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(f.Clusters)) {
+		if b := f.Clusters[name].Barrier; b != nil {
+			if err := dir.ClearBarrier(ctx, directory.ClusterResource(name), b.ID, "shunt serve"); err != nil {
+				log.Error("a barrier left by a previous process could not be cleared", "cluster", name, "barrier", b.ID, "err", err.Error())
+				continue
+			}
+			log.Warn("a barrier left by a previous process was cleared: repeat the change", "cluster", name, "barrier", b.ID)
 		}
 	}
 }
 
 // startMember builds a fleet member's directory client and its cluster registry, loads the cached
 // directory, and registers with the control plane before the proxy serves anything (ADR-0016).
-func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, error) {
+func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Metrics, log *slog.Logger) (*member.Client, *upstream.Registry, *runtimecfg.Publisher, *admission.Gates, error) {
 	mcfg := member.Config{Endpoints: cfg.Control.Endpoints, ProxyID: cfg.Control.ProxyID, CacheDir: cfg.Control.CacheDir,
 		Interval: cfg.Control.HeartbeatInterval, LeaseTTL: cfg.Control.LeaseTTL, Version: version}
 	if host, err := os.Hostname(); err == nil {
@@ -335,51 +412,69 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 	if ref := cfg.Control.TokenRef; ref != "" {
 		tok, err := config.ResolveSecret(ref)
 		if err != nil {
-			return nil, nil, fmt.Errorf("control.token_ref: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("control.token_ref: %w", err)
 		}
 		mcfg.Token = tok
 	}
 	if mcfg.ProxyID == "" {
 		host, err := os.Hostname()
 		if err != nil {
-			return nil, nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("control.proxy_id is unset and the host name is unknown: %w", err)
 		}
 		_, port, _ := net.SplitHostPort(cfg.Admin.Address)
 		mcfg.ProxyID = defaultProxyID(host, port)
 	}
 	if !config.ValidProxyID(mcfg.ProxyID) {
-		return nil, nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", mcfg.ProxyID)
+		return nil, nil, nil, nil, fmt.Errorf("proxy id %q (from the host name and admin port) is not a valid control.proxy_id: 1-64 letters, digits, '.', '_' or '-'; set control.proxy_id", mcfg.ProxyID)
 	}
 	m := member.New(mcfg, log)
 	m.Metrics = metrics
 	registry := upstream.NewRegistry(upstream.Options{}, m.Resolve)
 	rewrite := !cfg.KillSwitches.XMLRewriteDisable
-	m.Prepare = func(f *directory.File) error {
-		before := registry.Load()
-		added, removed, err := registry.Apply(f.Clusters)
+	m.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		for _, name := range added {
-			cl, _ := registry.Load().Get(name)
-			event := "cluster added"
-			if _, existed := before.Get(name); existed {
-				event = "cluster updated"
+		return func() {
+			before := registry.Load()
+			added, removed := cand.Commit()
+			for _, name := range added {
+				cl, _ := registry.Load().Get(name)
+				event := "cluster added"
+				if _, existed := before.Get(name); existed {
+					event = "cluster updated"
+				}
+				logCluster(log, event, cl, f.Clusters[name], rewrite)
 			}
-			logCluster(log, event, cl, f.Clusters[name], rewrite)
-		}
-		for _, name := range removed {
-			log.Info("cluster removed", "cluster", name)
-		}
-		return nil
+			for _, name := range removed {
+				log.Info("cluster removed", "cluster", name)
+			}
+		}, nil
 	}
+	// Each installed version is published as one bundle: the member has committed its clusters and
+	// swapped its keys before OnInstall, under its install lock, so bundles never go back (ADR-0021).
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: m.Snapshot(), Keys: m.Keys().Table(), Clusters: registry.Load()})
+	rt.Observe = observeBundles(metrics, log)
+	// The admission gates follow the directory (ADR-0021 D2): closed on install of a version
+	// carrying a barrier, opened once requests route by the version without it.
+	keeper := &proxy.GateKeeper{Gates: admission.New()}
+	m.Gates = keeper.Gates
+	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
+	keeper.Served(m.Snapshot())
+	m.Serving = func() *directory.Snapshot { return rt.Load().Snapshot }
+	m.SecretsHeld = func() map[string]int64 { return rt.Stats().SecretsHeld }
 	m.OnInstall = func(s *directory.Snapshot) {
+		if err := rt.Refresh(s, m.Keys().Table(), registry.Load()); err != nil {
+			log.Error("runtime bundle not published", "err", err.Error())
+		}
+		keeper.Installed(s)
 		publishRouteState(metrics, s)
 		warnUnknownRampHashes(log, s)
 	}
 	metrics.FleetStale.Set(1) // until the first heartbeat is answered
 	if err := m.Load(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	log.Info("fleet member", "proxy", mcfg.ProxyID, "control", cfg.Control.Endpoints, "heartbeat", mcfg.Interval.String(), "lease_ttl", mcfg.LeaseTTL.String(),
 		"cache_dir", cfg.Control.CacheDir, "control_channel", "PLAINTEXT http (control.plaintext: true; secrets and client keys cross the network in the clear)")
@@ -391,7 +486,26 @@ func startMember(ctx context.Context, cfg *config.Config, metrics *telemetry.Met
 		log.Warn("fleet member could not register with the control plane before serving: starting stale (writes on moving buckets are refused until it can)",
 			"proxy", mcfg.ProxyID, "err", err.Error())
 	}
-	return m, registry, nil
+	return m, registry, rt, keeper.Gates, nil
+}
+
+// observeBundles exports the runtime publisher's state and logs when installs start and stop
+// waiting on the retired-bundle bound. It runs under the publisher's lock, so its state needs none.
+func observeBundles(metrics *telemetry.Metrics, log *slog.Logger) func(runtimecfg.Stats) {
+	waiting := false
+	return func(st runtimecfg.Stats) {
+		metrics.BundlesRetired.Set(float64(st.Retired))
+		switch {
+		case st.Pending != 0 && !waiting:
+			metrics.InstallBackpressure.Set(1)
+			log.Warn("install backpressure: long-running requests hold the maximum number of replaced runtime bundles; new requests keep using the older version until one finishes",
+				"serving", st.Version, "pending", st.Pending, "retired", st.Retired)
+		case st.Pending == 0 && waiting:
+			metrics.InstallBackpressure.Set(0)
+			log.Info("install backpressure cleared", "serving", st.Version)
+		}
+		waiting = st.Pending != 0
+	}
 }
 
 // defaultProxyID is <host>-<port> with every character a proxy id cannot hold replaced by '-',
@@ -514,4 +628,10 @@ func newLogger(cfg *config.Config, stderr io.Writer) *slog.Logger {
 		log = log.With("client_listener", "PLAINTEXT http (listener.plaintext: true; lab use only)")
 	}
 	return log
+}
+
+// secretGeneration reads each cluster's secret generation from a directory version, for the
+// signers the registry builds from it (ADR-0021 D1).
+func secretGeneration(f *directory.File) func(string) int64 {
+	return func(name string) int64 { return f.Generation(directory.SecretResource(name)) }
 }

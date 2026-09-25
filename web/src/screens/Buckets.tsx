@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { adoptBucket, clearTarget, createBackendBucket, expandBucket, startOperation, getPlacementView, importClientKey, setPlacementReadOnly } from '../api/client'
+import { adoptBucket, clearTarget, createBackendBucket, expandBucket, startOperation, getPlacementView, importClientKey, setBucketWatch, setPlacementReadOnly } from '../api/client'
 import type { PlacementStatus, PlacementView } from '../api/client'
 import { Card } from '../components/Card'
 import { CopyLine } from '../components/CopyLine'
@@ -20,8 +20,8 @@ function splitKey(key: string): [string, string] {
 }
 
 function generatedName(placement: PlacementStatus, target: string, placements: PlacementStatus[]) {
-  const base = placement.names[placement.primary]
-  const used = new Set(placements.map((item) => item.names[target]).filter(Boolean))
+  const base = placement.names?.[placement.primary] ?? splitKey(placement.key)[1]
+  const used = new Set(placements.map((item) => item.names?.[target]).filter(Boolean))
   for (let n = 1; ; n++) {
     let name = `${base}-${String(n).padStart(3, '0')}`
     if (name.length > 63) name = `${base.slice(0, 59).replace(/[.-]+$/, '')}-${String(n).padStart(3, '0')}`
@@ -29,7 +29,10 @@ function generatedName(placement: PlacementStatus, target: string, placements: P
   }
 }
 
-export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
+// BucketRequest asks the Buckets screen to open one bucket's drawer, from another screen.
+export interface BucketRequest { key: string; action: 'expand' | 'move' | 'consolidate'; nonce: number }
+
+export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => void; request?: BucketRequest | null }) {
   const { token, directory, refresh, notify } = useStore()
   const placements = useMemo(() => directory?.placements ?? [], [directory])
   const clusters = useMemo(() => directory?.clusters ?? [], [directory])
@@ -120,12 +123,26 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
     const to = prefer && prefer !== placement.primary && clusters.some((item) => item.name === prefer) ? prefer : clusters.find((item) => item.name !== placement.primary)?.name ?? ''
     setTarget(to); setExpandName(name); setAcceptExisting(false); setExpanding(placement.key)
   }
+  // A request from another screen (Migrations) opens its drawer once, as soon as the bucket is
+  // known: a prop change adjusting state during render, not an effect.
+  const [seenRequest, setSeenRequest] = useState(0)
+  if (request && request.nonce !== seenRequest) {
+    const placement = placements.find((item) => item.key === request.key)
+    if (placement) {
+      setSeenRequest(request.nonce)
+      if (request.action === 'expand') openExpand(placement)
+      else if (request.action === 'move') openMove(placement)
+      else openConsolidate(placement)
+    }
+  }
   // The client bucket the add form names, when the tenant already has it: that is expand, not add.
   const existing = placements.find((item) => item.key === `${tenant.trim()}/${bucket.trim()}`)
   const tenantBuckets = placements.map((item) => splitKey(item.key)).filter(([t]) => t === tenant.trim()).map(([, b]) => b)
-  const act = async (fn: () => Promise<unknown>, success: string) => {
+  // A change that runs as an operation is only requested here: its outcome arrives on the event
+  // stream as a fence event, which the store turns into the final toast (ADR-0021 D5).
+  const act = async (fn: () => Promise<unknown>, success: string, tone: 'success' | 'neutral' = 'success') => {
     setBusy(true)
-    try { await fn(); notify(success); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
+    try { await fn(); notify(success, tone); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
   }
   const resetImport = () => { setImportAccess(''); setImportSecret(''); setImportOnlyBucket(false) }
   const importKey = async (event: FormEvent) => {
@@ -151,7 +168,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
     <Card eyebrow="Directory" title="Buckets" action={<button type="button" onClick={() => setAdding(true)} className="rounded-lg bg-ember-600 px-4 py-2 text-sm font-semibold text-white hover:bg-ember-500">Adopt or create</button>}>
       {placements.length === 0 ? <p className="text-sm text-muted">No bucket placements are recorded.</p> : <div className="overflow-x-auto"><table className="w-full text-left text-sm">
         <thead className="text-xs uppercase tracking-wider text-muted"><tr><th className="pb-3">Tenant</th><th className="pb-3">Bucket</th><th className="pb-3">State</th><th className="pb-3">Primary cluster</th><th className="pb-3">Backend name</th><th className="pb-3">Writes</th><th className="pb-3"><span className="sr-only">Actions</span></th></tr></thead>
-        <tbody className="divide-y divide-ink-700">{placements.map((placement) => { const [t, b] = splitKey(placement.key); return <tr key={placement.key} onClick={() => setSelected(placement.key)} className="cursor-pointer hover:bg-ink-800/60"><td className="py-3 text-muted">{t}</td><td className="py-3 font-semibold text-ember-300">{b}{placement.client_keys === 0 && <span className="ml-2 rounded-full border border-amber-500/60 bg-amber-950/40 px-2 py-0.5 text-xs font-normal text-amber-200">no client keys</span>}</td><td className="py-3"><StateBadge state={placement.state} /></td><td className="py-3">{placement.legs?.length ? <div className="min-w-40"><span title="Keys split by hash across these clusters">spread: {placement.legs.map((l) => l.cluster).join(' + ')}</span><div className="mt-1.5"><OwnershipBar legs={placement.legs} move={placement.move} compact /></div></div> : placement.primary}</td><td className="py-3 font-mono text-muted">{placement.legs?.length ? placement.legs.map((l) => l.bucket).join(', ') : placement.names[placement.primary]}</td><td className={`py-3 ${placement.read_only ? 'text-amber-200' : 'text-emerald-300'}`}>{placement.read_only ? 'read-only' : 'enabled'}</td><td className="py-3 text-right">{placement.state === 'ACTIVE' && (placement.legs?.length ?? 0) > 1 && <button type="button" aria-label={`Move keys of ${placement.key}`} onClick={(event) => { event.stopPropagation(); openMove(placement) }} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Move keys</button>}{placement.state === 'ACTIVE' && (placement.legs?.length ?? 0) > 1 && <button type="button" aria-label={`Consolidate ${placement.key}`} onClick={(event) => { event.stopPropagation(); openConsolidate(placement) }} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Consolidate</button>}{idleLegs(placement).length > 0 && <button type="button" aria-label={`Retire idle legs of ${placement.key}`} onClick={(event) => { event.stopPropagation(); const [t, b] = splitKey(placement.key); const idle = idleLegs(placement).map((l) => `${l.cluster}/${l.bucket}`).join(', '); void act(() => clearTarget(token, t, b), `${placement.key}: retired ${idle}, which owned no keys; the buckets are still there`) }} disabled={busy} className="mr-2 rounded-lg border border-ink-600 px-3 py-1.5 text-xs font-semibold text-muted hover:text-paper">Retire idle leg</button>}{placement.state === 'ACTIVE' && placement.target && <button type="button" aria-label={`Clear target of ${placement.key}`} onClick={(event) => { event.stopPropagation(); const [t, b] = splitKey(placement.key); void act(() => clearTarget(token, t, b), `${placement.key}: target ${placement.target} cleared; its bucket is still there`) }} disabled={busy} className="rounded-lg border border-ink-600 px-3 py-1.5 text-xs font-semibold text-muted hover:text-paper">Clear target</button>}{expandable(placement) && <button type="button" aria-label={`Expand ${placement.key}`} onClick={(event) => { event.stopPropagation(); openExpand(placement) }} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Expand</button>}</td></tr> })}</tbody>
+        <tbody className="divide-y divide-ink-700">{placements.map((placement) => { const [t, b] = splitKey(placement.key); return <tr key={placement.key} onClick={() => setSelected(placement.key)} className="cursor-pointer hover:bg-ink-800/60"><td className="py-3 text-muted">{t}</td><td className="py-3 font-semibold text-ember-300">{b}{placement.client_keys === 0 && <span className="ml-2 rounded-full border border-amber-500/60 bg-amber-950/40 px-2 py-0.5 text-xs font-normal text-amber-200">no client keys</span>}</td><td className="py-3"><StateBadge state={placement.state} /></td><td className="py-3">{placement.legs?.length ? <div className="min-w-40"><span title="Keys split by hash across these clusters">spread: {placement.legs.map((l) => l.cluster).join(' + ')}</span><div className="mt-1.5"><OwnershipBar legs={placement.legs} move={placement.move} compact /></div></div> : placement.primary}</td><td className="py-3 font-mono text-muted">{placement.legs?.length ? placement.legs.map((l) => l.bucket).join(', ') : placement.names?.[placement.primary]}</td><td className={`py-3 ${placement.read_only ? 'text-amber-200' : 'text-emerald-300'}`}>{placement.read_only ? 'read-only' : 'enabled'}</td><td className="py-3 text-right">{placement.state === 'ACTIVE' && (placement.legs?.length ?? 0) > 1 && <button type="button" aria-label={`Move keys of ${placement.key}`} onClick={(event) => { event.stopPropagation(); openMove(placement) }} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Move keys</button>}{placement.state === 'ACTIVE' && (placement.legs?.length ?? 0) > 1 && <button type="button" aria-label={`Consolidate ${placement.key}`} onClick={(event) => { event.stopPropagation(); openConsolidate(placement) }} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Consolidate</button>}{idleLegs(placement).length > 0 && <button type="button" aria-label={`Retire idle legs of ${placement.key}`} onClick={(event) => { event.stopPropagation(); const [t, b] = splitKey(placement.key); const idle = idleLegs(placement).map((l) => `${l.cluster}/${l.bucket}`).join(', '); void act(() => clearTarget(token, t, b), `${placement.key}: retired ${idle}, which owned no keys; the buckets are still there`) }} disabled={busy} className="mr-2 rounded-lg border border-ink-600 px-3 py-1.5 text-xs font-semibold text-muted hover:text-paper">Retire idle leg</button>}{placement.state === 'ACTIVE' && placement.target && <button type="button" aria-label={`Clear target of ${placement.key}`} onClick={(event) => { event.stopPropagation(); const [t, b] = splitKey(placement.key); void act(() => clearTarget(token, t, b), `${placement.key}: target ${placement.target} cleared; its bucket is still there`) }} disabled={busy} className="rounded-lg border border-ink-600 px-3 py-1.5 text-xs font-semibold text-muted hover:text-paper">Clear target</button>}{expandable(placement) && <button type="button" aria-label={`Expand ${placement.key}`} onClick={(event) => { event.stopPropagation(); openExpand(placement) }} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold hover:bg-ember-600 hover:text-white">Expand</button>}</td></tr> })}</tbody>
       </table></div>}
     </Card>
 
@@ -163,7 +180,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
         <label className="text-sm font-medium">Cluster{spreading && <span className="text-muted"> (not used: spreading)</span>}<select value={selectedCluster} disabled={spreading} onChange={(event) => setCluster(event.target.value)} className={inputClass}>{clusters.map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
         <label className="text-sm font-medium">Backend bucket name <span className="text-muted">(defaults to client name)</span><input value={backend} onChange={(event) => setBackend(event.target.value)} className={inputClass} placeholder={bucket || 'bucket-name'} /></label>
         {existing && <div role="status" className="rounded-lg border border-ember-500 bg-ink-950 p-4 text-sm">
-          <p><span className="font-mono text-paper">{existing.key}</span> already exists: {existing.legs?.length ? <>{existing.state}, spread over {existing.legs.map((l) => l.cluster).join(' + ')}</> : <>{existing.state} on {existing.primary} as <span className="font-mono">{existing.names[existing.primary]}</span></>}. Clients keep one name per bucket, so adding a cluster to it is Expand, not {mode === 'adopt' ? 'Adopt' : 'Create'}.</p>
+          <p><span className="font-mono text-paper">{existing.key}</span> already exists: {existing.legs?.length ? <>{existing.state}, spread over {existing.legs.map((l) => l.cluster).join(' + ')}</> : <>{existing.state} on {existing.primary} as <span className="font-mono">{existing.names?.[existing.primary]}</span></>}. Clients keep one name per bucket, so adding a cluster to it is Expand, not {mode === 'adopt' ? 'Adopt' : 'Create'}.</p>
           {existing.legs?.length
             ? <p className="mt-2 text-muted">It is spread over {existing.legs.length} backend buckets: Move keys adds one by moving part of a leg to it, and Consolidate brings it back to one.</p>
             : expandable(existing)
@@ -205,7 +222,7 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
 
     <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Bucket detail" onClose={() => { setSelected(null); setDetail(null); resetImport() }}>
       {detail ? <div className="space-y-6">
-        <div className="flex items-center justify-between"><StateBadge state={detail.state} /><span className={detail.read_only ? 'text-amber-200' : 'text-emerald-300'}>{detail.read_only ? 'read-only' : 'writes enabled'}</span></div>
+        <div className="flex items-center justify-between"><StateBadge state={detail.state} /><span className={detail.read_only ? 'text-amber-200' : 'text-emerald-300'}>{detail.read_only ? (detail.barrier?.kind === 'mutations' ? 'read-only requested, draining' : 'read-only') : 'writes enabled'}</span></div>
         {chosen?.client_keys === 0 && <div role="alert" className="rounded-lg border border-amber-500/60 bg-amber-950/40 p-4 text-sm text-amber-100">
           <p>No client key can reach this bucket, so shunt refuses every request for it. Import a key that {detail.primary} knows; its secret is checked against {detail.primary} before it is stored.</p>
           <form onSubmit={(event) => void importKey(event)} className="mt-3 grid gap-3">
@@ -219,8 +236,9 @@ export function Buckets({ onMigrate }: { onMigrate: (key: string) => void }) {
         </div>}
         <FenceStatus held={detail.fence.held} version={detail.fence.version} waitingOn={detail.fence.waiting_on} />
         {detail.legs?.length ? <Card title="Legs"><OwnershipBar legs={detail.legs} move={detail.move} /><dl className="mt-4 grid gap-3 text-sm">{detail.legs.map((l) => <div key={l.id} className="flex justify-between gap-4"><dt>{l.cluster}{l.id !== l.cluster && <span className="text-muted"> (leg {l.id})</span>}</dt><dd className="text-right font-mono text-muted">{l.bucket} · {l.ranges.length ? `${Math.round(l.share * 1000) / 10}% of keys` : l.idle ? 'idle' : 'no keys outside its prefix rules'}{l.ranges.map((r) => <span key={r.from} className="block text-xs">{r.from}–{r.to}</span>)}</dd></div>)}</dl></Card> : null}
-        <Card title="Placement names"><dl className="grid gap-3 text-sm">{Object.entries(detail.names).map(([name, value]) => <div key={name} className="flex justify-between gap-4"><dt>{name}</dt><dd className="font-mono text-muted">{value}</dd></div>)}</dl></Card>
-        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), `${detail.key} is ${detail.read_only ? 'writable' : 'read-only'}`) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button></div>
+        {detail.names && Object.keys(detail.names).length > 0 && <Card title="Placement names"><dl className="grid gap-3 text-sm">{Object.entries(detail.names).map(([name, value]) => <div key={name} className="flex justify-between gap-4"><dt>{name}</dt><dd className="font-mono text-muted">{value}</dd></div>)}</dl></Card>}
+        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy || Boolean(detail.barrier)} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), detail.read_only ? `${detail.key}: writable again once every proxy has it` : `${detail.key}: read-only requested; effective once every proxy has drained its writes`, 'neutral') }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setBucketWatch(token, t, b, !detail.watch), detail.watch ? `${detail.key}: no longer watched` : `${detail.key}: its traffic by backend shows on Telemetry`) }} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold">{detail.watch ? 'Stop watching traffic' : 'Watch traffic by backend'}</button></div>
+        <p className="text-xs text-muted">{detail.per_bucket_telemetry ? `Telemetry → Bucket traffic shows ${detail.key} by backend${!detail.watch ? ' (it is spread or moving, so it is counted without a watch)' : ''}.` : 'Watch this bucket to see its traffic by backend on Telemetry; spread and moving buckets are counted without one.'}</p>
       </div> : <p className="text-muted">Loading bucket detail…</p>}
     </Drawer>
   </div>

@@ -35,6 +35,55 @@ type ClusterView struct {
 		ConditionalDelete Capability `json:"conditional_delete"`
 	} `json:"capabilities"`
 	Probe Probe `json:"probe"`
+	// Secret is where the cluster's secret rotation stands, when the control plane holds its
+	// secret: its generation, and which member proxies sign with it yet. Installed is not drained:
+	// a request a proxy began before it installed the new secret may still be signing with the old
+	// one (ADR-0021 D1; the drain is H2's barrier).
+	Secret *SecretStatus `json:"secret,omitempty"`
+}
+
+// SecretStatus is one cluster's secret generation across the fleet.
+type SecretStatus struct {
+	Generation string   `json:"generation"`
+	Installed  []string `json:"installed"` // live members signing with this generation
+	Pending    []string `json:"pending"`   // live members still on an older one
+	Silent     []string `json:"silent"`    // members past their lease, not reporting
+	Held       []string `json:"held"`      // live members with requests still holding an older signer
+	Drained    bool     `json:"drained"`   // installed everywhere and no old signer can still be used
+}
+
+// secretStatus reads one cluster's secret generation across the fleet; nil when the directory
+// tracks none for it (a lab's env: or file: ref).
+func (s *Server) secretStatus(ctx context.Context, f *directory.File, name string) *SecretStatus {
+	gen := f.Generation(directory.SecretResource(name))
+	if gen == 0 {
+		return nil
+	}
+	st := &SecretStatus{Generation: strconv.FormatInt(gen, 10), Installed: []string{}, Pending: []string{}, Silent: []string{}, Held: []string{}}
+	ms, err := s.members(ctx)
+	if err != nil {
+		return st
+	}
+	for i := range ms {
+		m := &ms[i]
+		if m.Retired() {
+			continue
+		}
+		have, _ := strconv.ParseInt(m.Secrets[name], 10, 64) //nolint:errcheck // absent or malformed counts as behind
+		switch {
+		case !m.Live:
+			st.Silent = append(st.Silent, m.ID)
+		case m.Identity == f.Identity && have >= gen:
+			st.Installed = append(st.Installed, m.ID)
+		default:
+			st.Pending = append(st.Pending, m.ID)
+		}
+		if m.Live && m.SecretsHeld[name] > 0 {
+			st.Held = append(st.Held, m.ID)
+		}
+	}
+	st.Drained = len(st.Pending) == 0 && len(st.Silent) == 0 && len(st.Held) == 0
+	return st
 }
 
 func capability(v *bool, def bool) Capability {
@@ -55,7 +104,7 @@ func clusterStatus(f *directory.File, name string, c config.Cluster) ClusterStat
 		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false),
 		ConditionalWriteKnown: c.Capabilities.ConditionalWrite != nil, ConditionalDeleteKnown: c.Capabilities.ConditionalDelete != nil,
 		CapabilityProfile: profile,
-		References:        directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
+		References:        directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites, Barrier: c.Barrier,
 	}
 }
 
@@ -71,6 +120,7 @@ func (s *Server) clusterView(w http.ResponseWriter, r *http.Request) {
 	view.Capabilities.ConditionalWrite = capability(c.Capabilities.ConditionalWrite, true)
 	view.Capabilities.ConditionalDelete = capability(c.Capabilities.ConditionalDelete, false)
 	view.Probe = s.probe(r.Context(), name)
+	view.Secret = s.secretStatus(r.Context(), f, name)
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -154,18 +204,20 @@ func (s *Server) placementView(w http.ResponseWriter, r *http.Request) {
 
 // fenceStatus reads the fleet once and says who has the current version.
 func (s *Server) fenceStatus(ctx context.Context, p directory.Placement) FenceStatus {
-	fs := FenceStatus{Version: s.Dir.Snapshot().Version(), Held: p.Held(), WaitingOn: []string{}, Silent: []string{}}
+	snap := s.Dir.Snapshot()
+	fs := FenceStatus{Version: snap.Version(), Held: p.Held(), WaitingOn: []string{}, Silent: []string{}}
 	ms, err := s.members(ctx)
 	if err != nil {
 		return fs
 	}
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		switch {
 		case !m.Live:
 			fs.Silent = append(fs.Silent, m.ID)
 		default:
 			fs.Proxies++
-			if m.Applied < fs.Version {
+			if !m.Has(snap.Identity(), fs.Version) {
 				fs.WaitingOn = append(fs.WaitingOn, m.ID)
 			}
 		}

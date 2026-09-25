@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkBeat/placements=1000-16         	     169	   7458387 ns/op	     14735 bytes/heartbeat	 2956495 B/op	   12945 allocs/op
+BenchmarkBeat/placements=1000-16         	     172	   7006891 ns/op	     14735 bytes/heartbeat	 2958340 B/op	   12945 allocs/op
+BenchmarkBeat/placements=1000-16         	     142	   8095235 ns/op	     14735 bytes/heartbeat	 2959153 B/op	   12946 allocs/op
+BenchmarkBeat/placements=1000-16         	     154	   7584633 ns/op	     14735 bytes/heartbeat	 2958407 B/op	   12944 allocs/op
+BenchmarkBeat/placements=1000-16         	     166	   7177987 ns/op	     14735 bytes/heartbeat	 2955057 B/op	   12944 allocs/op
+BenchmarkBeat/placements=1000-16         	     147	   7852167 ns/op	     14735 bytes/heartbeat	 2954162 B/op	   12943 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 541049417 ns/op	     14733 bytes/heartbeat	263831356 B/op	 1201953 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 592683853 ns/op	     14733 bytes/heartbeat	263834432 B/op	 1201961 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 542416792 ns/op	     14733 bytes/heartbeat	263831832 B/op	 1201957 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 540937022 ns/op	     14733 bytes/heartbeat	263830832 B/op	 1201955 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 588172343 ns/op	     14733 bytes/heartbeat	263828732 B/op	 1201949 allocs/op
+BenchmarkBeat/placements=100000-16       	       2	 584110485 ns/op	     14733 bytes/heartbeat	263825100 B/op	 1201943 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	21.286s

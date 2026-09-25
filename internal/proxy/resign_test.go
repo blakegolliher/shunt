@@ -20,8 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/runtimecfg"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/sigv4/chunked"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -130,14 +132,44 @@ func resignParts(t testing.TB, endpoint string, caps Capabilities, tenant string
 	return set, dir
 }
 
+// follow publishes a runtime bundle of dir, keys and set, and publishes a new one on every
+// directory install, as serve does for the lab proxy.
+func follow(t testing.TB, dir *directory.FileDir, keys sigv4.CredentialStore, set *upstream.Registry) *runtimecfg.Publisher {
+	t.Helper()
+	rt, _ := followWithGates(t, dir, keys, set)
+	return rt
+}
+
+// followWithGates is follow with the admission gates wired as serve wires them (ADR-0021 D2): the
+// keeper closes them on install and on publish.
+func followWithGates(t testing.TB, dir *directory.FileDir, keys sigv4.CredentialStore, set *upstream.Registry) (*runtimecfg.Publisher, *admission.Gates) {
+	t.Helper()
+	rt := runtimecfg.NewPublisher(&runtimecfg.Bundle{Snapshot: dir.Snapshot(), Keys: keys, Clusters: set.Load()})
+	keeper := &GateKeeper{Gates: admission.New()}
+	rt.Published = func(b *runtimecfg.Bundle) { keeper.Served(b.Snapshot) }
+	keeper.Served(dir.Snapshot())
+	keeper.Installed(dir.Snapshot())
+	prev := dir.OnInstall
+	dir.OnInstall = func(s *directory.Snapshot) {
+		if prev != nil {
+			prev(s)
+		}
+		if err := rt.Refresh(s, keys, set.Load()); err != nil {
+			t.Error(err)
+		}
+		keeper.Installed(s)
+	}
+	return rt, keeper.Gates
+}
+
 func newResignRig(t *testing.T, be http.Handler, caps Capabilities) *rrig {
 	t.Helper()
 	r := newRig(t, be, time.Second)
 	errLog := &syncBuf{}
 	set, dir := resignParts(t, strings.TrimPrefix(r.backend.URL, "http://"), caps, "acme")
 	r.h.Mode = ModeResign
-	r.h.Store = mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "acme"}}
-	r.h.Clusters, r.h.Dir, r.h.Rewrite = set, dir, true
+	r.h.Runtime = follow(t, dir, mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "acme"}}, set)
+	r.h.Dir, r.h.Rewrite = dir, true
 	r.h.Log = slog.New(slog.NewJSONHandler(errLog, nil))
 	return &rrig{rig: r, errLog: errLog}
 }
@@ -436,7 +468,7 @@ func TestResignErrorsCountedAndSecretsNeverLeak(t *testing.T) {
 					http.Error(w, fmt.Sprint("recovered: ", p), 500)
 				}
 			}()
-			cred, _ := r.h.Store.Lookup(req.Context(), clientAK)
+			cred, _ := r.h.Runtime.Load().Keys.Lookup(req.Context(), clientAK)
 			panic(fmt.Sprintf("boom %v %+v %#v", cred, cred, cred))
 		}
 		inner.ServeHTTP(w, req)
@@ -520,9 +552,9 @@ func BenchmarkResignSmallGET(b *testing.B) {
 	}))
 	defer be.Close()
 	set, dir := resignParts(b, strings.TrimPrefix(be.URL, "http://"), Capabilities{true, true}, "t")
-	h := New(Handler{Clusters: set, Dir: dir, Rewrite: true, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
-		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign,
-		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}}, 256<<10)
+	h := New(Handler{Runtime: follow(b, dir, mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}, set), Dir: dir, Rewrite: true,
+		Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
+		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign}, 256<<10)
 	req := httptest.NewRequest(http.MethodGet, "/bbb/k", nil)
 	req.RequestURI = "/bbb/k"
 	clientSign(req, sigv4.UnsignedPayload)
@@ -543,9 +575,9 @@ func BenchmarkResignSignedChunkPUT1MiB(b *testing.B) {
 	}))
 	defer be.Close()
 	set, dir := resignParts(b, strings.TrimPrefix(be.URL, "http://"), Capabilities{true, true}, "t")
-	h := New(Handler{Clusters: set, Dir: dir, Rewrite: true, Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
-		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign,
-		Store: mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}}, 256<<10)
+	h := New(Handler{Runtime: follow(b, dir, mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}, set), Dir: dir, Rewrite: true,
+		Metrics: telemetry.NewMetrics(), Access: telemetry.NewAccessLogger(nil), Slow: telemetry.NewSlowRing(100, time.Second),
+		IdleTimeout: time.Second, MetadataTimeout: time.Second, Mode: ModeResign}, 256<<10)
 	payload := make([]byte, 1<<20)
 	tt := &testing.T{}
 	req, wire := signedChunkRequest(tt, "http://h/bbb/k", payload, "")

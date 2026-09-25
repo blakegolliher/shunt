@@ -6,6 +6,13 @@ Proposed follow-up: [ADR-0021](0021-distributed-correctness.md) specifies recove
 epochs, resumable learner joins and observed health. It is not implemented and
 does not change this ADR's substrate choice.
 
+**Amended by ADR-0021 (H2, 2026-09-25).** The substrate is unchanged. What changed in the
+amendments below: the member record also carries the member's incarnations, and those that ended
+without a clean retirement stay on it as evidence (at most eight). `shunt proxy forget` removes the
+record only once none is unresolved (`retirement_unproven` otherwise), so forget is no longer the
+way out for a silent member, and lease expiry is liveness only, never proof that a member's backend
+work has ended. See [ADR-0021](0021-distributed-correctness.md) and [docs/fleet.md](../fleet.md).
+
 Numbering note: this ADR was drafted as 0011 in an out-of-tree doc set. 0011 through 0014 were taken
 in the meantime (stepping out, importing client keys, conditional writes across a migration,
 cross-cluster copy), so it lands as 0015. Supersedes `docs/DESIGN.md` §1.5 (Postgres) where the two

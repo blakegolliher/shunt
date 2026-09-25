@@ -5,7 +5,23 @@ Status: accepted (UI-6, 2026-09-22). UI-0 through UI-6 are built and their Go, U
 Proposed follow-up: [ADR-0021](0021-distributed-correctness.md) and its
 [interface contract](../design/distributed-correctness-contracts.md) tighten
 operation outcomes, maintenance evidence, health and draft/event consistency.
-They are not implemented; they retain the manual visual acceptance policy.
+They were not implemented when this note was written (2026-09-24); they retain the manual visual
+acceptance policy.
+
+**Amended by ADR-0021 (H2, 2026-09-25).** The decision below is kept as the record. These parts of
+*Operation records* no longer hold ([ADR-0021](0021-distributed-correctness.md),
+[docs/reference/control-api.md](../reference/control-api.md#operations)):
+
+- "The server-side `wait` keeps the fence semantics of ADR-0016 exactly: a hold that does not reach
+  every member within it is released" is withdrawn. A wait bounds only how long the caller watches.
+  When it runs out the route answers 202 with the record `blocked`, the hold stays, and the CLI
+  exits 3 with the operation id and its blockers.
+- Statuses are `pending`, `running`, `blocked`, `succeeded`, `failed` and `cancelled`; a refusal is
+  `failed` with code `refused`. Records carry blockers and the actions they allow (`resume`,
+  `cancel`, `resolve-worker`).
+- A node no longer marks its lost barrier records failed, and a held step is no longer completed by
+  repeating it. A record whose owner stopped is `blocked` on `owner_lost` and is resumed, from the
+  phase it reached, on any live node (`shunt operation resume`), or cancelled before its commit.
 
 ## Context
 

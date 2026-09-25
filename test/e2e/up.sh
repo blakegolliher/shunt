@@ -13,6 +13,9 @@ MINIO2_HEALTH="http://127.0.0.1:9100/minio/health/live"
 
 cd "$DIR"
 mkdir -p data/garage/meta data/garage/data data/minio data/minio2
+# MinIO is built from source (minio.Dockerfile): build it explicitly, so up never tries to pull the
+# local tag from a registry. Its layers are cached after the first build.
+$COMPOSE build minio
 $COMPOSE up -d
 
 wait_for() { # name url [curl args...]  — waits for HTTP 200

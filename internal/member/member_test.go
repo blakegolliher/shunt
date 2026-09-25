@@ -4,21 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/telemetry"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
 // fakeControl speaks the member's side of the control API: directory long-poll, heartbeat,
@@ -27,15 +33,20 @@ type fakeControl struct {
 	mu      sync.Mutex
 	dir     control.Directory
 	beats   []control.Heartbeat
+	retired []control.RetireRequest
 	down    atomic.Bool
 	srv     *httptest.Server
 	answers int64 // version the heartbeat answers with; 0 = the directory's
+	// answer, if set, edits each heartbeat answer before it is sent; set it with setAnswer.
+	answer func(*control.HeartbeatAnswer)
+	// retireFails, while set, answers a retirement with 503, as a control plane without quorum.
+	retireFails atomic.Bool
 }
 
 func newFakeControl(t *testing.T) *fakeControl {
 	t.Helper()
 	f := &fakeControl{}
-	f.dir = control.Directory{File: directory.File{Version: 1,
+	f.dir = control.Directory{File: directory.File{Version: 1, Identity: testIdentity,
 		Clusters:   map[string]config.Cluster{"vast01": {Type: "s3", Scheme: "http", Region: "r", Endpoints: []string{"127.0.0.1:1"}, Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}},
 		Tenants:    map[string]directory.Tenant{"acme": {DefaultCluster: "vast01"}},
 		Placements: map[string]directory.Placement{"acme/data": {State: directory.StateActive, Primary: "vast01", Names: map[string]string{"vast01": "data"}}}},
@@ -49,6 +60,14 @@ func newFakeControl(t *testing.T) *fakeControl {
 		}
 		var since int64
 		_, _ = fmtSscan(r.URL.Query().Get("since"), &since)
+		f.mu.Lock()
+		cur := f.dir.Identity
+		f.mu.Unlock()
+		if e := r.URL.Query().Get("epoch"); e != "" && e != cur.Epoch {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
+			return
+		}
 		deadline := time.Now().Add(200 * time.Millisecond)
 		for {
 			f.mu.Lock()
@@ -79,8 +98,39 @@ func newFakeControl(t *testing.T) *fakeControl {
 		if f.answers != 0 {
 			v = f.answers
 		}
+		edit := f.answer
 		f.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(control.HeartbeatAnswer{Version: v, LeaseTTL: time.Second})
+		if hb.Protocol != control.Protocol {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeProtocol, Message: "protocol"})
+			return
+		}
+		f.mu.Lock()
+		cur := f.dir.Identity
+		f.mu.Unlock()
+		if !hb.Identity.IsZero() && hb.Identity != cur {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
+			return
+		}
+		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second, PreviousRecorded: hb.Previous != nil}
+		if edit != nil {
+			edit(&a)
+		}
+		_ = json.NewEncoder(w).Encode(a)
+	})
+	mux.HandleFunc("POST /v1/fleet/{id}/retire", func(w http.ResponseWriter, r *http.Request) {
+		if f.retireFails.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(control.Error{Code: "unavailable", Message: "no quorum"})
+			return
+		}
+		var req control.RetireRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.mu.Lock()
+		f.retired = append(f.retired, req)
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(control.MemberResult{})
 	})
 	mux.HandleFunc("POST /v1/placements/{tenant}/{bucket}/create", func(w http.ResponseWriter, r *http.Request) {
 		var req control.CreateRequest
@@ -117,6 +167,9 @@ func newFakeControl(t *testing.T) *fakeControl {
 	return f
 }
 
+// testIdentity is the fake control plane's lineage.
+var testIdentity = directory.Identity{ClusterID: "c0ffee00c0ffee00c0ffee00c0ffee00", Epoch: "e0000000000000000000000000000001"}
+
 func cloneP(m map[string]directory.Placement) map[string]directory.Placement {
 	out := make(map[string]directory.Placement, len(m))
 	for k, v := range m {
@@ -132,6 +185,29 @@ func fmtSscan(s string, v *int64) (int, error) {
 	n, err := json.Number(s).Int64()
 	*v = n
 	return 1, err
+}
+
+func (f *fakeControl) setAnswer(edit func(*control.HeartbeatAnswer)) {
+	f.mu.Lock()
+	f.answer = edit
+	f.mu.Unlock()
+}
+
+// version returns a deep copy of the fake's directory at version v.
+func (f *fakeControl) version(t *testing.T, v int64) *control.Directory {
+	t.Helper()
+	f.mu.Lock()
+	data, err := json.Marshal(f.dir)
+	f.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d control.Directory
+	if err := json.Unmarshal(data, &d); err != nil {
+		t.Fatal(err)
+	}
+	d.Version = v
+	return &d
 }
 
 func (f *fakeControl) bump() {
@@ -156,12 +232,12 @@ func TestMemberInstallsDirectoryAndKeys(t *testing.T) {
 	c.Telemetry = telemetry.NewCollector()
 	c.Telemetry.Observe(telemetry.Observation{At: time.Now().Add(-11 * time.Second), Operation: "GetObject", Cluster: "vast01", Status: 200, ClientTotal: time.Millisecond})
 	prepared := 0
-	c.Prepare = func(fl *directory.File) error {
-		if _, err := c.Resolve("control:vast01"); err != nil {
-			return err
+	c.Prepare = func(fl *directory.File, resolve func(string) (string, error)) (func(), error) {
+		if _, err := resolve("control:vast01"); err != nil {
+			return nil, err
 		}
 		prepared++
-		return nil
+		return func() {}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -286,11 +362,11 @@ func TestMemberStaleModeAndCache(t *testing.T) {
 func TestMemberRefusesAVersionItCannotPrepare(t *testing.T) {
 	f := newFakeControl(t)
 	c := newClient(t, f)
-	c.Prepare = func(fl *directory.File) error {
+	c.Prepare = func(fl *directory.File, _ func(string) (string, error)) (func(), error) {
 		if _, ok := fl.Clusters["bad"]; ok {
-			return errors.New("cannot build bad")
+			return nil, errors.New("cannot build bad")
 		}
-		return nil
+		return func() {}, nil
 	}
 	ctx := context.Background()
 	if err := c.Register(ctx); err != nil {
@@ -349,4 +425,355 @@ func TestMemberReadsPlacementSchemaV2(t *testing.T) {
 	if p, ok := c2.Snapshot().Lookup("acme", "data"); !ok || !reflect.DeepEqual(*p, want) {
 		t.Fatalf("from the cache: %+v, want %+v", p, want)
 	}
+}
+
+// T01: installs are serialized. A version whose preparation is slow is not installed over a newer
+// one that a concurrent fetch (a heartbeat's, a forwarded write's) brought in meanwhile; the
+// installed version and the cache only move forward, and a late older version is dropped.
+func TestMemberNeverInstallsAnOlderVersionOverANewerOne(t *testing.T) {
+	f := newFakeControl(t)
+	c := newClient(t, f)
+	preparing2 := make(chan struct{})
+	installed3 := make(chan struct{})
+	var mu sync.Mutex
+	var order []int64
+	c.OnInstall = func(s *directory.Snapshot) {
+		mu.Lock()
+		order = append(order, s.Version())
+		mu.Unlock()
+		if s.Version() == 3 {
+			close(installed3)
+		}
+	}
+	c.Prepare = func(fl *directory.File, _ func(string) (string, error)) (func(), error) {
+		if fl.Version == 2 {
+			close(preparing2)
+			// Unserialized, version 3 installs while 2 is held here, and 2 then lands on top of it.
+			// Serialized, 3 waits for 2, and the timer lets 2 go.
+			select {
+			case <-installed3:
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		return func() {}, nil
+	}
+	if _, err := c.install(f.version(t, 1), true); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := c.install(f.version(t, 2), true); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-preparing2
+	go func() {
+		defer wg.Done()
+		if _, err := c.install(f.version(t, 3), true); err != nil {
+			t.Error(err)
+		}
+	}()
+	wg.Wait()
+	if v := c.Snapshot().Version(); v != 3 {
+		t.Fatalf("installed version %d after installing 2 and 3 concurrently, want 3", v)
+	}
+	mu.Lock()
+	for i := 1; i < len(order); i++ {
+		if order[i] < order[i-1] {
+			t.Errorf("installed versions went back: %v", order)
+		}
+	}
+	mu.Unlock()
+	if installed, err := c.install(f.version(t, 2), true); installed || err != nil {
+		t.Errorf("a late older version: installed %v, err %v", installed, err)
+	}
+	if v := c.Snapshot().Version(); v != 3 {
+		t.Fatalf("a late older version was installed over 3: at %d", v)
+	}
+	if cached := readCache(t, c); cached.Version != 3 {
+		t.Fatalf("cache at version %d, want 3", cached.Version)
+	}
+}
+
+// T02: a candidate refused after its new secrets resolved leaves the live resolver, the cluster
+// registry, the client keys and the cache as they were. The refused secret never reaches any of
+// them, not even while the candidate is being prepared.
+func TestMemberRefusedCandidateLeavesTheLiveSecrets(t *testing.T) {
+	f := newFakeControl(t)
+	c := newClient(t, f)
+	reg := upstream.NewRegistry(upstream.Options{}, c.Resolve)
+	t.Cleanup(reg.Close)
+	c.Prepare = func(fl *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(fl.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		if fl.Version == 2 {
+			if s, _ := c.Resolve("control:vast01"); s != "s1" {
+				t.Errorf("the live resolver answered the candidate's secret %q while it was prepared", s)
+			}
+			return nil, errors.New("refused after its secrets resolved")
+		}
+		return func() { cand.Commit() }, nil
+	}
+	ctx := context.Background()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.dir.Secrets = map[string]string{"control:vast01": "s2"}
+	f.dir.Credentials = []control.Credential{{AccessKey: "CLIENT", Secret: "cs2", Tenant: "acme"}}
+	f.dir.Version++
+	f.mu.Unlock()
+	if _, err := c.fetch(ctx, 1, 0); err == nil {
+		t.Fatal("the refused version was installed")
+	}
+	if s, err := c.Resolve("control:vast01"); err != nil || s != "s1" {
+		t.Errorf("live resolver after a refused version: %q %v, want s1", s, err)
+	}
+	if cl, ok := reg.Load().Get("vast01"); !ok || cl.Creds.Secret != "s1" {
+		t.Errorf("the live registry signs with %q after a refused version, want s1", cl.Creds.Secret)
+	}
+	if cred, err := c.Keys().Lookup(ctx, "CLIENT"); err != nil || cred.Secret != "cs" {
+		t.Errorf("client key after a refused version: %+v %v", cred, err)
+	}
+	data, err := os.ReadFile(filepath.Join(c.cfg.CacheDir, "directory.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "s2") || strings.Contains(string(data), "cs2") {
+		t.Error("the refused version's secrets reached the cache")
+	}
+}
+
+// The heartbeat reports the secret generation of each cluster's signer, from the installed version.
+func TestHeartbeatReportsSecretGenerations(t *testing.T) {
+	f := newFakeControl(t)
+	f.mu.Lock()
+	f.dir.Generations = map[string]int64{directory.SecretResource("vast01"): 1}
+	f.mu.Unlock()
+	c := newClient(t, f)
+	if err := c.Register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	last := f.beats[len(f.beats)-1]
+	if last.Secrets["vast01"] != "1" || len(last.Secrets) != 1 {
+		t.Fatalf("heartbeat secrets %v, want vast01 at 1", last.Secrets)
+	}
+}
+
+// While installs are backpressured the proxy serves an older bundle than it installed: heartbeats
+// report the served version and its secret generations, so a fence waits for it (ADR-0021 D1).
+func TestHeartbeatReportsTheServedVersion(t *testing.T) {
+	f := newFakeControl(t)
+	f.mu.Lock()
+	f.dir.Generations = map[string]int64{directory.SecretResource("vast01"): 1}
+	f.mu.Unlock()
+	c := newClient(t, f)
+	if err := c.Register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	served := directory.NewSnapshot(&directory.File{Identity: c.Snapshot().File().Identity})
+	c.Serving = func() *directory.Snapshot { return served }
+	if err := c.beat(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if first := f.beats[0]; first.Applied != 1 {
+		t.Fatalf("without Serving the heartbeat reports the installed version: %d", first.Applied)
+	}
+	if last := f.beats[len(f.beats)-1]; last.Applied != 0 || len(last.Secrets) != 0 || last.Installed != 1 {
+		t.Fatalf("heartbeat applied %d installed %d secrets %v, want the served version 0, installed 1 and none", last.Applied, last.Installed, last.Secrets)
+	}
+}
+
+// fakeClock is a settable clock for the lease tests.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (k *fakeClock) Now() time.Time {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.now
+}
+
+func (k *fakeClock) Add(d time.Duration) {
+	k.mu.Lock()
+	k.now = k.now.Add(d)
+	k.mu.Unlock()
+}
+
+// T07: the lease runs from the heartbeat's send time, for the shorter of the control plane's
+// grant and the proxy's own lease_ttl, and only an answer to the heartbeat sent, on time, with a
+// grant, renews it.
+func TestMemberLeaseFollowsTheServerGrant(t *testing.T) {
+	f := newFakeControl(t) // grants 1 s
+	c := New(Config{Endpoints: []string{f.srv.URL}, ProxyID: "p1", CacheDir: t.TempDir(), Interval: time.Second, LeaseTTL: time.Minute, LongPoll: 200 * time.Millisecond},
+		slog.New(slog.DiscardHandler))
+	clock := &fakeClock{now: time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)}
+	c.Now = clock.Now
+	ctx := context.Background()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.Stale() {
+		t.Fatal("stale right after a granted heartbeat")
+	}
+	clock.Add(time.Second)
+	if c.Stale() {
+		t.Fatal("stale at the end of a 1 s grant")
+	}
+	clock.Add(time.Millisecond)
+	if !c.Stale() {
+		t.Fatal("fresh past the server's 1 s grant: the lease followed the proxy's own 60 s lease_ttl")
+	}
+
+	c.Metrics = telemetry.NewMetrics()
+	refused := []struct {
+		name   string
+		reason string
+		edit   func(*control.HeartbeatAnswer)
+	}{
+		{"an answer delayed past the lease it grants", GrantLate, func(*control.HeartbeatAnswer) { clock.Add(2 * time.Second) }},
+		{"a zero grant", GrantNoGrant, func(a *control.HeartbeatAnswer) { a.LeaseTTL = 0 }},
+		{"an answer to another heartbeat", GrantSequence, func(a *control.HeartbeatAnswer) { a.Seq-- }},
+		{"a version behind the proxy's", GrantBehind, func(a *control.HeartbeatAnswer) { a.Version = 0 }},
+		{"an answer for another lineage", GrantLineage, func(a *control.HeartbeatAnswer) { a.Identity.Epoch = "e0000000000000000000000000000002" }},
+	}
+	for _, r := range refused {
+		f.setAnswer(r.edit)
+		if err := c.beat(ctx); err == nil {
+			t.Errorf("%s: no error", r.name)
+		}
+		if !c.Stale() {
+			t.Errorf("%s renewed the lease", r.name)
+		}
+		if got := counterValue(t, c.Metrics.LeaseGrantErrors.WithLabelValues(r.reason)); got != 1 {
+			t.Errorf("%s: lease grant errors{reason=%s} = %v, want 1", r.name, r.reason, got)
+		}
+		if st := status(t, c); st.GrantError != r.reason {
+			t.Errorf("%s: /-/fleet grant_error %q, want %s", r.name, st.GrantError, r.reason)
+		}
+	}
+	f.down.Store(true)
+	if err := c.beat(ctx); err == nil {
+		t.Error("a heartbeat to a control plane that is down: no error")
+	}
+	if got := counterValue(t, c.Metrics.LeaseGrantErrors.WithLabelValues(GrantUnreachable)); got != 1 {
+		t.Errorf("lease grant errors{reason=unreachable} = %v, want 1", got)
+	}
+	f.down.Store(false)
+
+	f.setAnswer(nil)
+	if err := c.beat(ctx); err != nil || c.Stale() {
+		t.Fatalf("a good answer after the refused ones: %v, stale %v", err, c.Stale())
+	}
+	if st := status(t, c); st.GrantError != "" || st.LeaseGranted != "1s" || st.LeaseSeq != c.seq.Load() {
+		t.Fatalf("/-/fleet after a granted heartbeat: %+v", st)
+	}
+	// An older answer never replaces a newer grant, even with a later deadline.
+	if err := c.renew(ctx, c.seq.Load()-1, clock.Now().Add(time.Hour), c.Snapshot().Version(), control.HeartbeatAnswer{Seq: c.seq.Load() - 1, Identity: testIdentity, Version: c.Snapshot().Version(), LeaseTTL: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Add(time.Second + time.Millisecond)
+	if !c.Stale() {
+		t.Fatal("an older heartbeat's answer extended the lease")
+	}
+}
+
+// A control plane that moves to another epoch (a restore) leaves this member on the old lineage:
+// its versions compare with nothing there. The member refuses the new lineage's directory, takes
+// no lease, and stays stale until it is re-enrolled; it never installs across lineages.
+func TestMemberStaysStaleAcrossAnEpochChange(t *testing.T) {
+	f := newFakeControl(t)
+	c := newClient(t, f)
+	ctx := context.Background()
+	if err := c.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.Stale() {
+		t.Fatal("stale after registering")
+	}
+	f.mu.Lock()
+	f.dir.Identity.Epoch = "e0000000000000000000000000000002"
+	f.dir.Version = 1 // a restore: a lower or equal version in the new epoch
+	f.mu.Unlock()
+	if err := c.beat(ctx); err == nil {
+		t.Fatal("a heartbeat from the old epoch was answered with a lease")
+	}
+	if !c.Stale() {
+		t.Fatal("fresh after the control plane moved to another epoch")
+	}
+	if _, err := c.fetch(ctx, c.Snapshot().Version(), 0); err == nil {
+		t.Fatal("the new epoch's directory was fetched as if it continued the old one")
+	}
+	if _, err := c.install(f.version(t, 5), true); err == nil {
+		t.Fatal("a directory from another epoch was installed")
+	}
+	if id := c.Snapshot().File().Identity; id != testIdentity {
+		t.Fatalf("installed lineage changed to %+v", id)
+	}
+	f.setAnswer(nil)
+	_ = c.beat(ctx)
+	if !c.Stale() {
+		t.Fatal("a lineage fault cleared by itself")
+	}
+}
+
+// Stale is on the request path for every moving bucket: a pointer load, read by many requests at
+// once while heartbeats renew the lease.
+func BenchmarkStaleParallel(b *testing.B) {
+	c := New(Config{LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
+	c.lease.Store(&grant{seq: 1, until: time.Now().Add(time.Hour)})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if c.Stale() {
+				b.Error("stale")
+			}
+		}
+	})
+}
+
+// BenchmarkInstall is one directory version of 1,000 placements through validation, preparation,
+// publication and the cache write.
+func BenchmarkInstall(b *testing.B) { benchInstall(b, 1000) }
+
+// BenchmarkInstall100k is design §8's snapshot reload: one version of 100,000 placements, one
+// installation build and one cache write per version.
+func BenchmarkInstall100k(b *testing.B) { benchInstall(b, 100_000) }
+
+func benchInstall(b *testing.B, placements int) {
+	c := New(Config{ProxyID: "p1", CacheDir: b.TempDir(), LeaseTTL: time.Minute}, slog.New(slog.DiscardHandler))
+	base := control.Directory{File: directory.File{Identity: testIdentity,
+		Clusters: map[string]config.Cluster{"vast01": {Type: "s3", Scheme: "http", Region: "r", EndpointMode: "static", Endpoints: []string{"127.0.0.1:1"},
+			Credentials: config.Credentials{AccessKey: "AK", SecretRef: "control:vast01"}}},
+		Tenants: map[string]directory.Tenant{"acme": {DefaultCluster: "vast01"}}, Placements: map[string]directory.Placement{}},
+		Secrets: map[string]string{"control:vast01": "s1"}}
+	for i := range placements {
+		name := fmt.Sprintf("bucket-%06d", i)
+		base.Placements["acme/"+name] = directory.Placement{State: directory.StateActive, Primary: "vast01", Names: map[string]string{"vast01": name}}
+	}
+	for i := 0; b.Loop(); i++ {
+		d := base
+		d.Version = int64(i + 1)
+		if _, err := c.install(&d, true); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }

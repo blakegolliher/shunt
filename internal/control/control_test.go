@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,9 +187,12 @@ func newRig(t *testing.T) *rig {
 		return "secret", nil
 	})
 	t.Cleanup(reg.Close)
-	dir.Prepare = func(f *directory.File) error {
-		_, _, err := reg.Apply(f.Clusters)
-		return err
+	dir.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
 	}
 	rg := &rig{t: t, dir: dir, vast01: newFakeCluster(t), vast02: newFakeCluster(t), events: NewEvents(16), log: &syncLog{}}
 	// The event stream is wired as the lab proxy wires it: the directory's install hook, seeded
@@ -201,14 +205,27 @@ func newRig(t *testing.T) *rig {
 			rg.slept = append(rg.slept, d)
 			return nil
 		},
-		Events: rg.events, Ops: &MemOperations{OnChange: rg.events.Fence}}
+		Events: rg.events, Ops: &MemOperations{Dir: dir, OnChange: rg.events.Fence}}
 	rg.api = httptest.NewServer(rg.ctl.Handler())
 	t.Cleanup(rg.api.Close)
 	return rg
 }
 
 // call sends one API request and decodes the answer into out (if not nil); it returns the status.
+// call sends one request; a change carries a new Idempotency-Key, as a client's new request does.
 func (rg *rig) call(method, path string, body any, out any) (int, string) {
+	rg.t.Helper()
+	var h http.Header
+	if method != http.MethodGet {
+		h = http.Header{HeaderIdempotencyKey: {fmt.Sprintf("test-%d", rigKeys.Add(1))}}
+	}
+	return rg.callWith(method, path, h, body, out)
+}
+
+var rigKeys atomic.Int64
+
+// callWith sends one request with exactly the headers given.
+func (rg *rig) callWith(method, path string, h http.Header, body any, out any) (int, string) {
 	rg.t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -219,6 +236,9 @@ func (rg *rig) call(method, path string, body any, out any) (int, string) {
 	req, err := http.NewRequest(method, rg.api.URL+path, &buf)
 	if err != nil {
 		rg.t.Fatal(err)
+	}
+	for k, v := range h {
+		req.Header[k] = v
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -327,14 +347,21 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 	if !pr.Converged {
 		t.Fatalf("a completed pass copying nothing is converged: %+v", pr)
 	}
-	rg.ctl.Sleep = func(context.Context, time.Duration) error {
-		rg.ctl.Metrics.FallbackReads.WithLabelValues("acme/data01").Inc()
+	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error {
+		if d == 5*time.Second {
+			rg.ctl.Metrics.FallbackReads.WithLabelValues("acme/data01").Inc()
+		}
 		return nil
 	}
-	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, "still fall back")
+	// The window runs before the hold, so a read that falls back during it refuses the cutover
+	// with nothing held: the bucket's writes never paused.
+	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, "fell back to the source during the 5s window")
+	if p, _ := rg.dir.Snapshot().Lookup("acme", "data01"); p.Barrier != nil || p.State != directory.StateMigrating {
+		t.Fatalf("a refused cutover left the placement held: %+v", p)
+	}
 	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error { rg.slept = append(rg.slept, d); return nil }
-	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, &tr)
-	if tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.Window != 5*time.Second || tr.Cutover.FallbackReads != 1 {
+	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, &tr)
+	if tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.Window != 5*time.Second || tr.Cutover.FallbackReads < 1 {
 		t.Fatalf("cutover: %+v", tr)
 	}
 
@@ -1545,4 +1572,51 @@ func (k *stubKeys) Add(c sigv4.Credential) error {
 func (k *stubKeys) Remove(ak string) error {
 	k.stored = slices.DeleteFunc(k.stored, func(c sigv4.Credential) bool { return c.AccessKey == ak })
 	return nil
+}
+
+// A credential rotation replaces the cluster's secret, and its access key when given, and nothing
+// else. The new pair is checked first: a wrong one is refused and leaves the old secret in place.
+// It runs under a cluster-credentials operation record.
+func TestRotateCredentials(t *testing.T) {
+	rg := newRig(t)
+	def := rg.vast01.definition(true)
+	def.Credentials.SecretRef = ""
+	var added ClusterStatus
+	rg.must("POST", "/v1/clusters", ClusterRequest{Name: "vast01", Cluster: def, Secret: "first-secret"}, &added)
+	rg.answers("POST", "/v1/clusters/nope/credentials", CredentialsRequest{Secret: "x"}, http.StatusNotFound, "not_found")
+	rg.answers("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{}, http.StatusBadRequest, "bad_request")
+	rg.answers("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{Secret: "x", SecretRef: "env:X"}, http.StatusBadRequest, "bad_request")
+
+	rg.vast01.reject = "SignatureDoesNotMatch"
+	rg.refused("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{Secret: "wrong"}, "not the secret of access key AK")
+	rg.vast01.reject = ""
+	if c, _ := rg.dir.Snapshot().Cluster("vast01"); c.Credentials.SecretRef != added.SecretRef {
+		t.Fatalf("a refused rotation changed the secret_ref: %s", c.Credentials.SecretRef)
+	}
+
+	before := rg.dir.Snapshot().Version()
+	var out CredentialsResult
+	rg.must("POST", "/v1/clusters/vast01/credentials", CredentialsRequest{AccessKey: "AK", Secret: "second-secret"}, &out)
+	if out.Version <= before || out.Cluster.SecretRef == added.SecretRef || out.Cluster.AccessKey != "AK" {
+		t.Fatalf("rotation: %+v", out)
+	}
+	ref := strings.TrimPrefix(out.Cluster.SecretRef, "file:")
+	if b, err := os.ReadFile(ref); err != nil || string(b) != "second-secret" {
+		t.Fatalf("rotated secret file: %q %v", b, err)
+	}
+	if files := secretFiles(t, rg.ctl.SecretsDir); len(files) != 1 {
+		t.Fatalf("the old secret file stayed: %v", files)
+	}
+	c, _ := rg.dir.Snapshot().Cluster("vast01")
+	if c.Type != added.Type || c.Region != added.Region || strings.Join(c.Endpoints, ",") != strings.Join(added.Endpoints, ",") {
+		t.Fatalf("the rotation changed the definition: %+v", c)
+	}
+	if strings.Contains(rg.log.String(), "second-secret") {
+		t.Fatal("the secret reached the log")
+	}
+	var ops OperationList
+	rg.must("GET", "/v1/operations?cluster=vast01", nil, &ops)
+	if len(ops.Operations) == 0 || ops.Operations[0].Kind != OpClusterRotate || ops.Operations[0].Status != StatusSucceeded {
+		t.Fatalf("operation record: %+v", ops.Operations)
+	}
 }

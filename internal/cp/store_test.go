@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
 	"github.com/blakegolliher/shunt/internal/sigv4"
+	"github.com/blakegolliher/shunt/internal/upstream"
 )
 
 func openStore(t *testing.T, tc *testCluster, i int, key []byte) *Store {
@@ -208,15 +211,23 @@ func TestStoreSurvivesRestartAndReload(t *testing.T) {
 	if _, ok := b.Snapshot().Lookup("acme", "data"); !ok {
 		t.Fatal("node b lost the placement across a restart")
 	}
-	// Prepare sees every version, with the candidate's secrets resolvable.
+	// Prepare sees every version, with the candidate's secrets resolvable by the candidate's
+	// resolver only: a secret a write is adding does not resolve on the live store before it lands.
 	c := openStore(t, tc, 2, key)
 	seen := 0
-	c.Prepare = func(f *directory.File) error {
-		if _, err := c.Resolve("control:vast01"); err != nil {
-			return err
+	c.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		for name, cl := range f.Clusters {
+			if _, err := resolve(cl.Credentials.SecretRef); err != nil {
+				return nil, err
+			}
+			if _, live := c.Snapshot().Cluster(name); !live {
+				if _, err := c.Resolve(cl.Credentials.SecretRef); err == nil {
+					return nil, errors.New("a candidate's secret resolved on the live store before its version was installed")
+				}
+			}
 		}
 		seen++
-		return nil
+		return func() {}, nil
 	}
 	if err := c.SetTenantDefault(ctx, "acme", "vast01", "t"); err == nil || !errors.Is(err, directory.ErrConflict) {
 		t.Fatalf("setting the default to what it is: %v", err)
@@ -228,12 +239,170 @@ func TestStoreSurvivesRestartAndReload(t *testing.T) {
 		t.Error("Prepare did not run on the write")
 	}
 	refused := errors.New("cannot build")
-	c.Prepare = func(*directory.File) error { return refused }
+	c.Prepare = func(*directory.File, func(string) (string, error)) (func(), error) { return nil, refused }
 	if err := c.PutCluster(ctx, "vast04", cluster("control:vast04"), "s4", "t"); !errors.Is(err, refused) {
 		t.Errorf("Prepare's refusal did not refuse the write: %v", err)
 	}
 	if _, ok := c.Snapshot().Cluster("vast04"); ok {
 		t.Error("a refused write was installed")
+	}
+}
+
+// T02 on the control node: a write whose compare-and-swap never lands leaves the live cluster
+// registry as it was, though the write built its candidate. The version goes live only through
+// the watch, once it is in etcd.
+func TestStoreFailedWriteLeavesTheLiveClusters(t *testing.T) {
+	tc := startCluster(t, 1)
+	key := make([]byte, 32)
+	s := openStore(t, tc, 0, key)
+	reg := upstream.NewRegistry(upstream.Options{}, s.Resolve)
+	t.Cleanup(reg.Close)
+	var armed atomic.Bool
+	var cancelWrite context.CancelFunc
+	s.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		if armed.Load() {
+			cancelWrite() // the write's context ends after its candidate is built: its transaction fails
+		}
+		return func() { cand.Commit() }, nil
+	}
+	ctx := context.Background()
+	if err := s.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if cl, ok := reg.Load().Get("vast01"); !ok || cl.Creds.Secret != "s1" {
+		t.Fatalf("vast01 not live with s1 after its write: %v", ok)
+	}
+	v := s.Version()
+	var wctx context.Context
+	wctx, cancelWrite = context.WithCancel(ctx)
+	defer cancelWrite()
+	armed.Store(true)
+	err := s.PutCluster(wctx, "vast01", cluster("control:vast01"), "s2", "t")
+	armed.Store(false)
+	if err == nil {
+		t.Fatal("a write whose context ended before its transaction succeeded")
+	}
+	if s.Version() != v {
+		t.Fatalf("version %d after a failed write, want %d", s.Version(), v)
+	}
+	if cl, _ := reg.Load().Get("vast01"); cl.Creds.Secret != "s1" {
+		t.Errorf("the live registry signs with %q after a failed write, want s1", cl.Creds.Secret)
+	}
+	if sec, err := s.Resolve("control:vast01"); err != nil || sec != "s1" {
+		t.Errorf("the store resolves %q (%v) after a failed write, want s1", sec, err)
+	}
+}
+
+// The identity is drawn by the first write, in the same transaction as the version, and every
+// node reads the same one. A secret-only rotation changes the cluster's generation though its
+// definition does not.
+func TestStoreIdentityAndGenerations(t *testing.T) {
+	tc := startCluster(t, 2)
+	key := make([]byte, 32)
+	a, b := openStore(t, tc, 0, key), openStore(t, tc, 1, key)
+	ctx := context.Background()
+	if !a.Snapshot().File().Identity.IsZero() {
+		t.Fatal("an empty directory has an identity")
+	}
+	if err := a.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	fa := a.Snapshot().File()
+	if fa.Schema != directory.SchemaVersion || fa.Identity.Validate() != nil {
+		t.Fatalf("after the first write: schema %d identity %+v", fa.Schema, fa.Identity)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if id := b.Snapshot().File().Identity; id != fa.Identity {
+		t.Fatalf("node b reads identity %+v, node a %+v", id, fa.Identity)
+	}
+	g1 := fa.Generation(directory.ClusterResource("vast01"))
+	if g1 != fa.Version {
+		t.Fatalf("new cluster generation %d, want %d", g1, fa.Version)
+	}
+	if err := a.PutCluster(ctx, "vast01", cluster("control:vast01"), "s2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fb := b.Snapshot().File()
+	if g := fb.Generation(directory.ClusterResource("vast01")); g != fb.Version || g <= g1 {
+		t.Fatalf("after a secret-only rotation, cluster generation %d (was %d), version %d", g, g1, fb.Version)
+	}
+	if fb.Identity != fa.Identity {
+		t.Fatal("a write changed the identity")
+	}
+	s1 := fb.Generation(directory.SecretResource("vast01"))
+	if s1 != fb.Version {
+		t.Fatalf("the rotated secret's generation %d, want %d", s1, fb.Version)
+	}
+	// A definition change leaves the secret's generation alone.
+	moved := cluster("control:vast01")
+	moved.Endpoints = []string{"127.0.0.1:2"}
+	if err := a.PutCluster(ctx, "vast01", moved, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g := b.Snapshot().File().Generation(directory.SecretResource("vast01")); g != s1 {
+		t.Fatalf("an endpoint change moved the secret generation %d → %d", s1, g)
+	}
+}
+
+// A directory written before schema 2 is upgraded when a node starts: one new version carrying the
+// identity, with nothing else changed. Two nodes starting together upgrade it once.
+func TestStoreUpgradesASchema1Directory(t *testing.T) {
+	tc := startCluster(t, 2)
+	cli := tc.nodes[0].Client()
+	ctx := context.Background()
+	t1, _ := json.Marshal(directory.Tenant{DefaultCluster: "vast01"})
+	cl := cluster("env:X")
+	cl.EndpointMode = "static"
+	c1, _ := json.Marshal(clusterRecord{Cluster: cl})
+	if _, err := cli.Txn(ctx).Then(clientv3.OpPut(kVersion, "7"), clientv3.OpPut(kClusters+"vast01", string(c1)), clientv3.OpPut(kTenants+"acme", string(t1))).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	a, b := openStore(t, tc, 0, key), openStore(t, tc, 1, key)
+	if err := a.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fa, fb := a.Snapshot().File(), b.Snapshot().File()
+	if fa.Version != 8 || fb.Version != 8 {
+		t.Fatalf("versions after the upgrade: %d and %d, want 8 (one upgrade write)", fa.Version, fb.Version)
+	}
+	if fa.Identity.Validate() != nil || fa.Identity != fb.Identity {
+		t.Fatalf("identities after the upgrade: %+v and %+v", fa.Identity, fb.Identity)
+	}
+	if _, ok := fa.Clusters["vast01"]; !ok || len(fa.Generations) != 0 {
+		t.Fatalf("the upgrade changed resources: clusters %v generations %v", fa.Clusters, fa.Generations)
+	}
+}
+
+// A directory written by a newer shunt is refused at start.
+func TestStoreRefusesANewerSchema(t *testing.T) {
+	tc := startCluster(t, 1)
+	cli := tc.nodes[0].Client()
+	ctx := context.Background()
+	if _, err := cli.Txn(ctx).Then(clientv3.OpPut(kVersion, "1"), clientv3.OpPut(kSchema, strconv.Itoa(directory.SchemaVersion+1))).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, cli, c, slog.New(slog.DiscardHandler)); err == nil || !errors.Is(err, directory.ErrNewerSchema) {
+		t.Fatalf("opening a newer schema: %v", err)
 	}
 }
 
@@ -262,5 +431,46 @@ func TestStoreReadsPlacementSchemaV2(t *testing.T) {
 	b := openStore(t, tc, 0, key)
 	if got, ok := b.Snapshot().Lookup("acme", "data"); !ok || !reflect.DeepEqual(*got, *want) {
 		t.Fatalf("v2 placement loaded as %+v, want %+v (stored %s)", got, want, raw)
+	}
+}
+
+// Defect 3 of the H2 review on the etcd store: a read-only release names its barrier and is
+// refused once the barrier's commit has cleared it, so a late cancellation cannot undo a
+// committed read-only.
+func TestStoreReadOnlyReleaseComparesBarrier(t *testing.T) {
+	tc := startCluster(t, 1)
+	key := make([]byte, 32)
+	key[3] = 7
+	s := openStore(t, tc, 0, key)
+	ctx := context.Background()
+	if err := s.PutCluster(ctx, "vast01", cluster("control:vast01"), "s1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Adopt(ctx, "acme", "data01", "vast01", "data01", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPlacementReadOnly(ctx, "acme", "data01", true, false, "op-1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearBarrier(ctx, directory.PlacementResource("acme/data01"), "op-1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPlacementReadOnly(ctx, "acme", "data01", false, false, "op-1", "t"); !errors.Is(err, directory.ErrConflict) {
+		t.Fatalf("placement release after the commit: %v", err)
+	}
+	if p, _ := s.Snapshot().Lookup("acme", "data01"); !p.ReadOnly {
+		t.Fatalf("a committed placement read-only was undone: %+v", p)
+	}
+	if err := s.SetClusterReadOnly(ctx, "vast01", true, false, "op-2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearBarrier(ctx, directory.ClusterResource("vast01"), "op-2", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetClusterReadOnly(ctx, "vast01", false, false, "op-2", "t"); !errors.Is(err, directory.ErrConflict) {
+		t.Fatalf("cluster release after the commit: %v", err)
+	}
+	if c := s.Snapshot().File().Clusters["vast01"]; !c.ReadOnly {
+		t.Fatalf("a committed cluster read-only was undone: %+v", c)
 	}
 }

@@ -1,0 +1,12 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/proxy
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkMigratingDeleteObjects1000Keys-16    	      67	  15326278 ns/op	   4.05 MB/s	 2286094 B/op	   37083 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	      79	  14927410 ns/op	   4.16 MB/s	 2260811 B/op	   37069 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	      86	  13579791 ns/op	   4.57 MB/s	 2250987 B/op	   37066 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	      84	  13897217 ns/op	   4.46 MB/s	 2256876 B/op	   37067 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	      84	  13994176 ns/op	   4.43 MB/s	 2246728 B/op	   37066 allocs/op
+BenchmarkMigratingDeleteObjects1000Keys-16    	      74	  15090041 ns/op	   4.11 MB/s	 2250549 B/op	   37066 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/proxy	6.985s

@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,9 +24,10 @@ import (
 
 // apiOptions are the flags every command that talks to a running shunt takes.
 type apiOptions struct {
-	url      string
-	tokenRef string
-	json     bool
+	url       string
+	tokenRef  string
+	json      bool
+	requestID string
 }
 
 func addAPIFlags(cmd *cobra.Command, o *apiOptions) {
@@ -34,6 +39,8 @@ func addAPIFlags(cmd *cobra.Command, o *apiOptions) {
 	f.StringVar(&o.url, "api", def, "the control API: shunt's admin listener (env SHUNT_API)")
 	f.StringVar(&o.tokenRef, "token-ref", os.Getenv("SHUNT_API_TOKEN_REF"), "env:NAME or file:/path holding admin.control_token_ref's token (env SHUNT_API_TOKEN_REF)")
 	f.BoolVar(&o.json, "json", false, "print the API's JSON answer instead of a summary")
+	f.StringVar(&o.requestID, "request-id", "", "this command's request id: its changes are sent with Idempotency-Key <id>-1, <id>-2, …; "+
+		"repeat a command that lost its connection with the id it printed, and the control plane answers with what it already did (default: random)")
 }
 
 // apiClient calls the control API (docs/reference/control-api.md).
@@ -41,10 +48,20 @@ type apiClient struct {
 	base  string
 	token string
 	http  *http.Client
+	// requestID keys this command's changes; mutations counts them, so a repeat with the same
+	// id sends the same keys in the same order.
+	requestID string
+	mutations int
+	mu        sync.Mutex
 }
 
 func (o apiOptions) client() (*apiClient, error) {
-	c := &apiClient{base: strings.TrimRight(o.url, "/"), http: &http.Client{}}
+	c := &apiClient{base: strings.TrimRight(o.url, "/"), http: &http.Client{}, requestID: o.requestID}
+	if c.requestID == "" {
+		var b [8]byte
+		_, _ = rand.Read(b[:]) //nolint:errcheck // crypto/rand does not fail short
+		c.requestID = hex.EncodeToString(b[:])
+	}
 	if o.tokenRef != "" {
 		tok, err := config.ResolveSecret(o.tokenRef)
 		if err != nil {
@@ -73,8 +90,17 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	if method != http.MethodGet {
+		c.mu.Lock()
+		c.mutations++
+		req.Header.Set(control.HeaderIdempotencyKey, fmt.Sprintf("%s-%d", c.requestID, c.mutations))
+		c.mu.Unlock()
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if method != http.MethodGet {
+			return fmt.Errorf("control API %s: %w; the change may or may not have been made: repeat the command with --request-id %s to find out without making it twice", c.base, err, c.requestID)
+		}
 		return fmt.Errorf("control API %s: %w (is shunt serve running with its admin listener there?)", c.base, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // read below
@@ -98,25 +124,48 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
+// createTimeout bounds the request that creates an operation record.
+const createTimeout = time.Minute
+
 // operate starts an operation record for one action and polls it until it ends (ADR-0017). The
 // server runs the action on its own context, so a --wait longer than a listener's timeout is
 // fine, and an operator who loses the connection can still read the outcome from the record.
 func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, out any) error {
 	var op control.Operation
-	if err := c.call(ctx, http.MethodPost, "/v1/operations", req, &op); err != nil {
+	// ctx's deadline is the command's --wait, which bounds watching the operation, not creating it:
+	// a control plane that is slow to answer (quorum lost) still says why it refused, rather than
+	// the CLI giving up with the outcome unknown.
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createTimeout)
+	defer cancel()
+	if err := c.call(cctx, http.MethodPost, "/v1/operations", req, &op); err != nil {
 		return err
 	}
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
-	for op.Status == control.StatusRunning {
+	for !op.Terminal() {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("operation %s is still running (phase %s); follow it with GET %s/v1/operations/%s", op.ID, op.Phase, c.base, op.ID)
+			// The wait ran out with the operation unfinished: exit 3 and say where it stands and what
+			// to do (contracts §2, "CLI completion semantics"). It keeps running on the control node.
+			what := fmt.Sprintf("operation %s is still %s (phase %s)", op.ID, op.Status, op.Phase)
+			if len(op.Blockers) > 0 {
+				what += "; waiting on " + control.BlockerText(op.Blockers)
+			}
+			next := fmt.Sprintf("it keeps running: `shunt operation wait %s` follows it", op.ID)
+			if slices.Contains(op.AllowedActions, control.ActionCancel) {
+				next += fmt.Sprintf(", `shunt operation cancel %s` releases its hold and changes nothing", op.ID)
+			}
+			return &exitError{code: exitWaitDeadline, err: fmt.Errorf("%s; %s", what, next)}
 		case <-tick.C:
 		}
-		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &op); err != nil {
+		var next control.Operation // fresh: fields an ended record omits must not survive a poll
+		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &next); err != nil {
+			if ctx.Err() != nil {
+				continue // the next select reports the wait deadline with the last complete record
+			}
 			return err
 		}
+		op = next
 	}
 	msg := "operation " + op.ID + " " + op.Status
 	if op.Error != nil {
@@ -128,8 +177,8 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 			return json.Unmarshal(op.Result, out)
 		}
 		return nil
-	case control.StatusRefused:
-		if !strings.HasPrefix(msg, "refused") {
+	case control.StatusFailed:
+		if op.Error != nil && op.Error.Code == "refused" && !strings.HasPrefix(msg, "refused") {
 			return fmt.Errorf("refused: %s", shownText(msg))
 		}
 	}

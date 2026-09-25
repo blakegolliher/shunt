@@ -52,11 +52,14 @@ func newAPIRig(t *testing.T) *apiRig {
 	}
 	reg := upstream.NewRegistry(upstream.Options{DialTimeout: time.Second}, config.ResolveSecret)
 	t.Cleanup(reg.Close)
-	rg.dir.Prepare = func(f *directory.File) error {
-		_, _, aerr := reg.Apply(f.Clusters)
-		return aerr
+	rg.dir.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
+		cand, err := reg.Prepare(f.Clusters, resolve)
+		if err != nil {
+			return nil, err
+		}
+		return func() { cand.Commit() }, nil
 	}
-	rg.ctl = &control.Server{Dir: rg.dir, Clusters: reg, Metrics: telemetry.NewMetrics()}
+	rg.ctl = &control.Server{Dir: rg.dir, Clusters: reg, Metrics: telemetry.NewMetrics(), Ops: &control.MemOperations{Dir: rg.dir}}
 	api := httptest.NewServer(rg.ctl.Handler())
 	t.Cleanup(api.Close)
 	rg.url = api.URL

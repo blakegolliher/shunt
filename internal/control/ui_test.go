@@ -52,7 +52,7 @@ func (rg *rig) await(id string) Operation {
 	for {
 		var op Operation
 		rg.must("GET", "/v1/operations/"+id, nil, &op)
-		if op.Status != StatusRunning {
+		if op.Terminal() {
 			return op
 		}
 		if time.Now().After(deadline) {
@@ -71,8 +71,9 @@ func TestOperationRecords(t *testing.T) {
 	if code, raw := rg.call("POST", "/v1/operations", OperationRequest{Kind: OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio": 0.5}`)}, &op); code != http.StatusAccepted {
 		t.Fatalf("start: HTTP %d %s", code, raw)
 	}
-	if op.ID == "" || op.Status != StatusRunning || op.Kind != OpRamp || op.Placement != "acme/data01" || op.Node != "lab" || op.Actor != "api:127.0.0.1" {
-		t.Fatalf("started record: %+v", op)
+	if op.ID == "" || (op.Status != StatusPending && op.Status != StatusRunning) || op.Kind != OpRamp || op.Placement != "acme/data01" || op.Node != "lab" || op.Actor != "api:127.0.0.1" ||
+		op.Scope == nil || op.Scope.Resource != "placement:acme/data01" || op.Identity.IsZero() || op.EffectState != EffectNone {
+		t.Fatalf("started record: %+v scope %+v", op, op.Scope)
 	}
 	done := rg.await(op.ID)
 	var res TransitionResult
@@ -99,10 +100,10 @@ func TestOperationRecords(t *testing.T) {
 		t.Fatalf("list of another placement: %+v", list)
 	}
 
-	// A refused step ends its record refused, with the reason.
+	// A refused step ends its record failed, with the refusal's code and reason.
 	rg.call("POST", "/v1/operations", OperationRequest{Kind: OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio": 0.2}`)}, &op)
 	done = rg.await(op.ID)
-	if done.Status != StatusRefused || done.Error == nil || done.Error.Code != "refused" || !strings.Contains(done.Error.Message, "only grows") {
+	if done.Status != StatusFailed || done.Error == nil || done.Error.Code != "refused" || !strings.Contains(done.Error.Message, "only grows") {
 		t.Fatalf("refused record: %+v", done)
 	}
 	if !strings.Contains(rg.log.String(), "WARN  ramp refused  actor=api:127.0.0.1 operation="+op.ID) {
@@ -285,20 +286,21 @@ func TestUI3ProbeAndReadOnlyOperations(t *testing.T) {
 	}
 }
 
+// The lab store's listing and change hook; its transaction contract is TestMemOperationsContract.
 func TestMemOperations(t *testing.T) {
 	var seen []string
 	m := &MemOperations{Limit: 3, OnChange: func(op Operation) { seen = append(seen, op.ID+":"+op.Status) }}
 	ctx := context.Background()
 	for _, id := range []string{"1", "2", "3", "4"} {
-		if err := m.Put(ctx, &Operation{ID: id, Placement: "t/b", Status: StatusRunning}); err != nil {
+		if err := m.Create(ctx, &Operation{ID: id, Placement: "t/b", Status: StatusPending, Sequence: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Update(ctx, &Operation{ID: id, Placement: "t/b", Status: StatusSucceeded, EffectState: EffectNone, Sequence: 2}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := m.Put(ctx, &Operation{ID: "4", Placement: "t/b", Status: StatusSucceeded}); err != nil {
-		t.Fatal(err)
-	}
 	if op, _ := m.Get(ctx, "1"); op != nil {
-		t.Error("the oldest record was not forgotten")
+		t.Error("the oldest ended record was not forgotten")
 	}
 	if op, _ := m.Get(ctx, "4"); op == nil || op.Status != StatusSucceeded {
 		t.Errorf("get: %+v", op)
@@ -310,7 +312,7 @@ func TestMemOperations(t *testing.T) {
 	if ops, _ := m.List(ctx, "", "c", 10); len(ops) != 0 {
 		t.Errorf("list by cluster: %+v", ops)
 	}
-	if len(seen) != 5 || seen[4] != "4:succeeded" {
+	if len(seen) != 8 || seen[7] != "4:succeeded" {
 		t.Errorf("on change: %v", seen)
 	}
 }
@@ -704,7 +706,7 @@ func TestRouteTableIsUnique(t *testing.T) {
 			t.Errorf("route %s: mutation %v", k, r.Mutation)
 		}
 	}
-	if len(seen) != 39 {
+	if len(seen) != 49 {
 		t.Errorf("%d routes; update this count with the route table", len(seen))
 	}
 }

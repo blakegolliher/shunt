@@ -8,19 +8,22 @@ package member
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/auth"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/control"
@@ -52,24 +55,72 @@ type Client struct {
 	keys *auth.Static
 	log  *slog.Logger
 	http *http.Client
+	// heartbeatCap overrides maxHeartbeatBytes (tests); zero is the real cap.
+	heartbeatCap int
 	// Prepare, if set, is called with each directory before it is installed (the proxy builds its
-	// clusters with it); an error refuses the version, and the last good one stays.
-	Prepare func(*directory.File) error
+	// clusters with it); an error refuses the version, and the last good one stays. resolve
+	// resolves the candidate's own secrets: nothing live sees them until commit, which runs just
+	// before the version is installed.
+	Prepare func(f *directory.File, resolve func(ref string) (string, error)) (commit func(), err error)
 	// OnInstall, if set, is called after every installed version.
 	OnInstall func(*directory.Snapshot)
-	Metrics   *telemetry.Metrics
-	Telemetry *telemetry.Collector
-	Now       func() time.Time
+	// Serving, if set, returns the snapshot new requests use: the published runtime bundle's, which
+	// lags the installed one while installs are backpressured (ADR-0021 D1). Heartbeats report its
+	// version as applied, and its secret generations, so a fence never counts a version no request
+	// routes with yet. Unset: the installed snapshot.
+	Serving func() *directory.Snapshot
+	// SecretsHeld reports retired runtime bundles whose requests can still sign with an older
+	// cluster secret generation. It is safety metadata in every heartbeat (ADR-0021 D2).
+	SecretsHeld func() map[string]int64
+	Metrics     *telemetry.Metrics
+	Telemetry   *telemetry.Collector
+	Now         func() time.Time
 
-	snap    atomic.Pointer[directory.Snapshot]
-	secrets atomic.Pointer[map[string]string]
-	mu      sync.Mutex
-	cond    *sync.Cond // broadcast on every install, for WaitVersion
-	ep      atomic.Int32
-	started time.Time
-	seq     atomic.Int64
-	lastAck atomic.Pointer[time.Time]
-	stale   atomic.Bool
+	// installing serializes install: the poll, a heartbeat's fetch and a forwarded write each fetch
+	// on their own, and a slower older version must not be installed over a newer one.
+	installing sync.Mutex
+	snap       atomic.Pointer[directory.Snapshot]
+	secrets    atomic.Pointer[map[string]string]
+	mu         sync.Mutex
+	cond       *sync.Cond // broadcast on every install, for WaitVersion
+	ep         atomic.Int32
+	started    time.Time
+	seq        atomic.Int64
+	lastAck    atomic.Pointer[time.Time]
+	stale      atomic.Bool
+
+	// lease is the grant held, replaced whole by renew; nil: never granted. Stale reads it on the
+	// request path for every moving bucket, so it is a pointer load, not a lock. grantErr is why
+	// the last heartbeat granted no lease, nil when it did.
+	lease    atomic.Pointer[grant]
+	grantErr atomic.Pointer[string]
+
+	// caching serializes cache writes; cached is the last version a write was attempted for, so
+	// a slower older write never lands after a newer one. durable is the version the cache holds
+	// durably (renamed and its directory synced), and cacheErr why the newest attempt failed.
+	caching  sync.Mutex
+	cached   int64
+	durable  atomic.Int64
+	cacheErr atomic.Pointer[string]
+	ops      cacheOps
+
+	// lineage, once set, is why this member's directory is on another lineage than the control
+	// plane's (ADR-0021): another cluster, or another epoch after a restore. The member stays stale
+	// until it is re-enrolled; nothing it installed compares with the control plane's versions.
+	lineage atomic.Pointer[string]
+
+	// The incarnation protocol (incarnation.go). Gates, if set, is the proxy's admission
+	// accounting, whose uncertain count the heartbeat carries. OnRetire, if set, is called once
+	// when the control plane asks this proxy to retire; the caller drains and calls Retire.
+	incarnation  string
+	previous     *control.Incarnation
+	previousDone atomic.Bool
+	// retired is set once Retire has begun: the process has stopped admitting and drained, and a
+	// heartbeat would only put its lease key back and show a retired proxy live, delaying forget.
+	retired    atomic.Bool
+	retireOnce sync.Once
+	Gates      *admission.Gates
+	OnRetire   func()
 }
 
 var _ directory.Directory = (*Client)(nil)
@@ -82,7 +133,8 @@ func New(cfg Config, log *slog.Logger) *Client {
 	if cfg.LongPoll == 0 {
 		cfg.LongPoll = 30 * time.Second
 	}
-	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now}
+	c := &Client{cfg: cfg, keys: auth.NewEmpty(), log: log, http: &http.Client{Timeout: cfg.LongPoll + 10*time.Second}, Now: time.Now, ops: osCacheOps,
+		incarnation: newIncarnation()}
 	c.cond = sync.NewCond(&c.mu)
 	c.snap.Store(directory.NewSnapshot(&directory.File{}))
 	empty := map[string]string{}
@@ -96,75 +148,86 @@ func (c *Client) Keys() *auth.Static { return c.keys }
 // Snapshot implements directory.Directory.
 func (c *Client) Snapshot() *directory.Snapshot { return c.snap.Load() }
 
+func (c *Client) serving() *directory.Snapshot {
+	if c.Serving != nil {
+		return c.Serving()
+	}
+	return c.Snapshot()
+}
+
 // Resolve resolves a cluster's secret_ref from the secrets the control plane delivered, or from
 // the environment or a file for env:/file: refs. It is the resolver the proxy's cluster registry
 // is built with.
-func (c *Client) Resolve(ref string) (string, error) {
+func (c *Client) Resolve(ref string) (string, error) { return resolveFrom(*c.secrets.Load(), ref) }
+
+func resolveFrom(secrets map[string]string, ref string) (string, error) {
 	if !strings.HasPrefix(ref, "control:") {
 		return config.ResolveSecret(ref)
 	}
-	if v, ok := (*c.secrets.Load())[ref]; ok {
+	if v, ok := secrets[ref]; ok {
 		return v, nil
 	}
 	return "", fmt.Errorf("the control plane delivered no secret for %s", ref)
 }
 
-// Stale reports whether the lease has lapsed (ADR-0016): the last acknowledged heartbeat, sent
-// with the current directory installed, is older than the lease. A member that has never had one
-// answered is stale: it may be starting with the control plane unreachable, with no way to know
-// whether a bucket it sees as ACTIVE has started to move.
+// Stale reports whether the lease has lapsed (ADR-0016). A lease runs from the send time of the
+// heartbeat that earned it, for the shorter of the control plane's grant and this proxy's own
+// lease_ttl (renew). A member that has never had one granted is stale: it may be starting with the
+// control plane unreachable, with no way to know whether a bucket it sees as ACTIVE has started to
+// move.
 func (c *Client) Stale() bool {
-	ack := c.lastAck.Load()
-	return ack == nil || c.Now().Sub(*ack) > c.cfg.LeaseTTL
+	if c.lineage.Load() != nil {
+		return true
+	}
+	g := c.lease.Load()
+	return g == nil || c.Now().After(g.until)
 }
 
 // cacheFile is the last installed directory, with its secrets, on local disk (0600).
 func (c *Client) cacheFile() string { return filepath.Join(c.cfg.CacheDir, "directory.json") }
 
-// Load installs the cached directory, if any: a proxy restarting with the control plane down
-// serves ACTIVE buckets from it, stale, until the control plane is back.
-func (c *Client) Load() error {
-	if err := os.MkdirAll(c.cfg.CacheDir, 0o700); err != nil {
-		return fmt.Errorf("control.cache_dir: %w", err)
+// install validates and installs one directory version, and writes the cache when asked. A
+// version no newer than the installed one is dropped (installed false, no error): installs are
+// serialized, so the installed version, and the cache, only move forward. The cache is written
+// after the install lock is let go, so a slow disk never holds up the next install.
+func (c *Client) install(d *control.Directory, cache bool) (installed bool, err error) {
+	if installed, err = c.apply(d); installed && cache {
+		c.persist(d)
 	}
-	data, err := os.ReadFile(c.cacheFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("directory cache: %w", err)
-	}
-	var d control.Directory
-	if err := json.Unmarshal(data, &d); err != nil {
-		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
-	}
-	if err := c.install(&d, false); err != nil {
-		return fmt.Errorf("directory cache %s: %w", c.cacheFile(), err)
-	}
-	c.log.Info("directory loaded from the local cache; serving it stale until the control plane answers", "version", d.Version, "cache", c.cacheFile())
-	return nil
+	return installed, err
 }
 
-// install validates and installs one directory version, and writes the cache when asked.
-func (c *Client) install(d *control.Directory, cache bool) error {
+func (c *Client) apply(d *control.Directory) (installed bool, err error) {
+	c.installing.Lock()
+	defer c.installing.Unlock()
 	f := &d.File
+	if err := f.Identity.Validate(); err != nil {
+		return false, fmt.Errorf("directory version %d carries no valid identity: %w", d.Version, err)
+	}
+	if cur := c.Snapshot().Identity(); !cur.IsZero() && cur != f.Identity {
+		return false, c.lineageFault(fmt.Sprintf("directory version %d is from cluster %s epoch %s; this proxy's is from cluster %s epoch %s", d.Version, f.Identity.ClusterID, f.Identity.Epoch, cur.ClusterID, cur.Epoch))
+	}
+	if d.Version <= c.Snapshot().Version() {
+		return false, nil
+	}
 	config.ApplyClusterDefaults(f.Clusters)
 	if err := directory.Validate(f); err != nil {
-		return err
+		return false, err
 	}
 	secrets := d.Secrets
 	if secrets == nil {
 		secrets = map[string]string{}
 	}
-	// The candidate's secrets must resolve while Prepare builds its clusters.
-	c.secrets.Store(&secrets)
+	commit := func() {}
 	if c.Prepare != nil {
-		if err := c.Prepare(f); err != nil {
-			old := c.snapSecrets()
-			c.secrets.Store(&old)
-			return err
+		cm, err := c.Prepare(f, func(ref string) (string, error) { return resolveFrom(secrets, ref) })
+		if err != nil {
+			return false, err
 		}
+		commit = cm
 	}
+	c.secrets.Store(&secrets)
+	commit()
 	creds := make([]sigv4.Credential, 0, len(d.Credentials))
 	for _, k := range d.Credentials {
 		creds = append(creds, sigv4.Credential{AccessKey: k.AccessKey, Secret: k.Secret, Tenant: k.Tenant, Buckets: k.Buckets})
@@ -178,48 +241,7 @@ func (c *Client) install(d *control.Directory, cache bool) error {
 	if c.OnInstall != nil {
 		c.OnInstall(snap)
 	}
-	if cache {
-		if err := c.writeCache(d); err != nil {
-			c.log.Warn("directory cache not written; a restart with the control plane down would start empty", "err", err.Error())
-		}
-	}
-	return nil
-}
-
-// snapSecrets returns the secrets of the installed version, for rolling back a refused candidate.
-func (c *Client) snapSecrets() map[string]string {
-	if s := c.secrets.Load(); s != nil {
-		return *s
-	}
-	return map[string]string{}
-}
-
-func (c *Client) writeCache(d *control.Directory) error {
-	data, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(c.cfg.CacheDir, ".directory-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), c.cacheFile())
+	return true, nil
 }
 
 // WaitVersion blocks until the installed version is at least v, or ctx ends.
@@ -270,6 +292,13 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) (
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Shunt-Proxy", c.cfg.ProxyID) // who is asking, for the control plane's logs
+	if method != http.MethodGet {
+		// A forwarded bucket create or delete is an operation on the control plane (ADR-0021). The
+		// member never retries one itself; the client's own retry is a new request.
+		var b [12]byte
+		_, _ = rand.Read(b[:]) //nolint:errcheck // crypto/rand does not fail short
+		req.Header.Set(control.HeaderIdempotencyKey, c.cfg.ProxyID+"-"+hex.EncodeToString(b[:]))
+	}
 	if c.cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
 	}
@@ -282,7 +311,7 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) (
 	if resp.StatusCode == http.StatusNotModified {
 		return true, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectory))
 	if err != nil {
 		return false, err
 	}
@@ -327,18 +356,44 @@ func (e *Error) Is(target error) bool {
 	return false
 }
 
-// fetch gets the directory once it is newer than since, waiting up to wait, and installs it.
+// lineageFault records that this member's directory is on another lineage than the control
+// plane's, and returns it as an error.
+func (c *Client) lineageFault(why string) error {
+	if c.lineage.Swap(&why) == nil {
+		c.log.Error("this proxy's directory is from another lineage than the control plane's; it stays stale, refusing writes on moving buckets, until it is re-enrolled with an empty control.cache_dir (ADR-0021)", "reason", why)
+	}
+	return errors.New(why)
+}
+
+// checkAnswer records a lineage refusal from the control plane.
+func (c *Client) checkAnswer(err error) error {
+	var e *Error
+	if errors.As(err, &e) && (e.Code == control.CodeEpochMismatch || e.Code == control.CodeClusterMismatch) {
+		return c.lineageFault(e.Message)
+	}
+	return err
+}
+
+// fetch gets the directory once it is newer than since, waiting up to wait, and installs it. It
+// names the installed lineage, so the control plane answers 304 only on the same one.
 func (c *Client) fetch(ctx context.Context, since int64, wait time.Duration) (installed bool, err error) {
 	var d control.Directory
-	notModified, err := c.call(ctx, http.MethodGet, fmt.Sprintf("/v1/directory?since=%d&wait=%s", since, wait), nil, &d)
+	path := fmt.Sprintf("/v1/directory?since=%d&wait=%s", since, wait)
+	if id := c.Snapshot().Identity(); !id.IsZero() {
+		path += "&cluster_id=" + id.ClusterID + "&epoch=" + id.Epoch
+	} else {
+		path = fmt.Sprintf("/v1/directory?since=0&wait=%s", wait)
+	}
+	notModified, err := c.call(ctx, http.MethodGet, path, nil, &d)
 	if err != nil || notModified {
-		return false, err
+		return false, c.checkAnswer(err)
 	}
-	if d.Version <= c.Snapshot().Version() {
-		return false, nil
-	}
-	if err := c.install(&d, true); err != nil {
+	installed, err = c.install(&d, true)
+	if err != nil {
 		return false, fmt.Errorf("directory version %d refused on this proxy: %w", d.Version, err)
+	}
+	if !installed {
+		return false, nil
 	}
 	c.log.Info("directory installed", "version", d.Version, "clusters", len(d.Clusters), "placements", len(d.Placements), "keys", len(d.Credentials))
 	return true, nil
@@ -348,7 +403,9 @@ func (c *Client) fetch(ctx context.Context, since int64, wait time.Duration) (in
 // so the control plane counts it as a member from its first request (ADR-0016). An error means the
 // control plane could not be reached; the proxy may still start, stale, and Run keeps trying.
 func (c *Client) Register(ctx context.Context) error {
-	c.started = c.Now().UTC().Truncate(time.Second)
+	if c.started.IsZero() {
+		c.started = c.Now().UTC().Truncate(time.Second)
+	}
 	if _, err := c.fetch(ctx, c.Snapshot().Version(), 0); err != nil {
 		return err
 	}
@@ -390,20 +447,37 @@ func (c *Client) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// beat sends one heartbeat and records whether the lease holds. The lease renews only once this
-// proxy has installed the version the control plane answered with: a member back from silence
-// may have missed steps that went ahead without it (ADR-0016).
+// beat sends one heartbeat and records whether the lease holds (renew). A retired process sends
+// none.
 func (c *Client) beat(ctx context.Context) error {
-	sent := c.Now()
-	snap := c.Snapshot()
-	hb := control.Heartbeat{Started: c.started, Seq: c.seq.Add(1), Applied: snap.Version(), Host: c.cfg.Host, Version: c.cfg.Version}
-	if c.Telemetry != nil {
-		hb.Telemetry = c.Telemetry.Completed(c.Now())
+	if c.retired.Load() {
+		return nil
 	}
-	f := snap.File()
-	for key := range f.Placements {
-		if f.Placements[key].State == directory.StateActive {
-			continue
+	seq := c.seq.Add(1)
+	sent := c.Now()
+	snap := c.serving()
+	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.Identity(), Started: c.started, Seq: seq, Applied: snap.Version(),
+		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap),
+		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
+	if c.SecretsHeld != nil {
+		hb.SecretsHeld = c.SecretsHeld()
+	}
+	installedSnap := c.Snapshot()
+	if installed := installedSnap.Version(); installed > hb.Applied {
+		hb.Installed = installed
+	}
+	if why := c.cacheErr.Load(); why != nil {
+		hb.CacheError = *why
+	}
+	// The drain proof for every barrier in the installed directory (ADR-0021 D2). The gates are
+	// closed on install, so the acknowledgement reports the installed version's barriers, and the
+	// control plane checks the durable version against each barrier's generation.
+	hb.Barriers = c.Gates.Acks(installedSnap)
+	// Cutover's evidence, before the size cap so the cap counts it: only telemetry is dropped to
+	// fit, never a count cutover reads.
+	snap.EachPlacement(func(key string, p *directory.Placement) bool {
+		if p.State == directory.StateActive {
+			return true
 		}
 		if hb.FallbackReads == nil {
 			hb.FallbackReads = map[string]float64{}
@@ -411,21 +485,44 @@ func (c *Client) beat(ctx context.Context) error {
 		if c.Metrics != nil {
 			hb.FallbackReads[key] = control.Counters(c.Metrics.FallbackReads, key, "")[""]
 		}
+		return true
+	})
+	if c.Telemetry != nil {
+		hb.Telemetry = c.Telemetry.Completed(c.Now())
+	}
+	limit := maxHeartbeatBytes
+	if c.heartbeatCap > 0 {
+		limit = c.heartbeatCap
+	}
+	if dropped, size := capTelemetry(&hb, limit); dropped {
+		c.log.Warn("heartbeat over the size cap; its telemetry window is dropped so the lease and the drain proof get through", "bytes", size, "cap", limit)
 	}
 	bctx, cancel := context.WithTimeout(ctx, c.cfg.Interval)
 	defer cancel()
 	var ans control.HeartbeatAnswer
 	_, err := c.call(bctx, http.MethodPost, "/v1/fleet/"+c.cfg.ProxyID+"/heartbeat", hb, &ans)
 	if err == nil {
-		if ans.Version > snap.Version() {
-			// The control plane has a newer directory: fetch it now, not at the poll's next turn.
-			_, _ = c.fetch(ctx, snap.Version(), 0) //nolint:errcheck // the poll loop retries
+		if ans.PreviousRecorded && hb.Previous != nil {
+			c.previousDone.Store(true)
 		}
-		if v := c.Snapshot().Version(); v >= ans.Version {
-			c.lastAck.Store(&sent)
-		} else {
-			err = fmt.Errorf("directory version %d is behind the control plane's %d", v, ans.Version)
+		if ans.Retire && c.OnRetire != nil {
+			c.retireOnce.Do(func() {
+				c.log.Info("the control plane asked this proxy to retire; draining", "proxy", c.cfg.ProxyID)
+				c.OnRetire()
+			})
 		}
+		err = c.renew(ctx, seq, sent, snap.Version(), ans)
+	} else {
+		err = c.checkAnswer(err)
+	}
+	if err != nil {
+		reason := grantReason(err)
+		c.grantErr.Store(&reason)
+		if c.Metrics != nil {
+			c.Metrics.LeaseGrantErrors.WithLabelValues(reason).Inc()
+		}
+	} else {
+		c.grantErr.Store(nil)
 	}
 	stale := c.Stale()
 	if was := c.stale.Swap(stale); was != stale {
@@ -444,6 +541,123 @@ func (c *Client) beat(ctx context.Context) error {
 		c.Metrics.FleetStale.Set(v)
 	}
 	return err
+}
+
+// renew takes the lease granted in answer to heartbeat seq, sent at sent with version applied
+// installed (ADR-0016). The lease runs from sent, never from the answer's arrival, for the shorter
+// of the control plane's grant and this proxy's own lease_ttl, so a delayed answer cannot stretch
+// it. It renews only once this proxy has installed the version the answer names: a member back
+// from silence may have missed steps that went ahead without it. An answer to another heartbeat,
+// a missing grant, a version behind the one this proxy sent, an answer older than the grant held,
+// or one that arrives after its own lease has run out renews nothing.
+func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied int64, ans control.HeartbeatAnswer) error {
+	switch {
+	case ans.Seq != seq:
+		return &grantError{reason: GrantSequence, msg: fmt.Sprintf("heartbeat %d answered as heartbeat %d; not a lease", seq, ans.Seq)}
+	case ans.LeaseTTL <= 0:
+		return &grantError{reason: GrantNoGrant, msg: fmt.Sprintf("the control plane granted no lease (lease_ttl %s)", ans.LeaseTTL)}
+	case ans.Version < applied:
+		return &grantError{reason: GrantBehind, msg: fmt.Sprintf("the control plane answered with directory version %d, behind this proxy's %d; not a lease", ans.Version, applied)}
+	}
+	if ans.Version > c.Snapshot().Version() {
+		// The control plane has a newer directory: fetch it now, not at the poll's next turn.
+		_, _ = c.fetch(ctx, c.Snapshot().Version(), 0) //nolint:errcheck // the poll loop retries
+	}
+	if id := c.Snapshot().Identity(); id != ans.Identity {
+		return &grantError{reason: GrantLineage, msg: fmt.Sprintf("the heartbeat was answered for cluster %s epoch %s; this proxy's directory is cluster %s epoch %s; not a lease", ans.Identity.ClusterID, ans.Identity.Epoch, id.ClusterID, id.Epoch)}
+	}
+	if v := c.Snapshot().Version(); v < ans.Version {
+		return &grantError{reason: GrantBehind, msg: fmt.Sprintf("directory version %d is behind the control plane's %d", v, ans.Version)}
+	}
+	next := &grant{seq: seq, until: sent.Add(min(ans.LeaseTTL, c.cfg.LeaseTTL)), ttl: ans.LeaseTTL}
+	if c.Now().After(next.until) {
+		return &grantError{reason: GrantLate, msg: fmt.Sprintf("heartbeat %d was answered after the lease it grants had run out", seq)}
+	}
+	for {
+		cur := c.lease.Load()
+		if cur != nil && seq <= cur.seq {
+			return nil // an older answer never replaces a newer grant
+		}
+		if c.lease.CompareAndSwap(cur, next) {
+			c.lastAck.Store(&sent)
+			return nil
+		}
+	}
+}
+
+// grant is one lease: the heartbeat that earned it, when it runs out, from that heartbeat's send
+// time on c.Now's clock, and the TTL the control plane granted.
+type grant struct {
+	seq   int64
+	until time.Time
+	ttl   time.Duration
+}
+
+// The reasons a heartbeat's answer grants no lease (shunt_lease_grant_errors_total, ADR-0021 T07).
+const (
+	GrantSequence    = "sequence"    // the answer is to another heartbeat
+	GrantNoGrant     = "no_grant"    // the answer carries no positive lease TTL
+	GrantBehind      = "behind"      // the answer's version is behind this proxy's, or this proxy has not installed the answer's yet
+	GrantLate        = "late"        // the answer arrived after the lease it grants had run out
+	GrantLineage     = "lineage"     // the answer is from another cluster or epoch
+	GrantUnreachable = "unreachable" // the heartbeat got no answer
+)
+
+// grantError is a heartbeat's answer that granted no lease, with why, for the metric.
+type grantError struct {
+	reason string
+	msg    string
+}
+
+func (e *grantError) Error() string { return e.msg }
+
+// grantReason is the metric label for a heartbeat's error.
+func grantReason(err error) string {
+	var ge *grantError
+	if errors.As(err, &ge) {
+		return ge.reason
+	}
+	var e *Error
+	if errors.As(err, &e) && (e.Code == control.CodeEpochMismatch || e.Code == control.CodeClusterMismatch) {
+		return GrantLineage
+	}
+	return GrantUnreachable
+}
+
+// maxHeartbeatBytes is the largest heartbeat a member sends: the control plane's 1 MiB decoder cap
+// less a margin. Safety state (identity, incarnation, barrier acknowledgements) comes before
+// telemetry: a heartbeat over the cap drops its telemetry window rather than its lease or its
+// drain proof (ADR-0021 D2).
+const maxHeartbeatBytes = 1<<20 - 64<<10
+
+// capTelemetry drops a heartbeat's telemetry window when the heartbeat would pass limit bytes, and
+// reports whether it did and how large the heartbeat was.
+func capTelemetry(hb *control.Heartbeat, limit int) (dropped bool, size int) {
+	if hb.Telemetry == nil {
+		return false, 0
+	}
+	raw, err := json.Marshal(hb)
+	if err != nil || len(raw) <= limit {
+		return false, len(raw)
+	}
+	hb.Telemetry = nil
+	return true, len(raw)
+}
+
+// secretGenerations are the secret generations of the installed directory, by cluster: what the
+// runtime bundle published with it signs with, since both come from one install.
+func secretGenerations(snap *directory.Snapshot) map[string]string {
+	var out map[string]string
+	snap.EachCluster(func(name string, _ *config.Cluster) bool {
+		if g := snap.Generation(directory.SecretResource(name)); g > 0 {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[name] = strconv.FormatInt(g, 10)
+		}
+		return true
+	})
+	return out
 }
 
 func errString(err error) string {
@@ -493,14 +707,56 @@ type Status struct {
 	ControlNode string `json:"control_node"`
 	Stale       bool   `json:"stale"`
 	LastAck     string `json:"last_ack,omitempty"` // how long ago
-	Applied     int64  `json:"applied"`
+	// LeaseLeft is how long the lease has to run; negative once it has lapsed.
+	LeaseLeft string `json:"lease_left,omitempty"`
+	Applied   int64  `json:"applied"`
+	// Durable is the version the restart cache holds durably; CacheError why the newest version
+	// is not durable, when it is not (ADR-0021 D1: installed and durable are reported apart).
+	Durable    int64  `json:"durable"`
+	CacheError string `json:"cache_error,omitempty"`
+	// Identity is the installed directory's lineage; LineageFault says why it is not the control
+	// plane's, when it is not.
+	Identity     directory.Identity `json:"identity,omitzero"`
+	LineageFault string             `json:"lineage_fault,omitempty"`
+	// Incarnation is this process's; Uncertain how many backend outcomes it never learned
+	// (ADR-0021 D2).
+	Incarnation string `json:"incarnation"`
+	Uncertain   int64  `json:"uncertain"`
+	// The lease as granted (T07): the heartbeat it answered, the TTL the control plane granted
+	// (the lease runs for the shorter of it and control.lease_ttl, from the heartbeat's send
+	// time), and why the last heartbeat granted none, when it did not.
+	LeaseSeq     int64  `json:"lease_seq,omitempty"`
+	LeaseGranted string `json:"lease_granted,omitempty"`
+	GrantError   string `json:"grant_error,omitempty"`
+	// Barriers is the drain proof this proxy reports for every barrier in its directory.
+	Barriers []admission.Ack `json:"barriers"`
 }
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
 func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.Snapshot().Version()}
+	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().Identity(),
+		Incarnation: c.incarnation, Uncertain: c.Gates.Uncertain()}
+	if why := c.lineage.Load(); why != nil {
+		st.LineageFault = *why
+	}
+	st.Durable = c.durable.Load()
+	if why := c.cacheErr.Load(); why != nil {
+		st.CacheError = *why
+	}
+	now := c.Now()
 	if ack := c.lastAck.Load(); ack != nil {
-		st.LastAck = c.Now().Sub(*ack).Round(time.Millisecond).String()
+		st.LastAck = now.Sub(*ack).Round(time.Millisecond).String()
+	}
+	if g := c.lease.Load(); g != nil {
+		st.LeaseLeft = g.until.Sub(now).Round(time.Millisecond).String()
+		st.LeaseSeq, st.LeaseGranted = g.seq, g.ttl.String()
+	}
+	if why := c.grantErr.Load(); why != nil {
+		st.GrantError = *why
+	}
+	st.Barriers = c.Gates.Acks(c.Snapshot())
+	if st.Barriers == nil {
+		st.Barriers = []admission.Ack{}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)

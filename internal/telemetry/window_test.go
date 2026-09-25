@@ -2,9 +2,11 @@ package telemetry
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"math/rand"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -57,8 +59,8 @@ func TestCollectorRotatesLazilyAndResends(t *testing.T) {
 	if w == nil || len(w.Sketches) != 4 || len(w.Counters) != 1 {
 		t.Fatalf("completed window: %#v", w)
 	}
-	if got := w.Counters[0].Errors["5xx"]; got != 1 {
-		t.Fatalf("5xx errors = %d, want 1", got)
+	if got := w.Counters[0].Errors["503"]; got != 1 {
+		t.Fatalf("503 errors = %d, want 1", got)
 	}
 	if again := c.Completed(windowBase.Add(2 * WindowDuration)); again != w {
 		t.Fatal("an empty interval did not re-send the last non-empty window")
@@ -181,13 +183,25 @@ func TestHeartbeatPayloadBound(t *testing.T) {
 	}
 	ops := []OpClass{OpRead, OpWrite, OpList, OpDelete, OpMultipart, OpOther}
 	series := []string{SeriesClientTotal, SeriesUpstreamTTFB, SeriesUpstreamTotal, SeriesProxyOverhead}
+	// The worst case: every status key on every counter, and the full per-bucket block, 32 buckets
+	// each spread over two clusters.
+	allStatus := map[string]int64{"0": 1, notFound: 1, "4xx": 1, "5xx": 1}
+	for code := range trackedStatus {
+		allStatus[strconv.Itoa(code)] = 12345
+	}
 	w := Window{Start: windowBase, End: windowBase.Add(WindowDuration)}
+	for i := range MaxBucketsPerWindow {
+		for _, cl := range []string{"cluster-aa", "cluster-ba"} {
+			w.Buckets = append(w.Buckets, BucketCounter{Bucket: fmt.Sprintf("tenant-%02d/bucket-with-a-long-name-%02d", i, i), Cluster: cl,
+				Requests: 1_000_000, BytesIn: 1 << 40, BytesOut: 1 << 40, Errors: allStatus})
+		}
+	}
 	var payloads [14]int
 	for cluster := 0; cluster < 13; cluster++ {
 		name := "cluster-" + string(rune('a'+cluster%26)) + string(rune('a'+cluster/26))
 		for _, op := range ops {
 			w.Counters = append(w.Counters, WindowCounter{Op: op, Cluster: name, Requests: 10_000, BytesIn: 1 << 30, BytesOut: 2 << 30,
-				Errors: map[string]int64{"4xx": 17, "5xx": 3}})
+				Errors: allStatus})
 			for _, nameSeries := range series {
 				w.Sketches = append(w.Sketches, Sketch{Series: nameSeries, Op: op, Cluster: name, Data: data})
 			}
@@ -200,10 +214,10 @@ func TestHeartbeatPayloadBound(t *testing.T) {
 		}
 		payloads[cluster+1] = len(payload)
 	}
-	t.Logf("6 op classes x 4 series: compressed sketch %d bytes; 12-cluster heartbeat %d bytes; 13-cluster heartbeat %d bytes",
-		len(data), payloads[12], payloads[13])
-	if payloads[12] >= 1<<20 || payloads[13] < 1<<20 {
-		t.Fatalf("dense heartbeat ceiling is not 12 clusters: 12=%d, 13=%d, decoder cap=%d", payloads[12], payloads[13], 1<<20)
+	t.Logf("6 op classes x 4 series, every status key, %d buckets on 2 clusters: compressed sketch %d bytes; heartbeat by clusters %v",
+		MaxBucketsPerWindow, len(data), payloads[1:])
+	if payloads[11] >= 1<<20 || payloads[12] < 1<<20 {
+		t.Fatalf("dense heartbeat ceiling is not 11 clusters: 11=%d, 12=%d, decoder cap=%d", payloads[11], payloads[12], 1<<20)
 	}
 }
 
@@ -232,5 +246,154 @@ func BenchmarkWindowObserve(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		c.Observe(Observation{At: base, Operation: "GetObject", Cluster: "a", Status: 200,
 			ClientTotal: 2 * time.Millisecond, UpstreamTTFB: time.Millisecond, UpstreamTotal: 1500 * time.Microsecond})
+	}
+}
+
+// A read answered 404 is counted as not found, not as a 4xx error: a HEAD or GET of a missing key
+// is an answer. A 404 on a write, and any other 4xx, stay errors.
+func TestReadNotFoundIsNotAnError(t *testing.T) {
+	c := NewCollector()
+	at := windowBase.Add(time.Second)
+	for _, o := range []Observation{
+		{At: at, Operation: "HeadObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+		{At: at, Operation: "GetObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+		{At: at, Operation: "GetObject", Cluster: "a", Status: 403, ClientTotal: time.Millisecond},
+		{At: at, Operation: "PutObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond},
+	} {
+		c.Observe(o)
+	}
+	w := c.Completed(windowBase.Add(WindowDuration))
+	if w == nil {
+		t.Fatal("no window")
+	}
+	var read, write WindowCounter
+	for _, ct := range w.Counters {
+		switch ct.Op {
+		case OpRead:
+			read = ct
+		case OpWrite:
+			write = ct
+		}
+	}
+	if read.Errors[notFound] != 2 || read.Errors["403"] != 1 {
+		t.Fatalf("read counters %v: want 2 not found and one 403", read.Errors)
+	}
+	if write.Errors["404"] != 1 || write.Errors[notFound] != 0 {
+		t.Fatalf("write counters %v: a write's 404 is an error", write.Errors)
+	}
+	s := NewStore(time.Hour)
+	if _, err := s.Ingest([]MemberWindow{{ID: "p", Live: true, Telemetry: w}}); err != nil {
+		t.Fatal(err)
+	}
+	pts := s.CounterSeries("fleet", SeriesNotFoundPerSecond, OpRead, windowBase.Add(-time.Minute), windowBase.Add(time.Hour))
+	if len(pts) != 1 || pts[0].Value != 2/WindowDuration.Seconds() {
+		t.Fatalf("not_found_per_second: %+v", pts)
+	}
+}
+
+func TestStatusKeys(t *testing.T) {
+	cases := []struct {
+		status int
+		op     OpClass
+		want   string
+	}{
+		{0, OpRead, "0"}, {404, OpRead, notFound}, {404, OpList, notFound}, {404, OpWrite, "404"}, {404, OpDelete, "404"},
+		{403, OpRead, "403"}, {412, OpWrite, "412"}, {418, OpRead, "4xx"}, {429, OpWrite, "429"},
+		{500, OpRead, "500"}, {503, OpWrite, "503"}, {507, OpWrite, "5xx"},
+	}
+	for _, c := range cases {
+		if got := StatusKey(c.status, c.op); got != c.want {
+			t.Errorf("StatusKey(%d, %s) = %q, want %q", c.status, c.op, got, c.want)
+		}
+	}
+}
+
+// The class series sum their codes, and status_per_second names each code seen.
+func TestStatusSeries(t *testing.T) {
+	c := NewCollector()
+	at := windowBase.Add(time.Second)
+	for status, n := range map[int]int{503: 3, 500: 1, 403: 2, 418: 1, 507: 1} {
+		for range n {
+			c.Observe(Observation{At: at, Operation: "PutObject", Cluster: "a", Status: status, ClientTotal: time.Millisecond})
+		}
+	}
+	c.Observe(Observation{At: at, Operation: "GetObject", Cluster: "a", Status: 404, ClientTotal: time.Millisecond})
+	s := NewStore(time.Hour)
+	if _, err := s.Ingest([]MemberWindow{{ID: "p", Live: true, Telemetry: c.Completed(windowBase.Add(WindowDuration))}}); err != nil {
+		t.Fatal(err)
+	}
+	from, to := windowBase.Add(-time.Minute), windowBase.Add(time.Hour)
+	per := WindowDuration.Seconds()
+	for series, want := range map[string]float64{SeriesErrors5xxPerSecond: 5 / per, SeriesErrors4xxPerSecond: 3 / per, SeriesNotFoundPerSecond: 0} {
+		pts := s.CounterSeries("fleet", series, OpWrite, from, to)
+		if len(pts) != 1 || pts[0].Value != want {
+			t.Errorf("%s: %+v, want %v", series, pts, want)
+		}
+	}
+	got := map[string]float64{}
+	for _, p := range s.CounterSeries("fleet", SeriesStatusPerSecond, OpAll, from, to) {
+		got[p.Code] = p.Value * per
+	}
+	want := map[string]float64{"503": 3, "500": 1, "403": 2, "4xx": 1, "5xx": 1, notFound: 1}
+	if len(got) != len(want) {
+		t.Fatalf("status keys %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("status %s: %v, want %v", k, got[k], v)
+		}
+	}
+}
+
+// A bucket's traffic is counted by backend cluster and merged into a bucket scope that answers one
+// point per cluster; past MaxBucketsPerWindow buckets, the rest sum as (other).
+func TestBucketTrafficByCluster(t *testing.T) {
+	c := NewCollector()
+	at := windowBase.Add(time.Second)
+	for i, cl := range []string{"minio-a", "minio-a", "minio-a", "minio-b", "minio-c"} {
+		status := 200
+		if i == 0 {
+			status = 503
+		}
+		c.ObserveBucket(Observation{At: at, Operation: "PutObject", Cluster: cl, Status: status, BytesIn: 10}, "acme/data")
+	}
+	for i := range MaxBucketsPerWindow + 3 {
+		c.ObserveBucket(Observation{At: at, Operation: "GetObject", Cluster: "minio-a", Status: 200}, fmt.Sprintf("acme/b%02d", i))
+	}
+	w := c.Completed(windowBase.Add(WindowDuration))
+	buckets := map[string]bool{}
+	for _, b := range w.Buckets {
+		buckets[b.Bucket] = true
+	}
+	if len(buckets) != MaxBucketsPerWindow+1 || !buckets[OtherBuckets] || !buckets["acme/data"] {
+		t.Fatalf("%d buckets in the window, want %d named and (other): %v", len(buckets), MaxBucketsPerWindow, buckets)
+	}
+	s := NewStore(time.Hour)
+	if _, err := s.Ingest([]MemberWindow{{ID: "p", Live: true, Telemetry: w}}); err != nil {
+		t.Fatal(err)
+	}
+	per := WindowDuration.Seconds()
+	got := map[string]float64{}
+	for _, p := range s.CounterSeries("bucket:acme/data", SeriesRequestsPerSecond, OpAll, windowBase.Add(-time.Minute), windowBase.Add(time.Hour)) {
+		got[p.Cluster] = p.Value * per
+	}
+	if got["minio-a"] != 3 || got["minio-b"] != 1 || got["minio-c"] != 1 || len(got) != 3 {
+		t.Fatalf("acme/data by cluster: %v", got)
+	}
+	codes := s.CounterSeries("bucket:acme/data", SeriesStatusPerSecond, OpAll, windowBase.Add(-time.Minute), windowBase.Add(time.Hour))
+	if len(codes) != 1 || codes[0].Cluster != "minio-a" || codes[0].Code != "503" {
+		t.Fatalf("acme/data statuses: %+v", codes)
+	}
+	if pts := s.CounterSeries("fleet", SeriesRequestsPerSecond, OpAll, windowBase.Add(-time.Minute), windowBase.Add(time.Hour)); len(pts) != 0 {
+		t.Fatalf("bucket counters leaked into the fleet scope: %+v", pts)
+	}
+}
+
+func BenchmarkObserveBucket(b *testing.B) {
+	c := NewCollector()
+	base := time.Now()
+	o := Observation{At: base, Operation: "GetObject", Cluster: "a", Status: 200}
+	for b.Loop() {
+		c.ObserveBucket(o, "acme/data")
 	}
 }
