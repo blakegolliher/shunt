@@ -63,7 +63,7 @@ func LineageMismatch(cur, have directory.Identity) error {
 // checkLineage compares a caller's directory (have, at version v) with the installed one. A caller
 // with no identity has nothing installed yet. Versions compare only within one identity.
 func checkLineage(snap *directory.Snapshot, have directory.Identity, v int64) error {
-	cur := snap.File().Identity
+	cur := snap.Identity()
 	switch {
 	case have.IsZero():
 		return nil
@@ -450,7 +450,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Identity: snap.File().Identity, Version: snap.Version(), LeaseTTL: g.LeaseTTL,
+	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Identity: snap.Identity(), Version: snap.Version(), LeaseTTL: g.LeaseTTL,
 		Retire: g.Retire, PreviousRecorded: g.PreviousRecorded})
 }
 
@@ -550,7 +550,7 @@ func (s *Server) fleetList(w http.ResponseWriter, r *http.Request) {
 		ms = []Member{}
 	}
 	snap := s.Dir.Snapshot()
-	writeJSON(w, http.StatusOK, FleetStatus{Identity: snap.File().Identity, Version: snap.Version(), Members: ms})
+	writeJSON(w, http.StatusOK, FleetStatus{Identity: snap.Identity(), Version: snap.Version(), Members: ms})
 }
 
 // ProxyDiagnostics is GET /v1/fleet/{id}: one member's install state against the control plane's
@@ -687,7 +687,7 @@ func (s *Server) fenceRound(tr *tracker, v int64, strict bool, wait time.Duratio
 		if err != nil {
 			return nil, err
 		}
-		cur := s.Dir.Snapshot().File().Identity
+		cur := s.Dir.Snapshot().Identity()
 		var waiting []string
 		for i := range ms {
 			m := &ms[i]

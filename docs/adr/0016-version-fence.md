@@ -6,7 +6,36 @@ Known gap and proposed follow-up: installation alone does not drain requests
 using an older snapshot, including on a single proxy. Lease expiry also does not
 prove a dispatched backend write completed. [ADR-0021](0021-distributed-correctness.md)
 specifies stronger admission/drain and recovery semantics, including changes to
-the timeout, forget and dead-member rules below. That proposal is not implemented.
+the timeout, forget and dead-member rules below. That proposal was not implemented when this note
+was written (2026-09-24).
+
+**Amended by ADR-0021 (H2, 2026-09-25).** The decision below is kept as the record. H2 implemented
+ADR-0021 D2, and these of its rules no longer hold ([ADR-0021](0021-distributed-correctness.md),
+[docs/fleet.md](../fleet.md)):
+
+- *The fence* and *the hold*: a wait that runs out no longer answers `pending` or undoes a hold
+  ("If V1 does not reach every member within the wait, the step is undone" is withdrawn). A timeout
+  means blocked: the hold stays, and the operation record names its blockers until they clear or
+  an operator cancels it before the commit. A step commits only once every member has drained the
+  hold (gate closed, nothing admitted before still out, no backend outcome unknown, the hold in its
+  restart cache), not once it has installed it. The hold pauses every mutation of the bucket, not
+  only the moved keys, and one proxy holds and drains too.
+- *Leaving ACTIVE*: every round waits for every registered member, not only the first. A member
+  that falls silent is `proxy_missing`; it is never dropped when its lease ends, since lease expiry
+  does not prove that a dispatched write has ended.
+- *Membership*: `shunt proxy forget` is no longer the way out for a silent member. It is refused
+  (`retirement_unproven`) while any incarnation of the member is unresolved. A member counts out
+  after a clean retirement (SIGTERM, `shunt proxy retire`), or after an operator resolves its
+  stopped incarnation with an attestation (`shunt proxy resolve`) and forgets it.
+- *Held steps survive an interrupted call*: repeating the step no longer completes a hold another
+  call left. The operation that wrote it is resumed (`shunt operation resume`) or cancelled.
+- *Fleet-wide cutover evidence*: the window is still watched, and refused on, before anything is
+  held. The cutover then holds the bucket and, under the closed gate, requires every proxy that
+  watched the window to report twice more from the same process with the count unchanged; a failed
+  check there blocks the operation rather than refusing it. `purge-source` waits for every
+  registered member, not every live one.
+- *Consequences*: "A dead member costs an operator one command, and only at a bucket's first step"
+  is withdrawn. A dead member blocks every step until its incarnation is resolved.
 
 ## Context
 

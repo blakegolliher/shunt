@@ -58,7 +58,8 @@ func TestOperationsReapALostOwner(t *testing.T) {
 		t.Fatalf("a create over a lost owner's scope: %v", err)
 	}
 	got, err := ops.Get(ctx, ghost.ID)
-	if err != nil || got == nil || got.Status != control.StatusFailed || got.EffectState != control.EffectUncertain || got.Error == nil || got.Error.Code != "unavailable" {
+	// It was queued for the step lock and wrote nothing, so its effect is none (2026-09-25).
+	if err != nil || got == nil || got.Status != control.StatusFailed || got.EffectState != control.EffectNone || got.Error == nil || got.Error.Code != "unavailable" {
 		t.Fatalf("the lost owner's operation: %+v %v", got, err)
 	}
 	var busy *control.ScopeBusyError

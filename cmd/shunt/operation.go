@@ -119,9 +119,11 @@ func newOperationCancel() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cancel <id>",
 		Short: "Cancel an operation before its change is committed; the routing goes back as it was",
-		Long: "A step that waits on a proxy (blocked) can be canceled: its hold is released and its record ends\n" +
-			"canceled, with nothing changed. Once the change is committed, it is in force and cancellation is\n" +
-			"refused (not_cancellable): a further change is a new operation (ADR-0021 D2).",
+		Long: "An operation that has not committed its change can be canceled while its record offers cancel\n" +
+			"(`shunt operation show` lists the allowed actions): its hold is released and its record ends\n" +
+			"canceled, with nothing changed. Once the change is committed, or a purge has begun deleting, it is\n" +
+			"in force and cancellation is refused (not_cancellable): a further change is a new operation\n" +
+			"(ADR-0021 D2).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			api, err := o.client()
@@ -243,12 +245,16 @@ func newOperationWait() *cobra.Command {
 			defer cancel()
 			var op control.Operation
 			for {
-				if err := api.call(ctx, "GET", "/v1/operations/"+url.PathEscape(args[0]), nil, &op); err != nil {
+				// A fresh value per poll: fields an ended record omits (blockers, waiting_on) must
+				// not survive from an earlier answer.
+				var next control.Operation
+				if err := api.call(ctx, "GET", "/v1/operations/"+url.PathEscape(args[0]), nil, &next); err != nil {
 					if errors.Is(ctx.Err(), context.DeadlineExceeded) && op.ID != "" {
 						break
 					}
 					return err
 				}
+				op = next
 				if op.Terminal() {
 					break
 				}

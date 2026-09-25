@@ -22,6 +22,9 @@ import (
 //	                            that ended without retiring (memberRecord).
 //	/shunt/fleet/proxies/<id>   its last heartbeat, on a lease: gone when the lease expires, so a
 //	                            member whose key is absent is silent
+//	/shunt/fleet/forgotten/<id> written by forget: the incarnations of the forgotten member that
+//	                            were proven ended (retired or resolved), so a new process of the
+//	                            same proxy that reports one as its previous does not revive it
 //
 // Membership outlives liveness on purpose: a bucket's first step waits for every member, and a
 // partitioned member must not vanish from that check just because its lease expired. An
@@ -30,6 +33,7 @@ const (
 	fleetPrefix = "/shunt/fleet/"
 	kMembers    = fleetPrefix + "members/"
 	kProxies    = fleetPrefix + "proxies/"
+	kForgotten  = fleetPrefix + "forgotten/"
 )
 
 // defaultDropMargin is how far past its lease a silent member's key stays (Fleet.DropMargin). A
@@ -129,6 +133,13 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 		}
 	}
 	// The record is new, or changed since this node read it, or the heartbeat changes it.
+	var forgotten []string
+	if hb.Previous != nil {
+		var ferr error
+		if forgotten, ferr = f.forgottenIncarnations(ctx, id); ferr != nil {
+			return control.Grant{}, ferr
+		}
+	}
 	var grant control.Grant
 	err := f.change(ctx, id, true, func(rec *memberRecord) error {
 		now := f.now().UTC()
@@ -173,7 +184,9 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 			rec.Current = &control.Incarnation{ID: hb.Incarnation, Started: hb.Started, State: control.IncarnationActive}
 			rec.RetireRequested = false
 		}
-		if p := hb.Previous; p != nil && !rec.knows(p.ID) {
+		// A previous incarnation that forget proved ended (the proxy was forgotten, then started
+		// again on the same cache) is not evidence of anything still running.
+		if p := hb.Previous; p != nil && !rec.knows(p.ID) && !slices.Contains(forgotten, p.ID) {
 			// Evidence only the proxy held: a process that ended while the control plane was
 			// unreachable. A clean retirement needs no record; an unclean one is unresolved.
 			if p.State == control.IncarnationUnclean || p.Uncertain > 0 {
@@ -219,6 +232,35 @@ func (r *memberRecord) knows(id string) bool {
 		}
 	}
 	return false
+}
+
+// endedIncarnations are the incarnations forget proves ended: the current one once it retired,
+// and every resolved one the record keeps. Forget refuses while any other is left.
+func (r *memberRecord) endedIncarnations() []string {
+	var ids []string
+	if r.Current != nil && r.Current.State != control.IncarnationActive {
+		ids = append(ids, r.Current.ID)
+	}
+	for _, inc := range r.Resolved {
+		ids = append(ids, inc.ID)
+	}
+	return ids
+}
+
+// forgottenIncarnations reads what forget recorded for id: the incarnations it proved ended.
+func (f *Fleet) forgottenIncarnations(ctx context.Context, id string) ([]string, error) {
+	resp, err := f.cli.Get(ctx, kForgotten+id)
+	if err != nil {
+		return nil, fmt.Errorf("%w: reading the fleet: %w", control.ErrUnavailable, err)
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, nil
+	}
+	var ids []string
+	if err := json.Unmarshal(resp.Kvs[0].Value, &ids); err != nil {
+		return nil, fmt.Errorf("forgotten record %s: %w", id, err)
+	}
+	return ids, nil
 }
 
 // addUnresolved appends an incarnation that did not retire cleanly, refusing at the bound.
@@ -463,10 +505,14 @@ func (f *Fleet) Forget(ctx context.Context, id string) error {
 		if len(unproven) > 0 {
 			return &control.RetirementError{Proxy: id, Incarnations: unproven, What: "forgetting proxy " + id + " refused"}
 		}
+		ended, err := json.Marshal(rec.endedIncarnations())
+		if err != nil {
+			return err
+		}
 		tresp, err := f.cli.Txn(ctx).If(
 			clientv3.Compare(clientv3.CreateRevision(kProxies+id), "=", 0),
 			clientv3.Compare(clientv3.ModRevision(kMembers+id), "=", resp.Kvs[0].ModRevision),
-		).Then(clientv3.OpDelete(kMembers + id)).Commit()
+		).Then(clientv3.OpDelete(kMembers+id), clientv3.OpPut(kForgotten+id, string(ended))).Commit()
 		if err != nil {
 			return fmt.Errorf("%w: forget: %w", control.ErrUnavailable, err)
 		}

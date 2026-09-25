@@ -422,6 +422,62 @@ func TestCutoverBarrierBlocksOpenSourceMultipartUpload(t *testing.T) {
 	}
 }
 
+// The quiet window runs with the bucket's writes flowing (2026-09-25). H2e ran it behind the
+// closed mutations gate, which answered every write and delete 503 for the whole window (60 s by
+// default) and failed make walkthrough's verify; a fallback read is a read, which that gate does not
+// stop. The placement carries no barrier while the window runs. A read that falls back after the
+// window, before the commit, is still caught under the closed gate: a second window is watched,
+// held, and the evidence counts that read.
+func TestCutoverWindowKeepsWritesFlowing(t *testing.T) {
+	rg := newRig(t)
+	rg.prepare()
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
+	rg.vast02.put(t, "data01-001", "a", "one")
+	rg.vast02.put(t, "data01-001", "dir/b", "two")
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{
+		Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true,
+	}, nil)
+	var mu sync.Mutex
+	var heldDuringWindow []bool
+	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error {
+		if d == 5*time.Second {
+			p, _ := rg.dir.Snapshot().Lookup("acme", "data01")
+			mu.Lock()
+			heldDuringWindow = append(heldDuringWindow, p.Barrier != nil)
+			mu.Unlock()
+		}
+		return nil
+	}
+	// A read falls back after the window: when the hold is installed.
+	previousInstall := rg.dir.OnInstall
+	var once sync.Once
+	rg.dir.OnInstall = func(snap *directory.Snapshot) {
+		if p, ok := snap.Lookup("acme", "data01"); ok && p.Barrier != nil {
+			once.Do(func() { rg.ctl.Metrics.FallbackReads.WithLabelValues("acme/data01").Inc() })
+		}
+		previousInstall(snap)
+	}
+
+	var tr TransitionResult
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, &tr)
+	mu.Lock()
+	windows := slices.Clone(heldDuringWindow)
+	mu.Unlock()
+	if len(windows) == 0 || windows[0] {
+		t.Fatalf("the quiet window ran with the placement held (held per window: %v); writes must flow while it runs", windows)
+	}
+	// The read that fell back after the first window is not lost: the evidence comes from a second
+	// window, watched under the hold, that saw it.
+	if !slices.Equal(windows, []bool{false, true}) || tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.FallbackReads != 1 {
+		t.Fatalf("a read that fell back after the window: windows held %v, result %+v %+v", windows, tr, tr.Cutover)
+	}
+	var op Operation
+	rg.must(http.MethodGet, "/v1/operations/"+tr.Operation, nil, &op)
+	if op.Status != StatusSucceeded || op.EffectState != EffectCommitted {
+		t.Fatalf("cutover record: %+v", op)
+	}
+}
+
 func TestPurgeSourceBarrierDrainsLocalSourceWork(t *testing.T) {
 	rg := newRig(t)
 	rg.prepare()

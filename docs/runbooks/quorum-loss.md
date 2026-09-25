@@ -9,7 +9,7 @@ operator does here is urgent for clients on ACTIVE buckets.
 
 **What is not.** Writes to buckets that are `RAMPING`, `MIGRATING` or `CUTOVER` answer 503 with
 `Retry-After` on every proxy (stale mode, ADR-0016), and no migration step can be taken. Bucket
-creation through a proxy answers 503.
+creation through a proxy answers 503. None of this touches the ACTIVE buckets above.
 
 **Do.**
 1. Find which control nodes are down (`status` on each, or `/-/healthz`). A majority must be up:
@@ -25,5 +25,8 @@ creation through a proxy answers 503.
 a cluster of one and the other nodes then join it, which is the path for losing the data
 directories, not for losing a host.
 
-**Afterwards.** Check `shunt status` for a bucket left with a held step (`held→<ratio>`) by a
-command that was interrupted; run the same step again to finish it.
+**Afterwards.** A step that was running kept its hold throughout; nothing was released or rolled
+back. Check `shunt operation list` for unfinished records. One `blocked` on `owner_lost` lost its
+control node: resume it from a live node with `shunt operation resume <id>`. A restarted node
+resumes its own. Running the same step again answers `operation_conflict` naming the record
+([blocked-operation.md](blocked-operation.md)).

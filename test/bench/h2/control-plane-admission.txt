@@ -1,0 +1,102 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/admission
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkEnterRelease-16                    	 8276769	       140.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterRelease-16                    	 8744380	       137.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterRelease-16                    	 9558153	       139.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterRelease-16                    	 8263398	       131.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterRelease-16                    	 8506886	       133.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterRelease-16                    	 8326707	       133.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcks-16                            	     272	   5153028 ns/op	 2883315 B/op	   10026 allocs/op
+BenchmarkAcks-16                            	     208	   5473606 ns/op	 2883315 B/op	   10026 allocs/op
+BenchmarkAcks-16                            	     211	   5738634 ns/op	 2883318 B/op	   10026 allocs/op
+BenchmarkAcks-16                            	     240	   5421716 ns/op	 2883316 B/op	   10026 allocs/op
+BenchmarkAcks-16                            	     229	   5248179 ns/op	 2883325 B/op	   10026 allocs/op
+BenchmarkAcks-16                            	     229	   5282540 ns/op	 2883326 B/op	   10026 allocs/op
+BenchmarkAcksSnapshot-16                    	  499717	      2278 ns/op	     896 B/op	       9 allocs/op
+BenchmarkAcksSnapshot-16                    	  629242	      2149 ns/op	     896 B/op	       9 allocs/op
+BenchmarkAcksSnapshot-16                    	  755940	      2100 ns/op	     896 B/op	       9 allocs/op
+BenchmarkAcksSnapshot-16                    	  469231	      2260 ns/op	     896 B/op	       9 allocs/op
+BenchmarkAcksSnapshot-16                    	  542502	      1880 ns/op	     896 B/op	       9 allocs/op
+BenchmarkAcksSnapshot-16                    	  669806	      1875 ns/op	     896 B/op	       9 allocs/op
+BenchmarkEnterReleaseSpread-16              	154203842	         7.429 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterReleaseSpread-16              	158636178	         8.053 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterReleaseSpread-16              	136097018	         7.816 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterReleaseSpread-16              	125219185	         9.546 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterReleaseSpread-16              	136611127	        10.74 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterReleaseSpread-16              	136706805	         8.262 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	13943803	        89.68 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	13982542	        97.59 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	14394106	        95.82 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	13136197	        87.25 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	12028430	        96.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnterClosedParallel-16             	14370886	        87.06 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kFirst-16               	      43	  23926564 ns/op	    100000 placements/op	 2442840 B/op	  100139 allocs/op
+BenchmarkBarriers100kFirst-16               	      44	  28979126 ns/op	    100000 placements/op	 2442840 B/op	  100139 allocs/op
+BenchmarkBarriers100kFirst-16               	      39	  27505112 ns/op	    100000 placements/op	 2442840 B/op	  100139 allocs/op
+BenchmarkBarriers100kFirst-16               	      52	  28567745 ns/op	    100000 placements/op	 2442840 B/op	  100139 allocs/op
+BenchmarkBarriers100kFirst-16               	      48	  26889894 ns/op	    100000 placements/op	 2442842 B/op	  100139 allocs/op
+BenchmarkBarriers100kFirst-16               	      49	  28678170 ns/op	    100000 placements/op	 2442840 B/op	  100139 allocs/op
+BenchmarkBarriers100kCached-16              	76150231	        15.92 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kCached-16              	84668692	        14.32 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kCached-16              	49031468	        23.78 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kCached-16              	81221803	        14.14 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kCached-16              	80247418	        14.85 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBarriers100kCached-16              	87548616	        14.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcks100kFirst-16                   	      39	  28658804 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kFirst-16                   	      39	  30062204 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kFirst-16                   	      28	  35801244 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kFirst-16                   	      37	  29797574 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kFirst-16                   	      36	  31593840 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kFirst-16                   	      37	  34160963 ns/op	       100.0 acks/op	 2455992 B/op	  100241 allocs/op
+BenchmarkAcks100kCached-16                  	   35458	     29809 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kCached-16                  	   43096	     29144 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kCached-16                  	   40765	     28487 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kCached-16                  	   27378	     39821 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kCached-16                  	   38869	     29982 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kCached-16                  	   41358	     25633 ns/op	       100.0 acks/op	   12992 B/op	     101 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    2061	    611891 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    2018	    650042 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    1688	    665321 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    2364	    623426 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    2000	    719908 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkAcks100kClusterBarrierCached-16    	    2163	    621934 ns/op	     25025 placements/op	   13008 B/op	     102 allocs/op
+BenchmarkApply100k-16                       	      34	  39650791 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+BenchmarkApply100k-16                       	      22	  49363983 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+BenchmarkApply100k-16                       	      25	  44125065 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+BenchmarkApply100k-16                       	      26	  43205568 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+BenchmarkApply100k-16                       	      30	  42567877 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+BenchmarkApply100k-16                       	      26	  45359400 ns/op	    100000 gates/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/admission	98.388s
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/runtimecfg
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkLoad-16                    	1000000000	         0.1156 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1170 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1153 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1094 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1205 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLoad-16                    	1000000000	         0.1125 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	30120369	        37.83 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	32584002	        37.04 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	32347585	        37.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	31918843	        38.14 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	30535105	        37.84 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcquire-16                 	32401410	        37.52 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPublish-16                 	 1000000	      1017 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublish-16                 	 1000000	      1100 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublish-16                 	 1000000	      1054 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublish-16                 	 1000000	      1175 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublish-16                 	 1053270	      1105 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublish-16                 	 1000000	      1490 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1000000	      1195 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1104291	      1211 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1040956	      1106 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1281050	       958.3 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1000000	      1249 ns/op	     584 B/op	      11 allocs/op
+BenchmarkPublishBackpressured-16    	 1000000	      1038 ns/op	     584 B/op	      11 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/runtimecfg	22.499s

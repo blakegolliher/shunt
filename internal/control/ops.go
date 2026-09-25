@@ -125,7 +125,7 @@ func (s *Server) versionBlockers(ctx context.Context, v int64) ([]Blocker, error
 	if err != nil {
 		return nil, err
 	}
-	cur := s.Dir.Snapshot().File().Identity
+	cur := s.Dir.Snapshot().Identity()
 	var out []Blocker
 	for i := range ms {
 		m := &ms[i]
@@ -1013,6 +1013,11 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 		return TransitionResult{}, refuse("%s is %s; cutover happens from MIGRATING", key, p.State)
 	}
 	pv := moving(p)
+	// The quiet window runs before the hold, with the bucket's writes flowing: a fallback read is
+	// a read, which the mutations gate does not stop, so pausing writes for the window would buy
+	// nothing and cost the clients the whole window in 503s. What the window saw is carried
+	// through the drain and checked again under the closed gate before the commit.
+	var quiet *quietWindow
 	if tr.barrierState() == nil {
 		if perr := s.precondition(tr); perr != nil {
 			return TransitionResult{}, perr
@@ -1026,6 +1031,15 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 		case pr.Source != pv.ClusterOf(pv.Source) || pr.Primary != pv.ClusterOf(pv.Primary) || !pr.Converged:
 			return TransitionResult{}, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done)
 		}
+		q, blockers, werr := s.watchQuiet(tr.ctx, tr, key, window, wait)
+		if werr != nil {
+			return TransitionResult{}, fmt.Errorf("%w: cutover window interrupted: %w", ErrUnavailable, werr)
+		}
+		if len(blockers) > 0 {
+			// Nothing is held yet: the cutover is refused, and nothing needs canceling.
+			return TransitionResult{}, refuse("%s: %s", key, blockers[0].Message)
+		}
+		quiet = q
 	}
 	var evidence *directory.CutoverEvidence
 	var res TransitionResult
@@ -1061,33 +1075,25 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 			if n > 0 {
 				return []Blocker{{Code: BlockerMultipartOpen, Count: int64(n), Message: fmt.Sprintf("the source still has %d multipart upload(s); cancel cutover to let them finish, or abort them before retrying", n)}}, nil
 			}
-			before, beats, err := s.fleetFallbackReads(ctx, key)
-			if err != nil {
-				return nil, err
+			if quiet == nil {
+				// A resumed operation holds its barrier but not the window its first owner watched:
+				// it watches one now, with the bucket's writes paused until it ends.
+				q, blockers, werr := s.watchQuiet(ctx, tr, key, window, wait)
+				if werr != nil || len(blockers) > 0 {
+					return blockers, werr
+				}
+				quiet = q
 			}
-			s.info(tr.actor, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before, "members", len(beats))
-			tr.phase(PhaseWindow)
-			seconds := int64(window / time.Second)
-			tr.progress(0, seconds, "seconds")
-			if sleepErr := s.sleep(ctx, window); sleepErr != nil {
-				return nil, sleepErr
+			// The window ended before the hold; reads could have fallen back since. Two fresh reports
+			// from every proxy that watched it, from the same processes, must show the counter where
+			// the window left it. If not, the next poll watches a new window, now under the hold, and
+			// commits once one is quiet; until then the operation is blocked and may be canceled.
+			blockers, err := s.stillQuiet(ctx, key, quiet)
+			if err != nil || len(blockers) > 0 {
+				quiet = nil
+				return blockers, err
 			}
-			tr.progress(seconds, seconds, "seconds")
-			missing, err := s.awaitReports(ctx, beats, wait)
-			if err != nil {
-				return nil, err
-			}
-			if len(missing) > 0 {
-				return []Blocker{{Code: BlockerProxyMissing, Count: int64(len(missing)), Message: fmt.Sprintf("proxies %s did not report from the same incarnation after the %s window", strings.Join(missing, ", "), window)}}, nil
-			}
-			after, _, err := s.fleetFallbackReads(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-			if after != before {
-				return []Blocker{{Code: BlockerOldRequests, Count: int64(after - before), Message: fmt.Sprintf("%v read(s) fell back to the source during the %s window; run the mover again", after-before, window)}}, nil
-			}
-			evidence = &directory.CutoverEvidence{At: s.now().UTC().Truncate(time.Second), Window: window, FallbackReads: after}
+			evidence = &directory.CutoverEvidence{At: s.now().UTC().Truncate(time.Second), Window: window, FallbackReads: quiet.reads}
 			return nil, nil
 		},
 		commit: func() (int64, bool, error) {
@@ -1127,6 +1133,85 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 	}
 	s.logTransition(tr, "cutover", res, "window", window.String(), "fallback_reads", fallbackReads)
 	return res, nil
+}
+
+// quietWindow is what cutover's quiet window saw: the fleet's fallback reads of the bucket at its
+// end, and the process each proxy reported them from.
+type quietWindow struct {
+	reads float64
+	marks map[string]reportMark
+}
+
+// quietReportWait bounds the wait for two fresh heartbeats from every proxy after the window or
+// the drain. Proxies heartbeat every second or so; one that has not reported by then is named.
+const quietReportWait = 10 * time.Second
+
+// watchQuiet watches the fleet's fallback reads of key for window (ADR-0016). It answers the
+// window's evidence, or blockers naming why there is none: a proxy that did not report from the
+// same process afterwards, or reads that fell back to the source during it.
+func (s *Server) watchQuiet(ctx context.Context, tr *tracker, key string, window, wait time.Duration) (*quietWindow, []Blocker, error) {
+	before, beats, err := s.fleetFallbackReads(ctx, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.info(tr.actor, "cutover window started", "placement", key, "window", window.String(), "fallback_reads", before, "members", len(beats))
+	tr.phase(PhaseWindow)
+	seconds := int64(window / time.Second)
+	tr.progress(0, seconds, "seconds")
+	if serr := s.sleep(ctx, window); serr != nil {
+		return nil, nil, serr
+	}
+	tr.progress(seconds, seconds, "seconds")
+	missing, err := s.awaitReports(ctx, beats, max(wait, quietReportWait))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(missing) > 0 {
+		return nil, []Blocker{{Code: BlockerProxyMissing, Count: int64(len(missing)), Message: fmt.Sprintf("proxies %s did not report from the same incarnation after the %s window, so their reads are not evidence of quiet", strings.Join(missing, ", "), window)}}, nil
+	}
+	after, marks, err := s.fleetFallbackReads(ctx, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if after != before {
+		return nil, []Blocker{{Code: BlockerOldRequests, Count: int64(after - before), Message: fmt.Sprintf("%v read(s) fell back to the source during the %s window; run the mover again", after-before, window)}}, nil
+	}
+	return &quietWindow{reads: after, marks: marks}, nil, nil
+}
+
+// stillQuiet checks, after the drain, that no read has fallen back since the window ended: every
+// proxy that watched the window reports twice more from the same process, and the fleet's count
+// is unchanged. A proxy that restarted since has lost its count, so its silence proves nothing.
+func (s *Server) stillQuiet(ctx context.Context, key string, q *quietWindow) ([]Blocker, error) {
+	_, now, err := s.fleetFallbackReads(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	var restarted []string
+	for id, m := range q.marks {
+		if cur, ok := now[id]; !ok || cur.incarnation != m.incarnation {
+			restarted = append(restarted, id)
+		}
+	}
+	if len(restarted) > 0 {
+		slices.Sort(restarted)
+		return []Blocker{{Code: BlockerProxyMissing, Count: int64(len(restarted)), Message: fmt.Sprintf("proxies %s are not the processes that watched the quiet window; cancel cutover and run it again", strings.Join(restarted, ", "))}}, nil
+	}
+	missing, err := s.awaitReports(ctx, now, quietReportWait)
+	if err != nil {
+		return nil, err
+	}
+	if len(missing) > 0 {
+		return []Blocker{{Code: BlockerProxyMissing, Count: int64(len(missing)), Message: fmt.Sprintf("proxies %s have not reported since the drain", strings.Join(missing, ", "))}}, nil
+	}
+	final, _, err := s.fleetFallbackReads(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if final != q.reads {
+		return []Blocker{{Code: BlockerOldRequests, Count: int64(final - q.reads), Message: fmt.Sprintf("%v read(s) fell back to the source after the quiet window; a new window is watched with writes paused (cancel cutover to reopen them, run the mover again, then cut over)", final-q.reads)}}, nil
+	}
+	return nil, nil
 }
 
 // PurgeRequest is purge-source's body: a dry run, or the confirmation token the dry run issued.
@@ -1268,7 +1353,7 @@ func (s *Server) purgeChecks(tr *tracker, key string, fence bool) (purgePlan, er
 		return plan, err
 	}
 	if len(plan.missing) > 0 {
-		return plan, refuse("the listing diff is not empty: %s/%s holds keys %s/%s does not, first %d: %s; run the mover again",
+		return plan, refuse("the listing diff is not empty: %s/%s holds keys %s/%s does not, first %d: %s; the mover no longer runs in CUTOVER, so reconcile each key on the backends (copy it to the primary, or delete it from the source if a client deleted it) and purge again (docs/runbooks/blocked-operation.md)",
 			p.ClusterOf(p.Source), plan.srcBucket, p.ClusterOf(p.Primary), plan.dstBucket, len(plan.missing), strings.Join(plan.missing, ", "))
 	}
 	return plan, nil

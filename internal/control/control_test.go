@@ -353,19 +353,12 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 		}
 		return nil
 	}
-	var blocked Operation
-	if code, raw := rg.call("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, &blocked); code != http.StatusAccepted {
-		t.Fatalf("cutover with fallback read: want HTTP 202, got HTTP %d %s", code, raw)
+	// The window runs before the hold, so a read that falls back during it refuses the cutover
+	// with nothing held: the bucket's writes never paused.
+	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, "fell back to the source during the 5s window")
+	if p, _ := rg.dir.Snapshot().Lookup("acme", "data01"); p.Barrier != nil || p.State != directory.StateMigrating {
+		t.Fatalf("a refused cutover left the placement held: %+v", p)
 	}
-	if blocked.Status != StatusBlocked || len(blocked.Blockers) != 1 || blocked.Blockers[0].Code != BlockerOldRequests || !slices.Contains(blocked.AllowedActions, ActionCancel) {
-		t.Fatalf("cutover with fallback read: %+v", blocked)
-	}
-	var canceled Operation
-	rg.must("POST", "/v1/operations/"+blocked.ID+"/cancel", struct{}{}, &canceled)
-	if canceled.Status != StatusCancelled {
-		t.Fatalf("canceled cutover: %+v", canceled)
-	}
-	waitNotRunning(t, rg.ctl, blocked.ID)
 	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error { rg.slept = append(rg.slept, d); return nil }
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s", Wait: "0s"}, &tr)
 	if tr.To != directory.StateCutover || tr.Cutover == nil || tr.Cutover.Window != 5*time.Second || tr.Cutover.FallbackReads < 1 {

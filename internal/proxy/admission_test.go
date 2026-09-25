@@ -3,6 +3,7 @@ package proxy
 // The admission gates (ADR-0021 D2), driven through the handler: T05 and T06 of the delivery plan.
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/config"
 	"github.com/blakegolliher/shunt/internal/directory"
+	"github.com/blakegolliher/shunt/internal/sigv4"
 )
 
 // rewriteDirectory edits the rig's directory file as another writer would and reloads it.
@@ -191,6 +193,87 @@ func TestUncertainOutcomeStaysCounted(t *testing.T) {
 	ramp(t, m, directory.Transition{To: directory.StateRamping, Ratio: 0.5, Hold: true, Barrier: "op-2"})
 	if ack := ackOf(t, m, "op-2"); ack.Uncertain != 1 || !ack.Closed {
 		t.Fatalf("the barrier's ack must carry the uncertainty: %+v", ack)
+	}
+}
+
+// A client that goes away after its mutation reached the backend whole does not make the outcome
+// uncertain: the proxy waits for the backend's answer, as it would have with the client still
+// there, and counts it definitive. Before the fix the client's cancellation cut the upstream request
+// off, and one client timeout (verify's --duration ending, in make walkthrough) left the bucket
+// needing proxy retirement and an attestation before any later barrier could drain.
+func TestClientDisconnectDoesNotMakeAMutationUncertain(t *testing.T) {
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			m := newMixedRig(t, nil)
+			if r := m.acme(t, "PUT", "/data/gone", []byte("v1")); r.StatusCode != http.StatusOK {
+				t.Fatalf("seed: %d %s", r.StatusCode, r.body)
+			}
+			arrived := make(chan struct{}, 1)
+			hold := make(chan struct{})
+			var once sync.Once
+			release := func() { once.Do(func() { close(hold) }) }
+			t.Cleanup(release)
+			m.garage.mu.Lock()
+			m.garage.before = func(r *http.Request) {
+				if r.Method == method && strings.HasSuffix(r.URL.Path, "/gone") {
+					arrived <- struct{}{}
+					<-hold
+				}
+			}
+			m.garage.mu.Unlock()
+
+			body := []byte("v2")
+			if method == http.MethodDelete {
+				body = nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			req, err := http.NewRequestWithContext(ctx, method, m.front.URL+"/data/gone", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ContentLength = int64(len(body))
+			if len(body) == 0 {
+				req.Body = http.NoBody
+			}
+			sigv4.Sign(req, sigv4.Credentials{AccessKey: acmeAK, Secret: acmeSK}, "us-east-1", sigv4.UnsignedPayload, time.Now())
+			done := make(chan error, 1)
+			go func() {
+				resp, err := fresh().Do(req)
+				if err == nil {
+					_ = resp.Body.Close()
+				}
+				done <- err
+			}()
+			<-arrived
+			cancel() // the client gives up with the whole request at the backend
+			if err := <-done; err == nil {
+				t.Fatal("the client's request finished although it was canceled")
+			}
+			// Give the server time to see the connection close; a proxy that ties the upstream
+			// request to the client stops waiting here and records the outcome as uncertain.
+			time.Sleep(200 * time.Millisecond)
+			if st := m.gates.State("acme/data"); st.Uncertain[admission.Mutations] != 0 || st.Inflight[admission.Mutations] != 1 {
+				t.Fatalf("with the client gone and the backend not yet answered: %+v (want 1 in flight, 0 uncertain)", st)
+			}
+			release()
+			deadline := time.Now().Add(5 * time.Second)
+			for m.gates.State("acme/data").Inflight[admission.Mutations] != 0 {
+				if time.Now().After(deadline) {
+					t.Fatalf("the mutation never ended: %+v", m.gates.State("acme/data"))
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if st := m.gates.State("acme/data"); st.Uncertain[admission.Mutations] != 0 || m.gates.Uncertain() != 0 {
+				t.Fatalf("the backend answered, yet the outcome is uncertain: %+v", st)
+			}
+			got, ok := m.garage.object("acme-1111-data", "gone")
+			switch {
+			case method == http.MethodPut && (!ok || string(got) != "v2"):
+				t.Fatalf("the PUT the backend accepted is not there: %q %v", got, ok)
+			case method == http.MethodDelete && ok:
+				t.Fatalf("the DELETE the backend accepted left the object: %q", got)
+			}
+		})
 	}
 }
 

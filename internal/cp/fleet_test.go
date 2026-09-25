@@ -276,3 +276,48 @@ func TestFleetCleanRetirementFromMarker(t *testing.T) {
 		t.Fatalf("a marker with uncertain work: %+v", m)
 	}
 }
+
+// Found by make fleet (2026-09-25). A proxy killed, its incarnation resolved, and forgotten, then
+// started again on the same cache: its first heartbeat reports the killed process as its unclean
+// previous. Forget deleted the record that held the resolution, so the new record took the
+// previous for a crash and every step blocked on incarnation_unresolved again. Forget now keeps the
+// incarnations it proved ended; a previous the control plane has no proof for still counts.
+func TestFleetForgottenIncarnationStaysEnded(t *testing.T) {
+	tc := startCluster(t, 2)
+	ctx := context.Background()
+	fa, fb := NewFleet(tc.nodes[0].Client(), time.Second), NewFleet(tc.nodes[1].Client(), time.Second)
+	fa.DropMargin, fb.DropMargin = 500*time.Millisecond, 500*time.Millisecond
+	if _, err := fa.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc1}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "p7 to fall silent", func() bool { return !members(t, fa)["p7"].Live })
+	if err := fa.Resolve(ctx, "p7", inc1, "killed with SIGKILL; no connections to either backend", "token:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fa.Forget(ctx, "p7"); err != nil {
+		t.Fatal(err)
+	}
+	// The same cache starts a new process, registering through the other node.
+	killed := &control.Incarnation{ID: inc1, State: control.IncarnationUnclean, Started: time.Now().Add(-time.Hour)}
+	if _, err := fb.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: killed}); err != nil {
+		t.Fatal(err)
+	}
+	if m := members(t, fa)["p7"]; len(m.Unresolved) != 0 || m.Incarnation == nil || m.Incarnation.ID != inc2 {
+		t.Fatalf("a resolved and forgotten incarnation came back unresolved: %+v", m)
+	}
+	// A previous that forget never proved ended (a process of the forgotten proxy that ran during a
+	// control outage, say) is still unresolved.
+	if err := fb.Retire(ctx, "p7", inc2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := fb.Forget(ctx, "p7"); err != nil {
+		t.Fatal(err)
+	}
+	unseen := &control.Incarnation{ID: inc3, State: control.IncarnationUnclean}
+	if _, err := fa.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: unseen}); err != nil {
+		t.Fatal(err)
+	}
+	if m := members(t, fb)["p7"]; len(m.Unresolved) != 1 || m.Unresolved[0].ID != inc3 {
+		t.Fatalf("an unproven previous after a forget: %+v", m)
+	}
+}

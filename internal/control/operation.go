@@ -690,7 +690,7 @@ func (s *Server) begin(actor string, op Operation, args any, async bool) (*track
 	snap := s.Dir.Snapshot()
 	op.ID = fmt.Sprintf("%013d-%s", now.UnixMilli(), hex.EncodeToString(rnd[:]))
 	op.Actor, op.Node = actor, s.node()
-	op.Identity = snap.File().Identity
+	op.Identity = snap.Identity()
 	op.Created, op.Updated = now, now
 	op.Status, op.Phase, op.Sequence = StatusPending, PhaseQueued, 1
 	op.EffectState, op.AllowedActions = EffectNone, []string{}
@@ -1127,11 +1127,32 @@ func orphan(op *Operation, now time.Time, why string) {
 		}
 		return
 	}
-	if op.Status != StatusPending && (op.EffectState == EffectNone || op.EffectState == "") {
+	if op.EffectState == EffectNone || op.EffectState == "" {
 		op.EffectState = EffectUncertain
+		if op.Status == StatusPending || beforeFirstWrite(op) {
+			op.EffectState = EffectNone
+		}
 	}
 	op.Status, op.Phase = StatusFailed, PhaseDone
+	// An ended record offers nothing and waits on nothing: the blockers and the cancel of the phase
+	// it was in no longer apply.
+	op.Blockers, op.BlockerCount, op.AllowedActions = nil, 0, []string{}
 	op.Error = &Error{Code: "unavailable", Message: why}
+}
+
+// beforeFirstWrite reports whether a record stopped in a phase that writes nothing: waiting for
+// its turn or for the fleet's current version, watching cutover's window, taking purge's diff, with
+// no barrier intent on the record. Such a step changed nothing, so its effect is none, not
+// uncertain, and it does not stay behind as evidence.
+func beforeFirstWrite(op *Operation) bool {
+	if op.Barrier != nil {
+		return false
+	}
+	switch op.Phase {
+	case PhaseQueued, PhasePrecondition, PhaseWindow, PhaseDiff:
+		return true
+	}
+	return false
 }
 
 // Sweep is the control node's periodic care of the records (once a second, with PublishFleet):

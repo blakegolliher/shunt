@@ -12,10 +12,14 @@
 #      workload on an ACTIVE bucket sees zero errors; both proxies go stale and refuse writes on
 #      the moving bucket with 503; no step can be taken. Quorum back: everything resumes.
 #   4. A proxy restarted with the whole control plane down serves ACTIVE buckets from its cache.
-#   5. A proxy paused (SIGSTOP) is silent: a first step waits for it by name until it is forgotten;
-#      a later step goes ahead without it.
+#   5. A proxy paused (SIGSTOP) is silent, and every step waits for it (ADR-0021 D2): a --wait that
+#      runs out leaves the step blocked and holding (exit 3), cancel releases exactly its hold, forget
+#      is refused, and a step whose control node dies is resumed from another. A reachable proxy
+#      retires and is forgotten; a killed one is forgotten only after its incarnation is resolved.
 #   6. The walkthrough's remaining verbs (mover, cutover, purge-source) run through the control
 #      plane with two proxies, and the mover signs with secrets the control plane holds.
+#   7. Barrier latency on a healthy fleet, against the 5 s p99 target, and a barrier held open by
+#      a large upload already in flight.
 #
 #   make e2e-up && make fleet
 set -euo pipefail
@@ -315,26 +319,110 @@ curl -fsS "http://$A_ADMIN/-/fleet" | jq -e '.stale == true and .applied > 0' >/
 grep -q 'directory loaded from the local cache' a.log || fail "proxy A did not say it loaded the cache"
 note "A serves ACTIVE buckets from $WORK/cache-a with no control node reachable"
 
-say "5. Quorum back: leases return, a step goes through; a paused proxy is waited for by name"
+say "5. Quorum back; then a silent proxy blocks every step until it is back, retired, or resolved (ADR-0021 D2)"
 start_control 1 init
 start_control 2 join
 start_control 3 join
 member_ok proxy-a && member_ok proxy-b || fail "the proxies did not re-join after the control plane returned"
 for p in $A_ADMIN $B_ADMIN; do curl -fsS "http://$p/-/fleet" | jq -e '.stale == false' >/dev/null || fail "a proxy stayed stale after quorum returned"; done
 printf 'back' | via "$B_LISTEN" s3 cp --quiet - s3://fleet-a/after-outage || fail "B refused a write after its lease came back"
+
+# blocked <want> <shunt args...>: the command's --wait runs out with the operation durable and
+# blocked: exit 3, naming want; OP holds the operation id.
+blocked() {
+  local want=$1 out rc=0; shift
+  printf '   $ shunt %s   # must stay blocked\n' "$*"
+  out=$("$SHUNT" "$@" 2>&1) || rc=$?
+  printf '%s\n' "$out" | sed 's/^/     /'
+  [ "$rc" = 3 ] || fail "shunt $* exited $rc; a wait that runs out on a blocked step exits 3"
+  grep -q -- "$want" <<<"$out" || fail "shunt $* was blocked, but not on '$want'"
+  OP=$(sed -n 's/.*operation \([0-9a-z-]*\) is still.*/\1/p' <<<"$out" | head -n 1)
+  [ -n "$OP" ] || fail "shunt $* did not name its operation"
+}
+opjson() { curl -sf -H "Authorization: Bearer $TOKEN" "$SHUNT_API/v1/operations/$1"; }
+barrier_of() { curl -sf -H "Authorization: Bearer $TOKEN" "$SHUNT_API/v1/placements/default/$1" | jq -r '.placement.barrier.id // ""'; }
+not_live() { # not_live <id>: wait until the member's lease has lapsed
+  for _ in $(seq 1 200); do
+    [ "$("$SHUNT" proxy list --json 2>/dev/null | jq -r --arg id "$1" '.members[] | select(.id==$id) | .live')" = false ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 kill -STOP "${PID[b]}"
-refused "did not reach every proxy within 3s, waiting on proxy-b" ramp fleet-b --ratio 0.5 --wait 3s
-[ "$("$SHUNT" status fleet-b --json | jq -r '.placements[0].state')" = ACTIVE ] || fail "fleet-b is not ACTIVE after the release"
-sleep 9
-refused "shunt proxy forget" ramp fleet-b --ratio 0.5 --wait 2s
+blocked "proxy-b" ramp fleet-b --ratio 0.5 --wait 3s
+STEP=$OP
+[ "$(barrier_of fleet-b)" = "$STEP" ] || fail "the hold was released when the wait ran out; it must stay until the step commits or is canceled"
+opjson "$STEP" | jq -e '.status == "blocked" and (.allowed_actions | index("cancel")) != null and ([.blockers[] | select(.proxy_id == "proxy-b")] | length > 0)' >/dev/null \
+  || { opjson "$STEP"; fail "the blocked step's record does not name proxy-b and offer cancel"; }
+refused "is owned by unfinished operation $STEP" ramp fleet-b --ratio 0.6 --wait 2s
+accepted operation cancel "$STEP"
+[ -z "$(barrier_of fleet-b)" ] || fail "cancel did not release the step's hold"
+[ "$("$SHUNT" status fleet-b --json | jq -r '.placements[0].state')" = ACTIVE ] || fail "fleet-b is not ACTIVE after the cancel"
+note "a wait that ran out left the step durable and blocked, holding its scope; cancel released exactly its hold"
+
+not_live proxy-b || fail "proxy-b's lease did not lapse while it was stopped"
+refused "did not retire cleanly" proxy forget proxy-b
+note "a silent member cannot be forgotten: its process never retired, and its backend work may still land"
+blocked "proxy_missing" ramp fleet-b --ratio 0.5 --wait 2s
+STEP=$OP
+opjson "$STEP" | jq -e '.phase == "precondition" and (.allowed_actions | index("cancel")) != null' >/dev/null \
+  || { opjson "$STEP"; fail "a step waiting on a silent member before its hold does not offer cancel"; }
+accepted operation cancel "$STEP"
+note "a later step waits for the silent member too, before it holds anything; cancel ends it"
 kill -CONT "${PID[b]}"
 member_ok proxy-b || fail "B did not come back"
-accepted ramp fleet-b --ratio 0.5
-grep -q 'paused their writes' <<<"$OUT" || fail "fleet-b's first step was not held"
-kill -STOP "${PID[b]}"; sleep 9
+
+# The control node running a step dies while the step holds its barrier: the record is orphaned,
+# owner_lost, and another node carries it on from where it stands.
+kill -STOP "${PID[b]}"
+blocked "proxy-b" ramp fleet-b --ratio 0.5 --wait 2s
+STEP=$OP
+[ "$(barrier_of fleet-b)" = "$STEP" ] || { opjson "$STEP"; fail "the step did not hold its barrier before the owner crash"; }
+[ "$(opjson "$STEP" | jq -r '.node')" = c1 ] || fail "the step does not run on c1"
+kill -KILL "${PID[c1]}"; unset "PID[c1]"
+export SHUNT_API=http://$C2_API SHUNT_CONTROL_API=http://$C2_API
+for _ in $(seq 1 300); do opjson "$STEP" | jq -e '[.blockers[]?.code] | index("owner_lost") != null' >/dev/null && break; sleep 0.1; done
+opjson "$STEP" | jq -e '.status == "blocked" and (.allowed_actions | index("resume")) != null' >/dev/null \
+  || { opjson "$STEP"; fail "the step whose control node died is not blocked owner_lost with resume"; }
+[ "$(barrier_of fleet-b)" = "$STEP" ] || fail "the owner's death released the step's hold"
+accepted operation resume "$STEP"
+kill -CONT "${PID[b]}"
+member_ok proxy-b || fail "B did not come back"
+accepted operation wait "$STEP" --timeout 60s
+[ "$(opjson "$STEP" | jq -r '.status + " " + .node')" = "succeeded c2" ] || { opjson "$STEP"; fail "the resumed step did not succeed on c2"; }
+note "c1 died holding the step's barrier; c2 resumed it, and it committed once proxy-b was back"
+start_control 1 init
+export SHUNT_API=http://$C1_API SHUNT_CONTROL_API=http://$C1_API
 accepted ramp fleet-b --ratio 1.0
-grep -q 'silent, not waited for: proxy-b' <<<"$OUT" || fail "a step with a silent member did not name it"
-kill -CONT "${PID[b]}"; member_ok proxy-b || fail "B did not catch up after being silent"
+
+# A reachable member retires: it drains, records a clean retirement and exits; then it may be
+# forgotten, and a new process joins again.
+accepted proxy retire proxy-b --wait 30s
+grep -q 'retired cleanly' <<<"$OUT" || fail "proxy-b did not retire cleanly"
+for _ in $(seq 1 100); do kill -0 "${PID[b]}" 2>/dev/null || break; sleep 0.1; done
+kill -0 "${PID[b]}" 2>/dev/null && fail "proxy-b is still running after its retirement"
+unset "PID[b]"
+accepted proxy forget proxy-b
+start_proxy b
+member_ok proxy-b || fail "a new proxy-b process did not join after the retirement"
+note "a retired proxy was forgotten, and a new process under the same id joined again"
+
+# A member that crashes cannot be forgotten until an operator attests that its work has ended.
+kill -KILL "${PID[b]}"; unset "PID[b]"
+not_live proxy-b || fail "proxy-b's lease did not lapse after it was killed"
+refused "did not retire cleanly" proxy forget proxy-b
+blocked "proxy-b" readonly fleet-b --wait 2s
+STEP=$OP
+INC=$("$SHUNT" proxy show proxy-b --json | jq -r '.incarnation.id')
+[ -n "$INC" ] && [ "$INC" != null ] || fail "proxy show does not name proxy-b's incarnation"
+accepted proxy resolve proxy-b --incarnation "$INC" --attest "fleet.sh killed the process with SIGKILL; it has no connection to either backend"
+accepted proxy forget proxy-b
+accepted operation wait "$STEP" --timeout 30s
+note "the crashed incarnation was resolved with an attestation, then forgotten, and the read-only step went through"
+start_proxy b
+member_ok proxy-b || fail "proxy-b did not join again after being forgotten"
+accepted readonly fleet-b --off --wait 10s
 
 say "6. Browser mover operation, cutover and purge through the control plane, with the mover signing with secrets it holds"
 mover=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -H "Idempotency-Key: fleet-mover-$$" \
@@ -364,4 +452,34 @@ note "operation records: ramp, mover, cutover and purge-source on fleet-a all su
 curl -sf -H "Authorization: Bearer $TOKEN" "http://$C2_API/v1/control" | jq -e '.join | test("shunt-control join --name")' >/dev/null \
   || fail "GET /v1/control carries no join line for a new node"
 
-say "FLEET GREEN: three control nodes, two proxies sharing nothing, the fence, quorum loss and a cache restart all behave as ADR-0015 and ADR-0016 say"
+say "7. Barrier latency on a healthy fleet (1 s heartbeats): read-only on and off, ${BARRIER_ROUNDS:=20} times each"
+# Each toggle is a barrier operation: the hold, every proxy's drain, the commit. The gate's target
+# is a p99 under 5 s with no old work in flight (docs/prompts/distributed-hardening.md §3).
+: > barrier-ms.txt
+for i in $(seq 1 "$BARRIER_ROUNDS"); do
+  for mode in on off; do
+    args=(readonly fleet-b --wait 30s); [ "$mode" = off ] && args+=(--off)
+    t0=$(date +%s%N)
+    "$SHUNT" "${args[@]}" > barrier-last.log 2>&1 || { cat barrier-last.log; fail "readonly $mode, round $i"; }
+    echo $(( ($(date +%s%N) - t0) / 1000000 )) >> barrier-ms.txt
+  done
+done
+read -r n p50 p99 max < <(sort -n barrier-ms.txt | awk '{v[NR]=$1} END {i50=int(NR*0.50+0.5); i99=int(NR*0.99+0.5); if (i50<1) i50=1; if (i99<1) i99=1; print NR, v[i50], v[i99], v[NR]}')
+note "healthy barrier: $n operations, p50 ${p50} ms, p99 ${p99} ms, max ${max} ms (target: p99 under 5000 ms)"
+[ "$p99" -lt 5000 ] || fail "healthy barrier p99 ${p99} ms is over the 5 s target"
+# A long upload in flight holds the barrier until it ends; the hold is reported, never cut short.
+head -c $((512 << 20)) /dev/urandom > big.body
+# One PutObject, not a multipart upload: read-only would refuse the parts sent after it commits.
+( via "$A_LISTEN" s3api put-object --bucket fleet-b --key big.body --body big.body > big.log 2>&1; echo "rc=$?" >> big.log ) &
+UPLOAD_PID=$!
+for _ in $(seq 1 100); do [ -n "$(curl -fsS "http://$A_ADMIN/-/metrics" | awk '/^shunt_inflight\{op="PutObject"\}/ && $2 > 0')" ] && break; sleep 0.1; done
+t0=$(date +%s%N)
+accepted readonly fleet-b --wait 5m
+held=$(( ($(date +%s%N) - t0) / 1000000 ))
+wait "$UPLOAD_PID"
+grep -q 'rc=0' big.log || { cat big.log; fail "the upload in flight during the barrier failed"; }
+accepted readonly fleet-b --off --wait 30s
+rm -f big.body
+note "a barrier behind a 512 MiB PutObject already in flight took ${held} ms: it waited for the upload to finish"
+
+say "FLEET GREEN: three control nodes, two proxies sharing nothing, the fence, quorum loss and a cache restart all behave as ADR-0015, ADR-0016 and ADR-0021 say"

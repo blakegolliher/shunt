@@ -34,7 +34,7 @@ type Bundle struct {
 }
 
 // Identity is the lineage of the bundle's directory.
-func (b *Bundle) Identity() directory.Identity { return b.Snapshot.File().Identity }
+func (b *Bundle) Identity() directory.Identity { return b.Snapshot.Identity() }
 
 // Version is the bundle's directory version.
 func (b *Bundle) Version() int64 { return b.Snapshot.Version() }

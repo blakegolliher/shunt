@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/upstream
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkRegistryLoadGet-16             	75374938	        14.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16             	98857282	        14.58 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16             	84167319	        14.31 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16             	79333849	        17.39 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16             	86600829	        13.06 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryLoadGet-16             	91012658	        13.46 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRegistryRotateSecret-16        	   25558	     44814 ns/op	   19080 B/op	      90 allocs/op
+BenchmarkRegistryRotateSecret-16        	   26113	     51446 ns/op	   19080 B/op	      90 allocs/op
+BenchmarkRegistryRotateSecret-16        	   23880	     50612 ns/op	   19079 B/op	      90 allocs/op
+BenchmarkRegistryRotateSecret-16        	   22980	     50919 ns/op	   19079 B/op	      90 allocs/op
+BenchmarkRegistryRotateSecret-16        	   25329	     47497 ns/op	   19079 B/op	      90 allocs/op
+BenchmarkRegistryRotateSecret-16        	   24764	     53656 ns/op	   19080 B/op	      90 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   25465	     43488 ns/op	   18360 B/op	      85 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   26702	     45641 ns/op	   18360 B/op	      85 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   24046	     47326 ns/op	   18360 B/op	      85 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   24640	     50556 ns/op	   18360 B/op	      85 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   24841	     49823 ns/op	   18360 B/op	      85 allocs/op
+BenchmarkRegistryPrepareUnchanged-16    	   23372	     49329 ns/op	   18360 B/op	      85 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/upstream	22.082s

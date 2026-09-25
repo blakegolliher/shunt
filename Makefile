@@ -90,6 +90,18 @@ property: build ## POC-4 migration property test (PROPERTY_TIME, default 2m; PRO
 	  $(GO) test ./internal/proxy -run TestMigrationPreservesTheClientsView -count=1 -timeout $(PROPERTY_TIMEOUT) -v > $$dir/go-test.log 2>&1; \
 	rc=$$?; echo "property run exited $$rc; record in $$dir"; exit $$rc
 
+# The H2 acceptance soak (docs/prompts/distributed-hardening.md §3) records like property: the
+# whole run in test/property/runs/<timestamp>/ (go-test.log, never filtered; git.txt; the goroutine
+# profiles goroutines-warm.txt and goroutines-end.txt). SOAK_SEED passes through when set.
+soak: build ## H2 fleet soak: partitions and control-node crashes under the model workload (SOAK_TIME, default 10m; SOAK_SEED; SOAK_TIMEOUT)
+	@set -uo pipefail; \
+	dir=$(CURDIR)/test/property/runs/$$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $$dir; \
+	{ git rev-parse HEAD; git status --porcelain; } > $$dir/git.txt 2>&1; \
+	echo "soak run $(SOAK_TIME): full output in $$dir/go-test.log"; \
+	SHUNT_SOAK_RUN_DIR=$$dir SHUNT_SOAK_DURATION=$(SOAK_TIME) $(if $(SOAK_SEED),SHUNT_SOAK_SEED=$(SOAK_SEED)) \
+	  $(GO) test ./internal/proxy -run '^TestFleetSoak$$' -count=1 -timeout $(SOAK_TIMEOUT) -v > $$dir/go-test.log 2>&1; \
+	rc=$$?; echo "soak run exited $$rc; record in $$dir"; exit $$rc
+
 bench: ## run all benchmarks, write test/bench/new.txt
 	@mkdir -p test/bench
 	$(GO) test -run '^$$' -bench . -benchmem -benchtime $(BENCH_TIME) -count $(BENCH_COUNT) $(PKGS) | tee test/bench/new.txt
@@ -164,6 +176,8 @@ run-minio: build ## run shunt in front of the e2e MinIO (foreground)
 # VAST_ACCESS_KEY_ID / VAST_SECRET_ACCESS_KEY exported and `make run-vast-resign`.
 PROPERTY_TIME    ?= 2m
 PROPERTY_TIMEOUT ?= 20m
+SOAK_TIME        ?= 10m
+SOAK_TIMEOUT     ?= 60m
 BACKEND      ?= garage
 MODE         ?= passthrough
 VAST_ENDPOINT ?= https://vast.example.com:443

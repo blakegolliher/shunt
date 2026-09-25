@@ -74,7 +74,8 @@ reads, and the mover's last pass. Underneath, on the metrics listener:
 - `shunt_migration_dual_delete_total{outcome}` — `both`, `source_missing`, `source_failed`,
   `primary_failed`. A migration delete goes to the source first, then the primary. Alert on
   `source_failed` (the mover will copy the object back) and `primary_failed` (see "A delete can
-  half-succeed" below).
+  half-succeed" below). A delete paused while purge-source holds the source is not sent at all and
+  counts in `shunt_migration_refused_writes_total{reason="source_closed"}` instead.
 - `shunt_listing_merge_seconds` — what merged listings cost while `MIGRATING`.
 - `shunt_route_state{bucket,state}` and `shunt_ramp_ratio{bucket}` — where each bucket is.
 
@@ -194,14 +195,24 @@ The call waits out the window, then records the evidence on the placement (`cuto
 directory). Choose a window that covers your clients' read patterns. A bucket that is read once an
 hour needs an hour-long window, or a scripted read of its cold keys during a shorter one.
 
-**With several proxies** (ADR-0015, ADR-0016), run every command against the control plane
-(`--api` at any `shunt-control` node). Each step is in effect only once every member has installed
-it, and the command says so, or names the members it is still waiting on. A step that moves writes
-pauses the writes of the keys it moves (503 with `Retry-After`, retried by every SDK) for a couple
-of heartbeats while it reaches every member. The cutover window counts fallback reads on every
-live member, and refuses if one stops reporting during it. A bucket's first step waits for every
-member, even a silent one: check `shunt proxy list` first, and `shunt proxy forget <id>` a proxy
-that is gone for good.
+Writes flow during the window. A read that falls back in it refuses the cutover with nothing
+changed: run the mover again and repeat. After the window, cutover holds the bucket like any step
+(ADR-0021): every proxy stops admitting its writes and deletes (503 with `Retry-After`, retried by
+every SDK) and drains the ones in flight. Under that hold it checks that the source has no
+multipart upload in progress and that no read has fallen back since the window, then commits and
+writes resume. If either check fails, the operation stays blocked with the bucket's writes paused:
+cancel it (`shunt operation cancel <id>`), deal with the cause, and cut over again
+([docs/runbooks/blocked-operation.md](runbooks/blocked-operation.md)).
+
+**With several proxies** (ADR-0015, ADR-0016, ADR-0021), run every command against the control
+plane (`--api` at any `shunt-control` node). Every step waits for every registered member: a
+silent one blocks it (`proxy_missing`) until it is back, retires, or its stopped process is
+resolved; nothing goes ahead without it and no timeout releases the step. Check `shunt proxy list`
+first. A step that moves writes pauses the bucket's writes (503 with `Retry-After`) while every
+member drains the requests it admitted under the old routing: a couple of heartbeats plus the
+longest write in flight. When the CLI stops watching an unfinished step it exits 3 with the
+operation id and what it waits on; the operation stays blocked, with its hold, until its blockers
+clear or it is cancelled. [docs/fleet.md](fleet.md) has the steps to take.
 
 In `CUTOVER`, reads and listings use the new primary alone. Deletes still reach the source, so the
 source only ever loses keys. Then either:
@@ -210,13 +221,22 @@ source only ever loses keys. Then either:
   evidence *and* a full listing of both buckets finds no source key that the primary lacks (each
   candidate is confirmed with a HEAD on both sides, so clients deleting meanwhile do not trip it). It then
   aborts the source's in-progress multipart uploads, deletes every object and the bucket, and returns
-  the placement to `ACTIVE` without a source. The refusal names the first 20 missing keys: run the
-  mover again, or find out why they are missing, before retrying. The command runs the API's dry
+  the placement to `ACTIVE` without a source. The refusal names the first 20 missing keys. The mover
+  no longer runs in `CUTOVER`: find out why each is missing and reconcile it on the backends (copy it
+  to the primary, or delete it from the source if a client deleted it) before retrying
+  ([docs/runbooks/blocked-operation.md](runbooks/blocked-operation.md)). The command runs the API's dry
   run first and prints what would go (`would delete 100 objects (1.6 MiB) and abort 0 in-flight
   uploads from vast01/data01`); `--dry-run` stops there. The dry run issues a confirmation token,
   valid for ten minutes and bound to the placement and the source cluster's definition, which the
   purge presents: if either changed in between, the purge is refused and the dry run must be run
-  again (ADR-0017).
+  again (ADR-0017). The purge then holds the source (ADR-0021): every proxy stops reading it and
+  drains, and **the bucket's DELETEs answer 503 with `Retry-After`** until the purge ends, since a
+  delete that reached the primary alone would leave the source holding a key the primary lacks.
+  Under that hold the listing diff is taken again. If it is not empty, the operation blocks as
+  `source_diff` with nothing deleted: cancel it (`shunt operation cancel <id>`), which reopens the
+  source and lets deletes through, deal with the keys it names, and run `purge-source` again
+  ([docs/runbooks/blocked-operation.md](runbooks/blocked-operation.md)). Once the first delete is
+  sent the purge can no longer be cancelled; it is resumed to completion.
 - `shunt migrate finish data`: returns to `ACTIVE` and leaves the source bucket untouched and
   unreferenced, for you to keep or delete yourself.
 

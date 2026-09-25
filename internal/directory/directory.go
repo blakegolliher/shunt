@@ -378,6 +378,10 @@ func (s *Snapshot) Buckets(tenant string) []string { return s.buckets[tenant] }
 // File returns a deep copy of the directory contents.
 func (s *Snapshot) File() *File { return s.file.clone() }
 
+// Identity is the snapshot's directory lineage, without File's deep copy: heartbeats and barrier
+// polls read it on every round, and at 100,000 placements a copy costs about 130 ms.
+func (s *Snapshot) Identity() Identity { return s.file.Identity }
+
 // Generation is the generation of a resource in the snapshot's directory (File.Generation).
 func (s *Snapshot) Generation(resource string) int64 { return s.file.Generation(resource) }
 

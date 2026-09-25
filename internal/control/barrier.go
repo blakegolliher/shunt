@@ -230,7 +230,7 @@ func (s *Server) drainBlockers(ctx context.Context, st *BarrierState, extra func
 	if err != nil {
 		return nil, err
 	}
-	cur := s.Dir.Snapshot().File().Identity
+	cur := s.Dir.Snapshot().Identity()
 	var out []Blocker
 	for i := range ms {
 		m := &ms[i]

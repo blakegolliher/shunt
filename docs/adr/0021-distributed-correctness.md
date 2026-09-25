@@ -5,7 +5,7 @@ Status: **proposed; the first four regressions landed** (T01, T02, T03, T07 on 2
 transaction contract and scope reservations), H0c (idempotency keys, expected generations and
 operation capacity), H0d (typed refusals, `shunt operation`, the Operations screen, and the
 direct-write audit) and H0e (metric catalog rows and benchmarks, docs/bench/h0.md). H0's gate
-passed on 2026-09-24. H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations), H1c (resource lifetimes, the retained-bundle bound), H1d (the restart cache), H1e (rotation and install diagnostics on API, CLI and UI) and H1f (benchmarks, docs/bench/h1.md). H2–H5 are pending.
+passed on 2026-09-24. H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations), H1c (resource lifetimes, the retained-bundle bound), H1d (the restart cache), H1e (rotation and install diagnostics on API, CLI and UI) and H1f (benchmarks, docs/bench/h1.md). H2 passed on 2026-09-25: H2a–H2e, the review fixes, and H2f's acceptance (docs/bench/h2.md; "Decisions taken 2026-09-25"). H3–H5 are pending.
 
 Design baseline: `distributed` at `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03`.
 This proposal amends [ADR-0015](0015-embedded-etcd.md),
@@ -142,6 +142,62 @@ could reopen a source under its own deletes. The fixes settle four rules.
    that waits for an acknowledgement no proxy can send. A dead external mover's session is resolved
    by an operator with an attestation (`resolve-worker`, on API, CLI and GUI), which the record
    keeps.
+
+## Decisions taken 2026-09-25 (H2f acceptance)
+
+The H2 release gate ran `make walkthrough` and `make fleet` on the H2 build and found three
+behaviors that the slices' own tests did not. Each fix has a regression test that fails with the
+fix reverted.
+
+1. **A mutation dispatched whole runs to the backend's answer.** A client that disconnects no
+   longer cuts off the upstream request of a write, delete or other mutation (`migrate.Mutates`):
+   the proxy detaches it from the client's context and waits for the backend, bounded by its own
+   idle-progress and metadata deadlines, so the outcome is definitive. Before, a client that left
+   with its request at the backend made the outcome uncertain, and uncertainty is counted for the
+   life of the process (H2a), so one ordinary client timeout (in the walkthrough, `shunt verify
+   --duration` ending with two DELETEs in flight) blocked every later barrier on the bucket until
+   the proxy was retired and its incarnation resolved. A client that leaves mid-body still stops
+   the request: the body is cut short and a short body is never committed. Only the proxy's own
+   deadline expiring with the backend silent remains uncertain; that cost stands and the runbooks
+   state it. Reads keep following the client's context. (`TestClientDisconnectDoesNotMakeAMutationUncertain`.)
+2. **Cutover's quiet window runs before its hold, with writes flowing.** H2e ran the window as the
+   barrier's `extra`, behind the closed mutations gate, which answered every write and delete 503
+   for the whole window (60 s by default); the walkthrough's verify gave up after its SDK-like
+   retries. The gate buys the window nothing: a fallback read is a read, which the gate does not
+   stop. The window now runs first, bound to the proxies' incarnations as before; a fallback read
+   or a proxy that did not report is a refusal (409) with nothing held. Then cutover holds the
+   bucket like any step and, under the closed gate, checks the source has no open multipart upload
+   and that every proxy that watched the window reports twice more, from the same process, with the
+   fallback count unchanged. A read that fell back after the window blocks the operation
+   (`old_requests`) and a new window is watched under the hold; a resumed cutover, whose first
+   owner's window is not on the record, watches its window under the hold too.
+   (`TestCutoverWindowKeepsWritesFlowing`.)
+3. **An operation orphaned before its first write changed nothing, and an ended record offers
+   nothing.** A step whose control node died while it was queued, in its precondition, in
+   cutover's window or in purge's diff, with no barrier intent on its record, ends `failed` with
+   effect `none`, not `uncertain`. Any record ended by the owner-loss sweep or a restart carries no
+   blockers and no allowed actions; `make fleet` found such a record still offering `cancel`.
+   (`TestOrphanedBeforeFirstWriteChangedNothing`.)
+4. **Forget keeps the incarnations it proved ended.** Forget deleted the member record, and with
+   it the operator's resolution of a killed process. A new process started on the same cache
+   reports the killed one as its unclean previous incarnation, and the fresh record took it for a
+   crash, so every step blocked on `incarnation_unresolved` again. Forget now writes
+   `/shunt/fleet/forgotten/<id>`, in the transaction that deletes the member, listing its retired
+   and resolved incarnations, and a registration does not revive those. A previous incarnation
+   forget never proved ended still counts: a forgotten proxy restarted during a control outage
+   serves ACTIVE buckets from its cache, and its crash is real evidence.
+   (`TestFleetForgottenIncarnationStaysEnded`.)
+
+The CLI's `--wait` is now what the contract says (contracts §2, "CLI completion semantics"): how
+long the command watches its operation, after which it exits 3 with the record's id, phase,
+blockers and next commands. `ramp` and `migrate start` watched for one minute plus three times
+`--wait`, `cutover` for its window plus two minutes plus three times `--wait`, and `readonly` and
+`purge-source` until the operation ended. `cutover` now watches for its window plus `--wait`. The
+request that creates the record has its own one-minute bound, so a control plane without quorum
+still answers with its reason. `shunt operation wait` and the steps' own polling decoded every
+answer into one value, so an ended record, which omits its blockers, was printed with the blockers
+of an earlier poll; each poll now decodes into a fresh value. SIGINT's exit 130 is not implemented
+(H5).
 
 ## Scope and cost
 

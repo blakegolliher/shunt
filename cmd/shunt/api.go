@@ -124,12 +124,20 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
+// createTimeout bounds the request that creates an operation record.
+const createTimeout = time.Minute
+
 // operate starts an operation record for one action and polls it until it ends (ADR-0017). The
 // server runs the action on its own context, so a --wait longer than a listener's timeout is
 // fine, and an operator who loses the connection can still read the outcome from the record.
 func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, out any) error {
 	var op control.Operation
-	if err := c.call(ctx, http.MethodPost, "/v1/operations", req, &op); err != nil {
+	// ctx's deadline is the command's --wait, which bounds watching the operation, not creating it:
+	// a control plane that is slow to answer (quorum lost) still says why it refused, rather than
+	// the CLI giving up with the outcome unknown.
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createTimeout)
+	defer cancel()
+	if err := c.call(cctx, http.MethodPost, "/v1/operations", req, &op); err != nil {
 		return err
 	}
 	tick := time.NewTicker(250 * time.Millisecond)
@@ -145,17 +153,19 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 			}
 			next := fmt.Sprintf("it keeps running: `shunt operation wait %s` follows it", op.ID)
 			if slices.Contains(op.AllowedActions, control.ActionCancel) {
-				next += fmt.Sprintf(", `shunt operation cancel %s` restores its durable precommit hold", op.ID)
+				next += fmt.Sprintf(", `shunt operation cancel %s` releases its hold and changes nothing", op.ID)
 			}
 			return &exitError{code: exitWaitDeadline, err: fmt.Errorf("%s; %s", what, next)}
 		case <-tick.C:
 		}
-		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &op); err != nil {
+		var next control.Operation // fresh: fields an ended record omits must not survive a poll
+		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &next); err != nil {
 			if ctx.Err() != nil {
 				continue // the next select reports the wait deadline with the last complete record
 			}
 			return err
 		}
+		op = next
 	}
 	msg := "operation " + op.ID + " " + op.Status
 	if op.Error != nil {

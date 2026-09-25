@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkBeat/placements=1000-16         	     687	   1752847 ns/op	     14735 bytes/heartbeat	  171980 B/op	    1447 allocs/op
+BenchmarkBeat/placements=1000-16         	     844	   1475756 ns/op	     14735 bytes/heartbeat	  172874 B/op	    1447 allocs/op
+BenchmarkBeat/placements=1000-16         	     823	   1537764 ns/op	     14735 bytes/heartbeat	  171381 B/op	    1447 allocs/op
+BenchmarkBeat/placements=1000-16         	     753	   1570078 ns/op	     14735 bytes/heartbeat	  171392 B/op	    1447 allocs/op
+BenchmarkBeat/placements=1000-16         	     751	   1572752 ns/op	     14735 bytes/heartbeat	  166297 B/op	    1445 allocs/op
+BenchmarkBeat/placements=1000-16         	     864	   1404681 ns/op	     14735 bytes/heartbeat	  168316 B/op	    1446 allocs/op
+BenchmarkBeat/placements=100000-16       	      48	  27939094 ns/op	     14734 bytes/heartbeat	 2522157 B/op	  100436 allocs/op
+BenchmarkBeat/placements=100000-16       	      38	  32116367 ns/op	     14734 bytes/heartbeat	 2529202 B/op	  100438 allocs/op
+BenchmarkBeat/placements=100000-16       	      33	  33375577 ns/op	     14734 bytes/heartbeat	 2533019 B/op	  100440 allocs/op
+BenchmarkBeat/placements=100000-16       	      40	  29480059 ns/op	     14734 bytes/heartbeat	 2526954 B/op	  100438 allocs/op
+BenchmarkBeat/placements=100000-16       	      36	  31516735 ns/op	     14734 bytes/heartbeat	 2525678 B/op	  100437 allocs/op
+BenchmarkBeat/placements=100000-16       	      45	  31505583 ns/op	     14734 bytes/heartbeat	 2524285 B/op	  100437 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/member	18.343s

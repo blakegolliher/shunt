@@ -184,9 +184,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// known only once its response has arrived, and a drain barrier waits for exactly that.
 	defer o.releaseTokens(h.Gates)
 
+	// A mutation is not cut off when its client goes away (ADR-0021, 2026-09-25): once the backend
+	// has the whole request, only its answer tells whether the change landed, and an outcome this
+	// proxy never learns blocks every later barrier on the bucket for the life of the process. A
+	// client that leaves mid-body still stops the request, since its body read fails and a short
+	// body is never committed. The proxy's own deadlines below still apply.
+	parent := r.Context()
+	if migrate.Mutates(o.info.Op, r.Method) {
+		parent = context.WithoutCancel(parent)
+	}
 	// Deadline class (docs/DESIGN.md §2.8): metadata ops get a total deadline, data ops an
 	// idle-progress watchdog that cancels the upstream request when nothing moves.
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var wd *watchdog
 	if o.info.Op.IsData() {

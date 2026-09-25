@@ -2,13 +2,14 @@
 
 Name: **shunt** — to divert traffic onto another track without stopping it. Binary `shunt`, module `github.com/blakegolliher/shunt`, metric prefix `shunt_`.
 
-**Distributed correctness proposal (2026-09-24):**
+**Distributed correctness (2026-09-24):**
 [ADR-0021](adr/0021-distributed-correctness.md) and the
 [implementation plan](prompts/distributed-hardening.md) specify fixes for runtime
 installation, request draining, restore recovery, control membership and operator
-state. They are proposed, not shipped; §12 and ADR-0015 remain the implemented
-substrate. The proposal explicitly identifies the ADR-0016 guarantees that need
-stronger drain and recovery semantics.
+state. H0–H2 have landed (coherent installation, local admission and drain
+barriers, incarnations and leases; docs/bench/h1.md, docs/bench/h2.md); H3–H5
+(membership, restore recovery, operator workflow) are proposed. Where §12 or
+ADR-0015/0016 disagree with ADR-0021's landed parts, ADR-0021 holds.
 
 v2 changes from v1: TLS is userspace `crypto/tls` on both sides; no kTLS, no NIC offload, no sockmap, no hardware assumptions anywhere. See `docs/validation-report.md` for every assumption checked and every correction made.
 

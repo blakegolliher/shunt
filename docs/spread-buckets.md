@@ -107,8 +107,10 @@ is only assumed (ADR-0004).
 
 ## Retire an idle leg
 
-A first step whose hold did not reach every proxy is released, and leaves its destination as a leg
-that owns no keys. Forget such legs with:
+A first step cancelled before its commit (`shunt operation cancel <id>`, ADR-0021) releases its
+hold and leaves its destination as a leg that owns no keys. A step that waits on a proxy is not
+released by itself: it stays blocked until the proxy drains or the step is cancelled. Forget such
+legs with:
 
 ```sh
 shunt expand acme/wide --clear

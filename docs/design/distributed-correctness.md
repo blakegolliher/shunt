@@ -338,6 +338,14 @@ cache cannot be used for offline restart.
 
 ## 4. D2 — admission, drain barriers and server leases
 
+**Landed (2026-09-25, H2a–H2f); H2 passed:** docs/bench/h2.md. Local admission gates, proxy
+incarnations with attested resolution, heartbeat drain proofs and server-granted leases, durable
+barriers with resume and precommit cancel, and cutover, purge, movers and credential drain
+through them. H2f changed three things this section specified: a mutation sent whole runs to the
+backend's answer when its client leaves; cutover watches its quiet window before its hold, with
+writes flowing, and re-checks it under the closed gate; forget keeps the incarnations it proved
+ended. ADR-0021, "Decisions taken 2026-09-25", has each with its regression test.
+
 ### Local admission
 
 Maintain bounded counters/gates per configured placement and in-use generation,

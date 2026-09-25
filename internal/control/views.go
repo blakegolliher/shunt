@@ -217,7 +217,7 @@ func (s *Server) fenceStatus(ctx context.Context, p directory.Placement) FenceSt
 			fs.Silent = append(fs.Silent, m.ID)
 		default:
 			fs.Proxies++
-			if !m.Has(snap.File().Identity, fs.Version) {
+			if !m.Has(snap.Identity(), fs.Version) {
 				fs.WaitingOn = append(fs.WaitingOn, m.ID)
 			}
 		}

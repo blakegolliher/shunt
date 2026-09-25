@@ -55,6 +55,8 @@ type Client struct {
 	keys *auth.Static
 	log  *slog.Logger
 	http *http.Client
+	// heartbeatCap overrides maxHeartbeatBytes (tests); zero is the real cap.
+	heartbeatCap int
 	// Prepare, if set, is called with each directory before it is installed (the proxy builds its
 	// clusters with it); an error refuses the version, and the last good one stays. resolve
 	// resolves the candidate's own secrets: nothing live sees them until commit, which runs just
@@ -202,7 +204,7 @@ func (c *Client) apply(d *control.Directory) (installed bool, err error) {
 	if err := f.Identity.Validate(); err != nil {
 		return false, fmt.Errorf("directory version %d carries no valid identity: %w", d.Version, err)
 	}
-	if cur := c.Snapshot().File().Identity; !cur.IsZero() && cur != f.Identity {
+	if cur := c.Snapshot().Identity(); !cur.IsZero() && cur != f.Identity {
 		return false, c.lineageFault(fmt.Sprintf("directory version %d is from cluster %s epoch %s; this proxy's is from cluster %s epoch %s", d.Version, f.Identity.ClusterID, f.Identity.Epoch, cur.ClusterID, cur.Epoch))
 	}
 	if d.Version <= c.Snapshot().Version() {
@@ -377,7 +379,7 @@ func (c *Client) checkAnswer(err error) error {
 func (c *Client) fetch(ctx context.Context, since int64, wait time.Duration) (installed bool, err error) {
 	var d control.Directory
 	path := fmt.Sprintf("/v1/directory?since=%d&wait=%s", since, wait)
-	if id := c.Snapshot().File().Identity; !id.IsZero() {
+	if id := c.Snapshot().Identity(); !id.IsZero() {
 		path += "&cluster_id=" + id.ClusterID + "&epoch=" + id.Epoch
 	} else {
 		path = fmt.Sprintf("/v1/directory?since=0&wait=%s", wait)
@@ -454,8 +456,8 @@ func (c *Client) beat(ctx context.Context) error {
 	seq := c.seq.Add(1)
 	sent := c.Now()
 	snap := c.serving()
-	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.File().Identity, Started: c.started, Seq: seq, Applied: snap.Version(),
-		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap.File()),
+	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.Identity(), Started: c.started, Seq: seq, Applied: snap.Version(),
+		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap),
 		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
 	if c.SecretsHeld != nil {
 		hb.SecretsHeld = c.SecretsHeld()
@@ -471,16 +473,11 @@ func (c *Client) beat(ctx context.Context) error {
 	// closed on install, so the acknowledgement reports the installed version's barriers, and the
 	// control plane checks the durable version against each barrier's generation.
 	hb.Barriers = c.Gates.Acks(installedSnap)
-	if c.Telemetry != nil {
-		hb.Telemetry = c.Telemetry.Completed(c.Now())
-	}
-	if dropped, size := capTelemetry(&hb, maxHeartbeatBytes); dropped {
-		c.log.Warn("heartbeat over the size cap; its telemetry window is dropped so the lease and the drain proof get through", "bytes", size, "cap", maxHeartbeatBytes)
-	}
-	f := snap.File()
-	for key := range f.Placements {
-		if f.Placements[key].State == directory.StateActive {
-			continue
+	// Cutover's evidence, before the size cap so the cap counts it: only telemetry is dropped to
+	// fit, never a count cutover reads.
+	snap.EachPlacement(func(key string, p *directory.Placement) bool {
+		if p.State == directory.StateActive {
+			return true
 		}
 		if hb.FallbackReads == nil {
 			hb.FallbackReads = map[string]float64{}
@@ -488,6 +485,17 @@ func (c *Client) beat(ctx context.Context) error {
 		if c.Metrics != nil {
 			hb.FallbackReads[key] = control.Counters(c.Metrics.FallbackReads, key, "")[""]
 		}
+		return true
+	})
+	if c.Telemetry != nil {
+		hb.Telemetry = c.Telemetry.Completed(c.Now())
+	}
+	limit := maxHeartbeatBytes
+	if c.heartbeatCap > 0 {
+		limit = c.heartbeatCap
+	}
+	if dropped, size := capTelemetry(&hb, limit); dropped {
+		c.log.Warn("heartbeat over the size cap; its telemetry window is dropped so the lease and the drain proof get through", "bytes", size, "cap", limit)
 	}
 	bctx, cancel := context.WithTimeout(ctx, c.cfg.Interval)
 	defer cancel()
@@ -555,7 +563,7 @@ func (c *Client) renew(ctx context.Context, seq int64, sent time.Time, applied i
 		// The control plane has a newer directory: fetch it now, not at the poll's next turn.
 		_, _ = c.fetch(ctx, c.Snapshot().Version(), 0) //nolint:errcheck // the poll loop retries
 	}
-	if id := c.Snapshot().File().Identity; id != ans.Identity {
+	if id := c.Snapshot().Identity(); id != ans.Identity {
 		return &grantError{reason: GrantLineage, msg: fmt.Sprintf("the heartbeat was answered for cluster %s epoch %s; this proxy's directory is cluster %s epoch %s; not a lease", ans.Identity.ClusterID, ans.Identity.Epoch, id.ClusterID, id.Epoch)}
 	}
 	if v := c.Snapshot().Version(); v < ans.Version {
@@ -638,16 +646,17 @@ func capTelemetry(hb *control.Heartbeat, limit int) (dropped bool, size int) {
 
 // secretGenerations are the secret generations of the installed directory, by cluster: what the
 // runtime bundle published with it signs with, since both come from one install.
-func secretGenerations(f *directory.File) map[string]string {
+func secretGenerations(snap *directory.Snapshot) map[string]string {
 	var out map[string]string
-	for name := range f.Clusters {
-		if g := f.Generation(directory.SecretResource(name)); g > 0 {
+	snap.EachCluster(func(name string, _ *config.Cluster) bool {
+		if g := snap.Generation(directory.SecretResource(name)); g > 0 {
 			if out == nil {
 				out = map[string]string{}
 			}
 			out[name] = strconv.FormatInt(g, 10)
 		}
-	}
+		return true
+	})
 	return out
 }
 
@@ -725,7 +734,7 @@ type Status struct {
 
 // ServeHTTP answers /-/fleet on the proxy's admin listener.
 func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().File().Identity,
+	st := Status{ID: c.cfg.ProxyID, ControlNode: c.endpoint(), Stale: c.Stale(), Applied: c.serving().Version(), Identity: c.Snapshot().Identity(),
 		Incarnation: c.incarnation, Uncertain: c.Gates.Uncertain()}
 	if why := c.lineage.Load(); why != nil {
 		st.LineageFault = *why

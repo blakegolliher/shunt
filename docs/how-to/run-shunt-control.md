@@ -110,5 +110,7 @@ does not know, so it would be refused until the node is upgraded.
 
 Every node serves `/-/metrics` on its API listener: `shunt_fleet_members{state="live"|"silent"}`,
 `shunt_fleet_fence_wait_seconds`, and the request metrics of the API itself. Alert on
-`shunt_fleet_members{state="silent"} > 0` and on quorum loss (`status` says `NO QUORUM`); the
-runbooks are docs/runbooks/quorum-loss.md and docs/runbooks/lagging-proxy.md.
+`shunt_fleet_members{state="silent"} > 0`, `shunt_fleet_unresolved_incarnations > 0`,
+`shunt_operations{status="blocked"} > 0`, and on quorum loss (`status` says `NO QUORUM`); the
+runbooks are docs/runbooks/quorum-loss.md, docs/runbooks/lagging-proxy.md,
+docs/runbooks/crashed-proxy.md and docs/runbooks/blocked-operation.md.

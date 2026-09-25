@@ -51,7 +51,9 @@ func newClusterReadOnly() *cobra.Command {
 			}
 			var out control.ReadOnlyResult
 			req := control.OperationRequest{Kind: control.OpClusterReadOnly, Cluster: args[0], Args: argsOf(control.ReadOnlyRequest{ReadOnly: !off, Reject: reject, Wait: wait.String()})}
-			if opErr := api.operate(cmd.Context(), req, &out); opErr != nil {
+			ctx, cancel := waitContext(cmd, wait)
+			defer cancel()
+			if opErr := api.operate(ctx, req, &out); opErr != nil {
 				return opErr
 			}
 			if o.json {
@@ -64,7 +66,7 @@ func newClusterReadOnly() *cobra.Command {
 	addAPIFlags(cmd, &o)
 	cmd.Flags().BoolVar(&off, "off", false, "make the cluster writable again")
 	cmd.Flags().BoolVar(&reject, "reject", false, "fail writes fast with 403 instead of retryable 503")
-	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy at each fence")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the fence and have the change; exit 3 if it is still running then")
 	return cmd
 }
 
@@ -87,7 +89,9 @@ func newBucketReadOnly() *cobra.Command {
 			}
 			var out control.ReadOnlyResult
 			req := control.OperationRequest{Kind: control.OpPlacementReadOnly, Placement: key, Args: argsOf(control.ReadOnlyRequest{ReadOnly: !off, Reject: reject, Wait: wait.String()})}
-			if opErr := api.operate(cmd.Context(), req, &out); opErr != nil {
+			ctx, cancel := waitContext(cmd, wait)
+			defer cancel()
+			if opErr := api.operate(ctx, req, &out); opErr != nil {
 				return opErr
 			}
 			if o.json {
@@ -100,7 +104,7 @@ func newBucketReadOnly() *cobra.Command {
 	addAPIFlags(cmd, &o)
 	cmd.Flags().BoolVar(&off, "off", false, "make the bucket writable again")
 	cmd.Flags().BoolVar(&reject, "reject", false, "fail writes fast with 403 instead of retryable 503")
-	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy at each fence")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the fence and have the change; exit 3 if it is still running then")
 	return cmd
 }
 
@@ -650,7 +654,7 @@ func newRamp() *cobra.Command {
 			}
 			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, control.OpRamp, req, time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpRamp, req, wait)
 			})
 		},
 	}
@@ -662,7 +666,7 @@ func newRamp() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name on --to (default: a generated name)")
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
-	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	f.DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the step and have it; exit 3 if it is still running then")
 	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
 }
@@ -722,7 +726,7 @@ func newMigrateStart() *cobra.Command {
 			}
 			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
-				return transition(cmd, api, o, key, control.OpMigrate, req, time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpMigrate, req, wait)
 			})
 		},
 	}
@@ -734,7 +738,7 @@ func newMigrateStart() *cobra.Command {
 	f.StringVar(&req.Name, "name", "", "the bucket's name on --to")
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
-	f.DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the step")
+	f.DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the step and have it; exit 3 if it is still running then")
 	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
 	return cmd
 }
@@ -759,14 +763,14 @@ func newCutover() *cobra.Command {
 				if !o.json {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: waiting %s for fallback reads to stay flat\n", key, window)
 				}
-				return transition(cmd, api, o, key, control.OpCutover, control.CutoverRequest{Window: window.String(), Wait: wait.String()}, window+2*time.Minute+3*wait)
+				return transition(cmd, api, o, key, control.OpCutover, control.CutoverRequest{Window: window.String(), Wait: wait.String()}, window+wait)
 			})
 		},
 	}
 	addAPIFlags(cmd, &o)
 	cmd.Flags().DurationVar(&window, "window", 60*time.Second, "how long fallback reads must stay flat")
 	cmd.Flags().StringVar(&from, "from", "", "instead of one bucket: every bucket migrating off this cluster")
-	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to report and to have the change")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait, after the window, for every proxy to drain and have the change; exit 3 if it is still running then")
 	return cmd
 }
 
@@ -822,7 +826,9 @@ func newPurgeSource() *cobra.Command {
 			}
 			var res control.PurgeResult
 			req := control.OperationRequest{Kind: control.OpPurge, Placement: key, Args: argsOf(control.PurgeRequest{Token: plan.Token, Wait: wait.String()})}
-			if opErr := api.operate(cmd.Context(), req, &res); opErr != nil {
+			ctx, cancel := waitContext(cmd, wait)
+			defer cancel()
+			if opErr := api.operate(ctx, req, &res); opErr != nil {
 				return opErr
 			}
 			if o.json {
@@ -839,7 +845,7 @@ func newPurgeSource() *cobra.Command {
 	}
 	addAPIFlags(cmd, &o)
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "count what would be deleted and stop")
-	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "with several proxies: how long to wait for all of them to have the cutover")
+	cmd.Flags().DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the purge and for it to finish; exit 3 if it is still running then")
 	return cmd
 }
 
@@ -1098,13 +1104,13 @@ func printFleet(out io.Writer, res control.TransitionResult) {
 	switch {
 	case len(res.WaitingOn) > 0:
 		_, _ = fmt.Fprintf(out, "PENDING: not yet installed on %s. The change is written and each proxy applies it as it catches up;\n"+
-			"the next step on this bucket is refused until they all have it (`shunt proxy list`)\n", strings.Join(res.WaitingOn, ", "))
+			"the next step on this bucket waits for them (`shunt proxy list`)\n", strings.Join(res.WaitingOn, ", "))
 	case res.Proxies > 0:
 		_, _ = fmt.Fprintf(out, "in effect on every live proxy (this one and %d member(s))\n", res.Proxies)
 	}
 	if len(res.Silent) > 0 {
-		_, _ = fmt.Fprintf(out, "silent, not waited for: %s. A silent proxy refuses writes to moving buckets on its own and installs\n"+
-			"the change when it is back; one that is gone for good: `shunt proxy forget <id>`\n", strings.Join(res.Silent, ", "))
+		_, _ = fmt.Fprintf(out, "silent, not waited for: %s. It drained the hold before it fell silent, refuses writes to moving\n"+
+			"buckets on its own and installs the change when it is back; the next step waits for it (docs/runbooks/lagging-proxy.md)\n", strings.Join(res.Silent, ", "))
 	}
 }
 

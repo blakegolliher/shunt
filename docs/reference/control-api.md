@@ -279,22 +279,30 @@ and can repeat the guarded mover there after failover.
 
 `{"window": "60s", "wait": "30s"}`
 
-A durable `mutations` barrier (see [The fleet](#the-fleet)). It closes and drains mutation
-admission before it enters `CUTOVER`, and only commits once all of these hold:
-- the placement is `MIGRATING` and its latest mover report is `converged` (a whole pass copied nothing and failed nothing);
-- no multipart upload remains open on the source (`multipart_open` otherwise);
-- the fallback-read counter for the bucket, summed over this proxy and every live member, does not move during `window`. Every member must report twice afterward from the same incarnation; a missing or restarted member is no evidence of quiet.
+Refused unless the placement is `MIGRATING` and its latest mover report is `converged` (a whole
+pass copied nothing and failed nothing). Then it watches the quiet window, with the bucket's writes
+flowing: the fallback-read counter for the bucket, summed over this proxy and every live member,
+must not move during `window`, and every member must report twice afterwards from the same
+incarnation. A read that fell back, or a member missing or restarted, refuses the cutover (409)
+with nothing held.
 
-The call records `{"at", "window", "fallback_reads"}` on the placement as `cutover`. A failed
-window is `202 blocked` with `old_requests`, not a rollback or a 409; it keeps measuring until it
-becomes quiet, or the operator cancels its precommit barrier.
+Then it is a durable `mutations` barrier (see [The fleet](#the-fleet)): it closes and drains
+mutation admission before it enters `CUTOVER`, and only commits once, under the closed gate:
+- no multipart upload remains open on the source (`multipart_open` otherwise);
+- every member that watched the window reports twice more from the same incarnation, and the
+  fallback count is still where the window left it. If a read fell back since, the operation is
+  `blocked` on `old_requests` and watches a new window under the hold, committing once one is
+  quiet; the operator may cancel its precommit barrier instead. A cutover resumed on another
+  control node watches its window under the hold.
+
+The call records `{"at", "window", "fallback_reads"}` on the placement as `cutover`.
 
 ### `POST /v1/placements/{tenant}/{bucket}/purge-source`
 
 `{"dry_run": false, "token": "…", "wait": "30s"}`; the body may be empty.
 
 Deletes the source bucket, then returns the placement to `ACTIVE` on its primary. Refused unless all of these hold:
-- the placement is `CUTOVER`, and every live member has installed the current directory version (a proxy that has not seen the cutover still reads the source on a miss);
+- the placement is `CUTOVER`, and every member except a cleanly retired one has installed the current directory version, live or not (a proxy that has not seen the cutover still reads the source on a miss); until then the operation waits in its precondition;
 - it carries `cutover` evidence;
 - a full listing of both buckets finds no source key that the primary lacks, each candidate confirmed by a HEAD that finds it absent on the primary and then present on the source. The refusal names the first 20 keys it finds.
 

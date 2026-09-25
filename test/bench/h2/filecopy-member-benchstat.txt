@@ -1,0 +1,28 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/member
+cpu: AMD EPYC 7402P 24-Core Processor               
+                          │ filecopy-member-e0bd1fd.txt │       filecopy-member-h2.txt        │
+                          │           sec/op            │    sec/op     vs base               │
+Beat/placements=1000-16                     7.522m ± 8%   1.554m ± 13%  -79.34% (p=0.002 n=6)
+Beat/placements=100000-16                  563.26m ± 5%   31.51m ± 11%  -94.41% (p=0.002 n=6)
+geomean                                     65.09m        6.998m        -89.25%
+
+                          │ filecopy-member-e0bd1fd.txt │         filecopy-member-h2.txt          │
+                          │       bytes/heartbeat       │ bytes/heartbeat  vs base                │
+Beat/placements=1000-16                    14.39Ki ± 0%      14.39Ki ± 0%       ~ (p=1.000 n=6) ¹
+Beat/placements=100000-16                  14.39Ki ± 0%      14.39Ki ± 0%  +0.01% (p=0.002 n=6)
+geomean                                    14.39Ki           14.39Ki       +0.00%
+¹ all samples are equal
+
+                          │ filecopy-member-e0bd1fd.txt │       filecopy-member-h2.txt        │
+                          │            B/op             │     B/op      vs base               │
+Beat/placements=1000-16                   2888.1Ki ± 0%   167.4Ki ± 3%  -94.20% (p=0.002 n=6)
+Beat/placements=100000-16                251.609Mi ± 0%   2.409Mi ± 0%  -99.04% (p=0.002 n=6)
+geomean                                    26.64Mi        642.6Ki       -97.64%
+
+                          │ filecopy-member-e0bd1fd.txt │       filecopy-member-h2.txt       │
+                          │          allocs/op          │  allocs/op   vs base               │
+Beat/placements=1000-16                    12.944k ± 0%   1.447k ± 0%  -88.82% (p=0.002 n=6)
+Beat/placements=100000-16                  1202.0k ± 0%   100.4k ± 0%  -91.64% (p=0.002 n=6)
+geomean                                     124.7k        12.06k       -90.34%

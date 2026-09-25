@@ -467,6 +467,26 @@ func TestSweepSeesUnfinishedPastTheHistoryLimit(t *testing.T) {
 	}
 }
 
+// Found by make fleet (2026-09-25): a step whose control node died while it waited in its
+// precondition (a silent proxy; no hold written) was orphaned failed with effect uncertain, and its
+// ended record still offered cancel and named the proxy it had waited on. It had written nothing,
+// so its effect is none, and an ended record offers no action and carries no blocker. A step that
+// had begun writing stays uncertain.
+func TestOrphanedBeforeFirstWriteChangedNothing(t *testing.T) {
+	now := time.Now().UTC()
+	waiting := Operation{ID: "1-a", Kind: OpRamp, Node: "dead", Status: StatusBlocked, Phase: PhasePrecondition, EffectState: EffectNone,
+		Blockers: []Blocker{{Code: BlockerProxyMissing, ProxyID: "proxy-b"}}, BlockerCount: 1, AllowedActions: []string{ActionCancel}}
+	Orphan(&waiting, now, "gone")
+	if waiting.Status != StatusFailed || waiting.EffectState != EffectNone || len(waiting.AllowedActions) != 0 || len(waiting.Blockers) != 0 || waiting.BlockerCount != 0 {
+		t.Fatalf("a step orphaned in its precondition: %+v", waiting)
+	}
+	writing := Operation{ID: "1-b", Kind: OpAdopt, Node: "dead", Status: StatusRunning, Phase: PhaseStep, EffectState: EffectNone}
+	Orphan(&writing, now, "gone")
+	if writing.Status != StatusFailed || writing.EffectState != EffectUncertain {
+		t.Fatalf("a step orphaned while writing: %+v", writing)
+	}
+}
+
 // Quality item of the H2 review: a member whose process stopped (an unclean retirement leaves no
 // current incarnation) is not described as possibly still serving.
 func TestMissingTextForStoppedMember(t *testing.T) {

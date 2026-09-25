@@ -1,0 +1,49 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/control
+cpu: AMD EPYC 7402P 24-Core Processor               
+                                      │ filecopy-control-e0bd1fd.txt │       filecopy-control-h2.txt       │
+                                      │            sec/op            │    sec/op     vs base               │
+DrainBlockers1kDrained-16                               1.096m ± 10%   1.009m ±  8%   -7.91% (p=0.015 n=6)
+DrainBlockers1kMixed-16                                 1.369m ±  9%   1.090m ±  7%  -20.41% (p=0.002 n=6)
+DrainBlockers1kDir100k-16                            130480.0µ ±  9%   699.7µ ±  8%  -99.46% (p=0.002 n=6)
+HeartbeatHandler/placements=10-16                       1.998m ±  7%   1.869m ± 15%        ~ (p=0.394 n=6)
+HeartbeatHandler/placements=100000-16                 258.811m ±  5%   1.200m ±  5%  -99.54% (p=0.002 n=6)
+FenceStatus1k-16                                    1157779.3µ ± 11%   361.0µ ± 23%  -99.97% (p=0.002 n=6)
+geomean                                                 22.12m         924.1µ        -95.82%
+
+                          │ filecopy-control-e0bd1fd.txt │       filecopy-control-h2.txt       │
+                          │          members/op          │ members/op   vs base                │
+DrainBlockers1kDrained-16                    1.000k ± 0%   1.000k ± 0%       ~ (p=1.000 n=6) ¹
+DrainBlockers1kMixed-16                      1.000k ± 0%   1.000k ± 0%       ~ (p=1.000 n=6) ¹
+DrainBlockers1kDir100k-16                    1.000k ± 0%   1.000k ± 0%       ~ (p=1.000 n=6) ¹
+FenceStatus1k-16                             1.000k ± 0%   1.000k ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                      1.000k        1.000k       +0.00%
+¹ all samples are equal
+
+                                      │ filecopy-control-e0bd1fd.txt │       filecopy-control-h2.txt       │
+                                      │             B/op             │     B/op      vs base               │
+DrainBlockers1kDrained-16                               303.2Ki ± 0%   296.0Ki ± 0%   -2.37% (p=0.002 n=6)
+DrainBlockers1kMixed-16                                 346.4Ki ± 0%   339.2Ki ± 0%   -2.09% (p=0.002 n=6)
+DrainBlockers1kDir100k-16                             64647.4Ki ± 0%   296.0Ki ± 0%  -99.54% (p=0.002 n=6)
+HeartbeatHandler/placements=10-16                       714.5Ki ± 0%   699.8Ki ± 0%   -2.05% (p=0.002 n=6)
+HeartbeatHandler/placements=100000-16                129413.6Ki ± 0%   695.3Ki ± 0%  -99.46% (p=0.002 n=6)
+FenceStatus1k-16                                     663662.5Ki ± 0%   296.0Ki ± 0%  -99.96% (p=0.002 n=6)
+geomean                                                 8.440Mi        402.9Ki       -95.34%
+
+                                      │ filecopy-control-e0bd1fd.txt │      filecopy-control-h2.txt       │
+                                      │          allocs/op           │ allocs/op   vs base                │
+DrainBlockers1kDrained-16                                40.000 ± 0%   1.000 ± 0%   -97.50% (p=0.002 n=6)
+DrainBlockers1kMixed-16                                   549.0 ± 0%   510.0 ± 0%    -7.10% (p=0.002 n=6)
+DrainBlockers1kDir100k-16                            300266.000 ± 0%   1.000 ± 0%  -100.00% (p=0.002 n=6)
+HeartbeatHandler/placements=10-16                         498.5 ± 0%   420.0 ± 0%   -15.75% (p=0.002 n=6)
+HeartbeatHandler/placements=100000-16                  600980.0 ± 0%   408.0 ± 0%   -99.93% (p=0.002 n=6)
+FenceStatus1k-16                                    3011076.000 ± 0%   1.000 ± 0%  -100.00% (p=0.002 n=6)
+geomean                                                  13.46k        21.07        -99.84%
+
+                                      │ filecopy-control-e0bd1fd.txt │         filecopy-control-h2.txt         │
+                                      │       bytes/heartbeat        │ bytes/heartbeat  vs base                │
+HeartbeatHandler/placements=10-16                       186.8Ki ± 0%      186.8Ki ± 0%       ~ (p=1.000 n=6) ¹
+HeartbeatHandler/placements=100000-16                   186.8Ki ± 0%      186.8Ki ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                 186.8Ki           186.8Ki       +0.00%
+¹ all samples are equal

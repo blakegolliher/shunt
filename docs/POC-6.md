@@ -64,6 +64,13 @@ The open questions, as answered:
 
 ## Item 3 — version fence across proxies (done, ADR-0016; on etcd since P3c-1)
 
+*Superseded by ADR-0021 (H2, 2026-09-25) where the text below states current behavior. A hold that
+does not drain on every member is no longer released: the operation stays blocked, with its hold,
+until its blockers clear or an operator cancels it. Every step waits for every registered member,
+not only the first step; a silent member is `proxy_missing` and is never dropped when its lease
+ends. `shunt proxy forget` is refused until the member retired cleanly or its incarnation was
+resolved with an attestation. One proxy holds and drains too. See docs/fleet.md.*
+
 *P3c-1 moved the fleet from a proxy's memory and a shared directory file onto `shunt-control`
 (ADR-0015; ADR-0016 amendment). The semantics below are unchanged; "control node" now means a
 `shunt-control` node, and members share nothing but the network.*
@@ -101,6 +108,10 @@ restart, fleet cutover); `internal/proxy/fleet_property_test.go` (10 runs: 0 vio
 and `make walkthrough` green on the same build.
 
 ## Item 4 — cutover and in-progress multipart uploads
+
+*Superseded by ADR-0021 (H2e, 2026-09-24) where the text below states current behavior: cutover
+blocks on `multipart_open` while the source has uploads in progress, and is cancelled to let them
+finish or repeated once they are aborted on the source. There is no `--abort-uploads`.*
 
 **Today:** an upload started on the source before the ramp keeps its source-issued upload id, so its
 `CompleteMultipartUpload` lands on the source **after** cutover, where nothing reads any more, and

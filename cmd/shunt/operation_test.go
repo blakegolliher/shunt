@@ -54,6 +54,33 @@ func TestOperationVerbs(t *testing.T) {
 	if err == nil || errors.As(err, &ee) || !strings.Contains(err.Error(), "failed: no") {
 		t.Fatalf("wait on a failed operation: %v, want exit 1", err)
 	}
+	// Found by make fleet (2026-09-25): wait decoded every poll into one value, so the blockers of
+	// a poll that found the record blocked survived into the printout of the ended record, which
+	// omits them.
+	blocked := control.Operation{ID: "1700000000000-0000fe", Kind: control.OpRamp, Placement: "acme/third", Node: "lab", Status: control.StatusBlocked,
+		Sequence: 1, EffectState: control.EffectNone, Created: time.Now().UTC(), Updated: time.Now().UTC(),
+		Blockers: []control.Blocker{{Code: control.BlockerProxyMissing, ProxyID: "p9"}}, BlockerCount: 1, WaitingOn: []string{"p9"}}
+	if err := ctl.Ops.Create(t.Context(), &blocked); err != nil {
+		t.Fatal(err)
+	}
+	type waited struct {
+		out string
+		err error
+	}
+	done := make(chan waited, 1)
+	go func() {
+		out, err := rg.cli(t, "operation", "wait", blocked.ID, "--timeout", "10s")
+		done <- waited{out, err}
+	}()
+	time.Sleep(600 * time.Millisecond) // at least one poll sees it blocked
+	blocked.Status, blocked.Sequence, blocked.EffectState = control.StatusSucceeded, 2, control.EffectCommitted
+	blocked.Blockers, blocked.BlockerCount, blocked.WaitingOn = nil, 0, nil
+	if err := ctl.Ops.Update(t.Context(), &blocked); err != nil {
+		t.Fatal(err)
+	}
+	if w := <-done; w.err != nil || !strings.Contains(w.out, "succeeded") || strings.Contains(w.out, "blocker:") || strings.Contains(w.out, "waiting on:") {
+		t.Fatalf("wait on a record that was blocked, then succeeded: %v\n%s", w.err, w.out)
+	}
 	if _, err = rg.cli(t, "operation", "show", "1700000000000-nope00"); err == nil {
 		t.Fatal("show of an unknown operation succeeded")
 	}

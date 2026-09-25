@@ -1,0 +1,42 @@
+goos: linux
+goarch: amd64
+pkg: github.com/blakegolliher/shunt/internal/control
+cpu: AMD EPYC 7402P 24-Core Processor               
+BenchmarkDrainBlockers1kDrained-16    	    1460	   1067317 ns/op	      1000 members/op	  303122 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDrained-16    	    1215	    960426 ns/op	      1000 members/op	  303108 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDrained-16    	    1148	   1050884 ns/op	      1000 members/op	  303108 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDrained-16    	    1066	   1036674 ns/op	      1000 members/op	  303107 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDrained-16    	    1309	    981727 ns/op	      1000 members/op	  303111 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDrained-16    	    1353	    923815 ns/op	      1000 members/op	  303107 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	     988	   1046813 ns/op	      1000 members/op	  347351 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	    1195	   1102103 ns/op	      1000 members/op	  347345 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	    1321	   1062935 ns/op	      1000 members/op	  347336 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	     938	   1168430 ns/op	      1000 members/op	  347334 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	    1117	   1077002 ns/op	      1000 members/op	  347336 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kMixed-16      	     969	   1156920 ns/op	      1000 members/op	  347321 B/op	     510 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    2121	    676313 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    1632	    680397 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    2000	    721919 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    1650	    646703 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    1878	    731285 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkDrainBlockers1kDir100k-16    	    1995	    719062 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     643	   2151680 ns/op	    191243 bytes/heartbeat	  716384 B/op	     419 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     638	   1735238 ns/op	    191243 bytes/heartbeat	  716601 B/op	     420 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     680	   1847283 ns/op	    191243 bytes/heartbeat	  716567 B/op	     419 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     609	   1818899 ns/op	    191243 bytes/heartbeat	  716499 B/op	     420 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     646	   1891409 ns/op	    191243 bytes/heartbeat	  716739 B/op	     420 allocs/op
+BenchmarkHeartbeatHandler/placements=10-16         	     522	   2067566 ns/op	    191243 bytes/heartbeat	  716821 B/op	     421 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	     873	   1259303 ns/op	    191243 bytes/heartbeat	  712090 B/op	     408 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	     975	   1191011 ns/op	    191243 bytes/heartbeat	  712023 B/op	     408 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	    1114	   1151089 ns/op	    191243 bytes/heartbeat	  712029 B/op	     408 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	    1256	   1208359 ns/op	    191243 bytes/heartbeat	  712026 B/op	     408 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	     958	   1228803 ns/op	    191243 bytes/heartbeat	  712030 B/op	     408 allocs/op
+BenchmarkHeartbeatHandler/placements=100000-16     	     986	   1184559 ns/op	    191243 bytes/heartbeat	  712054 B/op	     408 allocs/op
+BenchmarkFenceStatus1k-16                          	    3937	    338656 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkFenceStatus1k-16                          	    2768	    368965 ns/op	      1000 members/op	  303105 B/op	       1 allocs/op
+BenchmarkFenceStatus1k-16                          	    3032	    349756 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkFenceStatus1k-16                          	    3398	    353075 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+BenchmarkFenceStatus1k-16                          	    2510	    444125 ns/op	      1000 members/op	  303105 B/op	       1 allocs/op
+BenchmarkFenceStatus1k-16                          	    3031	    410572 ns/op	      1000 members/op	  303104 B/op	       1 allocs/op
+PASS
+ok  	github.com/blakegolliher/shunt/internal/control	47.299s

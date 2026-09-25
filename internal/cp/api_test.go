@@ -419,25 +419,24 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-	// The window runs once every proxy has drained the hold (the fleet's blockers come first), so
-	// the record is followed until the window's verdict is on it rather than timed by the wait.
-	var cutoverBlocked control.Operation
-	code, raw := a.call("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms", Wait: "0s"}, &cutoverBlocked)
+	// The window runs before the hold, with writes flowing; the record is followed until the
+	// window's verdict is on it rather than timed by the wait. A read that fell back refuses the
+	// cutover with nothing held.
+	var cutoverRefused control.Operation
+	code, raw := a.call("POST", "/v1/placements/acme/data01/cutover", control.CutoverRequest{Window: "400ms", Wait: "0s"}, &cutoverRefused)
 	if code != http.StatusAccepted {
 		t.Fatalf("cutover: HTTP %d %s", code, raw)
 	}
-	waitFor(t, 5*time.Second, "the cutover window's fallback blocker", func() bool {
-		op, _ := a.ops.Get(context.Background(), cutoverBlocked.ID)
-		if op == nil || op.Terminal() {
-			t.Fatalf("cutover ended without the fallback blocker: %+v", op)
+	waitFor(t, 15*time.Second, "the cutover window's refusal", func() bool {
+		op, _ := a.ops.Get(context.Background(), cutoverRefused.ID)
+		if op == nil || !op.Terminal() {
+			return false
 		}
-		cutoverBlocked = *op
-		return op.Status == control.StatusBlocked && slices.ContainsFunc(op.Blockers, func(b control.Blocker) bool { return b.Code == control.BlockerOldRequests })
+		cutoverRefused = *op
+		return true
 	})
-	var cutoverCanceled control.Operation
-	a.must("POST", "/v1/operations/"+cutoverBlocked.ID+"/cancel", struct{}{}, &cutoverCanceled)
-	if cutoverCanceled.Status != control.StatusCancelled {
-		t.Fatalf("cancel cutover: %+v", cutoverCanceled)
+	if cutoverRefused.Status != control.StatusFailed || cutoverRefused.Error == nil || !strings.Contains(cutoverRefused.Error.Message, "fell back to the source during the 400ms window") || cutoverRefused.Barrier != nil {
+		t.Fatalf("cutover with a fallback read in its window: %+v %+v", cutoverRefused, cutoverRefused.Error)
 	}
 	time.Sleep(150 * time.Millisecond)
 	tr = control.TransitionResult{}

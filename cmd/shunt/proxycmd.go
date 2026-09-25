@@ -17,10 +17,11 @@ import (
 func newProxy() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "proxy",
-		Short: "The proxies in this shunt's fleet: list them, forget one that is gone",
-		Long: "Several shunt proxies can serve one directory. One is the control node (the one these commands\n" +
-			"talk to); the others are members that name it in control.endpoint and send it a heartbeat. A\n" +
-			"routing change is in effect only once every member has installed it (ADR-0016).",
+		Short: "The proxies in this shunt's fleet: list and show them, retire, resolve or forget one",
+		Long: "Several shunt proxies serve one directory. Each names the control nodes in control.endpoints and\n" +
+			"sends them a heartbeat. A change that moves or closes writes commits only once every registered\n" +
+			"proxy has drained its hold; a silent one blocks it until it is back, retired, or resolved and\n" +
+			"forgotten (ADR-0021 D2, docs/runbooks/lagging-proxy.md).",
 	}
 	cmd.AddCommand(newProxyList(), newProxyShow(), newProxyRetire(), newProxyResolve(), newProxyForget())
 	return cmd
@@ -256,12 +257,12 @@ func newProxyForget() *cobra.Command {
 	var o apiOptions
 	cmd := &cobra.Command{
 		Use:   "forget <proxy-id>",
-		Short: "Remove a member that is gone for good, so a bucket's first step stops waiting for it",
-		Long: "A bucket's first migration step waits for every member, live or not: a proxy cut off before it\n" +
-			"would keep writing every key to the source. When a member is gone for good (decommissioned,\n" +
+		Short: "Remove a member that is gone for good, so steps stop waiting for it",
+		Long: "Every step that moves or closes writes waits for every member, live or not: a proxy cut off\n" +
+			"before it would keep writing with the old routing. When a member is gone for good (decommissioned,\n" +
 			"its host lost), forget it. A live member cannot be forgotten, and nor can one whose last process\n" +
-			"did not retire cleanly: resolve its incarnation first (shunt proxy resolve). One that comes back\n" +
-			"re-joins on its next heartbeat.",
+			"did not retire cleanly: retire it (shunt proxy retire) or resolve its incarnation first (shunt\n" +
+			"proxy resolve). One that comes back re-joins on its next heartbeat.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			api, err := o.client()
