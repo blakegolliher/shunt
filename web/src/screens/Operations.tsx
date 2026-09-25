@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { listOperations, unfinished } from '../api/client'
+import { cancelOperation, listOperations, resumeOperation, unfinished } from '../api/client'
 import type { Operation } from '../api/client'
 import { Card } from '../components/Card'
 import { useStore } from '../store'
@@ -26,11 +26,16 @@ function scopeOf(op: Operation): string {
 // and what it did to the directory. A record ends succeeded, failed or cancelled; failed never means
 // rolled back, which is what the effect column says.
 export function Operations() {
-  const { token, lastEvent } = useStore()
+  const { token, lastEvent, notify } = useStore()
   const [ops, setOps] = useState<Operation[]>([])
   const [error, setError] = useState('')
   const [selected, setSelected] = useState('')
+  const [busy, setBusy] = useState(false)
   const fenceEvent = lastEvent?.type === 'fence' ? lastEvent.id : ''
+  const act = async (fn: () => Promise<Operation>, done: (op: Operation) => string) => {
+    setBusy(true)
+    try { const op = await fn(); setOps((old) => old.map((o) => o.id === op.id ? op : o)); notify(done(op)) } catch (cause) { notify(cause instanceof Error ? cause.message : String(cause), 'danger') } finally { setBusy(false) }
+  }
 
   useEffect(() => {
     let live = true
@@ -70,7 +75,8 @@ export function Operations() {
           {current.waiting_on && current.waiting_on.length > 0 && <><dt className="text-muted">Waiting on</dt><dd className="font-mono text-xs">{current.waiting_on.join(', ')}</dd></>}
           {current.blockers && current.blockers.length > 0 && <><dt className="text-muted">Blockers</dt><dd><ul>{current.blockers.map((b) => <li key={`${b.code}-${b.proxy_id ?? ''}`} className="font-mono text-xs">{b.code}{b.proxy_id ? ` ${b.proxy_id}` : ''}{b.message ? `: ${b.message}` : ''}</li>)}</ul></dd></>}
           {current.error && <><dt className="text-muted">Error</dt><dd role="alert" className="text-red-100">{current.error.code}: {current.error.message}</dd></>}
-          <dt className="text-muted">Actions</dt><dd className="text-muted">{current.allowed_actions && current.allowed_actions.length > 0 ? current.allowed_actions.join(', ') : 'none'}</dd>
+          {current.barrier && <><dt className="text-muted">Barrier</dt><dd className="text-xs">{current.barrier.kind} on <span className="font-mono">{current.barrier.scope}</span>{current.barrier.committed ? `, committed at version ${current.barrier.commit_version}` : current.barrier.hold_version ? `, held at version ${current.barrier.hold_version}, draining` : ', hold not written yet'}</dd></>}
+          <dt className="text-muted">Actions</dt><dd className="flex flex-wrap items-center gap-2 text-muted">{current.allowed_actions && current.allowed_actions.length > 0 ? current.allowed_actions.map((action) => <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : `${op.kind} cancelled; nothing changed`)} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
           <dt className="text-muted">Actor</dt><dd className="font-mono text-xs">{current.actor}{current.node ? ` on ${current.node}` : ''}</dd>
           {current.request_id && <><dt className="text-muted">Request</dt><dd className="font-mono text-xs">{current.request_id}</dd></>}
         </dl>}

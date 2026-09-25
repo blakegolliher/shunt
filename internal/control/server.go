@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blakegolliher/shunt/internal/admission"
 	"github.com/blakegolliher/shunt/internal/s3"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -81,9 +82,13 @@ type Server struct {
 	MoverLedger MoverLedgerReader
 	// Ctx is the server's lifetime: operations run on it, never on a request's. nil: Background.
 	Ctx context.Context
+	// LocalGates is a lab proxy's own admission accounting (ADR-0021 D2): with no members, the
+	// local proxy is what a barrier drains. nil on shunt-control, which serves no data.
+	LocalGates *admission.Gates
 
 	mu          sync.Mutex
 	progress    map[string]Progress // placement key → the mover's last report (in memory only)
+	running     map[string]*tracker // the operations this node is running now
 	prevFleet   []Member            // the fleet as of the last PublishFleet, for fleet events
 	fleetSeeded bool
 	opsOnce     sync.Once
@@ -344,6 +349,9 @@ type ClusterStatus struct {
 	References             []string `json:"references,omitempty"`
 	ReadOnly               bool     `json:"read_only"`
 	RejectWrites           bool     `json:"reject_writes"`
+	// Barrier is the drain barrier of a change in progress on the cluster (ADR-0021 D2): a
+	// read-only switch that is desired but not yet effective.
+	Barrier *directory.Barrier `json:"barrier,omitempty"`
 }
 
 // PlacementStatus is one placement with the migration signals an operator watches.
@@ -365,6 +373,9 @@ type PlacementStatus struct {
 	Mover           *Progress                  `json:"mover,omitempty"`
 	ReadOnly        bool                       `json:"read_only"`
 	RejectWrites    bool                       `json:"reject_writes"`
+	// Barrier is the drain barrier of a change in progress on the placement (ADR-0021 D2): a held
+	// step, a read-only switch desired but not yet effective, or a purge closing the source.
+	Barrier *directory.Barrier `json:"barrier,omitempty"`
 	// Watch: an operator asked for this bucket's traffic by backend in telemetry. Spread and
 	// moving buckets have it anyway; PerBucket says whether proxies count it now.
 	Watch     bool `json:"watch,omitempty"`
@@ -525,7 +536,7 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 	// migration shows the move as one; Legs and Move say which part (ADR-0018 N3).
 	p := moving(pl)
 	ps := PlacementStatus{Key: key, State: p.State, Primary: p.ClusterOf(p.Primary), Target: p.Target, Names: p.Names,
-		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites, Watch: pl.Watch,
+		ReadOnly: p.ReadOnly, RejectWrites: p.RejectWrites, Barrier: pl.Barrier, Watch: pl.Watch,
 		PerBucket: pl.Spread() || pl.State != directory.StateActive || pl.Watch,
 		Cutover:   p.Cutover, Writes: map[string]float64{}, DualDeletes: map[string]float64{}}
 	if p.Source != "" {

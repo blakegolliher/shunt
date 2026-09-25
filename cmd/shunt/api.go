@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -132,10 +133,23 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 	for !op.Terminal() {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("operation %s is still %s (phase %s); follow it with GET %s/v1/operations/%s", op.ID, op.Status, op.Phase, c.base, op.ID)
+			// The wait ran out with the operation unfinished: exit 3 and say where it stands and what
+			// to do (contracts §2, "CLI completion semantics"). It keeps running on the control node.
+			what := fmt.Sprintf("operation %s is still %s (phase %s)", op.ID, op.Status, op.Phase)
+			if len(op.Blockers) > 0 {
+				what += "; waiting on " + blockerLine(op.Blockers)
+			}
+			next := fmt.Sprintf("it keeps running: `shunt operation wait %s` follows it", op.ID)
+			if slices.Contains(op.AllowedActions, control.ActionCancel) {
+				next += fmt.Sprintf(", `shunt operation cancel %s` restores its durable precommit hold", op.ID)
+			}
+			return &exitError{code: exitWaitDeadline, err: fmt.Errorf("%s; %s", what, next)}
 		case <-tick.C:
 		}
 		if err := c.call(ctx, http.MethodGet, "/v1/operations/"+op.ID, nil, &op); err != nil {
+			if ctx.Err() != nil {
+				continue // the next select reports the wait deadline with the last complete record
+			}
 			return err
 		}
 	}
@@ -155,6 +169,22 @@ func (c *apiClient) operate(ctx context.Context, req control.OperationRequest, o
 		}
 	}
 	return fmt.Errorf("%s", shownText(msg))
+}
+
+// blockerLine is an operation's blockers in one line.
+func blockerLine(bs []control.Blocker) string {
+	parts := make([]string, 0, len(bs))
+	for _, b := range bs {
+		p := b.Code
+		if b.ProxyID != "" {
+			p += " " + b.ProxyID
+		}
+		if b.Count > 0 {
+			p += fmt.Sprintf(" (%d)", b.Count)
+		}
+		parts = append(parts, p)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // argsOf is an operation's args: the request body the action's own route takes.

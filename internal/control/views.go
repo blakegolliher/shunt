@@ -94,7 +94,7 @@ func clusterStatus(f *directory.File, name string, c config.Cluster) ClusterStat
 		ConditionalWrite: c.Capabilities.ConditionalWriteOr(true), ConditionalDelete: c.Capabilities.ConditionalDeleteOr(false),
 		ConditionalWriteKnown: c.Capabilities.ConditionalWrite != nil, ConditionalDeleteKnown: c.Capabilities.ConditionalDelete != nil,
 		CapabilityProfile: profile,
-		References:        directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites,
+		References:        directory.References(f, name), ReadOnly: c.ReadOnly, RejectWrites: c.RejectWrites, Barrier: c.Barrier,
 	}
 }
 

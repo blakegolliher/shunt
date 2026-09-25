@@ -138,9 +138,11 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
   // The client bucket the add form names, when the tenant already has it: that is expand, not add.
   const existing = placements.find((item) => item.key === `${tenant.trim()}/${bucket.trim()}`)
   const tenantBuckets = placements.map((item) => splitKey(item.key)).filter(([t]) => t === tenant.trim()).map(([, b]) => b)
-  const act = async (fn: () => Promise<unknown>, success: string) => {
+  // A change that runs as an operation is only requested here: its outcome arrives on the event
+  // stream as a fence event, which the store turns into the final toast (ADR-0021 D5).
+  const act = async (fn: () => Promise<unknown>, success: string, tone: 'success' | 'neutral' = 'success') => {
     setBusy(true)
-    try { await fn(); notify(success); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
+    try { await fn(); notify(success, tone); await refresh(); return true } catch (error) { notify(error instanceof Error ? error.message : String(error), 'danger'); return false } finally { setBusy(false) }
   }
   const resetImport = () => { setImportAccess(''); setImportSecret(''); setImportOnlyBucket(false) }
   const importKey = async (event: FormEvent) => {
@@ -220,7 +222,7 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
 
     <Drawer open={Boolean(selected)} title={selected ?? ''} eyebrow="Bucket detail" onClose={() => { setSelected(null); setDetail(null); resetImport() }}>
       {detail ? <div className="space-y-6">
-        <div className="flex items-center justify-between"><StateBadge state={detail.state} /><span className={detail.read_only ? 'text-amber-200' : 'text-emerald-300'}>{detail.read_only ? 'read-only' : 'writes enabled'}</span></div>
+        <div className="flex items-center justify-between"><StateBadge state={detail.state} /><span className={detail.read_only ? 'text-amber-200' : 'text-emerald-300'}>{detail.read_only ? (detail.barrier?.kind === 'mutations' ? 'read-only requested, draining' : 'read-only') : 'writes enabled'}</span></div>
         {chosen?.client_keys === 0 && <div role="alert" className="rounded-lg border border-amber-500/60 bg-amber-950/40 p-4 text-sm text-amber-100">
           <p>No client key can reach this bucket, so shunt refuses every request for it. Import a key that {detail.primary} knows; its secret is checked against {detail.primary} before it is stored.</p>
           <form onSubmit={(event) => void importKey(event)} className="mt-3 grid gap-3">
@@ -235,7 +237,7 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
         <FenceStatus held={detail.fence.held} version={detail.fence.version} waitingOn={detail.fence.waiting_on} />
         {detail.legs?.length ? <Card title="Legs"><OwnershipBar legs={detail.legs} move={detail.move} /><dl className="mt-4 grid gap-3 text-sm">{detail.legs.map((l) => <div key={l.id} className="flex justify-between gap-4"><dt>{l.cluster}{l.id !== l.cluster && <span className="text-muted"> (leg {l.id})</span>}</dt><dd className="text-right font-mono text-muted">{l.bucket} · {l.ranges.length ? `${Math.round(l.share * 1000) / 10}% of keys` : l.idle ? 'idle' : 'no keys outside its prefix rules'}{l.ranges.map((r) => <span key={r.from} className="block text-xs">{r.from}–{r.to}</span>)}</dd></div>)}</dl></Card> : null}
         {detail.names && Object.keys(detail.names).length > 0 && <Card title="Placement names"><dl className="grid gap-3 text-sm">{Object.entries(detail.names).map(([name, value]) => <div key={name} className="flex justify-between gap-4"><dt>{name}</dt><dd className="font-mono text-muted">{value}</dd></div>)}</dl></Card>}
-        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), `${detail.key} is ${detail.read_only ? 'writable' : 'read-only'}`) }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setBucketWatch(token, t, b, !detail.watch), detail.watch ? `${detail.key}: no longer watched` : `${detail.key}: its traffic by backend shows on Telemetry`) }} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold">{detail.watch ? 'Stop watching traffic' : 'Watch traffic by backend'}</button></div>
+        <div className="flex flex-wrap gap-3"><button type="button" disabled={busy || Boolean(detail.barrier)} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setPlacementReadOnly(token, t, b, !detail.read_only), detail.read_only ? `${detail.key}: writable again once every proxy has it` : `${detail.key}: read-only requested; effective once every proxy has drained its writes`, 'neutral') }} className="rounded-lg border border-ember-500 px-4 py-2 text-sm font-semibold">Make {detail.read_only ? 'writable' : 'read-only'}</button><button type="button" disabled={busy} onClick={() => { const [t, b] = splitKey(detail.key); void act(() => setBucketWatch(token, t, b, !detail.watch), detail.watch ? `${detail.key}: no longer watched` : `${detail.key}: its traffic by backend shows on Telemetry`) }} className="rounded-lg border border-ink-600 px-4 py-2 text-sm font-semibold">{detail.watch ? 'Stop watching traffic' : 'Watch traffic by backend'}</button></div>
         <p className="text-xs text-muted">{detail.per_bucket_telemetry ? `Telemetry → Bucket traffic shows ${detail.key} by backend${!detail.watch ? ' (it is spread or moving, so it is counted without a watch)' : ''}.` : 'Watch this bucket to see its traffic by backend on Telemetry; spread and moving buckets are counted without one.'}</p>
       </div> : <p className="text-muted">Loading bucket detail…</p>}
     </Drawer>

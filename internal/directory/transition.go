@@ -103,7 +103,7 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		return applyMove(p, t)
 	}
 	if t.Release {
-		return release(p)
+		return release(p, t.Barrier)
 	}
 	if !slices.Contains(States, t.To) {
 		return fail("unknown state %q; states are %s", t.To, strings.Join(States, ", "))
@@ -212,7 +212,7 @@ func Apply(p Placement, t Transition) (Placement, error) {
 		if p.Source != p.Primary && p.Source != p.Cold {
 			delete(np.Names, p.Source)
 		}
-		np.Source, np.Cutover = "", nil
+		np.Source, np.Cutover, np.Barrier = "", nil, nil // purge-source's source barrier ends with the source
 	}
 	if t.Complete || t.Hold {
 		np.Barrier = nil // a completed step's barrier is over; a new hold's is written below
@@ -237,10 +237,18 @@ func Apply(p Placement, t Transition) (Placement, error) {
 	return np, nil
 }
 
-// release undoes a held step (Transition.Release, ADR-0016).
-func release(p Placement) (Placement, error) {
+// release undoes a held step (Transition.Release, ADR-0016). barrier, when given, must be the
+// hold's: a cancellation releases its own operation's hold, never another's (ADR-0021 D2).
+func release(p Placement, barrier string) (Placement, error) {
 	if p.State != StateRamping || p.Ramp == nil || p.Ramp.Hold == nil {
 		return p, &TransitionError{From: p.State, To: p.State, Reason: "there is no held step to release"}
+	}
+	if barrier != "" && (p.Barrier == nil || p.Barrier.ID != barrier) {
+		held := "no barrier"
+		if p.Barrier != nil {
+			held = "barrier " + p.Barrier.ID
+		}
+		return p, &TransitionError{From: p.State, To: p.State, Reason: fmt.Sprintf("the held step carries %s, not %s; another operation's hold is not released", held, barrier)}
 	}
 	np := p.clone()
 	np.Barrier = nil

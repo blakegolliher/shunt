@@ -39,7 +39,65 @@ func newOperation() *cobra.Command {
 			"it runs (ADR-0021). A record is pending, running or blocked until it ends succeeded, failed or\n" +
 			"cancelled; its effect_state says whether it wrote the directory (none, committed, uncertain).", //nolint:misspell // the status is spelled as the contract spells it
 	}
-	cmd.AddCommand(newOperationList(), newOperationShow(), newOperationWait())
+	cmd.AddCommand(newOperationList(), newOperationShow(), newOperationWait(), newOperationResume(), newOperationCancel())
+	return cmd
+}
+
+func newOperationResume() *cobra.Command {
+	var o apiOptions
+	cmd := &cobra.Command{
+		Use:   "resume <id>",
+		Short: "Carry an operation on from where its record stands, on the control node --api names",
+		Long: "An operation whose control node stopped (its record says blocked, owner_lost) is not repeated:\n" +
+			"its hold is written and its record says which phase it reached, so another node picks it up there\n" +
+			"(ADR-0021 D2). Refused while the owner is live: it would run twice.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var op control.Operation
+			if err := api.call(cmd.Context(), "POST", "/v1/operations/"+url.PathEscape(args[0])+"/resume", nil, &op); err != nil {
+				return err
+			}
+			if o.json {
+				return printJSON(cmd, op)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s resumed on %s (%s, phase %s); `shunt operation wait %s` follows it\n", op.ID, op.Node, op.Status, op.Phase, op.ID)
+			return nil
+		},
+	}
+	addAPIFlags(cmd, &o)
+	return cmd
+}
+
+func newOperationCancel() *cobra.Command {
+	var o apiOptions
+	cmd := &cobra.Command{
+		Use:   "cancel <id>",
+		Short: "Cancel an operation before its change is committed; the routing goes back as it was",
+		Long: "A step that waits on a proxy (blocked) can be canceled: its hold is released and its record ends\n" +
+			"canceled, with nothing changed. Once the change is committed, it is in force and cancellation is\n" +
+			"refused (not_cancellable): a further change is a new operation (ADR-0021 D2).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			api, err := o.client()
+			if err != nil {
+				return err
+			}
+			var op control.Operation
+			if err := api.call(cmd.Context(), "POST", "/v1/operations/"+url.PathEscape(args[0])+"/cancel", nil, &op); err != nil {
+				return err
+			}
+			if o.json {
+				return printJSON(cmd, op)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s canceled; nothing changed\n", op.ID)
+			return nil
+		},
+	}
+	addAPIFlags(cmd, &o)
 	return cmd
 }
 
@@ -169,7 +227,11 @@ func newOperationWait() *cobra.Command {
 			}
 			switch {
 			case !op.Terminal():
-				return &exitError{code: exitWaitDeadline, err: fmt.Errorf("operation %s is still %s after %s; it keeps running: `shunt operation wait %s` again", op.ID, op.Status, timeout, op.ID)}
+				what := fmt.Sprintf("operation %s is still %s after %s", op.ID, op.Status, timeout)
+				if len(op.Blockers) > 0 {
+					what += "; waiting on " + blockerLine(op.Blockers)
+				}
+				return &exitError{code: exitWaitDeadline, err: fmt.Errorf("%s; it keeps running: `shunt operation wait %s` again", what, op.ID)}
 			case op.Status != control.StatusSucceeded:
 				msg := "operation " + op.ID + " " + op.Status
 				if op.Error != nil {
@@ -223,6 +285,19 @@ func printOperation(out io.Writer, op *control.Operation) {
 	for _, b := range op.Blockers {
 		line("blocker", strings.TrimSpace(b.Code+" "+b.ProxyID+" "+b.Message))
 	}
+	if b := op.Barrier; b != nil {
+		state := fmt.Sprintf("%s on %s", b.Kind, b.Scope)
+		switch {
+		case b.Committed:
+			state += fmt.Sprintf(", committed at version %d", b.CommitVersion)
+		case b.HoldVersion > 0:
+			state += fmt.Sprintf(", held at version %d (generation %d), draining", b.HoldVersion, b.Generation)
+		default:
+			state += ", hold not written yet"
+		}
+		line("barrier", state)
+	}
+	line("actions", strings.Join(op.AllowedActions, ", "))
 	if op.Progress != nil {
 		line("progress", fmt.Sprintf("%d/%d %s", op.Progress.Done, op.Progress.Total, op.Progress.Unit))
 	}

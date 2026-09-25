@@ -244,6 +244,9 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 					if ferr := ctl.FailOrphans(sctx); ferr != nil {
 						log.Warn("operation records left running by the last stop could not all be closed", "err", ferr.Error())
 					}
+					if rerr := ctl.ResumeOwn(sctx); rerr != nil {
+						log.Warn("barrier operations left running by the last stop could not all be resumed", "err", rerr.Error())
+					}
 				}
 			}
 			scancel()
@@ -289,6 +292,11 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		case <-tick.C:
 			if err := ctl.PublishFleet(ctx); err != nil && ctx.Err() == nil {
 				log.Warn("fleet unreadable", "err", err.Error())
+			}
+			if store.Ready() {
+				if err := ctl.Sweep(ctx); err != nil && ctx.Err() == nil {
+					log.Warn("operation records unreadable", "err", err.Error())
+				}
 			}
 		}
 	}

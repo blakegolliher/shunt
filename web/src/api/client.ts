@@ -89,7 +89,13 @@ export interface ClusterStatus {
   references?: string[]
   read_only: boolean
   reject_writes: boolean
+  // barrier is the drain barrier of a change in progress (ADR-0021 D2): read_only is desired, and
+  // effective only once the barrier is gone.
+  barrier?: Barrier
 }
+
+// Barrier is the drain barrier of a change in progress on a bucket or a cluster (ADR-0021 D2).
+export interface Barrier { id: string; kind: 'mutations' | 'source' }
 
 export interface PlacementStatus {
   key: string
@@ -102,6 +108,7 @@ export interface PlacementStatus {
   names: Record<string, string> | null
   read_only: boolean
   reject_writes: boolean
+  barrier?: Barrier
   // watch: an operator asked for this bucket's traffic by backend; per_bucket_telemetry: proxies
   // count it by backend now (spread, moving or watched).
   watch?: boolean
@@ -197,8 +204,14 @@ export interface Operation {
   created?: string
   updated?: string
   sequence?: number
+  // allowed_actions are what the server accepts now: cancel after the hold is durable and before
+  // its commit, resume once its owner is gone. blockers name what a blocked operation waits on;
+  // barrier is the drain barrier it runs (ADR-0021 D2).
   allowed_actions?: string[]
-  blockers?: { code: string; proxy_id?: string; message?: string }[]
+  blockers?: Blocker[]
+  blocker_count?: number
+  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number }
+  owner_term?: number
   phase?: string
   waiting_on?: string[]
   silent?: string[]
@@ -206,6 +219,13 @@ export interface Operation {
   version?: number
   result?: unknown
   error?: { code: string; message: string }
+}
+
+export interface Blocker { code: string; proxy_id?: string; incarnation?: string; count?: number; message?: string }
+
+// blockerText is a blocker list in one line.
+export function blockerText(blockers: Blocker[] | undefined): string {
+  return (blockers ?? []).map((b) => `${b.code}${b.proxy_id ? ` ${b.proxy_id}` : ''}${b.count ? ` (${b.count})` : ''}`).join(', ')
 }
 
 // unfinished reports whether an operation has not ended yet: poll it, and keep its scope's actions
@@ -357,9 +377,13 @@ export const adoptBucket = (token: string, tenant: string, bucket: string, body:
 export const createBackendBucket = (token: string, tenant: string, bucket: string, body: { cluster: string; name: string; keys?: { access_key: string; secret: string; buckets?: string[] }[]; legs?: { cluster: string; name?: string }[] }) => request<PlacementStatus>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/create-backend`, token, json(body))
 export const expandBucket = (token: string, tenant: string, bucket: string, to: string, name?: string, acceptExisting = false) => request<{ key: string; target: string; name: string; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/expand`, token, json({ to, name, create: true, accept_existing_objects: acceptExisting || undefined }))
 export const clearTarget = (token: string, tenant: string, bucket: string) => request<{ key: string; target?: string; name?: string; retired?: { id: string; cluster: string; bucket: string }[]; version: number }>(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/target`, token, { method: 'DELETE' })
-export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}/read-only`, token, json({ read_only: readOnly, reject }))
+// A read-only change runs as an operation (ADR-0021 D2): switching on is desired at once and
+// effective only when every proxy has drained; the operation record says which.
+export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request<Operation>(`${apiRoot}/operations`, token, json({ kind: 'cluster-read-only', cluster: name, args: { read_only: readOnly, reject } }))
 export const setBucketWatch = (token: string, tenant: string, bucket: string, watch: boolean) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/watch`, token, json({ watch }))
-export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/read-only`, token, json({ read_only: readOnly, reject }))
+export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request<Operation>(`${apiRoot}/operations`, token, json({ kind: 'placement-read-only', placement: `${tenant}/${bucket}`, args: { read_only: readOnly, reject } }))
+export const resumeOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/resume`, token, json({}))
+export const cancelOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/cancel`, token, json({}))
 export const removeClusterDryRun = (token: string, name: string) => request<RemoveDryRun>(`${apiRoot}/clusters/${encodeURIComponent(name)}?dry_run=1`, token, { method: 'DELETE' })
 export const removeCluster = (token: string, name: string, confirmation: string) => request(`${apiRoot}/clusters/${encodeURIComponent(name)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
 export const startOperation = (token: string, kind: string, placement: string, args?: unknown) => request<Operation>(`${apiRoot}/operations`, token, json({ kind, placement, args }))

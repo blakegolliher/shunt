@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -35,13 +36,14 @@ func TestOperationVerbs(t *testing.T) {
 	// An unfinished record: wait exits 3 at its timeout, not 1.
 	ctl := rg.ctl
 	planted := control.Operation{ID: "1700000000000-0000ff", Kind: control.OpMover, Placement: "acme/other", Node: "lab", Status: control.StatusRunning,
-		Sequence: 1, EffectState: control.EffectNone, Created: time.Now().UTC(), Updated: time.Now().UTC()}
+		Sequence: 1, EffectState: control.EffectNone, Created: time.Now().UTC(), Updated: time.Now().UTC(),
+		Blockers: []control.Blocker{{Code: control.BlockerProxyMissing, ProxyID: "p9"}}, BlockerCount: 1}
 	if err := ctl.Ops.Create(t.Context(), &planted); err != nil {
 		t.Fatal(err)
 	}
 	_, err = rg.cli(t, "operation", "wait", planted.ID, "--timeout", "300ms")
 	var ee *exitError
-	if !errors.As(err, &ee) || ee.code != exitWaitDeadline || !strings.Contains(err.Error(), "still running") {
+	if !errors.As(err, &ee) || ee.code != exitWaitDeadline || !strings.Contains(err.Error(), "still running") || !strings.Contains(err.Error(), "waiting on proxy_missing p9") {
 		t.Fatalf("wait past its timeout: %v, want exit %d", err, exitWaitDeadline)
 	}
 	planted.Status, planted.Sequence, planted.Error = control.StatusFailed, 2, &control.Error{Code: "refused", Message: "no"}
@@ -54,6 +56,50 @@ func TestOperationVerbs(t *testing.T) {
 	}
 	if _, err = rg.cli(t, "operation", "show", "1700000000000-nope00"); err == nil {
 		t.Fatal("show of an unknown operation succeeded")
+	}
+
+	// Resume takes a durable barrier from a lost owner and carries the same record to completion.
+	gen := rg.dir.Snapshot().Generation("cluster:vast01")
+	resumable := control.Operation{ID: "1700000000001-0000aa", Kind: control.OpClusterReadOnly, Cluster: "vast01", Node: "lost-node",
+		Identity: rg.dir.Snapshot().File().Identity, Scope: &control.Scope{Resource: "cluster:vast01", Generation: gen},
+		Status: control.StatusBlocked, Phase: control.PhaseDrain, Sequence: 1, EffectState: control.EffectNone,
+		AllowedActions: []string{control.ActionResume, control.ActionCancel}, Blockers: []control.Blocker{{Code: control.BlockerOwnerLost}}, BlockerCount: 1,
+		Barrier: &control.BarrierState{ID: "1700000000001-0000aa", Scope: "cluster:vast01", Kind: "mutations"},
+		Args:    json.RawMessage(`{"read_only":true,"wait":"0s"}`), Created: time.Now().UTC(), Updated: time.Now().UTC()}
+	if err := ctl.Ops.Create(t.Context(), &resumable); err != nil {
+		t.Fatal(err)
+	}
+	if out := rg.must(t, "operation", "resume", resumable.ID); !strings.Contains(out, "operation "+resumable.ID+" resumed on lab") {
+		t.Fatalf("resume: %s", out)
+	}
+	if out := rg.must(t, "operation", "wait", resumable.ID); !strings.Contains(out, "succeeded") {
+		t.Fatalf("resumed outcome: %s", out)
+	}
+	if out, err := rg.cli(t, "operation", "cancel", resumable.ID); err == nil || !strings.Contains(out, "has ended succeeded") {
+		t.Fatalf("cancel after commit: %v\n%s", err, out)
+	}
+
+	// Cancel is exposed as a CLI verb and safely ends a precommit record.
+	cancellable := resumable
+	cancellable.ID, cancellable.Node, cancellable.OwnerTerm = "1700000000002-0000bb", "lab", 0
+	if err := rg.dir.SetClusterReadOnly(t.Context(), "vast01", false, false, "", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rg.dir.SetClusterReadOnly(t.Context(), "vast01", true, false, cancellable.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	cancellable.Scope = &control.Scope{Resource: "cluster:vast01", Generation: rg.dir.Snapshot().Generation("cluster:vast01")}
+	cancellable.Status, cancellable.Phase, cancellable.Sequence = control.StatusBlocked, control.PhaseDrain, 1
+	cancellable.AllowedActions = []string{control.ActionCancel}
+	cancellable.Blockers, cancellable.BlockerCount = []control.Blocker{{Code: control.BlockerProxyMissing, ProxyID: "p9"}}, 1
+	cancellable.Barrier = &control.BarrierState{ID: cancellable.ID, Scope: "cluster:vast01", Kind: "mutations",
+		HoldVersion: rg.dir.Snapshot().Version(), Generation: rg.dir.Snapshot().Generation("cluster:vast01")}
+	cancellable.Result, cancellable.Error = nil, nil
+	if err := ctl.Ops.Create(t.Context(), &cancellable); err != nil {
+		t.Fatal(err)
+	}
+	if out := rg.must(t, "operation", "cancel", cancellable.ID); !strings.Contains(out, "operation "+cancellable.ID+" canceled; nothing changed") {
+		t.Fatalf("cancel: %s", out)
 	}
 }
 

@@ -71,8 +71,10 @@ const (
 const (
 	PhaseQueued       = "queued"       // waiting for the bucket's step lock
 	PhasePrecondition = "precondition" // waiting for every proxy to have the current version
-	PhaseHold         = "hold"         // the hold is written; waiting for every proxy to have it
-	PhaseStep         = "step"         // the step is being written
+	PhaseHold         = "hold"         // the hold is being written (ADR-0021 D2)
+	PhaseDrain        = "drain"        // the hold is written; waiting for every proxy to drain its gate
+	PhaseCommit       = "commit"       // the guarded change is being written
+	PhaseStep         = "step"         // a step that needs no barrier is being written
 	PhaseSettle       = "settle"       // the step is written; waiting for every live proxy to have it
 	PhaseWindow       = "window"       // cutover: the quiet window
 	PhaseDiff         = "diff"         // purge-source: the listing diff
@@ -136,14 +138,20 @@ type Operation struct {
 	RequestID    string `json:"request_id,omitempty"`
 	IntentDigest string `json:"intent_digest,omitempty"`
 	// Sequence counts the record's writes: an update is accepted only over the sequence it read.
+	// OwnerTerm counts the nodes that have owned it: a resume takes it with a new term.
 	Sequence    int64     `json:"sequence"`
+	OwnerTerm   int64     `json:"owner_term,omitempty"`
 	Created     time.Time `json:"created"`
 	Updated     time.Time `json:"updated"`
 	Status      string    `json:"status"`
 	EffectState string    `json:"effect_state"`
-	// AllowedActions are the actions the server accepts on the record now; none yet.
+	// AllowedActions are the actions the server accepts on the record now (ActionCancel after the
+	// hold is durable and before its commit, ActionResume once its owner is gone). Blockers name
+	// what it waits on; BlockerCount is their number. Barrier is its drain barrier, once it has one.
 	AllowedActions []string        `json:"allowed_actions"`
 	Blockers       []Blocker       `json:"blockers,omitempty"`
+	BlockerCount   int             `json:"blocker_count,omitempty"`
+	Barrier        *BarrierState   `json:"barrier,omitempty"`
 	Phase          string          `json:"phase,omitempty"`
 	WaitingOn      []string        `json:"waiting_on,omitempty"`
 	Silent         []string        `json:"silent,omitempty"`
@@ -166,6 +174,10 @@ func (op *Operation) clone() *Operation {
 	if op.Progress != nil {
 		p := *op.Progress
 		c.Progress = &p
+	}
+	if op.Barrier != nil {
+		b := *op.Barrier
+		c.Barrier = &b
 	}
 	if op.Error != nil {
 		e := *op.Error
@@ -191,6 +203,9 @@ type Operations interface {
 	Get(ctx context.Context, id string) (*Operation, error)
 	// List returns the newest records first, filtered by placement or cluster when given.
 	List(ctx context.Context, placement, cluster string, limit int) ([]*Operation, error)
+	// OwnerLive reports whether the control node named still runs its operations: its liveness
+	// key in the control plane holds. A lost owner's barrier operations are resumed, not repeated.
+	OwnerLive(ctx context.Context, node string) (bool, error)
 }
 
 // MemOperations keeps records in memory, newest last, and forgets the oldest ended ones past
@@ -202,6 +217,8 @@ type MemOperations struct {
 	Dir directory.Directory
 	// Capacity is the limit on unfinished operations; default DefaultCapacity.
 	Capacity int
+	// Node is the one node whose records these are; default "lab".
+	Node string
 	// Now dates the idempotency retention; default time.Now.
 	Now func() time.Time
 	// OnChange, if set, is called after every Create and Update with a copy of the record.
@@ -214,6 +231,16 @@ type MemOperations struct {
 }
 
 var _ Operations = (*MemOperations)(nil)
+
+// OwnerLive implements Operations: the lab's one node is this process (Node, "lab" when unset),
+// and every record it holds is this process's; a restart forgets them.
+func (m *MemOperations) OwnerLive(_ context.Context, node string) (bool, error) {
+	own := m.Node
+	if own == "" {
+		own = "lab"
+	}
+	return node == own, nil
+}
 
 // Get implements Operations.
 func (m *MemOperations) Get(_ context.Context, id string) (*Operation, error) {
@@ -273,13 +300,84 @@ type tracker struct {
 	op           Operation
 	lastProgress time.Time
 	// lost is set once an update found the record written by someone else (ErrStaleSequence): a
-	// node that saw this one's owner lost took it over, and this tracker writes it no more.
+	// cancellation, or a node that saw this one's owner lost and took it over. This tracker
+	// writes it no more, and check ends the run at its next turn.
 	lost bool
 	// startVersion is the directory version when the record was created.
 	startVersion int64
 }
 
 func (tr *tracker) id() string { return tr.op.ID }
+
+// barrierState is a copy of the record's barrier, nil before it has one.
+func (tr *tracker) barrierState() *BarrierState {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.op.Barrier == nil {
+		return nil
+	}
+	b := *tr.op.Barrier
+	return &b
+}
+
+// setBarrier writes the barrier's state and the actions the record accepts.
+func (tr *tracker) setBarrier(st *BarrierState, actions []string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	b := *st
+	tr.op.Barrier = &b
+	if actions == nil {
+		actions = []string{}
+	}
+	tr.op.AllowedActions = actions
+	tr.put()
+}
+
+// blocked writes what the operation waits on: blocked with the blockers when there are any,
+// running with none. It writes only on a change.
+func (tr *tracker) blocked(blockers []Blocker) {
+	tr.mu.Lock()
+	defer func() {
+		tr.mu.Unlock()
+		tr.s.publishBlockers()
+	}()
+	status := StatusRunning
+	if len(blockers) > 0 {
+		status = StatusBlocked
+	}
+	if tr.op.Status == status && slices.Equal(tr.op.Blockers, blockers) {
+		return
+	}
+	tr.op.Status, tr.op.Blockers, tr.op.BlockerCount = status, slices.Clone(blockers), len(blockers)
+	tr.put()
+}
+
+// check ends a run whose record this tracker no longer writes: it re-reads the record and
+// reports a cancellation, or a takeover by another node, as the error to end with. A run that
+// still owns an unfinished record goes on.
+func (tr *tracker) check() error {
+	tr.mu.Lock()
+	lost := tr.lost
+	id, term := tr.op.ID, tr.op.OwnerTerm
+	tr.mu.Unlock()
+	if !lost {
+		return nil
+	}
+	op, err := tr.s.ops().Get(context.WithoutCancel(tr.ctx), id)
+	switch {
+	case err != nil:
+		return errLost
+	case op == nil:
+		return errLost
+	case op.Status == StatusCancelled:
+		return errCanceled
+	case op.Terminal():
+		return errLost
+	case op.Node != tr.s.node() || op.OwnerTerm != term:
+		return errLost
+	}
+	return fmt.Errorf("%w: the record of operation %s was written by another node", errLost, id)
+}
 
 // snapshot returns a copy of the record.
 func (tr *tracker) snapshot() Operation {
@@ -347,9 +445,19 @@ func (tr *tracker) progress(done, total int64, unit string) {
 // finish closes the record with the outcome.
 func (tr *tracker) finish(res any, err error) {
 	tr.mu.Lock()
-	defer tr.mu.Unlock()
+	defer func() {
+		tr.mu.Unlock()
+		tr.s.publishBlockers()
+	}()
 	tr.op.Phase = PhaseDone
+	tr.op.Blockers, tr.op.BlockerCount, tr.op.AllowedActions = nil, 0, []string{}
 	switch {
+	case errors.Is(err, errCanceled):
+		// The record was ended by the cancellation; this tracker's write is refused as stale.
+		tr.op.Status = StatusCancelled
+		tr.op.Error = &Error{Code: StatusCancelled, Message: err.Error()}
+	case errors.Is(err, errLost):
+		return // the record is another node's now; it writes the outcome
 	case err != nil:
 		_, e := errorOf(err)
 		tr.op.Error = &e
@@ -425,8 +533,14 @@ func (tr *tracker) finishHTTP(status int, body []byte) {
 
 // settleEffect records, on an ending operation, whether it wrote the directory: the directory
 // version moved past the one it started on while it ran. Another writer's change in the same time
-// counts too; committed is the safe side of the two. tr.mu is held.
+// counts too; committed is the safe side of the two. A barrier operation canceled before its
+// commit wrote a hold and released it: the routing is as it was, and its effect is none. tr.mu is
+// held.
 func (tr *tracker) settleEffect() {
+	if tr.op.Status == StatusCancelled && (tr.op.Barrier == nil || !tr.op.Barrier.Committed) {
+		tr.op.EffectState = EffectNone
+		return
+	}
 	if tr.op.EffectState == EffectNone && (tr.op.Version > 0 || tr.s.Dir.Snapshot().Version() > tr.startVersion) {
 		tr.op.EffectState = EffectCommitted
 	}
@@ -533,11 +647,35 @@ type outcome struct {
 	err error
 }
 
+// trackerFor makes a tracker for a record this node took over (resume, or its own after a restart).
+func (s *Server) trackerFor(op *Operation, actor string) *tracker {
+	return &tracker{s: s, ctx: s.context(), actor: actor, async: true, op: *op.clone(), startVersion: s.Dir.Snapshot().Version()}
+}
+
+// runs reports whether this node is running the operation.
+func (s *Server) runs(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.running[id]
+	return ok
+}
+
 // operate runs fn under tr's record on the server's context, not a request's, and returns its
 // outcome on a channel: the routes wait for it, POST /v1/operations answers 202 and lets it run.
 func (s *Server) operate(tr *tracker, fn func(*tracker) (any, error)) <-chan outcome {
 	ch := make(chan outcome, 1)
+	s.mu.Lock()
+	if s.running == nil {
+		s.running = map[string]*tracker{}
+	}
+	s.running[tr.id()] = tr
+	s.mu.Unlock()
 	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.running, tr.id())
+			s.mu.Unlock()
+		}()
 		tr.running()
 		var out outcome
 		func() {
@@ -755,7 +893,7 @@ func (s *Server) serveOperation(w http.ResponseWriter, r *http.Request, req Oper
 		return
 	}
 	req.Args = raw
-	_, ch, err := s.launch(actor(r), req, false, meta)
+	tr, ch, err := s.launch(actor(r), req, false, meta)
 	if s.replayed(w, r, err) {
 		return
 	}
@@ -763,6 +901,9 @@ func (s *Server) serveOperation(w http.ResponseWriter, r *http.Request, req Oper
 		fail(w, err)
 		return
 	}
+	wait := waitOf(raw)
+	t := time.NewTimer(wait + 2*s.fencePoll())
+	defer t.Stop()
 	select {
 	case out := <-ch:
 		if out.err != nil {
@@ -770,9 +911,27 @@ func (s *Server) serveOperation(w http.ResponseWriter, r *http.Request, req Oper
 			return
 		}
 		writeJSON(w, http.StatusOK, out.res)
+	case <-t.C:
+		// The wait ran out with the operation unfinished: 202 and the record as it stands, never a
+		// success or a rollback (contracts §1). It runs on; the record has the outcome.
+		w.Header().Set("Location", "/v1/operations/"+tr.id())
+		writeJSON(w, http.StatusAccepted, tr.snapshot().Public())
 	case <-r.Context().Done():
 		// The client left; the operation completes on its own and its record has the outcome.
 	}
+}
+
+// waitOf reads a request's wait for the fleet from its raw args; the default when it has none.
+func waitOf(raw json.RawMessage) time.Duration {
+	var a struct {
+		Wait string `json:"wait"`
+	}
+	_ = json.Unmarshal(raw, &a) //nolint:errcheck // an unreadable wait is the default
+	d, err := parseWait(a.Wait)
+	if err != nil {
+		return defaultFenceWait
+	}
+	return d
 }
 
 func (s *Server) startOperation(w http.ResponseWriter, r *http.Request) {
@@ -838,7 +997,8 @@ func (s *Server) listOperations(w http.ResponseWriter, r *http.Request) {
 }
 
 // FailOrphans marks the records this node was running when it last stopped as failed: their
-// goroutines died with the process. A held step they left completes by repeating it (ADR-0016).
+// goroutines died with the process. A barrier operation is not among them: its record says where
+// it stands, and ResumeOwn carries it on.
 func (s *Server) FailOrphans(ctx context.Context) error {
 	ops, err := s.ops().List(ctx, "", "", defaultOperationLimit)
 	if err != nil {
@@ -846,7 +1006,7 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Terminal() {
+		if op.Node != s.node() || op.Terminal() || (resumable(op.Kind) && op.Barrier != nil) {
 			continue
 		}
 		orphan(op, s.now().UTC(), "the control node running this operation restarted before it finished; repeat the step to complete it")
@@ -861,20 +1021,74 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Orphan ends a record whose owner stopped running it (a control node that restarted, or whose
-// liveness key in the control plane lapsed), ready for Update.
+// Orphan marks a record whose owner stopped running it (a control node that restarted, or whose
+// liveness key in the control plane lapsed), ready for Update. A barrier operation is left
+// unfinished and blocked, owner_lost, with resume and (after its hold is durable and before its
+// commit) cancel allowed: its record says where it stands, and another node carries it on. Any
+// other record ends failed.
 func Orphan(op *Operation, now time.Time, why string) { orphan(op, now, why) }
 
-// orphan ends a record whose owner stopped running it. Its effect is uncertain unless it had not
-// started: a step interrupted between its writes may have left a hold, which repeating the step
-// completes (ADR-0016). An uncertain record stays past the history limit as evidence.
+// orphan is Orphan. A failed record's effect is uncertain unless it had not started; an uncertain
+// record stays past the history limit as evidence.
 func orphan(op *Operation, now time.Time, why string) {
+	op.Sequence++
+	op.Updated = now
+	if resumable(op.Kind) && op.Barrier != nil {
+		op.Status = StatusBlocked
+		op.Blockers = []Blocker{{Code: BlockerOwnerLost, Message: why}}
+		op.BlockerCount = 1
+		op.AllowedActions = []string{ActionResume}
+		if op.Barrier.HoldVersion > 0 && !op.Barrier.Committed {
+			op.AllowedActions = append(op.AllowedActions, ActionCancel)
+		}
+		return
+	}
 	if op.Status != StatusPending && (op.EffectState == EffectNone || op.EffectState == "") {
 		op.EffectState = EffectUncertain
 	}
-	op.Status, op.Phase, op.Updated = StatusFailed, PhaseDone, now
-	op.Sequence++
+	op.Status, op.Phase = StatusFailed, PhaseDone
 	op.Error = &Error{Code: "unavailable", Message: why}
+}
+
+// Sweep is the control node's periodic care of the records (once a second, with PublishFleet):
+// records whose owner's liveness has lapsed are orphaned, and the operations gauge is refreshed.
+func (s *Server) Sweep(ctx context.Context) error {
+	ops, err := s.ops().List(ctx, "", "", defaultOperationLimit)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	counts := map[[2]string]int{}
+	for _, op := range ops {
+		ownerLost := op.Status == StatusBlocked && len(op.Blockers) == 1 && op.Blockers[0].Code == BlockerOwnerLost
+		if !op.Terminal() && op.Node != s.node() && !ownerLost {
+			live, err := s.ops().OwnerLive(ctx, op.Node)
+			switch {
+			case err != nil:
+				errs = append(errs, err)
+			case !live:
+				orphan(op, s.now().UTC(), fmt.Sprintf("control node %s stopped running this operation (its liveness in the control plane lapsed); resume it on a live node, or cancel it", op.Node))
+				if err := s.ops().Update(ctx, op); err != nil && !errors.Is(err, ErrStaleSequence) {
+					errs = append(errs, err)
+				} else if s.Log != nil {
+					s.Log.Warn("operation orphaned: its control node is gone", "operation", op.ID, "kind", op.Kind, "node", op.Node, "status", op.Status)
+				}
+			}
+		}
+		switch {
+		case !op.Terminal():
+			counts[[2]string{op.Status, op.EffectState}]++
+		case op.EffectState == EffectUncertain:
+			counts[[2]string{op.Status, op.EffectState}]++
+		}
+	}
+	if s.Metrics != nil {
+		s.Metrics.Operations.Reset()
+		for k, n := range counts {
+			s.Metrics.Operations.WithLabelValues(k[0], k[1]).Set(float64(n))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // runningOperations lists the ids of running records for a placement, for its view.

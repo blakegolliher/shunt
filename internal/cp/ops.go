@@ -414,21 +414,38 @@ func (o *Operations) release(ctx context.Context, held, resource, ownerID string
 	_, _ = o.cli.Txn(ctx).If(clientv3.Compare(clientv3.Value(sk), "=", ownerID)).Then(clientv3.OpDelete(sk)).Commit() //nolint:errcheck // the retried create says what is left
 }
 
-// reap ends owner as orphaned when its node is no longer live, and reports whether it did. Only a
-// store that keeps its own node's liveness key judges others by theirs.
+// OwnerLive implements control.Operations: whether node's liveness key holds. A store that keeps
+// no liveness key of its own takes every node for live: only a node judges others by theirs.
+func (o *Operations) OwnerLive(ctx context.Context, node string) (bool, error) {
+	if o.Node == "" || node == o.Node {
+		return true, nil
+	}
+	resp, err := o.cli.Get(ctx, ownerPrefix+node, clientv3.WithCountOnly())
+	if err != nil {
+		return false, fmt.Errorf("%w: reading a node's liveness: %w", control.ErrUnavailable, err)
+	}
+	return resp.Count > 0, nil
+}
+
+// reap orphans owner when its node is no longer live, and reports whether the scope came free: a
+// short operation ends failed and releases its scope; a barrier operation stays, blocked and
+// resumable, and keeps it (ADR-0021 D2).
 func (o *Operations) reap(ctx context.Context, owner *control.Operation) bool {
-	if o.Node == "" || owner.Terminal() {
+	if owner.Terminal() {
 		return false
 	}
-	resp, err := o.cli.Get(ctx, ownerPrefix+owner.Node, clientv3.WithCountOnly())
-	if err != nil || resp.Count > 0 {
+	live, err := o.OwnerLive(ctx, owner.Node)
+	if err != nil || live {
 		return false
 	}
-	control.Orphan(owner, o.now().UTC(), fmt.Sprintf("control node %s stopped running this operation (its liveness in the control plane lapsed); repeat the step to complete it", owner.Node))
+	if owner.Status == control.StatusBlocked && len(owner.Blockers) == 1 && owner.Blockers[0].Code == control.BlockerOwnerLost {
+		return false // already orphaned, waiting for a resume
+	}
+	control.Orphan(owner, o.now().UTC(), fmt.Sprintf("control node %s stopped running this operation (its liveness in the control plane lapsed); resume it on a live node, or cancel it", owner.Node))
 	if err := o.Update(ctx, owner); err != nil {
 		return false
 	}
-	return true
+	return owner.Terminal()
 }
 
 // Update implements control.Operations: a compare-and-swap on the record as read at the sequence

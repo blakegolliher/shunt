@@ -167,7 +167,7 @@ func statusOf(code string) int {
 	case "not_found":
 		return http.StatusNotFound
 	case "refused", "conflict", CodeOperationConflict, CodeGenerationConflict, CodeIdempotencyConflict,
-		CodeClusterMismatch, CodeEpochMismatch, CodeResyncRequired:
+		CodeClusterMismatch, CodeEpochMismatch, CodeResyncRequired, CodeNotCancellable, CodeRetirementUnproven:
 		return http.StatusConflict
 	case CodeOperationCapacity:
 		return http.StatusTooManyRequests

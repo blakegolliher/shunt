@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -71,49 +72,80 @@ func parseWindow(v string) (time.Duration, error) {
 	return d, nil
 }
 
-// settle waits for version v to reach every live member and records who still lacks it.
+// settle waits for version v to reach every live member and records who still lacks it. A
+// silent member is listed, not waited for: the change is committed and a member that has not
+// installed it refuses writes on the moving bucket by itself until it has; a retired member is
+// counted out.
 func (s *Server) settle(tr *tracker, res *TransitionResult, v int64, wait time.Duration) {
 	tr.phase(PhaseSettle)
+	start := s.now()
 	waiting, _ := s.fenceRound(tr, v, false, wait) //nolint:errcheck // a canceled wait just leaves the change pending
+	s.observeBarrier(PhaseSettle, s.now().Sub(start))
 	res.WaitingOn = waiting
 	if ms, err := s.members(tr.ctx); err == nil {
-		for _, m := range ms {
-			if m.Live {
+		for i := range ms {
+			switch m := &ms[i]; {
+			case m.Retired():
+			case m.Live:
 				res.Proxies++
-			} else {
+			default:
 				res.Silent = append(res.Silent, m.ID)
 			}
 		}
 	}
 }
 
-// precondition refuses a fenced change while the fleet has not installed the current version: the
-// previous change is not in effect everywhere, and the next step must start from one that is.
-func (s *Server) precondition(tr *tracker, strict bool, wait time.Duration) error {
+// precondition waits until every proxy that could serve the old routing has the current directory
+// version: the previous change is in effect everywhere, and the next step starts from one that
+// is. Nothing is refused: what stands in the way is a blocker on the record (a member that has
+// not installed the version, a silent one, an unresolved incarnation), and the operation stays
+// blocked until it clears or the operation is canceled (ADR-0021 D2).
+func (s *Server) precondition(tr *tracker) error {
 	tr.phase(PhasePrecondition)
 	if err := s.Dir.Sync(tr.ctx); err != nil {
 		return err
 	}
 	v := s.Dir.Snapshot().Version()
-	waiting, err := s.fenceRound(tr, v, strict, wait)
+	return s.blockUntil(tr, func(ctx context.Context) ([]Blocker, error) { return s.versionBlockers(ctx, v) })
+}
+
+// versionBlockers is what keeps directory version v from being on every member: every member,
+// live or not, except a retired one.
+func (s *Server) versionBlockers(ctx context.Context, v int64) ([]Blocker, error) {
+	ms, err := s.members(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(waiting) > 0 {
-		hint := "; they install it within a heartbeat once they can reach this proxy"
-		if strict {
-			hint = "; a bucket's first step waits for every proxy, live or not, because one cut off before it would still write every key to the source. A proxy that is gone for good: `shunt proxy forget <id>`"
+	cur := s.Dir.Snapshot().File().Identity
+	var out []Blocker
+	for i := range ms {
+		m := &ms[i]
+		for _, inc := range m.Unresolved {
+			out = append(out, Blocker{Code: BlockerIncarnationUnresolved, ProxyID: m.ID, Incarnation: inc.ID, Count: inc.Uncertain,
+				Message: fmt.Sprintf("incarnation %s of %s did not retire cleanly; its backend work may still land (`shunt proxy resolve %s --incarnation %s --attest <why>` once it has ended)", inc.ID, m.ID, m.ID, inc.ID)})
 		}
-		return refuse("directory version %d is not on every proxy yet, %s (after %s)%s", v, waitingOn(waiting), wait, hint)
+		switch {
+		case m.Retired():
+		case !m.Live:
+			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: fmt.Sprintf("%s is silent (last seen %s ago); a proxy cut off before a step would still write every key by the old routing, so every step waits for it until it is back, retires, or its incarnation is resolved", m.ID, m.SinceSeen.Round(time.Second))})
+		case m.Identity != cur:
+			out = append(out, Blocker{Code: BlockerProxyMissing, ProxyID: m.ID, Message: m.ID + " is on another directory lineage and must be re-enrolled"})
+		case m.Installed >= v && m.Applied < v:
+			out = append(out, Blocker{Code: BlockerInstallBackpressure, ProxyID: m.ID, Message: fmt.Sprintf("%s has installed version %d but its requests still use %d, waiting for long-running requests to release a retired runtime bundle", m.ID, m.Installed, m.Applied)})
+		case !m.Has(cur, v):
+			out = append(out, Blocker{Code: BlockerInstallPending, ProxyID: m.ID, Message: fmt.Sprintf("%s has version %d installed, the directory is at %d; it installs it within a heartbeat once it can reach a control node", m.ID, m.Applied, v)})
+		}
 	}
-	return nil
+	return out, nil
 }
 
 // fencedStep applies a step that moves writes or reads for keys that already exist (a ramp step,
-// migrate start) under ADR-0016: the fleet must be at the current version first; a step that moves
-// writes to the new primary is held until every proxy has the hold when the fleet has members; and
-// the answer says which members have not installed the step yet. A hold that does not reach every
-// member is released, so the step either happens everywhere or nowhere.
+// migrate start) under ADR-0016 and ADR-0021 D2: the fleet must be at the current version first;
+// a step that moves writes is written as a hold, which every proxy installs, closing the
+// bucket's mutations, and is committed only once every proxy has drained them; the answer says
+// which live members have not installed the commit yet. The hold, the drain and the commit are
+// on the operation's record, so a control node that picks the operation up carries it on from
+// where it stands, and a cancellation before the commit releases the hold.
 func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, create, acceptLoss bool, wait time.Duration) (TransitionResult, error) {
 	// One fenced step per bucket at a time: the operation reserved the placement when it was
 	// created (ADR-0021), on every control node, so two operators stepping the same bucket cannot
@@ -126,96 +158,137 @@ func (s *Server) fencedStep(tr *tracker, key string, t directory.Transition, cre
 	if !ok {
 		return TransitionResult{}, fmt.Errorf("%w: no bucket %s in the directory", directory.ErrNotFound, key)
 	}
-	// A step out of ACTIVE waits for every member, live or not. A hold taken from ACTIVE and not yet
-	// completed (nothing in force, only the hold) is still that step.
 	pv := moving(p)
-	fromActive := p.State == directory.StateActive || (p.Held() && pv.Ramp.Ratio == 0 && len(pv.Ramp.Prefixes) == 0)
-	if err := s.precondition(tr, fromActive, wait); err != nil {
+	// A hold taken from ACTIVE and not yet completed (nothing in force, only the hold) is still
+	// that step, from ACTIVE.
+	from := p.State
+	if p.Held() && pv.Ramp.Ratio == 0 && len(pv.Ramp.Prefixes) == 0 {
+		from = directory.StateActive
+	}
+	resumed := tr.barrierState() != nil
+	if !resumed {
+		if err := s.precondition(tr); err != nil {
+			return TransitionResult{}, err
+		}
+		moves := t.To == directory.StateRamping ||
+			(t.To == directory.StateMigrating && (p.State != directory.StateRamping || pv.Ramp == nil || pv.Ramp.Ratio < 1 || p.Held()))
+		if !moves {
+			tr.phase(PhaseStep)
+			res, err := s.transition(tr, key, p, f, t, create, acceptLoss)
+			if err != nil {
+				return res, err
+			}
+			s.settle(tr, &res, res.Version, wait)
+			return res, nil
+		}
+		switch {
+		case p.Held() && (p.Barrier == nil || p.Barrier.ID != tr.id()):
+			owner := "an earlier call"
+			if p.Barrier != nil {
+				owner = "operation " + p.Barrier.ID
+			}
+			return TransitionResult{}, refuse("%s has a held step to %s left by %s; resume or cancel that operation (`shunt operation show`) before another step", key, holdText(pv.Ramp.Hold), owner)
+		case !p.Held():
+			// Anything that would refuse the completed step refuses before the hold is written.
+			np, err := directory.Apply(p, withDefaultName(key, p, t))
+			if err != nil {
+				return TransitionResult{}, err
+			}
+			if nv := moving(np); np.State == directory.StateMigrating && !f.Clusters[nv.ClusterOf(nv.Primary)].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
+				return TransitionResult{}, lostWriteWindow(key, nv.ClusterOf(nv.Primary))
+			}
+		}
+	}
+	complete := t // the step as written once every proxy has drained: never with a target
+	complete.Target, complete.Name, complete.Complete, complete.Range, complete.Leg, complete.Scope = "", "", true, nil, "", ""
+	th := t
+	th.Hold, th.Barrier = true, tr.id()
+	var res TransitionResult
+	var created string
+	b := &barrier{scope: directory.PlacementResource(key), kind: config.BarrierMutations,
+		hold: func() (int64, error) {
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, err
+			}
+			f1 := s.Dir.Snapshot().File()
+			p1 := f1.Placements[key]
+			if p1.Held() && p1.Barrier != nil && p1.Barrier.ID == tr.id() {
+				return f1.Version, nil // written by an earlier attempt of this operation
+			}
+			held, err := s.transition(tr, key, p1, f1, th, create, acceptLoss)
+			if err != nil {
+				return 0, err
+			}
+			created = held.CreatedBucket
+			s.info(tr.actor, "ramp step held", "placement", key, "version", held.Version, "to", t.To, "ratio", t.Ratio, "prefixes", t.Prefixes, "barrier", tr.id())
+			return held.Version, nil
+		},
+		commit: func() (int64, bool, error) {
+			if err := s.Dir.Sync(tr.ctx); err != nil {
+				return 0, false, err
+			}
+			f2 := s.Dir.Snapshot().File()
+			p2, ok := f2.Placements[key]
+			if !ok {
+				return 0, false, fmt.Errorf("%w: %s vanished while its step was held", directory.ErrConflict, key)
+			}
+			if !p2.Held() || p2.Barrier == nil || p2.Barrier.ID != tr.id() {
+				if stepInForce(p2, t) {
+					res = resultOf(key, from, p2, f2.Version)
+					return f2.Version, true, nil // an earlier attempt's commit landed and its reply was lost
+				}
+				return 0, false, errBarrierGone
+			}
+			r, err := s.transition(tr, key, p2, f2, complete, false, acceptLoss)
+			if err != nil {
+				return 0, false, err
+			}
+			res = r
+			return r.Version, false, nil
+		}}
+	if err := s.runBarrier(tr, b); err != nil {
 		return TransitionResult{}, err
 	}
-	moves := t.To == directory.StateRamping ||
-		(t.To == directory.StateMigrating && (p.State != directory.StateRamping || pv.Ramp == nil || pv.Ramp.Ratio < 1 || p.Held()))
-	hold := false
-	if moves {
-		var err error
-		if hold, err = s.counted(tr.ctx, fromActive); err != nil {
-			return TransitionResult{}, err
-		}
-	}
-	if !hold {
-		tr.phase(PhaseStep)
-		res, err := s.transition(tr, key, p, f, t, create, acceptLoss)
-		if err != nil {
-			return res, err
-		}
-		s.settle(tr, &res, res.Version, wait)
-		return res, nil
-	}
-
-	tenant, bucket, _ := directory.SplitKey(key)
-	complete := t // the step as written once every member holds it: never with a target
-	complete.Target, complete.Name, complete.Complete, complete.Range, complete.Leg, complete.Scope = "", "", true, nil, "", ""
-	var heldAt int64
-	var created string
-	if p.Held() {
-		// A hold left by an interrupted call, such as a control-node restart between the hold and
-		// its completion. Its keys answer 503 until it completes, so repeating the step resumes it
-		// rather than being refused as "already held".
-		if t.Target != "" && t.Target != pv.ClusterOf(pv.Primary) {
-			return TransitionResult{}, refuse("%s is already moving to %s; a different target needs a reconcile, not a ramp step", key, pv.ClusterOf(pv.Primary))
-		}
-		if _, err := directory.Apply(p, complete); err != nil {
-			return TransitionResult{}, refuse("%s has a held step to %s left by an interrupted call; repeat it to complete it (%v)", key, holdText(pv.Ramp.Hold), err)
-		}
-		heldAt = s.Dir.Snapshot().Version()
-		s.info(tr.actor, "resuming a held step", "placement", key, "version", heldAt, "hold", holdText(pv.Ramp.Hold))
-	} else {
-		// Anything that would refuse the completed step refuses before the hold is written.
-		np, err := directory.Apply(p, withDefaultName(key, p, t))
-		if err != nil {
-			return TransitionResult{}, err
-		}
-		if nv := moving(np); np.State == directory.StateMigrating && !f.Clusters[nv.ClusterOf(nv.Primary)].Capabilities.ConditionalWriteOr(true) && !acceptLoss {
-			return TransitionResult{}, lostWriteWindow(key, nv.ClusterOf(nv.Primary))
-		}
-		th := t
-		th.Hold = true
-		tr.phase(PhaseStep)
-		held, err := s.transition(tr, key, p, f, th, create, acceptLoss)
-		if err != nil {
-			return held, err
-		}
-		heldAt, created = held.Version, held.CreatedBucket
-		s.info(tr.actor, "ramp step held", "placement", key, "version", heldAt, "to", t.To, "ratio", t.Ratio, "prefixes", t.Prefixes)
-	}
-	release := func(why string) error {
-		if rerr := s.Dir.SetState(context.WithoutCancel(tr.ctx), tenant, bucket, directory.StateRamping, directory.Transition{Release: true}, tr.actor); rerr != nil {
-			return fmt.Errorf("%s, and releasing the hold failed: %w; repeat the step once the fleet is back to complete it", why, rerr)
-		}
-		s.info(tr.actor, "held step released", "placement", key, "reason", why)
-		return refuse("%s; the held step was released and nothing changed", why)
-	}
-	tr.phase(PhaseHold)
-	waiting, err := s.fenceRound(tr, heldAt, fromActive, wait)
-	switch {
-	case err != nil:
-		return TransitionResult{}, release("waiting for the fleet was interrupted: " + err.Error())
-	case len(waiting) > 0:
-		return TransitionResult{}, release(fmt.Sprintf("the held step did not reach every proxy within %s, %s", wait, waitingOn(waiting)))
-	}
-	f2 := s.Dir.Snapshot().File()
-	p2, ok := f2.Placements[key]
-	if !ok || !p2.Held() {
-		return TransitionResult{}, fmt.Errorf("%w: %s changed while its step was held", directory.ErrConflict, key)
-	}
-	tr.phase(PhaseStep)
-	res, err := s.transition(tr, key, p2, f2, complete, false, acceptLoss)
-	if err != nil {
-		return res, release("completing the held step failed: " + err.Error())
-	}
-	res.From, res.Held, res.CreatedBucket = p.State, true, created
+	res.From, res.Held, res.CreatedBucket = from, true, created
 	s.settle(tr, &res, res.Version, wait)
 	return res, nil
+}
+
+// stepInForce reports whether placement p already carries step t: a commit whose reply was lost.
+func stepInForce(p directory.Placement, t directory.Transition) bool {
+	pv := moving(p)
+	if pv.Held() {
+		return false
+	}
+	switch t.To {
+	case directory.StateMigrating:
+		return pv.State == directory.StateMigrating
+	case directory.StateRamping:
+		if pv.State != directory.StateRamping || pv.Ramp == nil || pv.Ramp.Ratio < t.Ratio {
+			return false
+		}
+		for _, pre := range t.Prefixes {
+			if !slices.Contains(pv.Ramp.Prefixes, pre) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// resultOf is the transition result for a placement a step already moved.
+func resultOf(key, from string, p directory.Placement, version int64) TransitionResult {
+	pv := moving(p)
+	res := TransitionResult{Key: key, From: from, To: p.State, Version: version, Primary: pv.ClusterOf(pv.Primary)}
+	if pv.Source != "" {
+		res.Source = pv.ClusterOf(pv.Source)
+	}
+	if pv.Ramp != nil {
+		res.Ratio = pv.Ramp.Ratio
+	}
+	res.Cutover = pv.Cutover
+	return res
 }
 
 // holdText describes a held step for an operator.
@@ -923,7 +996,7 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 	if p.State != directory.StateMigrating {
 		return TransitionResult{}, refuse("%s is %s; cutover happens from MIGRATING", key, p.State)
 	}
-	if perr := s.precondition(tr, false, wait); perr != nil {
+	if perr := s.precondition(tr); perr != nil {
 		return TransitionResult{}, perr
 	}
 	s.mu.Lock()
@@ -1057,7 +1130,7 @@ type purgePlan struct {
 // purgeChecks runs every refusal purge-source gives before it deletes: the state, the evidence,
 // the fence, and the listing diff, counting the source on the way. A refusal comes back with as
 // much of the plan as was gathered, for a dry run to show.
-func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purgePlan, error) {
+func (s *Server) purgeChecks(tr *tracker, key string, _ time.Duration) (purgePlan, error) {
 	var plan purgePlan
 	p, f, err := s.placementOf(key)
 	if err != nil {
@@ -1076,8 +1149,20 @@ func (s *Server) purgeChecks(tr *tracker, key string, wait time.Duration) (purge
 	}
 	p = moving(p)
 	// A proxy that has not installed the cutover still reads the source on a miss: it must have it
-	// before the source is deleted.
-	if perr := s.precondition(tr, false, wait); perr != nil {
+	// before the source is deleted. A dry run has no record to block on: it reports what stands
+	// in the way as its reason.
+	if tr.op.ID == "" {
+		if syncErr := s.Dir.Sync(tr.ctx); syncErr != nil {
+			return plan, syncErr
+		}
+		blockers, blockErr := s.versionBlockers(tr.ctx, s.Dir.Snapshot().Version())
+		if blockErr != nil {
+			return plan, blockErr
+		}
+		if len(blockers) > 0 {
+			return plan, refuse("directory version %d is not on every proxy yet: %s", s.Dir.Snapshot().Version(), blockerText(blockers))
+		}
+	} else if perr := s.precondition(tr); perr != nil {
 		return plan, perr
 	}
 	if plan.src, err = s.backendFor(p.ClusterOf(p.Source)); err != nil {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fullRange, leadingShare } from '../hashRange'
 import {
+  cancelOperation,
   getMoverLedger,
   getOperation,
   getPlacementView,
@@ -227,8 +228,8 @@ export function Migrations({ selected, onSelect, onPrepare }: { selected: string
     <Card eyebrow="Migration" title={`${source || 'source'} → ${target || 'target'}`} action={<StateBadge state={detail.state} />}>
       <label className="mb-4 block text-sm text-muted">Bucket<select value={key} onChange={(event) => onSelect(event.target.value)} className={inputClass}>{candidates.map((item) => <option key={item.key} value={item.key}>{item.key}</option>)}</select></label>
       {detail.move && <div className="mb-3 rounded-lg bg-ink-950 p-3 text-sm"><p>Moving <span className="font-semibold text-ember-300">{Math.round(detail.move.share * 1000) / 10}%</span> of the bucket's keys, leg {detail.move.from} → leg {detail.move.to}; the rest of the bucket stays where it is.</p>{detail.legs?.length ? <div className="mt-3"><OwnershipBar legs={detail.legs} move={detail.move} /></div> : null}</div>}
-      <FenceStatus held={detail.fence.held || operation?.phase === 'hold'} version={operation?.version ?? detail.fence.version} waitingOn={opWaiting} phase={operation && unfinished(operation) ? operation.phase : undefined} />
-      {operation && <div className="mt-3 rounded-lg bg-ink-950 p-3 text-xs"><span className="font-mono text-ember-300">{operation.id}</span><span className="ml-2 text-muted">{operation.kind} · {operation.status} · {operation.phase ?? 'done'}</span>{operation.error && <p className="mt-2 text-red-200">{operation.error.message}</p>}</div>}
+      <FenceStatus held={detail.fence.held || operation?.phase === 'hold'} version={operation?.version ?? detail.fence.version} waitingOn={opWaiting} phase={operation && unfinished(operation) ? operation.phase : undefined} blockers={operation && unfinished(operation) ? operation.blockers : undefined} />
+      {operation && <div className="mt-3 rounded-lg bg-ink-950 p-3 text-xs"><span className="font-mono text-ember-300">{operation.id}</span><span className="ml-2 text-muted">{operation.kind} · {operation.status} · {operation.phase ?? 'done'}</span>{operation.error && <p className="mt-2 text-red-200">{operation.error.message}</p>}{unfinished(operation) && operation.allowed_actions?.includes('cancel') && <button type="button" disabled={busy} onClick={() => { setBusy(true); void cancelOperation(token, operation.id).then((next) => { setOperation(next); notify(`${next.kind} cancelled; nothing changed`) }).catch((error) => notify(error instanceof Error ? error.message : String(error), 'danger')).finally(() => setBusy(false)) }} className="ml-3 rounded-lg border border-red-500 px-3 py-1 text-xs font-semibold text-red-100">Cancel before commit</button>}</div>}
     </Card>
 
     <Card eyebrow="Step 5–6" title="Ramp traffic">

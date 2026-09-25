@@ -675,8 +675,9 @@ func (s *Server) fenceRound(tr *tracker, v int64, strict bool, wait time.Duratio
 		}
 		cur := s.Dir.Snapshot().File().Identity
 		var waiting []string
-		for _, m := range ms {
-			if (strict || m.Live) && !m.Has(cur, v) {
+		for i := range ms {
+			m := &ms[i]
+			if (strict || m.Live) && !m.Retired() && !m.Has(cur, v) {
 				waiting = append(waiting, m.ID)
 			}
 		}
@@ -701,21 +702,6 @@ func (s *Server) fencePoll() time.Duration {
 		return s.FencePoll
 	}
 	return 100 * time.Millisecond
-}
-
-// counted reports whether a fence round with this strictness waits on any member at all, which is
-// what decides whether a step that moves writes has to be held first.
-func (s *Server) counted(ctx context.Context, strict bool) (bool, error) {
-	ms, err := s.members(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, m := range ms {
-		if strict || m.Live {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func waitingOn(ids []string) string {

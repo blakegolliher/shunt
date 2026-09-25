@@ -231,8 +231,8 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
 			CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
 		ctl = &control.Server{Dir: dir, Clusters: registry, Metrics: metrics, Log: log, SecretsDir: cfg.Directory.SecretsDir, Keys: store, Fleet: control.NoFleet{},
 			Ops: &control.MemOperations{Dir: dir, OnChange: events.Fence}, Node: "lab", Events: events, Telemetry: telemetryStore, Ctx: ctx,
-			Mover: worker.Run, MoverLedger: worker.Ledger}
-		warnHeldSteps(log, dir.Snapshot())
+			Mover: worker.Run, MoverLedger: worker.Ledger, LocalGates: keeper.Gates}
+		releaseOrphanHolds(ctx, log, dir)
 		if ref := cfg.Admin.ControlTokenRef; ref != "" {
 			if ctl.Token, err = config.ResolveSecret(ref); err != nil {
 				return fmt.Errorf("admin.control_token_ref: %w", err)
@@ -358,15 +358,41 @@ wait:
 	return nil
 }
 
-// warnHeldSteps names every bucket with a held ramp step at startup: a control node that stopped
-// between a hold and its completion leaves the held keys answering 503 until the step is repeated
-// (ADR-0016).
-func warnHeldSteps(log *slog.Logger, snap *directory.Snapshot) {
-	f := snap.File()
+// releaseOrphanHolds releases, at a lab's startup, every hold and barrier left by an operation of
+// a previous process: a lab keeps its operation records in memory, so nothing can resume them,
+// and with no members the hold protected nothing that outlives the process. A fleet's control
+// node keeps its records and resumes them instead (ResumeOwn).
+func releaseOrphanHolds(ctx context.Context, log *slog.Logger, dir *directory.FileDir) {
+	f := dir.Snapshot().File()
 	for _, key := range slices.Sorted(maps.Keys(f.Placements)) {
-		if p := f.Placements[key]; p.Held() {
-			log.Warn("a ramp step was left held by an interrupted call: writes to the keys it moves answer 503 until it is repeated",
-				"placement", key, "ratio", p.Ramp.Ratio, "hold_ratio", p.Ramp.Hold.Ratio, "hold_prefixes", p.Ramp.Hold.Prefixes)
+		p := f.Placements[key]
+		tenant, bucket, _ := directory.SplitKey(key)
+		barrier := ""
+		if p.Barrier != nil {
+			barrier = p.Barrier.ID
+		}
+		switch {
+		case p.Held():
+			if err := dir.SetState(ctx, tenant, bucket, directory.StateRamping, directory.Transition{Release: true, Barrier: barrier}, "shunt serve"); err != nil {
+				log.Error("a ramp step left held by a previous process could not be released; writes to the keys it moves answer 503", "placement", key, "err", err.Error())
+				continue
+			}
+			log.Warn("a ramp step left held by a previous process was released: repeat the step", "placement", key, "barrier", barrier)
+		case p.Barrier != nil:
+			if err := dir.ClearBarrier(ctx, directory.PlacementResource(key), barrier, "shunt serve"); err != nil {
+				log.Error("a barrier left by a previous process could not be cleared", "placement", key, "barrier", barrier, "err", err.Error())
+				continue
+			}
+			log.Warn("a barrier left by a previous process was cleared: repeat the change", "placement", key, "barrier", barrier)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(f.Clusters)) {
+		if b := f.Clusters[name].Barrier; b != nil {
+			if err := dir.ClearBarrier(ctx, directory.ClusterResource(name), b.ID, "shunt serve"); err != nil {
+				log.Error("a barrier left by a previous process could not be cleared", "cluster", name, "barrier", b.ID, "err", err.Error())
+				continue
+			}
+			log.Warn("a barrier left by a previous process was cleared: repeat the change", "cluster", name, "barrier", b.ID)
 		}
 	}
 }

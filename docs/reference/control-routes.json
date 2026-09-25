@@ -73,6 +73,14 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/operations/{id}/blockers",
+    "verbs": [
+      "operation show"
+    ],
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/clusters/{name}/view",
     "mutation": false
   },
@@ -112,6 +120,22 @@
       "purge-source",
       "migrate finish",
       "cluster remove"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations/{id}/resume",
+    "verbs": [
+      "operation resume"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "POST",
+    "pattern": "/v1/operations/{id}/cancel",
+    "verbs": [
+      "operation cancel"
     ],
     "mutation": true
   },
