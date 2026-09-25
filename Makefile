@@ -40,7 +40,7 @@ COMPOSE      ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker c
 E2E_DIR      := test/e2e
 DOMAIN       ?= shunt.example.com
 
-.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough demo-ui demo-ui-down s3diff s3diff-mixed bench-e2e probe check-tls-verify help
+.PHONY: all build test race lint fuzz bench bench-compare licenses web-licenses ui ui-dev ui-lint ui-test vuln tools tidy clean e2e-up e2e-down e2e-cert run-garage run-minio run-garage-resign run-minio-resign run-vast-resign run-mixed walkthrough demo-ui demo-ui-down s3diff s3diff-mixed s3clean bench-e2e probe check-tls-verify help
 
 all: build lint test race fuzz ## build, lint, test, race, fuzz — the CI gate
 	@scripts/check-tls-verify.sh >/dev/null 2>&1 || echo "WARNING: TLS verification is disabled in a committed config or make target (make check-tls-verify). POC-3 multi-cluster work must not start until it passes."
@@ -197,6 +197,12 @@ s3diff-mixed: ## POC-3: mixed-backend differential test through one shunt (needs
 s3diff: ## differential test direct vs via shunt (BACKEND=garage|minio|vast MODE=passthrough|resign)
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
 	  $(GO) run ./test/s3diff -mode $(MODE) -region $(S3_REGION) $(S3_BACKEND_ARGS) $(S3DIFF_ARGS)
+
+s3clean: ## empty BUCKET through shunt on :8443 (BACKEND, MODE as for s3diff; CLEAN_ARGS adds flags, e.g. -versions -uploads -delete-bucket)
+	@test -n "$(BUCKET)" || { echo "s3clean: set BUCKET=<name>"; exit 2; }
+	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
+	  $(GO) run ./test/s3clean -bucket $(BUCKET) \
+	  $(if $(filter resign,$(MODE)),-access-key-env SHUNT_ACCESS_KEY -secret-key-env SHUNT_SECRET,-region $(S3_REGION)) $(CLEAN_ARGS)
 
 bench-e2e: ## direct vs via bench (BACKEND=garage|minio MODE=passthrough|resign), prints a markdown table
 	. $(E2E_DIR)/data/garage.env && AWS_ACCESS_KEY_ID=$(S3_AK) AWS_SECRET_ACCESS_KEY=$(S3_SK) \
