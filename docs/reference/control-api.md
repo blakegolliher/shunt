@@ -261,8 +261,11 @@ placement `generation`, a strictly increasing `sequence`, and `inflight`/`uncert
 final heartbeat explicitly closes the clean session. The operation reserves the placement while
 the mover can still touch its source. If heartbeats stop for 5 seconds, it blocks as
 `worker_unresolved`; a later heartbeat cannot erase that interval unless it sets `resolve` with an
-operator attestation. A mover process that died does not heartbeat again: the operator resolves its
-session with `POST /v1/operations/{id}/resolve-worker` (below).
+operator attestation. Any control node takes the heartbeat: it is a compare-and-swap on the record,
+checked again on the record as it stands whenever the swap loses. A completed session is final: a
+later heartbeat, and any heartbeat to an ended record, is refused, and an exact repeat of the one
+that completed it answers as before. A mover process that died does not heartbeat again: the
+operator resolves its session with `POST /v1/operations/{id}/resolve-worker` (below).
 
 ### `GET /v1/placements/{tenant}/{bucket}/mover-ledger[?limit=20]`
 
@@ -450,8 +453,11 @@ so the record holds its placement until an operator establishes that the process
 requests have ended and says how. The resolution (actor and attestation) is kept on the session;
 the operation ends `failed` (its copy did not finish) and frees the placement. `session` is the id
 the record's `worker` names; the record offers `resolve-worker` in `allowed_actions` once the
-session is past its TTL. Refused while the worker still heartbeats (it ends itself), for another
-session, and for any other kind of operation. `shunt operation resolve-worker <id> --session <id>
+session is past its TTL. A 200 means the resolution is on the durable record; the same resolution
+again (same actor and attestation) answers the same, and a different one is refused. Refused while
+the worker still heartbeats (it ends itself), including a worker whose heartbeat reached another
+control node while the resolution was being written, for another session, and for any other kind
+of operation. `shunt operation resolve-worker <id> --session <id>
 --attest <why>`; the Operations screen asks for the attestation.
 
 ### `GET /v1/operations[?placement=t/b][&cluster=name][&limit=50]`

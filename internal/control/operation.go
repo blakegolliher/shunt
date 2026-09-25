@@ -450,22 +450,24 @@ func (tr *tracker) put() {
 	}
 	tr.op.Updated = tr.s.now().UTC()
 	tr.op.Sequence++
-	c := tr.op.clone()
-	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), c)
-	// Worker heartbeats are the one supported writer alongside an operation's owner. When one
-	// landed between this tracker's read and write, merge only that field and retry the owner's
-	// update over the new sequence. A changed owner/term remains a real takeover.
-	if errors.Is(err, ErrStaleSequence) {
+	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
+	// Worker heartbeats are the one supported writer alongside an operation's owner, and they
+	// write the durable record by its own compare-and-swap (applyWorker), on any node. The worker
+	// session is theirs: when one landed between this tracker's read and write, take the session
+	// from the record, never from this copy, and write the owner's fields over the new sequence.
+	// An ended record, or a changed owner or term, is a real takeover.
+	for attempt := 0; errors.Is(err, ErrStaleSequence) && attempt < 16; attempt++ {
 		stored, gerr := tr.s.ops().Get(context.WithoutCancel(tr.ctx), tr.op.ID)
-		if gerr == nil && stored != nil && stored.Node == tr.op.Node && stored.OwnerTerm == tr.op.OwnerTerm && !stored.Terminal() {
-			if stored.Worker != nil {
-				worker := *stored.Worker
-				tr.op.Worker = &worker
-			}
-			tr.op.Sequence = stored.Sequence + 1
-			c = tr.op.clone()
-			err = tr.s.ops().Update(context.WithoutCancel(tr.ctx), c)
+		if gerr != nil || stored == nil || stored.Node != tr.op.Node || stored.OwnerTerm != tr.op.OwnerTerm || stored.Terminal() {
+			break
 		}
+		tr.op.Worker = nil
+		if stored.Worker != nil {
+			worker := *stored.Worker
+			tr.op.Worker = &worker
+		}
+		tr.op.Sequence = stored.Sequence + 1
+		err = tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
 	}
 	switch {
 	case errors.Is(err, ErrStaleSequence):

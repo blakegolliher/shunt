@@ -38,12 +38,16 @@ export function Operations() {
   const [error, setError] = useState('')
   const [selected, setSelected] = useState('')
   const [busy, setBusy] = useState(false)
-  const [attestation, setAttestation] = useState('')
+  // An attestation is evidence about one record's worker: it belongs to the operation it was typed
+  // for, is cleared when another is selected or once it is recorded, and kept when the request fails.
+  const [attestation, setAttestation] = useState({ op: '', text: '' })
   const fenceEvent = lastEvent?.type === 'fence' ? lastEvent.id : ''
-  const act = async (fn: () => Promise<Operation>, done: (op: Operation) => string) => {
+  // act runs an action and reports whether it succeeded; a failure is shown, never thrown.
+  const act = async (fn: () => Promise<Operation>, done: (op: Operation) => string): Promise<boolean> => {
     setBusy(true)
-    try { const op = await fn(); setOps((old) => old.map((o) => o.id === op.id ? op : o)); notify(done(op)) } catch (cause) { notify(cause instanceof Error ? cause.message : String(cause), 'danger') } finally { setBusy(false) }
+    try { const op = await fn(); setOps((old) => old.map((o) => o.id === op.id ? op : o)); notify(done(op)); return true } catch (cause) { notify(cause instanceof Error ? cause.message : String(cause), 'danger'); return false } finally { setBusy(false) }
   }
+  const select = (id: string) => { if (id !== selected) setAttestation({ op: '', text: '' }); setSelected(id) }
 
   useEffect(() => {
     let live = true
@@ -55,6 +59,12 @@ export function Operations() {
   }, [fenceEvent, token])
 
   const current = ops.find((op) => op.id === selected)
+  const attested = current && attestation.op === current.id ? attestation.text : ''
+  const resolve = (op: Operation) => {
+    const session = workerSession(op)
+    void act(() => resolveWorker(token, op.id, session, attested.trim()), (res) => `worker session ${session} resolved; ${res.kind} ends and frees its bucket`)
+      .then((ok) => { if (ok) setAttestation((a) => a.op === op.id ? { op: '', text: '' } : a) })
+  }
   return <div className="grid gap-5 xl:grid-cols-[1fr_380px]">
     <Card eyebrow="Operation records" title="Recent operations">
       {error ? <p role="alert" className="rounded-lg border border-red-600 bg-red-950/40 p-3 text-sm text-red-100">{error}</p>
@@ -63,7 +73,7 @@ export function Operations() {
             <thead className="text-xs uppercase tracking-wider text-muted"><tr><th className="pb-3">Updated</th><th className="pb-3">Kind</th><th className="pb-3">Scope</th><th className="pb-3">Status</th><th className="pb-3">Phase</th><th className="pb-3">Effect</th></tr></thead>
             <tbody className="divide-y divide-ink-700">{ops.map((op) => <tr key={op.id} aria-selected={op.id === selected} className={op.id === selected ? 'bg-ink-800' : ''}>
               <td className="py-3 text-muted">{op.updated ? new Date(op.updated).toLocaleTimeString() : '—'}</td>
-              <td className="py-3"><button type="button" onClick={() => setSelected(op.id)} className="text-ember-300 underline-offset-2 hover:underline" aria-label={`Show operation ${op.id}`}>{op.kind}</button></td>
+              <td className="py-3"><button type="button" onClick={() => select(op.id)} className="text-ember-300 underline-offset-2 hover:underline" aria-label={`Show operation ${op.id}`}>{op.kind}</button></td>
               <td className="py-3 font-mono text-xs">{scopeOf(op)}</td>
               <td className="py-3"><Badge text={op.status} tone={statusTone[op.status]} /></td>
               <td className="py-3 text-muted">{unfinished(op) ? op.phase ?? '—' : '—'}</td>
@@ -86,10 +96,10 @@ export function Operations() {
           {current.barrier && <><dt className="text-muted">Barrier</dt><dd className="text-xs">{current.barrier.kind} on <span className="font-mono">{current.barrier.scope}</span>{current.barrier.committed ? `, committed at version ${current.barrier.commit_version}` : current.barrier.hold_version ? `, held at version ${current.barrier.hold_version}, draining` : ', hold not written yet'}</dd></>}
           {current.worker && <><dt className="text-muted">Worker</dt><dd className="text-xs"><span className="font-mono">{current.worker.id}</span> {current.worker.state}, {current.worker.inflight ?? 0} in flight, {current.worker.uncertain ?? 0} uncertain{current.worker.resolved_by ? `; resolved by ${current.worker.resolved_by}: ${current.worker.attestation ?? ''}` : ''}</dd></>}
           <dt className="text-muted">Actions</dt><dd className="flex flex-wrap items-center gap-2 text-muted">{current.allowed_actions && current.allowed_actions.length > 0 ? current.allowed_actions.map((action) => action === 'resolve-worker'
-            ? <form key={action} className="grid w-full gap-2" onSubmit={(event) => { event.preventDefault(); const session = workerSession(current); void act(() => resolveWorker(token, current.id, session, attestation.trim()), (op) => `worker session ${session} resolved; ${op.kind} ends and frees its bucket`).then(() => setAttestation('')) }}>
+            ? <form key={action} className="grid w-full gap-2" onSubmit={(event) => { event.preventDefault(); resolve(current) }}>
               <label htmlFor="worker-attestation" className="text-xs text-muted">The worker session expired with its work unresolved. Once its process and backend requests are known to have ended, say how:</label>
-              <textarea id="worker-attestation" required value={attestation} onChange={(event) => setAttestation(event.target.value)} className="rounded-lg border border-ink-700 bg-ink-950 p-2 text-xs text-paper" rows={2} />
-              <button type="submit" disabled={busy || attestation.trim() === '' || workerSession(current) === ''} className="justify-self-start rounded-lg border border-red-500 px-3 py-1 text-xs font-semibold text-red-100">Resolve worker session</button>
+              <textarea id="worker-attestation" required value={attested} onChange={(event) => setAttestation({ op: current.id, text: event.target.value })} className="rounded-lg border border-ink-700 bg-ink-950 p-2 text-xs text-paper" rows={2} />
+              <button type="submit" disabled={busy || attested.trim() === '' || workerSession(current) === ''} className="justify-self-start rounded-lg border border-red-500 px-3 py-1 text-xs font-semibold text-red-100">Resolve worker session</button>
             </form>
             : <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : `${op.kind} cancelled; nothing changed`)} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
           <dt className="text-muted">Actor</dt><dd className="font-mono text-xs">{current.actor}{current.node ? ` on ${current.node}` : ''}</dd>

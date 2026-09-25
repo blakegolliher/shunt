@@ -109,27 +109,13 @@ func (s *Server) workerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, answer)
 }
 
-// applyWorker applies a worker heartbeat, built from the record as it stands, to an operation.
-// The owner normally receives it: updating its tracker keeps phase/progress writes and the worker
-// sequence in one CAS stream. A different control node falls back to the durable record; the
-// owner's next write merges that worker-only update.
+// applyWorker applies a worker heartbeat, built from the record as it stands, by a compare-and-swap
+// on the durable record. Every control node writes the session this way, the owner too: a
+// heartbeat through another node advances the record past the owner's copy, so a write built on
+// that copy would be built on stale state. A lost swap re-reads the record and builds and checks
+// the heartbeat again; the owner's own writes take the session from the record (tracker.put).
 func (s *Server) applyWorker(ctx context.Context, id string, build func(*Operation) (WorkerHeartbeat, error), actor string) (WorkerHeartbeatAnswer, error) {
-	s.mu.Lock()
-	tr := s.running[id]
-	s.mu.Unlock()
-	if tr != nil {
-		op := tr.snapshot()
-		req, err := build(&op)
-		if err != nil {
-			return WorkerHeartbeatAnswer{}, err
-		}
-		worker, hold, err := tr.applyWorkerHeartbeat(req, actor)
-		if err != nil {
-			return WorkerHeartbeatAnswer{}, err
-		}
-		return WorkerHeartbeatAnswer{Worker: worker, Hold: hold}, nil
-	}
-	for range 8 {
+	for range 16 {
 		op, err := s.ops().Get(ctx, id)
 		if err != nil {
 			return WorkerHeartbeatAnswer{}, err
@@ -141,9 +127,9 @@ func (s *Server) applyWorker(ctx context.Context, id string, build func(*Operati
 		if err != nil {
 			return WorkerHeartbeatAnswer{}, err
 		}
-		worker, hold, err := s.nextWorker(op, req, actor)
-		if err != nil {
-			return WorkerHeartbeatAnswer{}, err
+		worker, changed, hold, err := s.nextWorker(op, req, actor)
+		if err != nil || !changed {
+			return WorkerHeartbeatAnswer{Worker: worker, Hold: hold}, err
 		}
 		op.Worker = &worker
 		op.Sequence++
@@ -155,29 +141,7 @@ func (s *Server) applyWorker(ctx context.Context, id string, build func(*Operati
 			return WorkerHeartbeatAnswer{}, err
 		}
 	}
-	return WorkerHeartbeatAnswer{}, fmt.Errorf("%w: operation %s kept changing while its worker heartbeated", ErrUnavailable, id)
-}
-
-// syncWorker brings a tracker's copy of its worker session up to the durable record's, which a
-// heartbeat to another control node may have advanced: a resolution must follow the session's
-// latest sequence, or the owner's next write would merge it away.
-func (s *Server) syncWorker(ctx context.Context, id string) {
-	s.mu.Lock()
-	tr := s.running[id]
-	s.mu.Unlock()
-	if tr == nil {
-		return
-	}
-	stored, err := s.ops().Get(ctx, id)
-	if err != nil || stored == nil || stored.Worker == nil {
-		return
-	}
-	tr.mu.Lock()
-	if tr.op.Worker == nil || stored.Worker.Sequence > tr.op.Worker.Sequence {
-		w := *stored.Worker
-		tr.op.Worker = &w
-	}
-	tr.mu.Unlock()
+	return WorkerHeartbeatAnswer{}, fmt.Errorf("%w: operation %s kept changing while its worker heartbeated; retry", ErrUnavailable, id)
 }
 
 // ResolveWorkerRequest is POST /v1/operations/{id}/resolve-worker: an operator's reconciliation
@@ -233,8 +197,13 @@ func (s *Server) resolveWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who := actor(r)
-	s.syncWorker(r.Context(), id)
 	answer, err := s.applyWorker(r.Context(), id, func(op *Operation) (WorkerHeartbeat, error) {
+		// The same resolution again (an answer lost on the way back) repeats the heartbeat that
+		// recorded it, which answers as it did and writes nothing.
+		if w := op.Worker; w != nil && w.State == WorkerCompleted && w.ID == req.Session && w.ResolvedBy == who && w.Attestation == req.Attestation {
+			return WorkerHeartbeat{Session: w.ID, Identity: w.Identity, Generation: w.Generation, Sequence: w.Sequence, Complete: true, Resolve: true,
+				Attestation: w.Attestation, Error: w.Error}, nil
+		}
 		if err := s.workerResolvable(op); err != nil {
 			return WorkerHeartbeat{}, err
 		}
@@ -279,59 +248,58 @@ func (s *Server) resolveWorker(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, op.Public())
 }
 
-func (tr *tracker) applyWorkerHeartbeat(req WorkerHeartbeat, actor string) (WorkerSession, bool, error) {
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	worker, hold, err := tr.s.nextWorker(&tr.op, req, actor)
-	if err != nil {
-		return WorkerSession{}, false, err
-	}
-	tr.op.Worker = &worker
-	tr.put()
-	return worker, hold, nil
-}
-
-func (s *Server) nextWorker(op *Operation, req WorkerHeartbeat, actor string) (WorkerSession, bool, error) {
+// nextWorker is the session req makes of op's, and whether it differs from the stored one. A
+// completed session is final, and an ended record keeps the session it ended with: a late
+// heartbeat, from a mover whose session an operator resolved or that already completed, is refused
+// rather than written over the evidence. An exact repeat of the heartbeat that wrote the stored
+// session answers it again.
+func (s *Server) nextWorker(op *Operation, req WorkerHeartbeat, actor string) (worker WorkerSession, changed, hold bool, err error) {
 	if op.Kind != OpMover || op.Scope == nil {
-		return WorkerSession{}, false, refuse("operation %s is not a mover operation", op.ID)
+		return WorkerSession{}, false, false, refuse("operation %s is not a mover operation", op.ID)
 	}
 	var args MoverRequest
 	if json.Unmarshal(op.Args, &args) != nil || !args.External || args.Session != req.Session {
-		return WorkerSession{}, false, refuse("operation %s is not enrolled for worker session %s", op.ID, req.Session)
+		return WorkerSession{}, false, false, refuse("operation %s is not enrolled for worker session %s", op.ID, req.Session)
 	}
 	if req.Identity != op.Identity || req.Generation != op.Scope.Generation {
-		return WorkerSession{}, false, refuse("worker session %s is for another directory lineage or placement generation", req.Session)
+		return WorkerSession{}, false, false, refuse("worker session %s is for another directory lineage or placement generation", req.Session)
 	}
 	now := s.now().UTC()
 	cur := op.Worker
+	repeat := cur != nil && req.Sequence == cur.Sequence && sameWorker(cur, req, actor)
+	if repeat && cur.State == WorkerCompleted {
+		return *cur, false, s.workerHeld(op.Placement), nil
+	}
+	if op.Terminal() {
+		return WorkerSession{}, false, false, refuse("operation %s has ended %s; worker session %s writes nothing more to it", op.ID, op.Status, req.Session)
+	}
+	if cur != nil && cur.State == WorkerCompleted {
+		how := ""
+		if cur.ResolvedBy != "" {
+			how = ", resolved by " + cur.ResolvedBy
+		}
+		return WorkerSession{}, false, false, refuse("worker session %s has completed%s; its operation ends with it", cur.ID, how)
+	}
 	expired := cur != nil && cur.State == WorkerActive && now.Sub(cur.LastSeen) > s.workerTTL()
 	if cur != nil && (cur.State == WorkerUnresolved || expired) && !req.Resolve {
-		return WorkerSession{}, false, refuse("worker session %s expired with work unresolved; reconcile it with resolve and an attestation", req.Session)
+		return WorkerSession{}, false, false, refuse("worker session %s expired with work unresolved; reconcile it with resolve and an attestation", req.Session)
 	}
 	if cur != nil {
 		if req.Sequence < cur.Sequence {
-			return WorkerSession{}, false, refuse("worker session %s heartbeat sequence %d is behind %d", req.Session, req.Sequence, cur.Sequence)
+			return WorkerSession{}, false, false, refuse("worker session %s heartbeat sequence %d is behind %d", req.Session, req.Sequence, cur.Sequence)
 		}
 		if req.Sequence == cur.Sequence {
-			state := WorkerActive
-			if req.Complete {
-				state = WorkerCompleted
+			if !repeat {
+				return WorkerSession{}, false, false, refuse("worker session %s heartbeat sequence %d was already used with different state", req.Session, req.Sequence)
 			}
-			exact := cur.ID == req.Session && cur.Identity == req.Identity && cur.Generation == req.Generation &&
-				cur.State == state && cur.Inflight == req.Inflight && cur.Uncertain == req.Uncertain && cur.Error == req.Error &&
-				((!req.Resolve && cur.ResolvedBy == "" && cur.Attestation == "") ||
-					(req.Resolve && cur.ResolvedBy == actor && cur.Attestation == req.Attestation))
-			if !exact {
-				return WorkerSession{}, false, refuse("worker session %s heartbeat sequence %d was already used with different state", req.Session, req.Sequence)
-			}
-			return *cur, s.workerHeld(op.Placement), nil
+			return *cur, false, s.workerHeld(op.Placement), nil
 		}
 	}
 	state := WorkerActive
 	if req.Complete {
 		state = WorkerCompleted
 	}
-	worker := WorkerSession{ID: req.Session, Identity: req.Identity, Generation: req.Generation,
+	worker = WorkerSession{ID: req.Session, Identity: req.Identity, Generation: req.Generation,
 		Sequence: req.Sequence, State: state, Inflight: req.Inflight, Uncertain: req.Uncertain,
 		LastSeen: now, Error: req.Error}
 	if req.Complete {
@@ -340,7 +308,19 @@ func (s *Server) nextWorker(op *Operation, req WorkerHeartbeat, actor string) (W
 	if req.Resolve {
 		worker.ResolvedBy, worker.Attestation = actor, req.Attestation
 	}
-	return worker, s.workerHeld(op.Placement), nil
+	return worker, true, s.workerHeld(op.Placement), nil
+}
+
+// sameWorker reports whether req, at cur's sequence, is the heartbeat that wrote cur.
+func sameWorker(cur *WorkerSession, req WorkerHeartbeat, actor string) bool {
+	state := WorkerActive
+	if req.Complete {
+		state = WorkerCompleted
+	}
+	return cur.ID == req.Session && cur.Identity == req.Identity && cur.Generation == req.Generation &&
+		cur.State == state && cur.Inflight == req.Inflight && cur.Uncertain == req.Uncertain && cur.Error == req.Error &&
+		((!req.Resolve && cur.ResolvedBy == "" && cur.Attestation == "") ||
+			(req.Resolve && cur.ResolvedBy == actor && cur.Attestation == req.Attestation))
 }
 
 func (s *Server) workerHeld(key string) bool {

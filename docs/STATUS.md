@@ -56,6 +56,20 @@ traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bu
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
+- **2026-09-25, resolve-worker is ordered by the record.** A worker heartbeat through a control
+  node that does not run the mover moved the record past the owner's copy; `resolve-worker` on the
+  owner then lost its compare-and-swap, the owner merged the older session over the resolution,
+  and the request answered 200 with nothing recorded. Every worker-session write is now a
+  compare-and-swap on the durable record, re-read and checked again on a lost swap, so a worker
+  that heartbeats meanwhile is live and the resolution is refused; the owner takes the session
+  from the record and keeps its record under repeated heartbeats; a completed session and an
+  ended record take only an exact repeat, so a late heartbeat cannot undo an attested resolution.
+  The regression runs on two nodes over embedded etcd and on a shared store, and fails on
+  `9761192`. The Operations screen keeps an attestation with the record it was typed for, clears
+  it on success and keeps it on a failed request. `make walkthrough` stops at `ramp 1.0` on
+  `backend_outcome_unknown` on this build and on `9761192` alike (process-lifetime uncertain
+  counts, H2f); `make fleet` was not run, its ports being held by a running `make demo-ui`.
+
 ### Previously recorded implementation work
 
 This branch carries everything past POC-5; `master` keeps what is done and tagged. Two bodies of
