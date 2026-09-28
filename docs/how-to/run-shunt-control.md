@@ -85,6 +85,14 @@ shunt-control member remove c3
 shunt-control join --name c3 --data-dir /var/lib/shunt-control --peer-url http://c3:2380 ... --existing http://c1:9901
 ```
 
+`member remove` first shows what the removal does (the member's id and role, and how many voting
+members are left) and then removes that member by its id, with a confirmation that is refused if the
+membership changed in between; `--dry-run` stops after the first step. A member that was added and
+never started (a join that was canceled or failed before its node ran) has no name: `shunt-control
+member list` shows its id, and `member remove --id <id>` removes it. The only voting member cannot be
+removed, nor the node you send the command to (use `--api` of another). Removing a voter warns when
+two or one are left: two voters need both for every write.
+
 A node that is only restarting keeps its data directory and needs neither.
 
 ## Snapshot and restore

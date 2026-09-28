@@ -3,6 +3,7 @@ package cp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -35,6 +36,16 @@ type StatusAnswer struct {
 	// Join is the command a new control node runs to join this one, with the parts only the
 	// operator knows in angle brackets.
 	Join string `json:"join"`
+	// Observed health (ADR-0021 D4, H3d; contracts §4). Members is the membership as this node
+	// sees it, each with its last observed health; Quorum is quorum as last observed; both come
+	// from the background sampler, never from this request. Partial: quorum is not reachable, or a
+	// member's health is not known, so what this answer says may be incomplete or stale.
+	ObservedAt                time.Time         `json:"observed_at"`
+	Partial                   bool              `json:"partial"`
+	MembershipRevision        string            `json:"membership_revision"`
+	Members                   []MemberHealth    `json:"members"`
+	Quorum                    QuorumObservation `json:"quorum"`
+	ActiveMembershipOperation string            `json:"active_membership_operation,omitempty"`
 }
 
 // Compaction is etcd's automatic compaction as this node runs it.
@@ -55,6 +66,9 @@ type API struct {
 	Control *control.Server
 	// Join is the join command line shunt-control renders from its own flags.
 	Join string
+	// Health, if set, is this node's sampler of the members' health and of quorum (ADR-0021 D4,
+	// H3d); without it, status reports every member's health unknown.
+	Health *Health
 }
 
 // Handler returns the routes. Authentication is the control API's, applied by the caller.
@@ -65,7 +79,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/control/status", a.status)
 	mux.HandleFunc("POST /v1/control/members", a.Control.ServeJoin)
 	mux.HandleFunc("POST /v1/control/joins/{id}/bootstrap", a.Control.ServeJoinBootstrap)
-	mux.HandleFunc("DELETE /v1/control/members/{name}", a.removeMember)
+	mux.HandleFunc("DELETE /v1/control/members/{name}", a.Control.ServeMemberRemove)
+	mux.HandleFunc("DELETE /v1/control/members/by-id/{id}", a.Control.ServeMemberRemove)
+	mux.HandleFunc("GET /v1/control/local-status", a.localStatus)
 	mux.HandleFunc("GET /v1/control/snapshot", a.snapshot)
 	mux.HandleFunc("POST /v1/control/defrag", a.defrag)
 	return mux
@@ -82,6 +98,8 @@ func Routes() []control.Route {
 		{Method: "POST", Pattern: "/v1/control/members", Verbs: []string{"join"}, Mutation: true},
 		{Method: "POST", Pattern: "/v1/control/joins/{id}/bootstrap", Verbs: []string{"join"}, Mutation: true},
 		{Method: "DELETE", Pattern: "/v1/control/members/{name}", Verbs: []string{"member remove"}, Mutation: true},
+		{Method: "DELETE", Pattern: "/v1/control/members/by-id/{id}", Verbs: []string{"member remove --id"}, Mutation: true},
+		{Method: "GET", Pattern: "/v1/control/local-status"}, // the other control nodes' health sampler
 		{Method: "GET", Pattern: "/v1/control/snapshot", Verbs: []string{"snapshot save"}},
 		{Method: "POST", Pattern: "/v1/control/defrag", Verbs: []string{"defrag"}, Mutation: true},
 	}
@@ -132,8 +150,9 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ans := StatusAnswer{Node: a.Node.Name(), Version: a.Version, Cluster: cs, Fleet: []control.Member{}, Directory: a.Store.Version(), DirectoryLoaded: a.Store.Ready(),
-		LastCompaction: lastCompaction(), Join: a.Join}
+		LastCompaction: lastCompaction(), Join: a.Join, ObservedAt: time.Now().UTC()}
 	ans.Compaction.Mode, ans.Compaction.Retention = a.Node.Compaction()
+	a.observed(r.Context(), &ans)
 	fctx, fcancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer fcancel()
 	if fleet, err := a.Fleet.Members(fctx); err != nil {
@@ -144,14 +163,39 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ans)
 }
 
-func (a *API) removeMember(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	if err := a.Node.MemberRemove(ctx, r.PathValue("name")); err != nil {
-		writeError(w, http.StatusConflict, "refused", err.Error())
-		return
+// observed adds the sampler's last observations to a status answer: each member's health, quorum,
+// and the compatibility field has_quorum from quorum's observed state rather than from a leader
+// in view.
+func (a *API) observed(ctx context.Context, ans *StatusAnswer) {
+	var leader uint64
+	for _, m := range ans.Cluster.Members {
+		if m.Leader {
+			_, _ = fmt.Sscanf(m.ID, "%x", &leader)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"removed": r.PathValue("name")})
+	h := a.Health
+	if h == nil {
+		h = &Health{Node: a.Node} // never cycled: everything unknown
+	}
+	ans.Members, ans.Quorum, ans.MembershipRevision = h.Snapshot(leader)
+	ans.Cluster.HasQuorum = ans.Quorum.State == QuorumReachable
+	ans.Partial = !ans.Cluster.HasQuorum
+	for _, m := range ans.Members {
+		if m.Health == HealthUnknown {
+			ans.Partial = true
+		}
+	}
+	if a.Control != nil {
+		octx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		ans.ActiveMembershipOperation = a.Control.ActiveMembershipOperation(octx)
+	}
+}
+
+// localStatus is GET /v1/control/local-status: this node's own etcd member, for the other members'
+// health sampler. It probes nothing.
+func (a *API) localStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, a.Node.LocalStatus())
 }
 
 func (a *API) snapshot(w http.ResponseWriter, r *http.Request) {

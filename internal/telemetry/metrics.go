@@ -52,6 +52,7 @@ type Metrics struct {
 	BarrierBlockers        *prometheus.GaugeVec     // shunt_barrier_blockers{code}
 	UnresolvedIncarnations prometheus.Gauge         // shunt_fleet_unresolved_incarnations
 	Operations             *prometheus.GaugeVec     // shunt_operations{status,effect}
+	ControlHealthAge       *prometheus.GaugeVec     // shunt_control_health_observation_age_seconds{member}
 }
 
 // barrierBuckets is 10 ms … 1 h, log-spaced, 16 buckets.
@@ -183,6 +184,9 @@ func NewMetrics() *Metrics {
 		UnresolvedIncarnations: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "shunt_fleet_unresolved_incarnations", Help: "Control plane: proxy incarnations that ended without a clean retirement and still block barriers.",
 		}),
+		ControlHealthAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "shunt_control_health_observation_age_seconds", Help: "Control plane: age of this node's last health observation of each control member, set at each sampling cycle.",
+		}, []string{"member"}),
 		Operations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "shunt_operations", Help: "Control plane: unfinished operations, and ended ones whose effect is uncertain.",
 		}, []string{"status", "effect"}),
@@ -191,7 +195,7 @@ func NewMetrics() *Metrics {
 		m.AuthFailures, m.AuthDuration, m.Compensation,
 		m.RouteState, m.RampRatio, m.RampWrites, m.FallbackReads, m.DualDelete, m.ListingMerge, m.RefusedWrites,
 		m.FleetMembers, m.FleetStale, m.FenceWait, m.TelemetryMerge, m.BundlesRetired, m.InstallBackpressure,
-		m.CacheFailures, m.LeaseGrantErrors, m.BarrierDuration, m.BarrierBlockers, m.UnresolvedIncarnations, m.Operations,
+		m.CacheFailures, m.LeaseGrantErrors, m.BarrierDuration, m.BarrierBlockers, m.UnresolvedIncarnations, m.Operations, m.ControlHealthAge,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

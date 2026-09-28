@@ -256,7 +256,31 @@ membership and a real-etcd cancel of a started and an unstarted learner, with ne
 voter check, the peer-URL reconciliation, and self-promotion restored each fail their test); race suite,
 lint, the UI gates and `make fleet` passed on the H3b build, the fleet's two joins promoted by their
 operations. Joins no longer count in `shunt_barrier_blockers`, whose catalogued codes they are not.
-H3c (removal by ID), H3d (observed health) and H3e (CLI/UI, acceptance) remain. New endpoints/commands in those documents are design
+H3c (2026-09-28) removes a control-plane member by its etcd ID: the name route looks a name up once,
+a dry run answers the member, the voters left and a token bound to the ID and the whole member list,
+and the removal runs as a `control-remove` operation on the same `control:members` reservation as
+joins, recording its intent before it is sent and reconciling a lost answer by ID. The only voter,
+the answering node and a removal etcd refuses for quorum are refused; two or one voters left warn.
+`shunt-control member remove <name> | --id <id> [--dry-run]`, and `member list` shows ids and
+`(unnamed)` for a member that never started. Tests: by name and by id (an unnamed learner), the token
+refusing a reused name and a changed membership, the refusals, a lost answer, etcd's quorum refusal,
+resume after owner loss (removed already: nothing sent; still there: sent once), a removal beside a
+join refused on its scope, a real-etcd run from three voters to one, and the CLI; binding the token to
+the ID alone, or dropping the lost-answer reconciliation, each fails its test. The Control plane
+screen's removal is H3e's. H3d (2026-09-28) makes health observed: each control node samples every
+member's `local-status` at its registered API in the background (5 s cycles, 3 s deadline, five
+probes at once) and quorum by a linearizable read through itself; status serves the samples and
+never probes. A member is healthy only when reached lately as itself with a leader in view; one that
+never started, or observed more than 15 s ago, is unknown; `started` is history. Status comes from
+the node's own view of the membership, so it answers without quorum, marked partial; quorum math
+counts voters only, and `has_quorum` is quorum's observed state. `GET /v1/control` gains `members[]`
+with health, `quorum{}`, `partial`, `membership_revision` and `active_membership_operation`;
+`shunt-control status`, `member list` and the Control plane screen show them; the health age metric
+is implemented. Tests: each kind of member (self, reached, stopped, another member answering, never
+started), staleness, a cycle bounded by its deadline and five probes, a thousand status reads
+probing nothing, quorum unavailable, a real three-member cluster losing c3 then c2 with status still
+answering, and the screen; judging health by a name, dropping staleness, or dropping the probe bound
+each fails its test. H3e (CLI/UI, acceptance) remains. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

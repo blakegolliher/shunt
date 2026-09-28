@@ -70,3 +70,30 @@ test('asks a live proxy to retire', async () => {
   expect(await screen.findByText(/retirement requested; it drains and stops at its next heartbeat/)).toBeInTheDocument()
   expect(retired).toMatch(/\/v1\/fleet\/proxy-a\/retire$/)
 })
+
+test('shows each control member\'s observed health, never health from a name, and quorum as observed', async () => {
+  const observed = {
+    ...control,
+    cluster: { ...control.cluster, members: [...control.cluster.members, { name: 'c2', id: '2', peer_urls: ['http://peer-2'], leader: false, started: true }, { name: '', id: 'beef', peer_urls: ['http://peer-9'], leader: false, learner: true, started: false }], quorum: 2, has_quorum: false },
+    partial: true,
+    members: [
+      { id: '1', name: 'c1', role: 'voter', leader: true, peer_urls: ['http://peer-1'], started: true, health: 'healthy', observed_at: '2026-09-28T12:00:00Z', age_ms: 2000, observer: 'c1' },
+      { id: '2', name: 'c2', role: 'voter', peer_urls: ['http://peer-2'], started: true, health: 'unreachable', observed_at: '2026-09-28T12:00:00Z', age_ms: 2000, observer: 'c1', reason: 'connection refused: shunt-control is not running there' },
+      { id: 'beef', role: 'learner', peer_urls: ['http://peer-9'], started: false, health: 'unknown', observed_at: '2026-09-28T12:00:00Z', age_ms: 2000, observer: 'c1', reason: 'added and never started: nothing to probe' },
+    ],
+    quorum: { state: 'unavailable', observed_at: '2026-09-28T12:00:00Z', age_ms: 1000, observer: 'c1', method: 'linearizable_read', error_code: 'timeout' },
+  }
+  mock((url) => (url.endsWith('/v1/control') ? Response.json(observed) : undefined))
+  render(<StoreProvider><App /></StoreProvider>)
+  expect(await screen.findByText('Control members')).toBeInTheDocument()
+  expect(screen.getByText('Unavailable')).toBeInTheDocument()
+  expect(screen.getByText(/timeout, read 1s ago by c1/)).toBeInTheDocument()
+  expect(screen.getByText(/Partial: quorum is not reachable/)).toBeInTheDocument()
+  expect(screen.getByText(/connection refused: shunt-control is not running there/)).toBeInTheDocument()
+  expect(screen.getByText('(unnamed)')).toBeInTheDocument()
+  expect(screen.getByText(/added and never started/)).toBeInTheDocument()
+  // c2 has a name and once started; it is not healthy for that.
+  expect(screen.getAllByText(/^healthy/)).toHaveLength(1)
+  expect(screen.getByText(/^unreachable/)).toBeInTheDocument()
+  expect(screen.getByText(/^unknown/)).toBeInTheDocument()
+})

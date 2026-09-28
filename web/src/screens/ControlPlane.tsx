@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { forgetProxy, getProxyDiagnostics, resolveProxy, retireProxy } from '../api/client'
+import { forgetProxy, getProxyDiagnostics, memberHealth, resolveProxy, retireProxy } from '../api/client'
 import type { ProxyDiagnostics, ProxyMember } from '../api/client'
 import { Card } from '../components/Card'
 import { CopyLine } from '../components/CopyLine'
 import { Drawer } from '../components/Drawer'
 import { Stat } from '../components/Stat'
 import { useStore } from '../store'
+
+// ago says an observation's age in whole seconds.
+function ago(ms?: number): string {
+  return `${Math.round((ms ?? 0) / 1000)}s`
+}
 
 function bytes(value: number) {
   if (!value) return '0 B'
@@ -57,22 +62,29 @@ export function ControlPlane() {
   if (!control) return <Card title="Control plane"><p role={error ? 'alert' : 'status'} className="text-muted">{error || (loading ? 'Loading control state…' : 'No control state yet.')}</p></Card>
   const members = fleet?.members ?? control.fleet ?? []
   const stale = members.filter((member) => !member.live)
-  const quorumMath = `${control.cluster.started} started ≥ ${control.cluster.quorum} required of ${control.cluster.members.length}`
+  const observed = memberHealth(control)
+  const voters = observed.filter((m) => m.role === 'voter').length
+  const quorumMath = `${voters} voting · ${control.cluster.quorum} needed for writes`
+  const quorumState = control.quorum?.state ?? 'unknown'
+  const quorumDetail = control.quorum?.observed_at
+    ? `${quorumState === 'unavailable' ? `${control.quorum.error_code ?? 'error'}, ` : ''}read ${ago(control.quorum.age_ms)} ago by ${control.quorum.observer || control.node} · ${quorumMath}`
+    : `no recent observation · ${quorumMath}`
   return <div className="space-y-5">
     {error && <div role="alert" className="rounded-lg border border-red-600/60 bg-red-950/40 p-3 text-sm text-red-200">{error}</div>}
     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      <Card><Stat label="Quorum" value={control.cluster.has_quorum ? 'Healthy' : 'Lost'} detail={quorumMath} /></Card>
+      <Card><Stat label="Quorum" value={quorumState === 'reachable' ? 'Reachable' : quorumState === 'unavailable' ? 'Unavailable' : 'Unknown'} detail={quorumDetail} /></Card>
       <Card><Stat label="Fleet" value={members.length} detail={`${members.filter((member) => member.live).length} live`} /></Card>
       <Card><Stat label="Directory" value={control.directory} detail={`etcd revision ${control.cluster.revision}`} /></Card>
       <Card><Stat label="Database" value={bytes(control.cluster.db_in_use_bytes)} detail={`${bytes(control.cluster.db_bytes)} / ${bytes(control.cluster.quota_bytes)} quota`} /></Card>
     </div>
     <Card eyebrow="Consensus" title="Control members" action={<div className="flex gap-2"><button type="button" onClick={() => setAdding(true)} className="rounded-md bg-ember-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-ember-500">Add node</button><button type="button" onClick={() => void refresh()} className="rounded-md border border-ink-700 px-3 py-1.5 text-xs font-semibold text-muted hover:border-ember-500 hover:text-paper">Refresh</button></div>}>
-      <p className="mb-3 text-sm text-muted">Leader: <span className="text-paper">{control.cluster.leader || 'none'}</span> · Majority: {quorumMath}</p>
+      <p className="mb-3 text-sm text-muted">Leader: <span className="text-paper">{control.cluster.leader || 'none'}</span> · {quorumMath}</p>
+      {control.partial && <p role="status" className="mb-3 rounded-lg border border-amber-500/60 bg-amber-950/30 p-2 text-xs text-amber-100">Partial: quorum is not reachable or a member's health is not known, so this view may be incomplete or stale.</p>}
       <div className="divide-y divide-ink-700">
-        {control.cluster.members.map((member) => <div key={member.id} data-highlighted={member.name === expected || undefined} className={`grid gap-2 rounded-lg px-2 py-3 text-sm sm:grid-cols-[1fr_auto_auto] sm:items-center ${member.name === expected ? 'bg-ember-600/20 ring-1 ring-ember-400' : ''}`}>
-          <div><span className="font-semibold">{member.name || 'joining…'}</span><span className="ml-2 text-muted">{member.peer_urls[0]}</span></div>
-          <span className="text-muted">{member.leader ? 'leader' : member.learner ? 'learner' : 'follower'}</span>
-          <span className={member.started ? 'text-emerald-300' : 'text-red-300'}>{member.started ? 'healthy' : 'not started'}</span>
+        {observed.map((member) => <div key={member.id} data-highlighted={member.name === expected || undefined} className={`grid gap-2 rounded-lg px-2 py-3 text-sm sm:grid-cols-[1fr_auto_auto] sm:items-center ${member.name === expected ? 'bg-ember-600/20 ring-1 ring-ember-400' : ''}`}>
+          <div><span className="font-semibold">{member.name || '(unnamed)'}</span><span className="ml-2 font-mono text-xs text-muted">{member.id}</span><span className="ml-2 text-muted">{member.peer_urls[0]}</span>{member.reason && <p className="text-xs text-muted">{member.reason}</p>}</div>
+          <span className="text-muted">{member.leader ? 'leader' : member.role === 'learner' ? 'learner' : 'follower'}</span>
+          <span title={member.observed_at ? `observed ${ago(member.age_ms)} ago by ${member.observer ?? control.node}` : 'not observed yet'} className={member.health === 'healthy' ? 'text-emerald-300' : member.health === 'unreachable' ? 'text-red-300' : 'text-amber-200'}>{member.health}{member.observed_at ? ` · ${ago(member.age_ms)} ago` : ''}</span>
         </div>)}
       </div>
     </Card>

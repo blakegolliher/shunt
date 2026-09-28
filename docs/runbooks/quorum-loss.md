@@ -1,7 +1,10 @@
 # Runbook: the control plane has lost quorum
 
-**Signal.** `shunt-control status` on any reachable node says `NO QUORUM`; every `shunt` verb
-answers `503 unavailable`; `shunt_fleet_stale` is 1 on every proxy within `lease_ttl`.
+**Signal.** `shunt-control status` on any reachable node says `QUORUM UNAVAILABLE`, with the code
+of the linearizable read that failed (`timeout`, `no_leader`) and how long ago; every `shunt` verb
+answers `503 unavailable`; `shunt_fleet_stale` is 1 on every proxy within `lease_ttl`. The status
+answer itself stays available without quorum: it lists the members from the node's own view with
+each one's observed health, and says `partial`.
 
 **What is still working.** Every proxy serves reads and writes on every bucket that is not
 moving, from its last installed directory. That is the data path, and it is unaffected; nothing an
@@ -12,14 +15,17 @@ operator does here is urgent for clients on ACTIVE buckets.
 creation through a proxy answers 503. None of this touches the ACTIVE buckets above.
 
 **Do.**
-1. Find which control nodes are down (`status` on each, or `/-/healthz`). A majority must be up:
-   two of three, three of five.
+1. Find which control nodes are down: `shunt-control status` on a reachable node shows each
+   member's `HEALTH`, `unreachable` with its reason (`connection refused: shunt-control is not
+   running there`, no answer before the deadline) for the ones it cannot reach. A member reads
+   `unknown` once its last observation is older than 15 s, never `healthy`. A majority of voting
+   members must be up: two of three, three of five.
 2. Start the down nodes with the same `init` or `join` command line they run under (a restart
    changes nothing on a data directory that holds a member). If a node's host is gone for good,
    bring the majority back first with the nodes you have; then `member remove` the lost one and
    `join` its replacement on a fresh data directory (docs/how-to/run-shunt-control.md).
-3. Watch `status`: once it says `quorum`, every proxy's next heartbeat is answered, leases return,
-   and moving buckets take writes again. Nothing needs re-running.
+3. Watch `status`: once it says `quorum reachable`, every proxy's next heartbeat is answered, leases
+   return, and moving buckets take writes again. Nothing needs re-running.
 
 **Do not** restore from a snapshot while a majority can still be brought back: a restore rebuilds
 a cluster of one and the other nodes then join it, which is the path for losing the data

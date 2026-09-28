@@ -35,6 +35,9 @@ type fakeMembers struct {
 	promoteIn  chan struct{} // if set, a promotion of a caught-up learner signals here, then waits on promoteGo
 	promoteGo  chan struct{}
 	removed    []uint64
+	loseRemove bool  // a removal lands, and its answer is lost
+	removeErr  error // a removal is refused with this, and nothing changes
+	removes    int
 }
 
 func newFakeMembers() *fakeMembers {
@@ -99,14 +102,27 @@ func (f *fakeMembers) promote(_ context.Context, id uint64) error {
 func (f *fakeMembers) remove(_ context.Context, id uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.removes++
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	for i := range f.ms {
 		if f.ms[i].ID == id {
 			f.ms = slices.Delete(f.ms, i, i+1)
 			f.removed = append(f.removed, id)
+			if f.loseRemove {
+				return context.DeadlineExceeded
+			}
 			return nil
 		}
 	}
 	return errors.New("etcdserver: member not found")
+}
+
+func (f *fakeMembers) removeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.removes
 }
 
 // catchUp lets member id be promoted.
@@ -160,6 +176,8 @@ func joinRig(t *testing.T) (*rig, *fakeMembers, *httptest.Server) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/control/members", rg.ctl.ServeJoin)
 	mux.HandleFunc("POST /v1/control/joins/{id}/bootstrap", rg.ctl.ServeJoinBootstrap)
+	mux.HandleFunc("DELETE /v1/control/members/{name}", rg.ctl.ServeMemberRemove)
+	mux.HandleFunc("DELETE /v1/control/members/by-id/{id}", rg.ctl.ServeMemberRemove)
 	mux.Handle("/", rg.ctl.Handler())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

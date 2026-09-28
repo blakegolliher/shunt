@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -146,19 +150,24 @@ func newStatus() *cobra.Command {
 				return printJSON(cmd, st)
 			}
 			out := cmd.OutOrStdout()
-			quorum := "quorum"
-			if !st.Cluster.HasQuorum {
-				quorum = "NO QUORUM: no change is possible until a majority of members is back"
+			voters, healthy := 0, 0
+			for _, m := range st.Members {
+				if m.Role == "voter" {
+					voters++
+				}
+				if m.Health == cp.HealthHealthy {
+					healthy++
+				}
 			}
-			_, _ = fmt.Fprintf(out, "node %s (shunt-control %s): %d of %d members started, %d needed for writes, %s\n",
-				st.Node, st.Version, st.Cluster.Started, len(st.Cluster.Members), st.Cluster.Quorum, quorum)
+			_, _ = fmt.Fprintf(out, "node %s (shunt-control %s): %d voting member(s), %d needed for writes; %d of %d member(s) healthy; %s\n",
+				st.Node, st.Version, voters, st.Cluster.Quorum, healthy, len(st.Members), quorumText(st.Quorum))
 			loaded := ""
 			if !st.DirectoryLoaded {
 				loaded = " (NOT LOADED on this node yet: waiting for quorum)"
 			}
 			_, _ = fmt.Fprintf(out, "directory version %d%s; etcd revision %d; database %s of %s in use, quota %s\n\n",
 				st.Directory, loaded, st.Cluster.Revision, size(st.Cluster.DBInUse), size(st.Cluster.DBBytes), size(st.Cluster.QuotaByte))
-			printMembers(out, st.Cluster.Members)
+			printMembers(out, st.Members)
 			_, _ = fmt.Fprintln(out)
 			if st.FleetError != "" {
 				_, _ = fmt.Fprintln(out, st.FleetError)
@@ -172,22 +181,40 @@ func newStatus() *cobra.Command {
 	return cmd
 }
 
-func printMembers(out io.Writer, ms []cp.MemberInfo) {
+// quorumText says quorum as the node last observed it (ADR-0021 D4, H3d): a leader in view is not
+// evidence of quorum, and an observation that is stale or missing reads unknown.
+func quorumText(q cp.QuorumObservation) string {
+	switch q.State {
+	case cp.QuorumReachable:
+		return fmt.Sprintf("quorum reachable (a linearizable read %s ago)", ago(q.AgeMS))
+	case cp.QuorumUnavailable:
+		return fmt.Sprintf("QUORUM UNAVAILABLE (%s, %s ago): no change is possible until a majority of voting members is back", q.ErrorCode, ago(q.AgeMS))
+	}
+	return "quorum unknown (no recent observation): no change is known to be possible"
+}
+
+func ago(ms int64) string { return (time.Duration(ms) * time.Millisecond).Round(time.Second).String() }
+
+// printMembers shows each member with its observed health: a member is healthy only when a control
+// node has lately reached it, not because it once started.
+func printMembers(out io.Writer, ms []cp.MemberHealth) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "MEMBER\tPEER\tROLE\tSTATE")
+	_, _ = fmt.Fprintln(tw, "MEMBER\tID\tPEER\tROLE\tHEALTH\tOBSERVED\tREASON")
 	for i := range ms {
 		m := &ms[i]
-		role, state := "follower", "started"
+		role := m.Role
 		if m.Leader {
-			role = "leader"
+			role = "voter, leader"
 		}
-		if m.Learner {
-			role = "learner"
+		name := m.Name
+		if name == "" {
+			name = "(unnamed)" // added, never started: remove it by id
 		}
-		if !m.Started {
-			state = "added, not started"
+		observed := "-"
+		if !m.ObservedAt.IsZero() {
+			observed = ago(m.AgeMS) + " ago"
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", m.Name, strings.Join(m.PeerURLs, ","), role, state)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, m.ID, strings.Join(m.PeerURL, ","), role, m.Health, observed, m.Reason)
 	}
 	_ = tw.Flush()
 }
@@ -242,30 +269,93 @@ func newMember() *cobra.Command {
 				return err
 			}
 			if o.json {
-				return printJSON(cmd, st.Cluster.Members)
+				return printJSON(cmd, st.Members)
 			}
-			printMembers(cmd.OutOrStdout(), st.Cluster.Members)
+			printMembers(cmd.OutOrStdout(), st.Members)
 			return nil
 		},
 	}
 	addAPIFlags(list, &o)
 	var ro apiOptions
+	var byID string
+	var dryRun bool
 	remove := &cobra.Command{
-		Use:   "remove <name>",
-		Short: "Remove a member from the cluster (to replace a failed node: remove, then join with the same name on a fresh data directory)",
-		Args:  cobra.ExactArgs(1),
+		Use:   "remove [<name>] [--id <id>]",
+		Short: "Remove a member from the cluster, by name or by id (to replace a failed node: remove, then join with the same name on a fresh data directory)",
+		Long: "Removes one control-plane member (ADR-0021 D4). A member is named by its id (`member list`), or by its\n" +
+			"name, which is looked up once; a member that was added and never started has no name and is removed by\n" +
+			"id. The command first asks what the removal would do (the member, its role, the voting members left) and\n" +
+			"then removes it with that answer's confirmation token, which is refused if the membership changed in\n" +
+			"between. The only voting member, and the control node answering, are not removed. --dry-run stops after\n" +
+			"the first step.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if (len(args) == 1) == (byID != "") {
+				return errors.New("name the member, or give --id (a member that never started has no name)")
+			}
+			path := "/v1/control/members/by-id/" + url.PathEscape(byID)
+			if len(args) == 1 {
+				path = "/v1/control/members/" + url.PathEscape(args[0])
+			}
 			api, err := ro.client()
 			if err != nil {
 				return err
 			}
-			if err := api.call(cmd.Context(), http.MethodDelete, "/v1/control/members/"+args[0], nil, nil); err != nil {
+			var plan control.MemberRemoveDryRun
+			if err := api.call(cmd.Context(), http.MethodDelete, path+"?dry_run=1", nil, &plan); err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "member %s removed; stop its shunt-control if it is still running\n", args[0])
+			if !plan.Allowed {
+				return fmt.Errorf("refused: %s", plan.Reason)
+			}
+			if dryRun && ro.json {
+				return printJSON(cmd, plan)
+			}
+			out := cmd.OutOrStdout()
+			name, started := plan.Member.Name, "started"
+			if name == "" {
+				name = "(unnamed)"
+			}
+			if !plan.Member.Started {
+				started = "never started"
+			}
+			verb := "removing"
+			if dryRun {
+				verb = "would remove"
+			}
+			_, _ = fmt.Fprintf(out, "%s member %s (%s, %s, %s); %d voting member(s) left\n", verb, name, plan.Member.ID, plan.Member.Role, started, plan.VotersAfter)
+			if plan.Warning != "" {
+				_, _ = fmt.Fprintf(out, "warning: %s\n", plan.Warning)
+			}
+			if dryRun {
+				return nil
+			}
+			var rid [8]byte
+			if _, err := rand.Read(rid[:]); err != nil {
+				return err
+			}
+			api.idem = "member-remove-" + hex.EncodeToString(rid[:])
+			var res struct {
+				control.MemberRemoveResult
+				ID     string `json:"id"`
+				Status string `json:"status"` // an operation still running answers its record
+			}
+			if err := api.call(cmd.Context(), http.MethodDelete, path, control.RemoveRequest{Token: plan.Token}, &res); err != nil {
+				return err
+			}
+			if ro.json {
+				return printJSON(cmd, res)
+			}
+			if res.Status != "" {
+				_, _ = fmt.Fprintf(out, "the removal is still running (operation %s, %s); follow it with `shunt operation wait %s`\n", res.ID, res.Status, res.ID)
+				return nil
+			}
+			_, _ = fmt.Fprintf(out, "member %s removed (operation %s); %d voting member(s); stop its shunt-control if it is still running\n", name, res.Operation, res.Voters)
 			return nil
 		},
 	}
+	remove.Flags().StringVar(&byID, "id", "", "the member's id, as `member list` shows it")
+	remove.Flags().BoolVar(&dryRun, "dry-run", false, "say what the removal would do, and remove nothing")
 	addAPIFlags(remove, &ro)
 	cmd.AddCommand(list, remove)
 	return cmd

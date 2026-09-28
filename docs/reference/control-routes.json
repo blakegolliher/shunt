@@ -423,6 +423,19 @@
     "mutation": true
   },
   {
+    "method": "DELETE",
+    "pattern": "/v1/control/members/by-id/{id}",
+    "verbs": [
+      "member remove --id"
+    ],
+    "mutation": true
+  },
+  {
+    "method": "GET",
+    "pattern": "/v1/control/local-status",
+    "mutation": false
+  },
+  {
     "method": "GET",
     "pattern": "/v1/control/snapshot",
     "verbs": [

@@ -250,8 +250,9 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	// node restarting alone after an outage must serve its API for the operator to see that. The
 	// operation records follow the directory, and the records this node was running when it last
 	// stopped are closed as failed.
+	apiURL := advertisedAPI(o.api, o.peerURL)
 	go func() {
-		loaded := false
+		loaded, registered := false, apiURL == ""
 		for ctx.Err() == nil {
 			sctx, scancel := context.WithTimeout(ctx, 15*time.Second)
 			var err error
@@ -261,7 +262,13 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 					log.Info("directory loaded", "version", store.Version())
 				}
 			}
-			if loaded {
+			if loaded && !registered {
+				// Where the other members' health sampler reaches this node (ADR-0021 D4, H3d).
+				if err = node.RegisterAPI(sctx, apiURL); err == nil {
+					registered = true
+				}
+			}
+			if loaded && registered {
 				if err = ops.Start(sctx); err == nil {
 					if ferr := ctl.FailOrphans(sctx); ferr != nil {
 						log.Warn("operation records left running by the last stop could not all be closed", "err", ferr.Error())
@@ -275,9 +282,12 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 			if err == nil {
 				return
 			}
-			if !loaded {
+			switch {
+			case !loaded:
 				log.Warn("directory not loaded yet (waiting for quorum?)", "err", err.Error())
-			} else {
+			case !registered:
+				log.Warn("this node's control API not registered for the members' health sampler yet", "api", apiURL, "err", err.Error())
+			default:
 				log.Warn("operation records not loaded yet", "err", err.Error())
 			}
 			select {
@@ -288,8 +298,12 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	}()
 	defer store.Close()
 	defer ops.Close()
-	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Key: cipher.Key}
-	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o), Control: ctl}
+	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Self: node.ID, Key: cipher.Key}
+	// Each node samples the members' health and quorum in the background, so status serves what it
+	// last observed and never probes per request (ADR-0021 D4, H3d).
+	health := &cp.Health{Node: node, Token: token, Metrics: metrics}
+	go health.Run(ctx)
+	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o), Control: ctl, Health: health}
 
 	adm := admin.New(metrics.Registry, telemetry.NewSlowRing(1, time.Hour))
 	mountControl(adm, ctl, api, store)

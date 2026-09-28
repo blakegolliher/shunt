@@ -85,9 +85,19 @@ func TestJoinOnEtcdFromOneNodeToTwo(t *testing.T) {
 // joinAPI serves node 0's control API with its membership, promoting through promote, and returns
 // the node and a POST helper.
 func joinAPI(t *testing.T, tc *testCluster, key []byte, promote func(context.Context, uint64) error) (*node, func(path, idem string, body, out any) (int, string)) {
+	n, call := memberAPI(t, tc, key, promote)
+	return n, func(path, idem string, body, out any) (int, string) {
+		return call(http.MethodPost, path, idem, body, out)
+	}
+}
+
+// memberAPI is joinAPI with the method named: node 0's control API with its membership (Self set,
+// as shunt-control sets it), and a helper that sends any method.
+func memberAPI(t *testing.T, tc *testCluster, key []byte, promote func(context.Context, uint64) error) (*node, func(method, path, idem string, body, out any) (int, string)) {
 	t.Helper()
 	n := startNode(t, tc, 0, key, time.Second)
-	n.ctl.Members = &control.Membership{List: tc.nodes[0].ListMembers, AddLearner: tc.nodes[0].AddLearner, Promote: promote, Remove: tc.nodes[0].RemoveMember, Key: func() []byte { return key }}
+	n.ctl.Members = &control.Membership{List: tc.nodes[0].ListMembers, AddLearner: tc.nodes[0].AddLearner, Promote: promote, Remove: tc.nodes[0].RemoveMember,
+		Self: tc.nodes[0].ID, Key: func() []byte { return key }}
 	api := &API{Node: tc.nodes[0], Store: n.store, Fleet: n.fleet, Control: n.ctl}
 	mux := http.NewServeMux() // as shunt-control mounts them: its own routes, and the control API
 	mux.Handle("/v1/control", api.Handler())
@@ -95,10 +105,10 @@ func joinAPI(t *testing.T, tc *testCluster, key []byte, promote func(context.Con
 	mux.Handle("/v1/", n.ctl.Handler())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return n, func(path, idem string, body, out any) (int, string) {
+	return n, func(method, path, idem string, body, out any) (int, string) {
 		t.Helper()
 		raw, _ := json.Marshal(body)
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, bytes.NewReader(raw))
+		req, _ := http.NewRequest(method, srv.URL+path, bytes.NewReader(raw))
 		if idem != "" {
 			req.Header.Set(control.HeaderIdempotencyKey, idem)
 		}

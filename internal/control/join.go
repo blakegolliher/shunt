@@ -88,8 +88,11 @@ type Membership struct {
 	// Promote makes learner id a voter; etcd's refusal of one that has not caught up is
 	// ErrLearnerNotReady.
 	Promote func(ctx context.Context, id uint64) error
-	// Remove removes member id: a canceled join's learner.
+	// Remove removes member id: a canceled join's learner, or a member a removal names (H3c).
+	// etcd's refusal of a removal that would cost quorum is ErrQuorumAtRisk.
 	Remove func(ctx context.Context, id uint64) error
+	// Self, if set, is the member ID of the node this server runs on, which a removal refuses.
+	Self func() uint64
 	// Key is the data-encryption key a joining node needs; it leaves only through the bootstrap.
 	Key func() []byte
 }
@@ -482,7 +485,7 @@ func (s *Server) cancelJoin(tr *tracker, op Operation, a JoinRequest, ms []EtcdM
 	case !mine.Learner:
 		s.info(req.Actor, "join cancellation came after the promotion; nothing removed", "operation", op.ID, "name", mine.Name, "member", memberHex(mine.ID))
 		res := joinResult(ms, memberHex(mine.ID), mine.Name)
-		res.Warning = strings.TrimSpace(fmt.Sprintf("%s was promoted to a voting member before %s's cancellation reached the join, and votes; removing a voter is `shunt-control member remove`. %s", firstNonEmpty(mine.Name, a.Name), req.Actor, res.Warning))
+		res.Warning = strings.TrimSpace(fmt.Sprintf("%s was promoted to a voting member before %s's cancellation reached the join, and votes; removing a voter is `shunt-control member remove --id %s`. %s", firstNonEmpty(mine.Name, a.Name), req.Actor, memberHex(mine.ID), res.Warning))
 		tr.blocked(nil)
 		return res, true, nil
 	case !promoteLost.IsZero() && s.now().Sub(promoteLost) < promoteSettle:
@@ -605,7 +608,7 @@ func (s *Server) addLearner(tr *tracker, op Operation, a JoinRequest, ms []EtcdM
 		case op.Phase != PhaseLearnerAdd:
 			// Not this join's: its add was never sent.
 			if mine.Name == "" {
-				return refuse("peer URL %s already belongs to member %s, which has not started (an earlier join?); remove it with `shunt-control member remove`, or use another peer URL", a.PeerURL, memberHex(mine.ID))
+				return refuse("peer URL %s already belongs to member %s, which has not started (an earlier join?); remove it with `shunt-control member remove --id %s`, or use another peer URL", a.PeerURL, memberHex(mine.ID), memberHex(mine.ID))
 			}
 			return refuse("peer URL %s already belongs to member %s (%s)", a.PeerURL, mine.Name, memberHex(mine.ID))
 		case mine.Name != "" && mine.Name != a.Name:

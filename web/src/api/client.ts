@@ -4,7 +4,35 @@ export interface ControlMember {
   peer_urls: string[]
   leader: boolean
   learner?: boolean
+  // started is history (the member once ran under its name), never health (ADR-0021 D4).
   started: boolean
+}
+
+// MemberHealth is a control member as the answering node last observed it (H3d): healthy only when
+// it was lately reached and running as itself; an observation older than 15 s reads unknown.
+export interface MemberHealth {
+  id: string
+  name?: string
+  role: 'voter' | 'learner'
+  leader?: boolean
+  peer_urls: string[]
+  started: boolean
+  api_url?: string
+  health: 'healthy' | 'unreachable' | 'unknown'
+  observed_at?: string
+  age_ms?: number
+  observer?: string
+  reason?: string
+}
+
+// QuorumObservation is quorum as the answering node last observed it, by a linearizable read.
+export interface QuorumObservation {
+  state: 'reachable' | 'unavailable' | 'unknown'
+  observed_at?: string
+  age_ms?: number
+  observer?: string
+  method: string
+  error_code?: string
 }
 
 // Incarnation is one process of a proxy (ADR-0021 D2): active, retired (stopped cleanly), unclean
@@ -66,6 +94,20 @@ export interface ControlStatus {
   directory_loaded: boolean
   last_compaction: string | null
   join: string
+  // Observed health (H3d): absent from an older control node, whose members then read unknown.
+  observed_at?: string
+  partial?: boolean
+  membership_revision?: string
+  members?: MemberHealth[]
+  quorum?: QuorumObservation
+  active_membership_operation?: string
+}
+
+// memberHealth is each control member's observed health: the answer's own, or unknown for every
+// member of an answer without it. A member's name or started flag never makes it healthy.
+export function memberHealth(control: ControlStatus): MemberHealth[] {
+  if (control.members) return control.members
+  return control.cluster.members.map((m) => ({ id: m.id, name: m.name, role: m.learner ? 'learner' : 'voter', leader: m.leader, peer_urls: m.peer_urls, started: m.started, health: 'unknown', reason: 'this control node reports no observed health' }))
 }
 
 export interface FleetStatus {
