@@ -21,9 +21,22 @@ var version, commit, date = "dev", "", "" // set by -ldflags in the Makefile
 func main() {
 	if err := newRoot().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "shunt-control:", err)
+		var ee *exitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.code)
+		}
 		os.Exit(1)
 	}
 }
+
+// exitError ends the command with a given exit status. Every other error exits 1.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
 
 func newRoot() *cobra.Command {
 	root := &cobra.Command{

@@ -1205,7 +1205,8 @@ func beforeFirstWrite(op *Operation) bool {
 }
 
 // Sweep is the control node's periodic care of the records (once a second, with PublishFleet):
-// records whose owner's liveness has lapsed are orphaned, and the operations gauge is refreshed.
+// records whose owner's liveness has lapsed are orphaned, and the operations and membership-phase
+// gauges are refreshed.
 func (s *Server) Sweep(ctx context.Context) error {
 	ops, err := s.ops().Evidence(ctx)
 	if err != nil {
@@ -1242,6 +1243,7 @@ func (s *Server) Sweep(ctx context.Context) error {
 			s.Metrics.Operations.WithLabelValues(k[0], k[1]).Set(float64(n))
 		}
 	}
+	s.publishMembershipPhase(ops)
 	return errors.Join(errs...)
 }
 

@@ -136,7 +136,11 @@ func newStatus() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "The cluster (members, leader, quorum, database size), the fleet, and the directory version",
-		Args:  cobra.NoArgs,
+		Long: "Each member's health and quorum as this node last observed them (ADR-0021 D4). Exits 0 when\n" +
+			"quorum is reachable and every member was lately observed healthy; 1 when quorum was observed\n" +
+			"unavailable or a member unreachable; 3 when nothing was observed wrong but quorum or a member was\n" +
+			"not observed lately (unknown). With --json the answer is printed either way.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			api, err := o.client()
 			if err != nil {
@@ -147,7 +151,10 @@ func newStatus() *cobra.Command {
 				return err
 			}
 			if o.json {
-				return printJSON(cmd, st)
+				if err := printJSON(cmd, st); err != nil {
+					return err
+				}
+				return statusExit(&st)
 			}
 			out := cmd.OutOrStdout()
 			voters, healthy := 0, 0
@@ -174,11 +181,52 @@ func newStatus() *cobra.Command {
 			} else {
 				printFleet(out, st.Fleet)
 			}
-			return nil
+			return statusExit(&st)
 		},
 	}
 	addAPIFlags(cmd, &o)
 	return cmd
+}
+
+// Exit statuses of `shunt-control status` besides 0 (quorum reachable and every member lately
+// observed healthy) and 2 (usage). Unknown is not healthy and not unhealthy: nothing was observed
+// wrong, but something was not observed lately enough to say (ADR-0021 D4, contracts §2).
+const (
+	exitUnhealthy = 1 // quorum observed unavailable, or a member observed unreachable (or no answer at all)
+	exitUnknown   = 3 // nothing observed unhealthy, but quorum or a member not observed lately
+)
+
+// statusExit is the status's exit: exitUnhealthy over exitUnknown over success, with what caused it.
+func statusExit(st *cp.StatusAnswer) error {
+	var bad, unknown []string
+	switch st.Quorum.State {
+	case cp.QuorumReachable:
+	case cp.QuorumUnavailable:
+		bad = append(bad, "quorum unavailable")
+	default:
+		unknown = append(unknown, "quorum")
+	}
+	for i := range st.Members {
+		m := &st.Members[i]
+		name := m.Name
+		if name == "" {
+			name = m.ID
+		}
+		switch m.Health {
+		case cp.HealthHealthy:
+		case cp.HealthUnreachable:
+			bad = append(bad, name+" unreachable")
+		default:
+			unknown = append(unknown, name)
+		}
+	}
+	switch {
+	case len(bad) > 0:
+		return &exitError{code: exitUnhealthy, err: fmt.Errorf("not healthy: %s", strings.Join(bad, ", "))}
+	case len(unknown) > 0:
+		return &exitError{code: exitUnknown, err: fmt.Errorf("health not known for %s: not observed yet, or not observed lately", strings.Join(unknown, ", "))}
+	}
+	return nil
 }
 
 // quorumText says quorum as the node last observed it (ADR-0021 D4, H3d): a leader in view is not

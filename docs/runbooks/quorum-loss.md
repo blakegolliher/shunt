@@ -4,7 +4,7 @@
 of the linearizable read that failed (`timeout`, `no_leader`) and how long ago; every `shunt` verb
 answers `503 unavailable`; `shunt_fleet_stale` is 1 on every proxy within `lease_ttl`. The status
 answer itself stays available without quorum: it lists the members from the node's own view with
-each one's observed health, and says `partial`.
+each one's observed health, says `partial`, and exits 1, so a check that runs it alerts.
 
 **What is still working.** Every proxy serves reads and writes on every bucket that is not
 moving, from its last installed directory. That is the data path, and it is unaffected; nothing an
@@ -25,7 +25,8 @@ creation through a proxy answers 503. None of this touches the ACTIVE buckets ab
    bring the majority back first with the nodes you have; then `member remove` the lost one and
    `join` its replacement on a fresh data directory (docs/how-to/run-shunt-control.md).
 3. Watch `status`: once it says `quorum reachable`, every proxy's next heartbeat is answered, leases
-   return, and moving buckets take writes again. Nothing needs re-running.
+   return, and moving buckets take writes again. Nothing needs re-running. It exits 0 once every
+   member is observed healthy again, and 3 while one is only not observed lately.
 
 **Do not** restore from a snapshot while a majority can still be brought back: a restore rebuilds
 a cluster of one and the other nodes then join it, which is the path for losing the data

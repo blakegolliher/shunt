@@ -24,7 +24,7 @@ type healthRig struct {
 	peers []localMember
 }
 
-func newHealthRig(t *testing.T, probe func(ctx context.Context, api string) (LocalStatus, error), peers ...localMember) *healthRig {
+func newHealthRig(t testing.TB, probe func(ctx context.Context, api string) (LocalStatus, error), peers ...localMember) *healthRig {
 	t.Helper()
 	tc := startCluster(t, 1)
 	n := tc.nodes[0]

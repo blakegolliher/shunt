@@ -286,10 +286,48 @@ func (s *Server) ActiveMembershipOperation(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	for _, op := range ops {
-		if !op.Terminal() && op.Scope != nil && op.Scope.Resource == MembersResource {
-			return op.ID
-		}
+	if op := membershipChange(ops); op != nil {
+		return op.ID
 	}
 	return ""
+}
+
+// membershipChange is the unfinished record holding the control plane's membership, or nil: the
+// reservation lets at most one run.
+func membershipChange(ops []*Operation) *Operation {
+	for _, op := range ops {
+		if !op.Terminal() && op.Scope != nil && op.Scope.Resource == MembersResource {
+			return op
+		}
+	}
+	return nil
+}
+
+// MembershipPhases are the values of shunt_control_join_phase's phase label: every phase a join's
+// or a removal's record passes, and PhaseOther for one not listed, so the label set stays bounded.
+var MembershipPhases = []string{PhaseQueued, PhaseLearnerAdd, PhaseLearnerAdded, PhaseCatchingUp, PhaseLearnerRemove, PhaseMemberRemove, PhaseOther}
+
+// PhaseOther is shunt_control_join_phase's label for a membership record in a phase not listed.
+const PhaseOther = "other"
+
+// publishMembershipPhase sets shunt_control_join_phase: 1 for the phase of the unfinished
+// membership change, 0 for every other phase, all 0 when none runs.
+func (s *Server) publishMembershipPhase(ops []*Operation) {
+	if s.Metrics == nil {
+		return
+	}
+	phase := ""
+	if op := membershipChange(ops); op != nil {
+		phase = PhaseOther
+		if slices.Contains(MembershipPhases, op.Phase) {
+			phase = op.Phase
+		}
+	}
+	for _, p := range MembershipPhases {
+		v := 0.0
+		if p == phase {
+			v = 1
+		}
+		s.Metrics.JoinPhase.WithLabelValues(p).Set(v)
+	}
 }

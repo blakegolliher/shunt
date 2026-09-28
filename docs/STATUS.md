@@ -199,10 +199,9 @@ to retryable and writable to read-only, each canceled while held by a silent mem
 switch on the durable record before the cancel. Releasing to writable, as before, fails the six
 cases whose scope was read-only.
 
-The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
-has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
-plane screen shows started as healthy (H3d; with H3b every join spends a moment as a learner). A
-snapshot restore keeps its application epoch (H4). Capacity at 1,000 proxies (docs/bench/h2.md)
+The review's notes on H3–H5 stand, less what H3d fixed (status judging a member by its name,
+learners in the quorum, `has_quorum` from the local leader). A snapshot restore keeps its
+application epoch (H4). Capacity at 1,000 proxies (docs/bench/h2.md)
 stays open under T19.
 
 ### Planned correctness work (2026-09-24; no runtime fixes shipped here)
@@ -280,7 +279,21 @@ is implemented. Tests: each kind of member (self, reached, stopped, another memb
 started), staleness, a cycle bounded by its deadline and five probes, a thousand status reads
 probing nothing, quorum unavailable, a real three-member cluster losing c3 then c2 with status still
 answering, and the screen; judging health by a name, dropping staleness, or dropping the probe bound
-each fails its test. H3e (CLI/UI, acceptance) remains. New endpoints/commands in those documents are design
+each fails its test. H3e (2026-09-28) wires the operator surfaces: the Control plane screen's join
+wizard records the join's intent over the API (its Idempotency-Key kept across a retry) and shows the
+new host's command with `--resume <operation>`, so the key never reaches the browser; it follows the
+join by its record (phase, blockers, cancel, resume), announces the end only once the record ended,
+and finds the change again after a reload. Member rows show role and health and offer Remove (not
+on the answering node) through the dry run: the member by ID, the voters and quorum it leaves, and
+its token. `shunt-control status` exits 0, 1 (quorum unavailable or a member unreachable) or 3
+(something not observed lately); `shunt_control_join_phase` is implemented. `make fleet` joins c3 the
+wizard's way and cancels a join that never started, on real processes. Tests: the wizard (intent,
+the kept key, the command, no bootstrap fetched, cancel announced only once ended), removal of an
+unnamed learner, a refused and a followed removal, the change found after a reload, the status
+exits, and the phase gauge; a new key per attempt, a removable answering node, not reading the
+active change, or not publishing the gauge each fails its test. `shunt-control operation` (one
+operation client for both binaries, contracts §2) moves to H5 with T17; `shunt operation` cancels and
+resumes a join meanwhile. H3's acceptance: docs/bench/h3.md. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
