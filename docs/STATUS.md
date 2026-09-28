@@ -17,6 +17,194 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### Third correctness review (2026-09-26): ten open faults, fixed next
+
+An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three
+carried from its earlier review of `b01f65d`. Its ten diagnostic tests all fail on `151608d` (H3b)
+under `-race`, as on the reviewed commit; H3a and H3b touched none of the code they cite. Each test is
+committed with its fix, so the branch stays green. R3-01 to R3-04, which let a drain barrier advance
+on a proof that left out unfinished work, are fixed, and `make fleet` passed on that build
+(2026-09-28): H2's acceptance stands again. **All ten are fixed as of `f4b554b` (2026-09-28)**, each
+with the review's case kept as a named regression test, the wider cases it asked for, and a negative
+control. On that build: the race suite over every package, lint, fuzz on the new parser, the UI tests
+and lint, `make walkthrough` (60,478 operations, 0 errors) and `make fleet` passed. The first fleet
+run, started right after the walkthrough, stopped on its telemetry cross-check (fleet p99 13.3 % from
+the client's, limit 10 %, 0 client errors); run alone it passed at 5.6 %, as earlier runs did (3–7 %).
+Two proxy tests failed once each under the full suite's load and not in isolation:
+`TestResignTrailerChecksumMismatch` (0 failures in 200 isolated runs; an ordering race in the test
+between the fake backend's answer and the decoder's trailer check) and the probabilistic negative
+control `TestFleetRangeMoveWithoutTheFence` (no violation found in one loaded run). Neither is from
+this work; both are recorded here to be looked at.
+
+| ID | Pri | | Fault | Test | State |
+|---|---|---|---|---|---|
+| R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestOldRouteCannotCrossABarrier` (was `TestReviewOldBundleCannotEnterAfterBarrierCompletes`) | fixed 2026-09-28 |
+| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestOldMoveReportCannotAuthorizeCutover`, `TestMoverReportGoesStaleWithThePlacement` (was `TestReviewOldScopeProgressMustNotAuthorizeNewScope`) | fixed 2026-09-28 |
+| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestCompletionOutcomeIsTheWholeAnswer` (was `TestReviewIncompleteMultipartResponseMustRemainUncertain`), `TestLearnAnswerReadsTheRestAfterTheRelayStops` | fixed 2026-09-28 |
+| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestOfflineRestartsKeepEveryPredecessor` (was `TestReviewOfflineRestartMustPreserveUnreportedIncarnations`), `TestPredecessorBacklogAndBound`, `TestFleetRecordsEveryPredecessor` | fixed 2026-09-28 |
+| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestDirectoryExportIsOneVersion` (was `TestReviewDirectoryExportMustUseOneVersion`), `TestStoreExportIsOneVersion` | fixed 2026-09-28 |
+| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestConditionalCompletionIsJudgedOnBothClusters` (was `TestReviewConditionalMultipartChecksOtherBackend`), `TestConditionalCompletionPinnedToTheSource`, `TestConditionalCompletionUncheckable` | fixed 2026-09-28 |
+| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestSpreadDeleteAnswersForEveryKey` (was `TestReviewSpreadDeleteMustReportSourceOwnedFailure`), `FuzzParseDeleteRequest` | fixed 2026-09-28 |
+| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestCacheRecoversOnARefetch` (was `TestReviewRecoveredDiskMustRetryCurrentCacheVersion`), `TestCacheRecoversOnTheHeartbeat`, `TestCacheRetryBackoffAndCancellation` | fixed 2026-09-28 |
+| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestCanceledReadOnlyRestoresThePriorSwitch` (was `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly`) | fixed 2026-09-28 |
+| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestMergedListingLookaheadFailureIsNotTheEnd` (was `TestReviewListingLookaheadFailureMustNotDeclareComplete`), `TestMergedListingAtAnExactPageBoundary` | fixed 2026-09-28 |
+
+Order of work (the review's): R3-01 to R3-04 first, since destructive routing changes trust their
+proofs; then R3-05 to R3-07 and R3-10; then R3-08 and R3-09; then H3c and H3d. Each fix lands with its
+review test moved into the package's own tests under a descriptive name, a negative control where the
+test alone does not show the guard is load-bearing, and the review's wider cases for it (R3-01:
+credential rotation, cutover, read-only and scoped moves, and a benchmark of admission; R3-03: early
+200, embedded error, truncated XML, timeout, client disconnect; R3-05: the production store under
+concurrent rotation; R3-07: quiet and verbose, mixed keys, per-key and whole-leg failure). Protocol
+changes (R3-01, R3-02, R3-04) update the durable schema, API, CLI and UI together. After the ten, the
+review asks for the same cases on the distributed store and its failure interleavings; passing these
+ten is not a safety proof.
+
+**R3-01 fixed (2026-09-28).** A placement's gates remember the directory version they last reopened
+at, and `Enter` takes the request's bundle version and refuses one routing by an older version
+(`admission.Superseded`): a request that took its bundle before a barrier and reaches the gate after
+the barrier has closed and reopened it is answered 503 + Retry-After and counted
+`shunt_migration_refused_writes_total{reason="superseded"}`, and its retry routes by the current
+bundle. The version is kept per placement, not per gate kind (either barrier changed the placement's
+route), which keeps a gate in its 80-byte allocation class: one field per kind grew it to the 96-byte
+class and cost the 10,000-placement admission benchmark +13.7 % (p=0.003); per placement it is
+unchanged (EnterRelease 134.3 → 134.3 ns, EnterReleaseSpread 9.9 → 8.7 ns within ±10 %, closed gate
+87 → 88 ns; interleaved runs, n=12). `TestOldRouteCannotCrossABarrier` runs a whole barrier while a
+request holds its pre-barrier bundle: a scoped ramp step (the review's case), a cluster read-only
+change (the write would reach a now read-only cluster), purge-source's source barrier (a CUTOVER
+delete's source leg), and a spread bucket's DeleteObjects across a read-only change; all four fail
+with the version check removed. Credential rotation has no drain barrier to cross: a rotation is
+a plain directory write, reported installed per member, and a request that took the old bundle signs
+with the old secret until it ends (H1b). The design's credential revocation barrier, which would
+drain those, is not built.
+
+**R3-02 fixed (2026-09-28).** A mover's progress report carries the directory identity and the
+placement generation its mover planned from: its worker session's for `shunt migrate run`, its mover
+operation's reserved generation for the control node's own mover. A report without them answers
+400; one for another lineage or generation is refused as superseded, which is what a replayed or late
+report of an earlier move of the bucket is, since every later move or change writes the placement.
+Cutover counts a converged report only for the placement's current generation, and a MIGRATING
+bucket's view shows only such a report. Between cutover's check and its commit the evidence cannot
+change: the operation reserves the placement, so no mover operation can run, and its hold moves the
+generation, so every earlier report is refused from then on. A `--dry-run` pass reports nothing
+(it copied nothing, and a pass that copies nothing reads as converged). No protocol-1 mover is
+deployed, so unbound reports are refused rather than accepted for compatibility. Tests: the review's
+two scoped moves (the replay refused, cutover refused, and the data/ move's own report cutting it
+over) and a report that goes stale when the placement changes after the last pass; removing the
+ingestion check or cutover's check each fails its test. `make walkthrough` passed (60,315 operations,
+0 errors) with the CLI mover's bound reports.
+
+**R3-03 fixed (2026-09-28).** A mutation's outcome is its backend's whole answer, not its status
+line. Its response body is watched as it is relayed: read to its end, and, for an operation whose 200
+can come before it has finished (CompleteMultipartUpload, CopyObject, UploadPartCopy), through the
+close of its result or `<Error>` element, judged from the body's last 64 bytes. A relay that stopped
+early (the client left, the upstream failed, a deadline fired) reads the rest of the answer first,
+bounded at 1 MiB and under the request's own deadlines, since a mutation's request does not end
+with its client; an answer never read whole releases the token uncertain, which the heartbeat
+carries as `backend_outcome_unknown`. Reads are not watched. Tests: an early 200 then the result, or
+then an error (definitive); a result cut short at a clean end of stream, no result before the
+deadline (the review's case), and a client gone while the backend never finishes (uncertain); a
+client gone before a result that then arrives (definitive); an abandoned GET (nothing uncertain);
+the drain unit-tested, since at the handler level the XML rewriter has read the whole answer before
+its write to a departed client fails. Removing the verdict, the drain or the closing-element check
+each fails its tests.
+
+**R3-04 fixed (2026-09-28).** A proxy's incarnation marker keeps every earlier process the control
+plane has not recorded (schema 2, `predecessors`, oldest first), carries them into each new marker
+before the process serves, and drops them only when a heartbeat answer says they are recorded. The
+heartbeat's `previous` is now a list: the oldest eight, then the rest once those are recorded, and
+the control plane records each (an unclean one unresolved, a clean one discharging what it had).
+A process that retired cleanly and was never registered is not carried: the control plane never
+knew it and nothing of it is uncertain. The marker keeps at most 32; a process that would hold more
+does not start, leaving the marker as it was. `/-/fleet` lists them as `unrecorded`. Tests: the
+review's chain (A registered, B and C crashed offline, D retired offline) reports A, B and C in one
+heartbeat and nothing after the answer; a backlog of ten goes out eight then two; past 32 the start
+is refused and the marker untouched; on etcd, a heartbeat carrying three records all three, and its
+repeat changes nothing. Negative controls: a marker keeping only the last process, and a control
+plane recording only the first of the list, each fail. `make fleet`
+passed on the R3-01 to R3-04 build.
+
+**R3-05 fixed (2026-09-28).** `GET /v1/directory` hands a member one version whole. The control
+plane's store publishes each installed version as one state holding its directory, client keys and
+cluster secrets, and now its snapshot too; `Store.Export` reads all of them from that one state, and
+shunt-control serves the export from it (`Server.Export`), as its embedded mover now takes its
+directory and secrets (`MoverWorker.Export`). A lab, whose directory and key files are separate,
+reads them one after another with the directory's version read again after them, repeats the reads
+when it moved, and answers a retryable 503 when it keeps moving: never a mixed pair. Tests: on the
+lab path, a rotation that lands between the reads answers the rotated version with its own secret,
+and a directory rotated on every read answers 503 (the review's test, whose hook rotates on every
+read, gets that 503 rather than a mixed pair); on etcd, a hundred rotations of an access key and its
+secret together while node a exports continuously, every export pairing each key with its own
+secret. Negative controls: the lab path without the version check reproduces the review's version 7
+key with version 8 secret; `Export` reading the snapshot and the secrets one after another pairs
+versions wrongly in four runs of five.
+
+**R3-06 fixed (2026-09-28).** Whether a write's `If-None-Match`/`If-Match` is judged against both
+clusters of a moving bucket (ADR-0013) now depends on the operation (PutObject,
+CompleteMultipartUpload, CopyObject), not its routing class: a completion is routed as an upload,
+pinned by its uploadId to the cluster holding its parts, and still commits the logical object its
+conditions are about. The pinned cluster is where it lands; the other one is asked. As for a PUT, a
+completion on a cluster that ignores `If-None-Match: *` has its create-once judged by shunt in
+every state. Tests, while MIGRATING: create-once over a source-only object refused and nothing
+written (the review's case), create-once over nothing completing, update-if-current matching the
+source's version completing as create-only on the target, update-if-current naming another version
+refused; an upload pinned to the source refused when the key is on the target; a completion whose
+other-cluster HEAD fails refused with 503 and not sent. Exempting completions again fails four of
+the six.
+
+**R3-07 fixed (2026-09-28).** A spread bucket's DeleteObjects answers every key from the leg that
+owns it, and a key the move's source still owns (outside the move's scope or range) has no other
+answer: when the source leg fails whole, each such key the request names gets an `InternalError`
+entry, which quiet mode keeps, and a source delete that may have landed makes the mutation's outcome
+uncertain. For a key in the move the source is a redundant copy, and its failure stays a logged
+diagnostic (`shunt_migration_dual_delete_total{outcome="source_failed"}`), as before. The request's
+keys are read from the body already bounded at 1 MiB (`parseDeleteRequest`, with its fuzz target).
+Tests: the source leg failing whole, quiet (the review's case) and verbose; per-key errors from the
+source, where the source-owned key carries its error and the in-move key does not; the source's
+connection ending after the request, where the owned key is an error and the mutation uncertain.
+Removing the per-key answer fails the three whole-leg cases.
+
+**R3-10 fixed (2026-09-28).** A migrating bucket's merged listing peeks each side once after filling
+a page, to learn whether it is truncated; a peek that fails is now answered as the failure, as a
+failed page inside the merge already was, instead of reading as the end of that side. The client
+retries the page and loses nothing; memory stays one page per side. A spread bucket's listing
+(ADR-0019) already failed on a failed peek. Tests: 1,001 keys with the second page failing on the
+source (the review's case) or on the primary, with and without a delimiter, each refused rather
+than answered complete, and paging through all 1,001 once the side answers again; exactly one page
+of keys, where no peek is made, answered complete. Ignoring the peek's error again fails all four
+failure cases with 1,000 of 1,001 keys. ListObjects v1 on a migrating bucket still goes to the
+primary alone (a POC-4 limit, unchanged).
+
+**R3-08 fixed (2026-09-28).** A cache write that fails keeps its directory as the candidate to write
+again: the heartbeat retries it (off the request path) once a backoff has run out, starting at the
+heartbeat interval and doubling to 30 s, and a full refetch of the installed version writes it at
+once. A newer version written meanwhile cancels the retry, and the cache never moves back. So a disk
+that recovers makes the installed version durable, clears `cache_error`, and the next heartbeat
+reports it, without a new directory version or a restart: a barrier waiting on it unblocks. Tests:
+each stage (write, fsync, rename, directory sync) recovered on the heartbeat once the backoff ran out
+and not before, with the heartbeat and a restart showing the version; the backoff doubling while the
+disk keeps failing; a newer version cancelling the retry; the review's refetch case. Removing the
+heartbeat retry fails every stage and the backoff test; removing the refetch write fails the
+review's case.
+
+**R3-09 fixed (2026-09-28).** A read-only change records the switch it replaces (read-only and
+reject mode) on its barrier, with its intent, before its hold is written, and a cancellation puts it
+back in the write that releases the hold (`ReleaseReadOnly`, on the file and etcd stores): a repeated
+switch-on canceled leaves the scope read-only, a reject-mode change goes back to the mode before it,
+and only a switch-on of a writable scope ends writable. The record says where to restore to, so a
+resumed owner or another node's cancellation restores the same; the canceled record's effect is
+none, and true. A repeated switch-on still holds and drains, re-proving quiescence, as the review's
+test expects. Tests: on a cluster and a placement, a repeated switch-on, retryable to reject, reject
+to retryable and writable to read-only, each canceled while held by a silent member, with the prior
+switch on the durable record before the cancel. Releasing to writable, as before, fails the six
+cases whose scope was read-only.
+
+The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
+has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
+plane screen shows started as healthy (H3d; with H3b every join spends a moment as a learner). A
+snapshot restore keeps its application epoch (H4). Capacity at 1,000 proxies (docs/bench/h2.md)
+stays open under T19.
+
 ### Planned correctness work (2026-09-24; no runtime fixes shipped here)
 
 A review of `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03` identified gaps in snapshot
@@ -26,7 +214,7 @@ do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) pro
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
-H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25; H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
+H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25 (qualified by the third review's R3-01 to R3-04 until their fixes, above, on 2026-09-28); H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
 that fails when its fix is reverted: T01 (monotonic member installs), T02 (a refused or
 uncommitted candidate changes no live secret, key or cluster, on the member, the control node
 and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease
@@ -52,7 +240,23 @@ control-plane baseline for H1–H5 (docs/bench/h0.md). H0 passed on 2026-09-24: 
 `make walkthrough` green, and a manual acceptance pass of the web UI on `make demo-ui` (a bucket
 spread over two MinIOs, moved onto a third backend, consolidated, and both MinIOs removed). That
 pass found and fixed eight UI and telemetry bugs, and added per-code status charts and per-bucket
-traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations, reported per member and per cluster), H1c (counted bundles, sets and transports; at most eight retired bundles, then installs back up), H1d (a checksummed, fsynced restart cache, durable reported apart from applied), H1e (`cluster credentials` and `proxy show` on API, CLI and UI) and H1f (docs/bench/h1.md: data path unchanged, a member install +20 % for the durable cache, transport reuse measured on the wire); `make fleet` and `make walkthrough` passed on the H1 build. H2 passed on 2026-09-25: H2a (admission gates on the proxy, drain barriers in the directory), H2b (proxy incarnations, retirement and attested resolution), H2c (heartbeats carry the drain proof; server-granted leases), H2d (durable barriers; blocked operations resume or cancel), H2e (cutover, movers, purge and credential drain through their gates), the review fixes, and H2f (acceptance: docs/bench/h2.md). H2f fixed six things the slices' tests had not caught (ADR-0021, decisions of 2026-09-25): a client disconnect made a mutation's outcome uncertain, which blocked every later step on the bucket; cutover paused writes for its whole quiet window; a step orphaned before its first write was recorded uncertain and kept offering cancel; forget lost the resolution of a killed process, so a restart revived it as unresolved; `operation wait` printed blockers of an ended record; and the heartbeat's size check left out the fallback counts. `--wait` is now the CLI's deadline, as the contract says. Heartbeats and barrier polls no longer copy the directory (a control-node heartbeat at 100,000 placements: 259 ms → 1.2 ms). Data path unchanged; a healthy barrier commits at p99 2.0 s against the 5 s target. `make fleet` (with a new H2 section and a barrier-latency section), `make walkthrough`, a 10-minute partition/owner-crash soak (`make soak`, 0 violations in 1.28 M operations), the property test, fuzz, race, lint, the UI gates and a manual UI pass on `make demo-ui` passed on the H2f build. Carried to T19: a barrier poll reads every member's whole record (0.2–0.8 s at 1,000 proxies), and heartbeat apply runs just under 1,000 a second on one etcd node. H3 is next. New endpoints/commands in those documents are design
+traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bundle), H1b (secret generations, reported per member and per cluster), H1c (counted bundles, sets and transports; at most eight retired bundles, then installs back up), H1d (a checksummed, fsynced restart cache, durable reported apart from applied), H1e (`cluster credentials` and `proxy show` on API, CLI and UI) and H1f (docs/bench/h1.md: data path unchanged, a member install +20 % for the durable cache, transport reuse measured on the wire); `make fleet` and `make walkthrough` passed on the H1 build. H2 passed on 2026-09-25: H2a (admission gates on the proxy, drain barriers in the directory), H2b (proxy incarnations, retirement and attested resolution), H2c (heartbeats carry the drain proof; server-granted leases), H2d (durable barriers; blocked operations resume or cancel), H2e (cutover, movers, purge and credential drain through their gates), the review fixes, and H2f (acceptance: docs/bench/h2.md). H2f fixed six things the slices' tests had not caught (ADR-0021, decisions of 2026-09-25): a client disconnect made a mutation's outcome uncertain, which blocked every later step on the bucket; cutover paused writes for its whole quiet window; a step orphaned before its first write was recorded uncertain and kept offering cancel; forget lost the resolution of a killed process, so a restart revived it as unresolved; `operation wait` printed blockers of an ended record; and the heartbeat's size check left out the fallback counts. `--wait` is now the CLI's deadline, as the contract says. Heartbeats and barrier polls no longer copy the directory (a control-node heartbeat at 100,000 placements: 259 ms → 1.2 ms). Data path unchanged; a healthy barrier commits at p99 2.0 s against the 5 s target. `make fleet` (with a new H2 section and a barrier-latency section), `make walkthrough`, a 10-minute partition/owner-crash soak (`make soak`, 0 violations in 1.28 M operations), the property test, fuzz, race, lint, the UI gates and a manual UI pass on `make demo-ui` passed on the H2f build. Carried to T19: a barrier poll reads every member's whole record (0.2–0.8 s at 1,000 proxies), and heartbeat apply runs just under 1,000 a second on one etcd node. H3 has begun: H3a (2026-09-25) makes a control node's join durable, as a
+`control-join` operation that reserves the membership, records its intent before the learner is added,
+reconciles a lost add answer by peer URL, follows the node to its promotion and resumes after owner loss;
+the key moves to a no-store bootstrap route, and the joining node resumes from an fsynced `join.json`
+(`join --resume`). A node joined right behind another waits for it rather than fail. `make fleet` passed
+on the H3a build. H3b (2026-09-28) makes a join cancelable until its node votes: the join's operation,
+not the node, now promotes the learner, and a cancellation is a request on the record that the join's
+owner carries out between two membership changes, removing the learner by its member ID (found by peer
+URL first when the add's answer was lost); one that arrives after the promotion removes nothing and
+answers `not_cancellable`. A join whose owner is lost offers cancel beside resume. The joined node
+follows its join: it resumes one whose owner is lost, records `promoted` in `join.json`, and stops,
+naming the data directory to remove, when the join is canceled. Four cancellation tests over a fake
+membership and a real-etcd cancel of a started and an unstarted learner, with negative controls (the
+voter check, the peer-URL reconciliation, and self-promotion restored each fail their test); race suite,
+lint, the UI gates and `make fleet` passed on the H3b build, the fleet's two joins promoted by their
+operations. Joins no longer count in `shunt_barrier_blockers`, whose catalogued codes they are not.
+H3c (removal by ID), H3d (observed health) and H3e (CLI/UI, acceptance) remain. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
@@ -67,9 +271,11 @@ runner that permits Unix sockets; they were not validated in the review sandbox.
   ended record take only an exact repeat, so a late heartbeat cannot undo an attested resolution.
   The regression runs on two nodes over embedded etcd and on a shared store, and fails on
   `9761192`. The Operations screen keeps an attestation with the record it was typed for, clears
-  it on success and keeps it on a failed request. `make walkthrough` stops at `ramp 1.0` on
+  it on success and keeps it on a failed request. `make walkthrough` stopped at `ramp 1.0` on
   `backend_outcome_unknown` on this build and on `9761192` alike (process-lifetime uncertain
-  counts, H2f); `make fleet` was not run, its ports being held by a running `make demo-ui`.
+  counts); H2f fixed that, and the walkthrough is green on the H3a build (`e4c89dc`, 2026-09-28:
+  61,014 verify operations, 0 errors). `make fleet` was not run for this fix, its ports being held
+  by a running `make demo-ui`.
 
 ### Previously recorded implementation work
 

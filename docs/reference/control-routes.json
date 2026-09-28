@@ -407,6 +407,14 @@
     "mutation": true
   },
   {
+    "method": "POST",
+    "pattern": "/v1/control/joins/{id}/bootstrap",
+    "verbs": [
+      "join"
+    ],
+    "mutation": true
+  },
+  {
     "method": "DELETE",
     "pattern": "/v1/control/members/{name}",
     "verbs": [

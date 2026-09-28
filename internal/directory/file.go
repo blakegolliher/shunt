@@ -260,6 +260,15 @@ func (d *FileDir) ClearBarrier(ctx context.Context, resource, id, actor string) 
 	return d.mutate(ctx, actor, "clear-barrier", key, func(f *File) error { return f.ClearBarrier(tenant, bucket, id) })
 }
 
+// ReleaseReadOnly implements Store.
+func (d *FileDir) ReleaseReadOnly(ctx context.Context, resource, id string, readOnly, reject bool, actor string) error {
+	key := strings.TrimPrefix(resource, "placement:")
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		key = clusterKey(name)
+	}
+	return d.mutate(ctx, actor, "release-read-only", key, func(f *File) error { return f.ReleaseReadOnly(resource, id, readOnly, reject) })
+}
+
 // PutCluster implements Store. The proxy's Prepare hook builds the cluster (and resolves its
 // secret_ref) before the write lands, so a cluster the proxy cannot sign for is refused. The
 // directory file carries only refs: a secret is refused.

@@ -57,9 +57,12 @@ type MoverRunner func(ctx context.Context, key string, req MoverRequest, report 
 // MoverLedgerReader returns a bounded newest-first-visible tail of the append-only object ledger.
 type MoverLedgerReader func(key string, limit int) ([]moveengine.LedgerEntry, error)
 
-// MoverWorker adapts the shared copy engine to a control Server. Snapshot must return a safe
-// current directory copy; Secrets resolves control: refs on a control node and may be nil in a lab.
+// MoverWorker adapts the shared copy engine to a control Server. Export, on a control node, is one
+// directory version and the cluster secrets that go with it, read from one store state (third
+// review, R3-05). A lab has no control: secrets and sets Snapshot instead, which must return a safe
+// current directory copy, and Secrets, if any, is read beside it.
 type MoverWorker struct {
+	Export       func() Export
 	Snapshot     func() *directory.File
 	Secrets      func() map[string]string
 	CursorDir    string
@@ -69,14 +72,21 @@ type MoverWorker struct {
 
 // Run implements MoverRunner.
 func (w MoverWorker) Run(ctx context.Context, key string, req MoverRequest, report func(Progress)) (MoverResult, error) {
-	if w.Snapshot == nil {
+	var f *directory.File
+	var secrets map[string]string
+	switch {
+	case w.Export != nil:
+		exp := w.Export()
+		f, secrets = exp.Snapshot.File(), exp.Secrets
+	case w.Snapshot != nil:
+		f = w.Snapshot()
+		if w.Secrets != nil {
+			secrets = w.Secrets()
+		}
+	default:
 		return MoverResult{}, fmt.Errorf("%w: the mover has no directory source", ErrUnavailable)
 	}
-	var secrets map[string]string
-	if w.Secrets != nil {
-		secrets = w.Secrets()
-	}
-	res, err := moveengine.Run(ctx, w.Snapshot(), secrets, moveengine.Options{
+	res, err := moveengine.Run(ctx, f, secrets, moveengine.Options{
 		Key: key, AcceptLostWriteWindow: req.AcceptLostWriteWindow,
 		UntilConverged: req.UntilConverged, MaxPasses: req.MaxPasses,
 		Paths: moveengine.Paths{CursorDir: w.CursorDir, LedgerDir: w.LedgerDir, LedgerBucket: w.LedgerBucket},
@@ -165,8 +175,13 @@ func (s *Server) runMover(tr *tracker, key string, req MoverRequest) (MoverResul
 	if req.External {
 		return s.runExternalMover(tr, key, req)
 	}
+	op := tr.snapshot()
 	return s.Mover(tr.ctx, key, req, func(p Progress) {
 		p.UpdatedAt = s.now().UTC()
+		p.Identity = op.Identity // the move this mover operation reserved (R3-02)
+		if op.Scope != nil {
+			p.Generation = op.Scope.Generation
+		}
 		if len(p.Ranges) == 0 {
 			p.Ranges = []MoverRange{{Name: "all keys", Cursor: p.LastKey,
 				Done: int64(p.Copied + p.Skipped + p.Vanished + p.Failed), Complete: p.Done}}

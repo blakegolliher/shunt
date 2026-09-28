@@ -76,12 +76,21 @@ func (c *Client) Load() error {
 	// The incarnation marker (ADR-0021 D2): what the previous process left, then this one's, on
 	// disk before anything is served. A marker that cannot be written keeps the proxy from
 	// starting: a process whose end no one could learn of must not serve.
-	c.previous = c.readPrevious()
-	if p := c.previous; p != nil && (p.State == control.IncarnationUnclean || p.Uncertain > 0) {
-		c.log.Warn("the previous process of this proxy did not retire cleanly; the control plane is told, and every barrier waits on it until an operator resolves it",
-			"incarnation", p.ID, "state", p.State, "uncertain", p.Uncertain)
+	predecessors, err := c.readPredecessors()
+	if err != nil {
+		return err
 	}
-	if err := c.mark(control.IncarnationActive, 0); err != nil {
+	for _, p := range predecessors {
+		if p.State == control.IncarnationUnclean || p.Uncertain > 0 {
+			c.log.Warn("an earlier process of this proxy did not retire cleanly; the control plane is told, and every barrier waits on it until an operator resolves it",
+				"incarnation", p.ID, "state", p.State, "uncertain", p.Uncertain)
+		}
+	}
+	c.marking.Lock()
+	c.predecessors, c.markState, c.markUncertain, c.registered = predecessors, control.IncarnationActive, 0, false
+	err = c.writeMarker()
+	c.marking.Unlock()
+	if err != nil {
 		return fmt.Errorf("incarnation marker: %w", err)
 	}
 	f, err := os.Open(c.cacheFile())
@@ -144,14 +153,31 @@ func (c *Client) decodeCache(data []byte) (d *control.Directory, why string) {
 	return d, ""
 }
 
-// persist writes d to the restart cache unless a newer version was already attempted. Writes are
-// serialized, so the cache moves forward like the install. A failure keeps the in-memory version
-// and the last durable cache, and is reported (status cache_error, the durable version in the
-// heartbeat) until a later write succeeds.
+// persist writes d to the restart cache unless it is durable already or a newer version was
+// attempted. Writes are serialized, so the cache moves forward like the install. A failure keeps the
+// in-memory version and the last durable cache, is reported (status cache_error, the durable
+// version in the heartbeat), and keeps d as the candidate retryCache writes again: a disk that
+// recovers makes the current version durable without waiting for a newer one (third review,
+// R3-08).
 func (c *Client) persist(d *control.Directory) {
 	c.caching.Lock()
 	defer c.caching.Unlock()
-	if d.Version <= c.cached {
+	c.persistLocked(d)
+}
+
+// cacheRetry is the newest version whose cache write failed, and when to write it again.
+type cacheRetry struct {
+	d    *control.Directory
+	at   time.Time
+	wait time.Duration
+}
+
+// maxCacheRetryWait caps the backoff between retries of a failed cache write.
+const maxCacheRetryWait = 30 * time.Second
+
+// persistLocked is persist with c.caching held.
+func (c *Client) persistLocked(d *control.Directory) {
+	if d.Version < c.cached || d.Version <= c.durable.Load() {
 		return
 	}
 	c.cached = d.Version
@@ -162,11 +188,31 @@ func (c *Client) persist(d *control.Directory) {
 		if c.Metrics != nil {
 			c.Metrics.CacheFailures.WithLabelValues(stage).Inc()
 		}
-		c.log.Warn("directory cache not durable; a restart with the control plane down would serve the last durable version", "version", d.Version, "durable", c.durable.Load(), "stage", stage, "err", err.Error())
+		wait := c.cfg.Interval
+		if r := c.retry; r != nil && r.d.Version == d.Version {
+			wait = min(2*r.wait, maxCacheRetryWait)
+		}
+		c.retry = &cacheRetry{d: d, at: c.Now().Add(wait), wait: wait}
+		c.log.Warn("directory cache not durable; a restart with the control plane down would serve the last durable version; the write is retried",
+			"version", d.Version, "durable", c.durable.Load(), "stage", stage, "retry_in", wait.String(), "err", err.Error())
 		return
 	}
+	if c.cacheErr.Load() != nil {
+		c.log.Info("directory cache durable again", "version", d.Version)
+	}
+	c.retry = nil
 	c.cacheErr.Store(nil)
 	c.durable.Store(d.Version)
+}
+
+// retryCache writes again the newest version whose cache write failed, once its backoff has run
+// out. It runs on the heartbeat, never on a request.
+func (c *Client) retryCache() {
+	c.caching.Lock()
+	defer c.caching.Unlock()
+	if r := c.retry; r != nil && !c.Now().Before(r.at) {
+		c.persistLocked(r.d)
+	}
 }
 
 // writeCache writes the envelope to a 0600 temporary file in the cache directory, syncs it, renames

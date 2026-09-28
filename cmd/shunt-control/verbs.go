@@ -52,6 +52,9 @@ func (o apiOptions) client() (*apiClient, error) {
 type apiClient struct {
 	base  string
 	token string
+	// idem, if set, is sent as the Idempotency-Key of every request that is not a GET: a join's
+	// request id, so a retry answers the same operation (ADR-0021).
+	idem string
 }
 
 func (c *apiClient) do(ctx context.Context, method, path string, body any) (*http.Response, error) {
@@ -70,6 +73,9 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any) (*htt
 	req.Header.Set("Content-Type", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.idem != "" && method != http.MethodGet {
+		req.Header.Set(control.HeaderIdempotencyKey, c.idem)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -92,18 +98,28 @@ func (c *apiClient) call(ctx context.Context, method, path string, body, out any
 	if resp.StatusCode >= 300 {
 		var e control.Error
 		if json.Unmarshal(data, &e) == nil && e.Message != "" {
+			msg := e.Message
 			if e.Code == "refused" {
-				return fmt.Errorf("refused: %s", e.Message)
+				msg = "refused: " + msg
 			}
-			return fmt.Errorf("%s", e.Message)
+			return &apiError{status: resp.StatusCode, code: e.Code, msg: msg}
 		}
-		return fmt.Errorf("control API %s %s: HTTP %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+		return &apiError{status: resp.StatusCode, msg: fmt.Sprintf("control API %s %s: HTTP %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))}
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
 	}
 	return nil
 }
+
+// apiError is a control API answer other than 2xx: its status, its code and its message.
+type apiError struct {
+	status int
+	code   string
+	msg    string
+}
+
+func (e *apiError) Error() string { return e.msg }
 
 func printJSON(cmd *cobra.Command, v any) error {
 	enc := json.NewEncoder(cmd.OutOrStdout())

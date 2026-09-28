@@ -17,6 +17,8 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
 	"go.uber.org/zap"
+
+	"github.com/blakegolliher/shunt/internal/control"
 )
 
 // The embedded etcd member (ADR-0015). shunt-control runs one per control node. There is no
@@ -114,7 +116,7 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 	ec.LogOutputs = []string{"stderr"}
 	// A member joining right after it was added can find the cluster's member list not yet
 	// settled ("incompatible with current running cluster"); it is a matter of seconds. It joins as
-	// a learner (MemberAdd), so the members it asks keep their quorum and can answer it.
+	// a learner (AddLearner), so the members it asks keep their quorum and can answer it.
 	var e *embed.Etcd
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -157,18 +159,10 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 		}
 	}
 	n := &Node{cfg: cfg, e: e, cli: v3client.New(e.Server), socket: socket, rmSock: rmSock}
-	if cfg.Existing {
-		if err := n.promote(ctx); err != nil {
-			if !restart {
-				n.Close()
-				return nil, err
-			}
-			// A learner restarting (it stopped between its join and its promotion) may find no
-			// leader to promote it yet; it runs as a learner, and its next start tries again.
-			if cfg.Log != nil {
-				cfg.Log.Warn("etcd member is still a learner: not promoted to a voting member yet", "name", cfg.Name, "err", err)
-			}
-		}
+	if n.learner() && cfg.Log != nil {
+		// The join's operation promotes it once it has caught up (ADR-0021 D4): a member never
+		// promotes itself, so a cancellation of its join cannot race a promotion.
+		cfg.Log.Info("etcd member runs as a learner: its join promotes it to a voting member once it has caught up", "name", cfg.Name)
 	}
 	if cfg.Log != nil {
 		cfg.Log.Info("etcd member ready", "name", cfg.Name, "peer", cfg.PeerURL, "data_dir", cfg.DataDir, "members", len(e.Server.Cluster().Members()))
@@ -200,48 +194,43 @@ func (n *Node) Close() {
 // Err reports the member's fatal errors, if any.
 func (n *Node) Err() <-chan error { return n.e.Err() }
 
-// MemberAdd adds a member at peerURL as a learner and returns the initial-cluster string it must
-// start with. The name is the caller's; etcd learns it when the member starts. A learner does not
-// vote, so adding it leaves the quorum as it was: added as a voter, a second member would make the
-// first alone short of quorum, unable to answer the new member's own startup checks, and the join
-// would hang on them for seconds or fail ("incompatible with current running cluster"). The member
-// promotes itself once it has caught up (promote).
-func (n *Node) MemberAdd(ctx context.Context, name, peerURL string) (string, error) {
-	for _, m := range n.e.Server.Cluster().Members() {
-		if m.Name == name {
-			return "", fmt.Errorf("a member named %s already exists (peer %s); remove it first, or choose another name", name, strings.Join(m.PeerURLs, ","))
-		}
+// ListMembers is the member list, read linearizably: a membership change needs quorum, and a join
+// reconciles against it (ADR-0021 D4).
+func (n *Node) ListMembers(ctx context.Context) ([]control.EtcdMember, error) {
+	ml, err := n.cli.MemberList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("etcd member list: %w", err)
 	}
+	out := make([]control.EtcdMember, 0, len(ml.Members))
+	for _, m := range ml.Members {
+		out = append(out, control.EtcdMember{ID: m.ID, Name: m.Name, PeerURLs: m.PeerURLs, Learner: m.IsLearner})
+	}
+	return out, nil
+}
+
+// AddLearner adds a non-voting member at peerURL and returns its ID. A learner does not vote, so
+// adding it leaves the quorum as it was: added as a voter, a second member would make the first
+// alone short of quorum, unable to answer the new member's own startup checks. The member promotes
+// itself once it has caught up (promote). etcd refuses a second member with the same peer URL, which
+// is what lets a join retry an add whose answer was lost.
+func (n *Node) AddLearner(ctx context.Context, peerURL string) (uint64, error) {
 	// etcd refuses a membership change while a member it already has is not yet caught up
 	// ("unhealthy cluster"), which is the normal state for a few seconds after the previous join.
-	var resp *clientv3.MemberAddResponse
-	var err error
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		resp, err = n.cli.MemberAddAsLearner(ctx, []string{peerURL})
-		if err == nil || !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
-			break
+		resp, err := n.cli.MemberAddAsLearner(ctx, []string{peerURL})
+		if err == nil {
+			return resp.Member.ID, nil
+		}
+		if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
+			return 0, fmt.Errorf("etcd member add: %w", err)
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return 0, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("etcd member add: %w", err)
-	}
-	parts := make([]string, 0, len(resp.Members))
-	for _, m := range resp.Members {
-		mn := m.Name
-		if m.ID == resp.Member.ID {
-			mn = name // not started yet: etcd does not know its name
-		}
-		for _, u := range m.PeerURLs {
-			parts = append(parts, mn+"="+u)
-		}
-	}
-	return strings.Join(parts, ","), nil
 }
 
 // MemberInfo is one control node as `shunt-control member list` shows it.
@@ -307,24 +296,31 @@ func (n *Node) MemberRemove(ctx context.Context, name string) error {
 	}
 	for _, m := range ml.Members {
 		if m.Name == name {
-			deadline := time.Now().Add(30 * time.Second)
-			for {
-				_, err := n.cli.MemberRemove(ctx, m.ID)
-				if err == nil {
-					return nil
-				}
-				if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
-					return fmt.Errorf("etcd member remove: %w", err)
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(500 * time.Millisecond):
-				}
-			}
+			return n.RemoveMember(ctx, m.ID)
 		}
 	}
 	return fmt.Errorf("no member named %s", name)
+}
+
+// RemoveMember removes member id. etcd refuses a membership change while a member it has is not yet
+// caught up ("unhealthy cluster"), which is the normal state for a few seconds after a join, so it
+// retries that for a while.
+func (n *Node) RemoveMember(ctx context.Context, id uint64) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, err := n.cli.MemberRemove(ctx, id)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
+			return fmt.Errorf("etcd member remove: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // Snapshot streams a point-in-time snapshot of the store to w: `shunt-control snapshot save`.
@@ -364,38 +360,29 @@ func Restore(snapshotPath, dataDir, name, peerURL string) error {
 	return nil
 }
 
-// promote makes this member a voter once it has caught up with the leader, which etcd requires
-// ("can only promote a learner member which is in sync with leader"); a member that votes already
-// is left as it is. The request goes to the leader through this member's own server.
-func (n *Node) promote(ctx context.Context) error {
+// Promote makes learner id a voter: one request, which a join's operation repeats until it lands.
+// etcd refuses a learner that has not caught up with the leader ("can only promote a learner member
+// which is in sync with leader"); that refusal is control.ErrLearnerNotReady, and changes nothing.
+func (n *Node) Promote(ctx context.Context, id uint64) error {
+	_, err := n.cli.MemberPromote(ctx, id)
+	switch {
+	case err == nil:
+		return nil
+	case strings.Contains(err.Error(), "in sync with leader"):
+		return fmt.Errorf("etcd member promote: %w (%w)", control.ErrLearnerNotReady, err)
+	}
+	return fmt.Errorf("etcd member promote: %w", err)
+}
+
+// learner reports whether this member is a learner, from its own view of the membership.
+func (n *Node) learner() bool {
 	id := n.e.Server.MemberID()
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		learner := false
-		for _, m := range n.e.Server.Cluster().Members() {
-			if m.ID == id {
-				learner = m.IsLearner
-			}
-		}
-		if !learner {
-			return nil
-		}
-		_, err := n.cli.MemberPromote(ctx, uint64(id))
-		if err == nil {
-			if n.cfg.Log != nil {
-				n.cfg.Log.Info("etcd member promoted to a voting member", "name", n.cfg.Name)
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("etcd: promoting %s to a voting member: %w", n.cfg.Name, err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+	for _, m := range n.e.Server.Cluster().Members() {
+		if m.ID == id {
+			return m.IsLearner
 		}
 	}
+	return false
 }
 
 // WaitReady blocks until the member has a leader, or ctx ends: after a restart, before serving.

@@ -187,6 +187,37 @@ func (f *File) SetClusterReadOnly(name string, readOnly, reject bool, barrier st
 	return nil
 }
 
+// ReleaseReadOnly removes read-only hold id from a placement or a cluster (resource) and sets its
+// read-only switch to readOnly and reject in the same write: a read-only change canceled before its
+// commit, back to the switch it replaced (third review, R3-09). Only while the scope still carries
+// hold id: once the change's commit cleared it, the change is in force and stays.
+func (f *File) ReleaseReadOnly(resource, id string, readOnly, reject bool) error {
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		c, ok := f.Clusters[name]
+		if !ok {
+			return fmt.Errorf("%w: cluster %q is not in the directory", ErrNotFound, name)
+		}
+		if c.Barrier == nil || c.Barrier.ID != id {
+			return fmt.Errorf("%w: cluster %s does not carry barrier %s", ErrConflict, name, id)
+		}
+		c.ReadOnly, c.RejectWrites, c.Barrier = readOnly, readOnly && reject, nil
+		f.Clusters[name] = c
+		return nil
+	}
+	k := strings.TrimPrefix(resource, "placement:")
+	p, ok := f.Placements[k]
+	if !ok {
+		return fmt.Errorf("%w: no bucket %s in the directory", ErrNotFound, k)
+	}
+	if p.Barrier == nil || p.Barrier.ID != id {
+		return fmt.Errorf("%w: %s does not carry barrier %s", ErrConflict, k, id)
+	}
+	np := p.clone()
+	np.ReadOnly, np.RejectWrites, np.Barrier = readOnly, readOnly && reject, nil
+	f.Placements[k] = np
+	return nil
+}
+
 // ClearClusterBarrier removes barrier id from a cluster, and only that one.
 func (f *File) ClearClusterBarrier(name, id string) error {
 	c, ok := f.Clusters[name]

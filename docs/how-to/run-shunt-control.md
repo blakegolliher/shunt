@@ -31,13 +31,26 @@ shunt-control init --name c1 --data-dir /var/lib/shunt-control --peer-url http:/
   --api c1:9901 --token-ref file:/etc/shunt/control.token --plaintext
 ```
 
-Each further node joins through a running node's API, receives the cluster's member list and the
-key, and starts:
+Each further node joins through a running node's API. The join is an operation on the cluster
+(`shunt operation show <id>`, ADR-0021 D4): the node is added as a learner, fetches the member list
+and the key from the join's bootstrap, starts, and is promoted to a voter by the join once it has
+caught up. It records its progress in `--data-dir/join.json`, fsynced before each step, so a join
+interrupted anywhere (the network, the disk, the process) resumes when the same command runs again;
+`--resume <operation-id>` carries on a join whose `join.json` was lost. The joined node follows its
+join until it votes, and resumes it on `--existing` should the control node running it be lost. The
+data directory must be empty the first time:
 
 ```sh
 shunt-control join --name c2 --data-dir /var/lib/shunt-control --peer-url http://c2:2380 \
   --api c2:9901 --token-ref file:/etc/shunt/control.token --plaintext --existing http://c1:9901
 ```
+
+A join can be canceled until its node votes: `shunt operation cancel <id>` (or Cancel on the join
+in the Operations screen). The control node running the join removes its learner by member ID and
+the record ends `cancelled`; the joining node, if it started, stops with the reason and the data
+directory to remove before joining again. A cancellation that arrives after the promotion removes
+nothing and is refused (`not_cancellable`): the node votes, and removing it is `shunt-control member
+remove`, which changes the quorum.
 
 Both commands are also how a node is restarted: on a data directory that already holds a member
 they start it again and change nothing, so the same line is the node's service definition

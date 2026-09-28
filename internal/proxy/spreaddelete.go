@@ -31,8 +31,10 @@ import (
 // way its source leg is sent the request first and every other leg after, the order a single
 // DELETE of a moving key takes (ADR-0004 race 1). The answer takes each key's entry from the leg
 // that owns it: for a key in the move, the destination. A leg other than the move's source that
-// does not answer fails the request, since its keys' outcomes are unknown; a source leg that does
-// not answer is logged, as a dual delete's is, and the owners' answers stand.
+// does not answer fails the request, since its keys' outcomes are unknown. A source leg that does
+// not answer is logged, as a dual delete's is, for the keys in the move, whose owners' answers
+// stand; for a key the source still owns (outside the move's scope or range) it is the only answer
+// there is, so that key gets an error entry, which quiet mode keeps (third review, R3-07).
 
 // deleteResult is DeleteObjects' answer, as far as shunt reads and writes it.
 type deleteResult struct {
@@ -54,6 +56,28 @@ type deleteError struct {
 	VersionID string `xml:"VersionId,omitempty"`
 	Code      string `xml:"Code"`
 	Message   string `xml:"Message"`
+}
+
+// deleteRequest is a DeleteObjects body, as far as shunt reads it: the objects it names.
+type deleteRequest struct {
+	XMLName xml.Name `xml:"Delete"`
+	Objects []struct {
+		Key       string `xml:"Key"`
+		VersionID string `xml:"VersionId"`
+	} `xml:"Object"`
+}
+
+// parseDeleteRequest reads the objects a DeleteObjects body names; the body is bounded (1 MiB)
+// before it is read.
+func parseDeleteRequest(body []byte) (deleteRequest, error) {
+	var req deleteRequest
+	if err := xml.Unmarshal(body, &req); err != nil {
+		return deleteRequest{}, err
+	}
+	if req.XMLName.Local != "Delete" {
+		return deleteRequest{}, fmt.Errorf("not a Delete: <%s>", req.XMLName.Local)
+	}
+	return req, nil
 }
 
 // maxDeleteResult bounds a leg's answer: 1000 keys of at most 1024 bytes each, with their tags.
@@ -136,14 +160,18 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 	// The bucket's gates, as for any delete (ADR-0021 D2): a mutation token, and, while a move is
 	// under way, a source token; a closed source gate pauses the delete (the DELETE rule).
 	bucketKey := directory.Key(o.tenant, bucket)
-	tok, _, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
+	tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations, rt.snap.Version())
 	if !admitted {
-		h.refuseWrite(w, r, o, bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+		h.refuseGate(w, r, o, bucket, barrier)
 		return
 	}
 	o.tok = tok
 	if p.Move != nil {
-		src, _, ok := h.Gates.Enter(bucketKey, admission.Source)
+		src, barrier, ok := h.Gates.Enter(bucketKey, admission.Source, rt.snap.Version())
+		if barrier == admission.Superseded {
+			h.refuseGate(w, r, o, bucket, barrier)
+			return
+		}
 		if !ok || (p.Barrier != nil && p.Barrier.Kind == config.BarrierSource) {
 			src.Release(h.Gates, admission.Definitive)
 			h.refuseWrite(w, r, o, bucket, "source_closed", "This bucket's deletes pause while its migration source is removed. Retry shortly.")
@@ -196,7 +224,8 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 	// Every leg's answer, read; a leg that did not answer, or answered an error for the whole
 	// request, fails it unless it is the move's source.
 	results := map[string]deleteResult{}
-	sourceFailed := false
+	sourceFailed, sourceDispatched := false, false
+	var sourceErr error
 	for _, l := range legs {
 		source := p.Move != nil && l.id == p.Move.From
 		var res deleteResult
@@ -206,7 +235,7 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 			err = l.err
 			if dispatched(l.err, nil, 0) {
 				if source {
-					o.srcUncertain = true
+					o.srcUncertain, sourceDispatched = true, true
 				} else {
 					o.uncertain = true
 				}
@@ -223,7 +252,7 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 				h.Log.Error("delete did not reach the migration source; the objects can come back when the mover copies them (ADR-0004)",
 					"request_id", o.rid, "bucket", bucketKey, "leg", l.id, "source", l.cl.Name, "err", err.Error())
 			}
-			sourceFailed = true
+			sourceFailed, sourceErr = true, err
 			continue
 		}
 		if err != nil {
@@ -264,6 +293,26 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 		for _, e := range res.Errors {
 			if owner(e.Key) == l.id {
 				out.Errors = append(out.Errors, e)
+			}
+		}
+	}
+	if sourceFailed {
+		// The source is a redundant copy only for the keys in the move. A key it still owns has no
+		// other answer: it is an error, never silence (R3-07), and a delete of it that may have
+		// reached the source leaves a mutation whose outcome is unknown.
+		req, perr := parseDeleteRequest(body)
+		if perr != nil {
+			h.upstreamError(w, r, o, fmt.Errorf("leg %s answered nothing, and the request's keys could not be read to answer for them: %w", p.Move.From, perr))
+			return
+		}
+		for _, obj := range req.Objects {
+			if owner(obj.Key) != p.Move.From {
+				continue
+			}
+			out.Errors = append(out.Errors, deleteError{Key: obj.Key, VersionID: obj.VersionID, Code: string(s3.InternalError),
+				Message: "The backend that holds this key did not answer the delete: " + sourceErr.Error()})
+			if sourceDispatched {
+				o.uncertain = true
 			}
 		}
 	}

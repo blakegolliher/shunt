@@ -56,7 +56,13 @@ func (k *GateKeeper) applyLocked() {
 		}
 	}
 	sticky := k.installed != nil && k.served != nil && k.served.Version() < k.installed.Version()
-	k.Gates.Apply(closures, sticky)
+	var version int64 // a gate opened now opens at the newest version: an older route is superseded
+	for _, snap := range []*directory.Snapshot{k.installed, k.served} {
+		if snap != nil && snap.Version() > version {
+			version = snap.Version()
+		}
+	}
+	k.Gates.Apply(closures, version, sticky)
 }
 
 // dispatched reports whether a failed upstream exchange may have reached the backend whole: the

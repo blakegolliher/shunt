@@ -128,14 +128,16 @@ type Heartbeat struct {
 	// it has installed one.
 	Identity directory.Identity `json:"identity,omitzero"`
 	Started  time.Time          `json:"started"`
-	// Incarnation is this process's id. Previous is the process before it on this proxy, as the
-	// proxy's own marker recorded its end (retired, or unclean: it never got to retire), sent
-	// until the control plane says it has recorded it (HeartbeatAnswer.PreviousRecorded): a
-	// process that crashed while the control plane was unreachable is evidence only the proxy
-	// holds. Uncertain is how many backend outcomes this process has never learned.
-	Incarnation string       `json:"incarnation"`
-	Previous    *Incarnation `json:"previous,omitempty"`
-	Uncertain   int64        `json:"uncertain,omitempty"`
+	// Incarnation is this process's id. Previous are the processes before it on this proxy that
+	// the control plane has not recorded, oldest first, as the proxy's own marker recorded their
+	// ends (retired, or unclean: they never got to retire), sent until the control plane says it
+	// has recorded them (HeartbeatAnswer.PreviousRecorded): processes that started and crashed
+	// while the control plane was unreachable are evidence only the proxy holds, however many
+	// restarts they took (at most MaxUnresolvedIncarnations; third review, R3-04). Uncertain is
+	// how many backend outcomes this process has never learned.
+	Incarnation string        `json:"incarnation"`
+	Previous    []Incarnation `json:"previous,omitempty"`
+	Uncertain   int64         `json:"uncertain,omitempty"`
 	// Seq counts this member's heartbeats since it started, so a caller can tell which reports
 	// were assembled after a point in time.
 	Seq int64 `json:"seq"`
@@ -421,9 +423,16 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("incarnation %q: want 32 lowercase hex characters", hb.Incarnation))
 		return
 	}
-	if hb.Previous != nil && (!ValidIncarnation(hb.Previous.ID) || hb.Previous.ID == hb.Incarnation || (hb.Previous.State != IncarnationRetired && hb.Previous.State != IncarnationUnclean) || hb.Previous.Uncertain < 0) {
-		writeError(w, http.StatusBadRequest, "bad_request", "previous: want another incarnation's id, its state retired or unclean, and a non-negative uncertain count")
+	if len(hb.Previous) > MaxUnresolvedIncarnations {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("previous: at most %d incarnations", MaxUnresolvedIncarnations))
 		return
+	}
+	for i, p := range hb.Previous {
+		if !ValidIncarnation(p.ID) || p.ID == hb.Incarnation || (p.State != IncarnationRetired && p.State != IncarnationUnclean) || p.Uncertain < 0 ||
+			slices.ContainsFunc(hb.Previous[:i], func(q Incarnation) bool { return q.ID == p.ID }) {
+			writeError(w, http.StatusBadRequest, "bad_request", "previous: want other incarnations' ids, once each, their state retired or unclean, and non-negative uncertain counts")
+			return
+		}
 	}
 	if hb.Uncertain < 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", "uncertain: want a non-negative count")
@@ -452,6 +461,37 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, HeartbeatAnswer{Seq: hb.Seq, Identity: snap.Identity(), Version: snap.Version(), LeaseTTL: g.LeaseTTL,
 		Retire: g.Retire, PreviousRecorded: g.PreviousRecorded})
+}
+
+// Export is one directory version with the client keys and cluster secrets that go with it: what
+// GET /v1/directory hands a member, which installs and caches it as one bundle.
+type Export struct {
+	Snapshot    *directory.Snapshot
+	Credentials []sigv4.Credential
+	Secrets     map[string]string
+}
+
+// export reads one version whole (R3-05): from the store's one state when it can (Export), or else
+// the directory, the keys and the secrets one after another, with the directory's version read
+// again after them and the reads repeated when it moved, so a rotation that lands between them
+// cannot pair one version's routing with another's secrets.
+func (s *Server) export() (Export, error) {
+	if s.Export != nil {
+		return s.Export(), nil
+	}
+	for range 8 {
+		exp := Export{Snapshot: s.Dir.Snapshot()}
+		if s.Keys != nil {
+			exp.Credentials = s.Keys.All()
+		}
+		if s.ClusterSecrets != nil {
+			exp.Secrets = s.ClusterSecrets()
+		}
+		if s.Dir.Snapshot().Version() == exp.Snapshot.Version() {
+			return exp, nil
+		}
+	}
+	return Export{}, fmt.Errorf("%w: the directory kept changing while it was read; retry", ErrUnavailable)
 }
 
 // RetireRequest is POST /v1/fleet/{id}/retire. From a proxy, it reports that Incarnation has
@@ -866,14 +906,18 @@ func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if snap.Version() > since {
-			payload := Directory{File: *snap.File(), Credentials: []Credential{}}
-			if s.Keys != nil {
-				for _, c := range s.Keys.All() {
-					payload.Credentials = append(payload.Credentials, Credential{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: c.Tenant, Buckets: c.Buckets})
-				}
+			exp, err := s.export()
+			if err != nil {
+				fail(w, err)
+				return
 			}
-			if s.ClusterSecrets != nil {
-				payload.Secrets = s.ClusterSecrets()
+			if err := checkLineage(exp.Snapshot, have, since); err != nil {
+				fail(w, err)
+				return
+			}
+			payload := Directory{File: *exp.Snapshot.File(), Credentials: make([]Credential, 0, len(exp.Credentials)), Secrets: exp.Secrets}
+			for _, c := range exp.Credentials {
+				payload.Credentials = append(payload.Credentials, Credential{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: c.Tenant, Buckets: c.Buckets})
 			}
 			writeJSON(w, http.StatusOK, payload)
 			return

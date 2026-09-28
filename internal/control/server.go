@@ -53,6 +53,11 @@ type Server struct {
 	// ClusterSecrets resolves the cluster secret_refs only the control plane can (control:<name>),
 	// for GET /v1/directory and the mover. nil: every ref resolves on the reader's own host.
 	ClusterSecrets func() map[string]string
+	// Export, if set, is one version whole for GET /v1/directory: its directory, client keys and
+	// cluster secrets from one store state (third review, R3-05). nil: they are read separately
+	// and the directory's version checked around the reads, which is all a lab's separate
+	// directory and key files allow.
+	Export func() Export
 	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab. LeaseTTL is the grant
 	// every heartbeat answer carries, for the diagnostics.
 	Fleet    Fleet
@@ -75,6 +80,9 @@ type Server struct {
 	// ConfirmKey keys the confirmation tokens dry runs issue; every control node shares one.
 	// Empty: a random key for this process, so a lab's tokens die with it.
 	ConfirmKey []byte
+	// Members is the control plane's own etcd membership, which a join changes (ADR-0021 D4). nil:
+	// a lab proxy, which has none.
+	Members *Membership
 	// Mover runs the copy engine for a browser-started mover operation. It is installed at the
 	// process edge and never runs in a proxy request handler.
 	Mover MoverRunner
@@ -588,8 +596,13 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 			}
 		}
 	}
+	// A report shows only the move it describes (R3-02): while the bucket is MIGRATING, one from
+	// another generation of the placement is an earlier move's, or from before a later change, and
+	// is not shown as this move's convergence. After cutover the report that authorized it stays.
+	snap := s.Dir.Snapshot()
+	gen := snap.Generation(directory.PlacementResource(key))
 	s.mu.Lock()
-	if pr, ok := s.progress[key]; ok {
+	if pr, ok := s.progress[key]; ok && pr.Identity == snap.Identity() && (p.State != directory.StateMigrating || pr.Generation == gen) {
 		ps.Mover = &pr
 	}
 	s.mu.Unlock()

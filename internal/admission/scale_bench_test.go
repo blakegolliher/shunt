@@ -49,7 +49,7 @@ func BenchmarkEnterReleaseSpread(b *testing.B) {
 	g := New()
 	for i := range keys {
 		keys[i] = fmt.Sprintf("tenant-%03d/bucket-%06d", i%1000, i)
-		tok, _, _ := g.Enter(keys[i], Mutations) // gates are made on first use; this is the steady state
+		tok, _, _ := g.Enter(keys[i], Mutations, 0) // gates are made on first use; this is the steady state
 		tok.Release(g, Definitive)
 	}
 	var worker atomic.Int64
@@ -57,7 +57,7 @@ func BenchmarkEnterReleaseSpread(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		i := int(worker.Add(1)) * 7919
 		for pb.Next() {
-			tok, _, ok := g.Enter(keys[i%n], Mutations)
+			tok, _, ok := g.Enter(keys[i%n], Mutations, 0)
 			if !ok {
 				b.Error("an open gate refused")
 				return
@@ -77,7 +77,7 @@ func BenchmarkEnterClosedParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if _, barrier, ok := g.Enter("acme/held", Mutations); ok || barrier == "" {
+			if _, barrier, ok := g.Enter("acme/held", Mutations, 0); ok || barrier == "" {
 				b.Error("a closed gate admitted")
 				return
 			}
@@ -176,14 +176,14 @@ func BenchmarkApply100k(b *testing.B) {
 	snap := directory.NewSnapshot(scaleDirectory(100_000, 100, false))
 	g := New()
 	snap.EachPlacement(func(key string, _ *directory.Placement) bool {
-		tok, _, _ := g.Enter(key, Mutations)
+		tok, _, _ := g.Enter(key, Mutations, 0)
 		tok.Release(g, Definitive)
 		return true
 	})
 	closures, _ := g.Barriers(snap)
 	b.ReportAllocs()
 	for b.Loop() {
-		g.Apply(closures, false)
+		g.Apply(closures, snap.Version(), false)
 	}
 	b.ReportMetric(100_000, "gates/op")
 }

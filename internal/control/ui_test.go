@@ -41,7 +41,7 @@ func (rg *rig) cutOver() {
 	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
 	rg.vast02.put(rg.t, "data01-001", "a", "one")
 	rg.vast02.put(rg.t, "data01-001", "dir/b", "two")
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true}), nil)
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "5s"}, nil)
 }
 

@@ -282,6 +282,10 @@ type Store interface {
 	// named from a placement (PlacementResource) or a cluster (ClusterResource), and only that one.
 	SetBarrier(ctx context.Context, tenant, bucket string, b Barrier, actor string) error
 	ClearBarrier(ctx context.Context, resource, id, actor string) error
+	// ReleaseReadOnly removes read-only hold id from a placement or cluster resource and sets its
+	// read-only switch to readOnly and reject in the same write: a canceled read-only change, back
+	// to the switch it replaced.
+	ReleaseReadOnly(ctx context.Context, resource, id string, readOnly, reject bool, actor string) error
 	// Adopt takes over an existing backend bucket as an ACTIVE placement.
 	Adopt(ctx context.Context, tenant, bucket, cluster, backend, actor string) error
 	// SetTarget records the cluster and backend bucket `shunt expand` prepared, on an ACTIVE placement.

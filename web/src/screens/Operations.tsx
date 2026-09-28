@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { cancelOperation, listOperations, resolveWorker, resumeOperation, unfinished } from '../api/client'
+import { cancelOperation, cancelOutcome, listOperations, resolveWorker, resumeOperation, unfinished } from '../api/client'
 import type { Operation } from '../api/client'
 import { Card } from '../components/Card'
 import { useStore } from '../store'
@@ -101,7 +101,7 @@ export function Operations() {
               <textarea id="worker-attestation" required value={attested} onChange={(event) => setAttestation({ op: current.id, text: event.target.value })} className="rounded-lg border border-ink-700 bg-ink-950 p-2 text-xs text-paper" rows={2} />
               <button type="submit" disabled={busy || attested.trim() === '' || workerSession(current) === ''} className="justify-self-start rounded-lg border border-red-500 px-3 py-1 text-xs font-semibold text-red-100">Resolve worker session</button>
             </form>
-            : <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : `${op.kind} cancelled; nothing changed`)} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
+            : <button key={action} type="button" disabled={busy} onClick={() => void act(() => action === 'resume' ? resumeOperation(token, current.id) : cancelOperation(token, current.id), (op) => action === 'resume' ? `${op.kind} resumed on ${op.node ?? 'this node'}` : cancelOutcome(op))} className={`rounded-lg border px-3 py-1 text-xs font-semibold ${action === 'cancel' ? 'border-red-500 text-red-100' : 'border-ember-500 text-paper'}`}>{action === 'resume' ? 'Resume here' : 'Cancel before commit'}</button>) : 'none'}</dd>
           <dt className="text-muted">Actor</dt><dd className="font-mono text-xs">{current.actor}{current.node ? ` on ${current.node}` : ''}</dd>
           {current.request_id && <><dt className="text-muted">Request</dt><dd className="font-mono text-xs">{current.request_id}</dd></>}
         </dl>}

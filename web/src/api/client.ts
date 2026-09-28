@@ -173,6 +173,10 @@ export interface MoverRange {
 }
 
 export interface MoverProgress {
+  // identity and generation bind the report to the move it describes; the server shows a MIGRATING
+  // bucket's report only for its current generation (R3-02).
+  identity?: { cluster_id: string; epoch: string }
+  generation?: number
   source: string
   primary: string
   pass: number
@@ -211,10 +215,14 @@ export interface Operation {
   allowed_actions?: string[]
   blockers?: Blocker[]
   blocker_count?: number
-  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number; dispatch_started?: boolean }
+  // barrier.prior is the read-only switch a read-only change replaces: what a cancel puts back (R3-09).
+  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number; dispatch_started?: boolean; prior?: { read_only: boolean; reject?: boolean } }
   // worker is an external mover's session (`shunt migrate run`): an expired one is resolved by the
   // operator with an attestation (resolve-worker), which the session then keeps.
   worker?: WorkerSession
+  // cancel_request is a cancellation asked of a control-plane join, which the join's owner carries
+  // out (ADR-0021 D4): the record stays unfinished until the learner is removed.
+  cancel_request?: { actor: string; at: string }
   args?: Record<string, unknown>
   owner_term?: number
   phase?: string
@@ -224,6 +232,12 @@ export interface Operation {
   version?: number
   result?: unknown
   error?: { code: string; message: string }
+}
+
+// cancelOutcome says what a cancel request's answer means: a join answers 202 with its record still
+// unfinished while its owner removes the learner, so success is only a record that ended cancelled.
+export function cancelOutcome(op: Operation): string {
+  return op.status === 'cancelled' ? `${op.kind} cancelled; nothing changed` : `${op.kind} cancellation requested; the operation is ${op.status}`
 }
 
 export interface WorkerSession { id: string; state: 'active' | 'completed' | 'unresolved'; sequence: number; inflight?: number; uncertain?: number; last_seen?: string; error?: string; resolved_by?: string; attestation?: string }

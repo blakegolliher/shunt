@@ -52,13 +52,13 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	f.mu.Lock()
 	first := f.beats[0]
 	f.mu.Unlock()
-	if first.Incarnation != c.Incarnation() || first.Previous != nil || first.Uncertain != 0 {
+	if first.Incarnation != c.Incarnation() || len(first.Previous) != 0 || first.Uncertain != 0 {
 		t.Fatalf("first heartbeat: %+v", first)
 	}
 
 	// A retirement with a lost reply is retried until it lands.
 	c.Gates = admission.New()
-	tok, _, _ := c.Gates.Enter("acme/data", admission.Mutations)
+	tok, _, _ := c.Gates.Enter("acme/data", admission.Mutations, 0)
 	tok.Release(c.Gates, admission.Uncertain)
 	f.retireFails.Store(true)
 	go func() {
@@ -101,7 +101,7 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	if next.Incarnation() == c.Incarnation() {
 		t.Fatal("a new process drew the same incarnation")
 	}
-	if p := next.previousToReport(); p == nil || p.ID != c.Incarnation() || p.State != control.IncarnationUnclean || p.Uncertain != 1 {
+	if p := next.predecessorsToReport(); len(p) != 1 || p[0].ID != c.Incarnation() || p[0].State != control.IncarnationUnclean || p[0].Uncertain != 1 {
 		t.Fatalf("previous to report: %+v", p)
 	}
 	if err := next.Register(ctx); err != nil {
@@ -113,7 +113,7 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	f.mu.Lock()
 	beats := append([]control.Heartbeat(nil), f.beats...)
 	f.mu.Unlock()
-	if n := len(beats); n < 3 || beats[1].Previous == nil || beats[1].Previous.ID != c.Incarnation() || beats[2].Previous != nil {
+	if n := len(beats); n < 3 || len(beats[1].Previous) != 1 || beats[1].Previous[0].ID != c.Incarnation() || len(beats[2].Previous) != 0 {
 		t.Fatalf("the previous incarnation must be reported until recorded, then not: %+v", beats[1:])
 	}
 	if m := readMarker(t, next); m.State != control.IncarnationActive || m.Incarnation != next.Incarnation() {
@@ -125,7 +125,7 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	if err := crashed.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if p := crashed.previousToReport(); p == nil || p.ID != next.Incarnation() || p.State != control.IncarnationUnclean {
+	if p := crashed.predecessorsToReport(); len(p) != 1 || p[0].ID != next.Incarnation() || p[0].State != control.IncarnationUnclean {
 		t.Fatalf("a marker left active is an unclean previous incarnation: %+v", p)
 	}
 
@@ -143,7 +143,7 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 	if err := o.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if o.previousToReport() != nil {
+	if len(o.predecessorsToReport()) != 0 {
 		t.Fatal("another proxy's marker was taken as a previous incarnation")
 	}
 }
@@ -189,7 +189,7 @@ func TestHeartbeatCarriesBarrierAcks(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Gates.Close("acme/data", admission.Mutations, "op-7")
-	tok, _, _ := c.Gates.Enter("acme/data", admission.Source)
+	tok, _, _ := c.Gates.Enter("acme/data", admission.Source, 0)
 	if err := c.beat(ctx); err != nil {
 		t.Fatal(err)
 	}

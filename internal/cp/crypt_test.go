@@ -1,6 +1,7 @@
 package cp
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,7 +46,15 @@ func TestCipherRoundTrip(t *testing.T) {
 	if _, err := LoadOrCreateKey(t.TempDir(), false); err == nil {
 		t.Error("a missing key was created without create")
 	}
-	if err := WriteKey(dir, key); err == nil {
-		t.Error("overwrote an existing key")
+	// A join resumed after saving its bootstrap writes the same key again: accepted. Another key is
+	// refused, and the file keeps the first.
+	if err := WriteKey(dir, key); err != nil {
+		t.Errorf("writing the same key again: %v", err)
+	}
+	if err := WriteKey(dir, bytes.Repeat([]byte{9}, 32)); err == nil {
+		t.Error("overwrote an existing key with another")
+	}
+	if got, err := LoadOrCreateKey(dir, false); err != nil || !bytes.Equal(got, key) {
+		t.Errorf("the key after a refused overwrite: %x %v", got, err)
 	}
 }

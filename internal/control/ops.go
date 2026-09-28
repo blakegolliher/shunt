@@ -940,19 +940,26 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 // Progress is a mover's report on one placement, held in memory by this proxy for status and for
 // cutover's convergence check. It is counts and a cursor key, never a per-object record.
 type Progress struct {
-	Source    string       `json:"source"`
-	Primary   string       `json:"primary"`
-	Pass      int          `json:"pass"`
-	Copied    int          `json:"copied"`
-	Skipped   int          `json:"skipped"`
-	Vanished  int          `json:"vanished"`
-	Failed    int          `json:"failed"`
-	Bytes     int64        `json:"bytes"`
-	LastKey   string       `json:"last_key,omitempty"`
-	Done      bool         `json:"done"`      // the pass reached the end of the source listing
-	Converged bool         `json:"converged"` // a completed pass copied nothing and failed nothing
-	UpdatedAt time.Time    `json:"updated_at"`
-	Ranges    []MoverRange `json:"ranges,omitempty"`
+	// Identity and Generation bind the report to the move it describes: the directory lineage and
+	// the placement generation its mover planned from, which is its mover operation's (third
+	// review, R3-02). Source and Primary alone name only clusters, which two moves of one bucket can
+	// share. A report without them, or for another generation, is refused, and cutover counts only a
+	// report for the placement's current generation.
+	Identity   directory.Identity `json:"identity,omitzero"`
+	Generation int64              `json:"generation"`
+	Source     string             `json:"source"`
+	Primary    string             `json:"primary"`
+	Pass       int                `json:"pass"`
+	Copied     int                `json:"copied"`
+	Skipped    int                `json:"skipped"`
+	Vanished   int                `json:"vanished"`
+	Failed     int                `json:"failed"`
+	Bytes      int64              `json:"bytes"`
+	LastKey    string             `json:"last_key,omitempty"`
+	Done       bool               `json:"done"`      // the pass reached the end of the source listing
+	Converged  bool               `json:"converged"` // a completed pass copied nothing and failed nothing
+	UpdatedAt  time.Time          `json:"updated_at"`
+	Ranges     []MoverRange       `json:"ranges,omitempty"`
 }
 
 func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
@@ -960,12 +967,20 @@ func (s *Server) moverProgress(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	key, pl, _, ok := s.lookup(w, r)
+	key, pl, f, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
 	p := moving(pl)
-	if src, dst := p.ClusterOf(p.Source), p.ClusterOf(p.Primary); req.Source != src || req.Primary != dst {
+	gen := f.Generation(directory.PlacementResource(key))
+	switch src, dst := p.ClusterOf(p.Source), p.ClusterOf(p.Primary); {
+	case req.Identity.IsZero():
+		fail(w, bad("a progress report names the directory identity and placement generation its mover planned from (`shunt migrate run` of this version)"))
+		return
+	case req.Identity != f.Identity || req.Generation != gen:
+		fail(w, refuse("this report is for %s at generation %d of lineage %s; the placement is at generation %d of %s: the move it describes has been superseded", key, req.Generation, req.Identity.ClusterID, gen, f.Identity.ClusterID))
+		return
+	case req.Source != src || req.Primary != dst:
 		fail(w, refuse("%s moves %s → %s; this report is for %s → %s", key, src, dst, req.Source, req.Primary))
 		return
 	}
@@ -1025,9 +1040,16 @@ func (s *Server) runCutover(tr *tracker, key string, req CutoverRequest) (Transi
 		s.mu.Lock()
 		pr, reported := s.progress[key]
 		s.mu.Unlock()
+		gen := f.Generation(directory.PlacementResource(key))
 		switch {
 		case !reported:
 			return TransitionResult{}, refuse("no mover has reported on %s to this proxy; run `shunt migrate run %s --until-converged` first", key, key)
+		case pr.Identity != f.Identity || pr.Generation != gen:
+			// A report from an earlier move of this bucket, or from before a later change to it: it
+			// says nothing about the keys this move covers (R3-02). The hold below changes the
+			// generation and nothing else can while this operation reserves the placement, so the
+			// evidence cannot change between here and the commit.
+			return TransitionResult{}, refuse("the last mover report on %s is for generation %d; the placement is at generation %d, so it describes an earlier move or state; run `shunt migrate run %s --until-converged`", key, pr.Generation, gen, key)
 		case pr.Source != pv.ClusterOf(pv.Source) || pr.Primary != pv.ClusterOf(pv.Primary) || !pr.Converged:
 			return TransitionResult{}, refuse("the mover has not converged on %s (last report: pass %d, %d copied, %d failed, done %v); run it until a pass copies nothing", key, pr.Pass, pr.Copied, pr.Failed, pr.Done)
 		}

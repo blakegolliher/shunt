@@ -92,7 +92,7 @@ func newInit() *cobra.Command {
 			"command line is the node's service definition. Other nodes join with `shunt-control join`.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runNode(cmd, &o, "")
+			return runNode(cmd, &o, "", "")
 		},
 	}
 	addNodeFlags(cmd, &o)
@@ -101,24 +101,26 @@ func newInit() *cobra.Command {
 
 func newJoin() *cobra.Command {
 	var o nodeOptions
-	var existing string
+	var existing, resume string
 	cmd := &cobra.Command{
 		Use:   "join",
 		Short: "Start a control node that joins a running cluster (also how it is restarted)",
-		Long: "Asks the node at --existing to add this one, receives the cluster's members and its data-encryption\n" +
-			"key, and runs. On a data directory that already holds a member, join just starts it again; --existing\n" +
-			"is then ignored. Replacing a failed node is `shunt-control member remove <name>` on a live node, then\n" +
-			"join with the same name on a fresh data directory.",
+		Long: "Asks the node at --existing to add this one as a learner, fetches the cluster's members and its\n" +
+			"data-encryption key, and runs; the join promotes it to a voter once it has caught up. The join is\n" +
+			"an operation on the cluster (`shunt operation show <id>`), and this node records its progress in\n" +
+			"--data-dir/join.json: a join interrupted anywhere resumes when the same command runs again. --resume\n" +
+			"<operation> carries on a join whose join.json was lost. Until it votes, the join can be canceled\n" +
+			"(`shunt operation cancel <id>`), which removes the learner and stops this node. On a data directory\n" +
+			"that already holds a member, join just starts it again. Replacing a failed node is `shunt-control\n" +
+			"member remove <name>` on a live node, then join with the same name on a fresh data directory.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if existing == "" && !initialized(o.dataDir) {
-				return errors.New("--existing is required the first time a node joins: the API address of a running control node")
-			}
-			return runNode(cmd, &o, existing)
+			return runNode(cmd, &o, existing, resume)
 		},
 	}
 	addNodeFlags(cmd, &o)
 	cmd.Flags().StringVar(&existing, "existing", "", "a running control node's API, http://host:9901, that adds this node")
+	cmd.Flags().StringVar(&resume, "resume", "", "the operation id of a join to carry on, when this data directory has lost its join.json")
 	return cmd
 }
 
@@ -129,7 +131,7 @@ func initialized(dataDir string) bool {
 }
 
 // runNode starts etcd, opens the store, serves the API, and blocks until a signal.
-func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
+func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
@@ -151,33 +153,53 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	log.Info("shunt-control starting", "version", version, "name", o.name, "data_dir", abs, "peer", o.peerURL, "api", o.api)
 
 	ncfg := cp.NodeConfig{Name: o.name, DataDir: o.dataDir, PeerURL: o.peerURL, Log: log}
+	joined, err := loadJoin(o.dataDir)
+	if err != nil {
+		return err
+	}
 	var key []byte
 	switch {
 	case initialized(o.dataDir):
-		// A restart: the member is on disk, and so is the key.
-		k, err := cp.LoadOrCreateKey(o.dataDir, false)
-		if err != nil {
-			return err
+		// A restart: the member is on disk, and so is the key. A node that joined may still be a
+		// learner; its join's operation promotes it.
+		k, kerr := cp.LoadOrCreateKey(o.dataDir, false)
+		if kerr != nil {
+			return kerr
 		}
-		key, ncfg.Existing = k, existing != ""
+		key, ncfg.Existing = k, existing != "" || joined != nil
 		log.Info("restarting an existing member", "name", o.name)
-	case existing != "":
-		ans, err := requestJoin(ctx, existing, token, cp.JoinRequest{Name: o.name, PeerURL: o.peerURL})
-		if err != nil {
-			return err
+	case existing != "" || resume != "" || joined != nil:
+		// A join, new or interrupted (ADR-0021 D4): join.json says where it stands.
+		k, initial, jerr := joinCluster(ctx, o, existing, resume, token, log)
+		if jerr != nil {
+			return jerr
 		}
-		if err := cp.WriteKey(o.dataDir, ans.EncryptionKey); err != nil {
-			return err
-		}
-		key, ncfg.InitialCluster, ncfg.Existing = ans.EncryptionKey, ans.InitialCluster, true
-		log.Info("joining", "existing", existing, "initial_cluster", ans.InitialCluster)
+		key, ncfg.InitialCluster, ncfg.Existing = k, initial, true
+	case cmd.Name() == "join":
+		return errors.New("--existing is required the first time a node joins: the API address of a running control node")
 	default:
-		k, err := cp.LoadOrCreateKey(o.dataDir, true)
-		if err != nil {
-			return err
+		k, kerr := cp.LoadOrCreateKey(o.dataDir, true)
+		if kerr != nil {
+			return kerr
 		}
 		key = k
 		log.Info("forming a new cluster", "name", o.name)
+	}
+	// A node whose join has not ended follows it (followJoin); one whose join was canceled while it
+	// was stopped does not start a member the cluster has removed.
+	var follow *joinState
+	var joinAPI *apiClient
+	if joined, err = loadJoin(o.dataDir); err != nil {
+		return err
+	}
+	if joined != nil && joined.Operation != "" && joined.Phase != joinPromoted {
+		follow, joinAPI = joined, &apiClient{base: strings.TrimRight(joined.Existing, "/"), token: token}
+		qctx, qcancel := context.WithTimeout(ctx, 5*time.Second)
+		op, qerr := joinOperation(qctx, joinAPI, follow.Operation)
+		qcancel()
+		if qerr == nil && op.Terminal() && op.Status != control.StatusSucceeded {
+			return endedJoin(op, o.dataDir)
+		}
 	}
 	cipher, err := cp.NewCipher(key)
 	if err != nil {
@@ -204,10 +226,10 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	fleet := cp.NewFleet(node.Client(), o.leaseTTL)
 	telemetryStore := telemetry.NewStore(o.leaseTTL)
 	moverDir := filepath.Join(o.dataDir, "mover")
-	worker := control.MoverWorker{Snapshot: func() *directory.File { return store.Snapshot().File() }, Secrets: store.ClusterSecrets,
+	worker := control.MoverWorker{Export: store.Export,
 		CursorDir: filepath.Join(moverDir, "cursor"), LedgerDir: filepath.Join(moverDir, "ledger")}
 	ctl := &control.Server{Dir: store, Clusters: registry, Metrics: metrics, Log: log, Keys: store, Fleet: fleet, LeaseTTL: o.leaseTTL, ClusterSecrets: store.ClusterSecrets, Token: token,
-		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"),
+		Ops: ops, Node: o.name, Events: events, Telemetry: telemetryStore, Ctx: ctx, ConfirmKey: cipher.Derive("confirm"), Export: store.Export,
 		Mover: worker.Run, MoverLedger: worker.Ledger}
 	store.Prepare = func(f *directory.File, resolve func(string) (string, error)) (func(), error) {
 		cand, aerr := registry.PrepareWith(f.Clusters, resolve, secretGeneration(f))
@@ -266,7 +288,8 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	}()
 	defer store.Close()
 	defer ops.Close()
-	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o)}
+	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Key: cipher.Key}
+	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o), Control: ctl}
 
 	adm := admin.New(metrics.Registry, telemetry.NewSlowRing(1, time.Hour))
 	mountControl(adm, ctl, api, store)
@@ -275,6 +298,11 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 	go func() { errCh <- srv.ListenAndServe() }()
 	log.Info("shunt-control serving", "api", o.api, "directory_version", store.Version(), "lease_ttl", o.leaseTTL.String())
 
+	var joinEnd chan error
+	if follow != nil {
+		joinEnd = make(chan error, 1)
+		go func() { joinEnd <- followJoin(ctx, joinAPI, o.dataDir, follow, log) }()
+	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -282,6 +310,13 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing string) error {
 		case <-ctx.Done():
 			log.Info("signal received, stopping")
 			return shutdown(srv)
+		case err := <-joinEnd:
+			joinEnd = nil
+			if err != nil {
+				log.Error("stopping: the join did not make this node a member", "err", err.Error())
+				_ = shutdown(srv) //nolint:errcheck // the join's end is the error to report
+				return err
+			}
 		case err := <-errCh:
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
@@ -351,19 +386,6 @@ func shutdown(srv *http.Server) error {
 	dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(dctx)
-}
-
-// requestJoin asks a running node to add this one.
-func requestJoin(ctx context.Context, existing, token string, req cp.JoinRequest) (cp.JoinAnswer, error) {
-	c := &apiClient{base: strings.TrimRight(existing, "/"), token: token}
-	var ans cp.JoinAnswer
-	if err := c.call(ctx, http.MethodPost, "/v1/control/members", req, &ans); err != nil {
-		return ans, fmt.Errorf("join via %s: %w", existing, err)
-	}
-	if len(ans.EncryptionKey) != 32 || ans.InitialCluster == "" {
-		return ans, fmt.Errorf("join via %s: the answer carried no key or no member list", existing)
-	}
-	return ans, nil
 }
 
 func newLogger(format string, plaintext bool, stderr io.Writer) *slog.Logger {

@@ -2,6 +2,7 @@ package cp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/blakegolliher/shunt/internal/control"
 )
 
 // testCluster starts n embedded members on free loopback ports, the first alone and the rest
@@ -44,12 +47,10 @@ func startCluster(t testing.TB, n int) *testCluster {
 		port := freePort(t)
 		peer := fmt.Sprintf("http://127.0.0.1:%d", port)
 		cfg := NodeConfig{Name: name, DataDir: dir, PeerURL: peer, Log: log}
+		var id uint64
 		if i > 0 {
-			initial, err := tc.nodes[0].MemberAdd(ctx, name, peer)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg.InitialCluster, cfg.Existing = initial, true
+			id, cfg.InitialCluster = addLearner(ctx, t, tc.nodes[0], name, peer)
+			cfg.Existing = true
 		}
 		node, err := Start(ctx, cfg)
 		if err != nil {
@@ -58,6 +59,9 @@ func startCluster(t testing.TB, n int) *testCluster {
 		tc.nodes, tc.dirs, tc.ports = append(tc.nodes, node), append(tc.dirs, dir), append(tc.ports, port)
 		if err := node.WaitReady(ctx); err != nil {
 			t.Fatalf("%s: %v", name, err)
+		}
+		if i > 0 {
+			promote(ctx, t, tc.nodes[0], id)
 		}
 	}
 	t.Cleanup(func() {
@@ -68,6 +72,50 @@ func startCluster(t testing.TB, n int) *testCluster {
 		}
 	})
 	return tc
+}
+
+// addLearner adds a learner at peer through node and returns its ID and the initial cluster it
+// starts with, as a join's bootstrap gives it.
+func addLearner(ctx context.Context, t testing.TB, node *Node, name, peer string) (uint64, string) {
+	t.Helper()
+	id, err := node.AddLearner(ctx, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := node.ListMembers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for _, m := range ms {
+		mn := m.Name
+		if m.ID == id {
+			mn = name
+		}
+		for _, u := range m.PeerURLs {
+			parts = append(parts, mn+"="+u)
+		}
+	}
+	return id, strings.Join(parts, ",")
+}
+
+// promote promotes learner id through node once it has caught up, as a join's operation does.
+func promote(ctx context.Context, t testing.TB, node *Node, id uint64) {
+	t.Helper()
+	for {
+		err := node.Promote(ctx, id)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, control.ErrLearnerNotReady) {
+			t.Fatalf("promoting %x: %v", id, err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("promoting %x: %v", id, err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // restart stops node i and starts it again on the same data directory and port.
@@ -94,8 +142,8 @@ func TestClusterFormsJoinsAndReports(t *testing.T) {
 	if len(st.Members) != 3 || st.Started != 3 || st.Quorum != 2 || !st.HasQuorum || st.Leader == "" {
 		t.Fatalf("status: %+v", st)
 	}
-	// A member joins as a learner, so its join leaves the quorum as it was, and promotes itself
-	// once it has caught up: every member of a formed cluster votes.
+	// A member joins as a learner, so its join leaves the quorum as it was, and is promoted once it
+	// has caught up: every member of a formed cluster votes.
 	for _, m := range st.Members {
 		if m.Learner {
 			t.Errorf("%s is still a learner after its join", m.Name)
@@ -106,8 +154,10 @@ func TestClusterFormsJoinsAndReports(t *testing.T) {
 			t.Errorf("%s sees leader %q, want %q (%v)", nd.Name(), s2.Leader, st.Leader, err)
 		}
 	}
-	if _, err := tc.nodes[0].MemberAdd(ctx, "c2", "http://127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Errorf("adding a member with a taken name: %v", err)
+	// etcd refuses a second member with a peer URL a member has: what lets a join retry an add
+	// whose answer was lost without ever making two members (ADR-0021 D4).
+	if _, err := tc.nodes[0].AddLearner(ctx, fmt.Sprintf("http://127.0.0.1:%d", tc.ports[1])); err == nil || !strings.Contains(err.Error(), "Peer URLs already exists") {
+		t.Errorf("adding a learner at a member's peer URL: %v", err)
 	}
 
 	// A member leaves; the two left keep quorum. The last member cannot be removed.

@@ -1,4 +1,4 @@
-import { newRequestKey, parseSSEFrame, startOperation, unfinished } from './client'
+import { cancelOutcome, newRequestKey, parseSSEFrame, startOperation, unfinished } from './client'
 
 test('parses authenticated stream frames without putting the token in a URL', () => {
   expect(parseSSEFrame('id: node:7\nevent: fleet\ndata: {"id":"proxy-a","event":"live"}')).toEqual({
@@ -16,6 +16,13 @@ test('treats pending, running and blocked operations as unfinished', () => {
   for (const status of ['pending', 'running', 'blocked'] as const) expect(unfinished({ status })).toBe(true)
   for (const status of ['succeeded', 'failed', 'cancelled'] as const) expect(unfinished({ status })).toBe(false)
   expect(unfinished(null)).toBe(false)
+})
+
+test('reports a cancellation only once the record ended cancelled', () => {
+  const op = { id: 'j', kind: 'control-join', actor: 'a' }
+  expect(cancelOutcome({ ...op, status: 'cancelled' })).toBe('control-join cancelled; nothing changed')
+  // A join's cancel answers 202 while its owner removes the learner: no early success toast.
+  expect(cancelOutcome({ ...op, status: 'running' })).toBe('control-join cancellation requested; the operation is running')
 })
 
 test('sends every change with its own Idempotency-Key and every read without one', async () => {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"sync"
@@ -34,6 +35,54 @@ type progressReader struct {
 	n    atomic.Int64
 	rc   *http.ResponseController // set for the client request body: refresh the server read deadline
 	idle time.Duration
+	// ans, set on a mutation's response body, watches for the backend's whole answer (R3-03).
+	ans *answerWatch
+}
+
+// answerWatch is what a mutation's response body showed of the backend's answer: whether it was
+// read to its end, and, for an operation whose 200 carries its result in the body, the body's last
+// bytes. Only the handler's goroutine reads a response body, so it needs no lock.
+type answerWatch struct {
+	eof        bool
+	result     bool // the 200 carries the operation's result, or an error, in its body
+	tail       [64]byte
+	tailLen    int
+	tailClosed bool
+}
+
+// record keeps the last bytes read.
+func (a *answerWatch) record(b []byte) {
+	if len(b) >= len(a.tail) {
+		a.tailLen = copy(a.tail[:], b[len(b)-len(a.tail):])
+		return
+	}
+	if keep := len(a.tail) - len(b); a.tailLen > keep {
+		copy(a.tail[:], a.tail[a.tailLen-keep:a.tailLen])
+		a.tailLen = keep
+	}
+	a.tailLen += copy(a.tail[a.tailLen:], b)
+}
+
+// resultClosings end a body that carries a complete result or error (AWS: CompleteMultipartUpload,
+// CopyObject and UploadPartCopy can answer 200 before they have finished, then write either).
+var resultClosings = [][]byte{[]byte("</CompleteMultipartUploadResult>"), []byte("</CopyObjectResult>"), []byte("</CopyPartResult>"), []byte("</Error>")}
+
+// whole reports whether the backend's answer was read whole: to its end, and for a result body,
+// through the close of its result or error element.
+func (a *answerWatch) whole() bool {
+	if !a.eof {
+		return false
+	}
+	if !a.result {
+		return true
+	}
+	tail := bytes.TrimRight(a.tail[:a.tailLen], " \t\r\n")
+	for _, c := range resultClosings {
+		if bytes.HasSuffix(tail, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // count reports the bytes read so far.
@@ -49,6 +98,12 @@ func (p *progressReader) Read(b []byte) (int, error) {
 		if p.wd != nil {
 			p.wd.kick()
 		}
+		if p.ans != nil && p.ans.result {
+			p.ans.record(b[:n])
+		}
+	}
+	if err == io.EOF && p.ans != nil {
+		p.ans.eof = true
 	}
 	return n, err
 }

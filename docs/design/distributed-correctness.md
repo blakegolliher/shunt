@@ -225,7 +225,9 @@ fleet protocol, proxy ID, identity, version, SHA-256 of the directory as written
 temporary file, fsyncs it, renames it and fsyncs the directory, after the install lock is let go.
 Writes are serialized and a version older than one already attempted is skipped, so the cache only
 moves forward. A failure at any stage keeps the in-memory version and the last durable file (no
-temporary file stays), counts `shunt_directory_cache_failures_total{stage}`, and is reported:
+temporary file stays), counts `shunt_directory_cache_failures_total{stage}` (and, since the third review's R3-08, keeps
+the version as a candidate the heartbeat writes again after a backoff, or a refetch at once), and is
+reported:
 `/-/fleet` shows `durable` and `cache_error`, the heartbeat carries `durable`, and the Control
 plane screen's proxy table shows Durable beside Applied. A cache that is torn, altered, oversized
 (64 MiB, checked before decoding), of another schema or protocol, another proxy's, or without
@@ -348,6 +350,13 @@ ended. ADR-0021, "Decisions taken 2026-09-25", has each with its regression test
 
 ### Local admission
 
+**Amended (2026-09-28, third review R3-01):** gate closure and the check/increment interlock was
+not enough: a request could take its bundle before a hold, wait out the whole barrier between its
+bundle and its gate, and enter the reopened gate by the route the barrier replaced. A placement's
+gates now record the directory version they last reopened at (one version per placement), and a
+request routing by an older bundle is refused as superseded before dispatch; it retries on the
+current bundle. No request body is consumed before the refusal.
+
 Maintain bounded counters/gates per configured placement and in-use generation,
 with cluster gates for maintenance. No object-key map. The request acquires its
 bundle, resolves all involved scopes, and enters their gates in canonical order.
@@ -366,7 +375,11 @@ token; dual deletes and compensation retain their tokens through all effects.
 
 Keep a mutation token until backend work has a definitive completed outcome,
 including response-body parsing where a successful HTTP status can carry an S3
-error. A definitive rejection with no outstanding effect can drain. A response
+error. (**Landed 2026-09-28, third review R3-03:** H2 released the token on a relay
+that failed after the status line; a mutation's response body is now watched to its
+end, and a result body through the close of its result or error element, with the
+rest of an interrupted answer read, bounded, before the verdict. The watch keeps the
+body's last 64 bytes; nothing of the body is buffered for forwarding.) A definitive rejection with no outstanding effect can drain. A response
 lost after dispatch, partial compensation, or cancellation with an unknown
 backend outcome marks that scope/generation `uncertain`. Local handler exit does
 not erase it. Request-local classification may distinguish a proven pre-dispatch
@@ -567,14 +580,47 @@ not from the live store before or after the streaming snapshot call.
 
 ### Join and remove
 
-**Landed (2026-09-23, on `1-to-n-bucket-support`):** a joining node is now added
-with `MemberAddAsLearner` and promotes itself with `MemberPromote` once etcd
+**Landed (2026-09-23, on `1-to-n-bucket-support`; the self-promotion replaced by H3b):** a
+joining node is now added with `MemberAddAsLearner` and promotes itself with `MemberPromote` once etcd
 reports it caught up, retrying while it is not (`internal/cp/etcd.go`, `promote`);
 a learner that restarts before promotion tries again and runs as a learner with a
 warning if it cannot. This removed the intermittent `internal/cp` test failure
 ("incompatible with current running cluster") and a ~7 s stall on every join. What
 remains for D4/T12 is everything durable below: the persisted join intent and its
 phases, reconciling a lost add response, resume and cancel, and removal by ID.
+
+**Landed (2026-09-25, H3a):** the durable join. A join is a `control-join` operation
+that reserves `control:members`, records phase `learner_add` before it asks for the
+learner, and puts the learner's member ID on the record before anything depends on
+it; a lost add answer is reconciled from the member list by normalized peer URL
+(etcd refuses a second member with the same peer URL, so a retried add can never
+make two). The record follows the node to its promotion, blocked on
+`member_not_started` and then `learner_catching_up`, and a lost owner leaves it
+resumable. The key moves to `POST /v1/control/joins/{id}/bootstrap` (no-store; on no
+record, event or URL). The joining node keeps `join.json` in its data directory,
+fsynced before each step, and resumes from it; `--resume <id>` carries on a join whose
+file was lost. Cancel and removal by ID (H3b, H3c) and observed health (H3d) remain.
+
+**Landed (2026-09-28, H3b):** cancel. The join's operation, not the joining node, promotes the
+learner (`Membership.Promote`; etcd's refusal of a learner that has not caught up is
+`ErrLearnerNotReady`), so one process at a time changes the membership for a join. A cancellation
+is a `cancel_request` written on the record without taking it from its owner; the owner reads it
+at the top of every round, between two membership changes, and removes the learner by the member
+ID on the record (phase `learner_remove`, the ID found by peer URL first when the add's answer was
+lost), then ends `cancelled` with effect `none`. A request that lands while the owner is promoting
+finds a voter and removes nothing: the join ends succeeded and the cancel answers `not_cancellable`.
+After a promotion that did not answer, a removal waits `promoteSettle` (10 s) for the member list to
+settle. A join whose owner is gone offers cancel beside resume, and the node the cancellation
+reaches takes the record over under a new owner term to carry it out. The bootstrap of a canceled
+or failed join is refused. The joined node follows its join (`followJoin`): it resumes one whose
+owner is lost on the node it joined through, records `promoted` in `join.json` once the join
+succeeds (a restart then asks the cluster nothing), and stops, naming the data directory to remove,
+when the join was canceled; a node restarted after its join was canceled does not start. Tests:
+cancel before the promotion (waiting for the node, and catching up), cancel racing the promotion,
+cancel with a lost add answer, cancel with the owner lost, each over a fake membership, with
+negative controls for the voter check and the peer-URL reconciliation; a real-etcd cancel of a
+started and of an unstarted learner, whose check that a held-back learner is never promoted fails
+with self-promotion restored.
 
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability

@@ -154,6 +154,8 @@ type Operation struct {
 	BlockerCount   int             `json:"blocker_count,omitempty"`
 	Barrier        *BarrierState   `json:"barrier,omitempty"`
 	Worker         *WorkerSession  `json:"worker,omitempty"`
+	Member         *JoinMember     `json:"member,omitempty"`         // a join's learner, once added
+	CancelRequest  *CancelRequest  `json:"cancel_request,omitempty"` // a cancellation asked of a join, which its owner carries out
 	Phase          string          `json:"phase,omitempty"`
 	WaitingOn      []string        `json:"waiting_on,omitempty"`
 	Silent         []string        `json:"silent,omitempty"`
@@ -181,9 +183,17 @@ func (op *Operation) clone() *Operation {
 		b := *op.Barrier
 		c.Barrier = &b
 	}
+	if op.Member != nil {
+		m := *op.Member
+		c.Member = &m
+	}
 	if op.Worker != nil {
 		w := *op.Worker
 		c.Worker = &w
+	}
+	if op.CancelRequest != nil {
+		r := *op.CancelRequest
+		c.CancelRequest = &r
 	}
 	if op.Error != nil {
 		e := *op.Error
@@ -451,11 +461,12 @@ func (tr *tracker) put() {
 	tr.op.Updated = tr.s.now().UTC()
 	tr.op.Sequence++
 	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
-	// Worker heartbeats are the one supported writer alongside an operation's owner, and they
-	// write the durable record by its own compare-and-swap (applyWorker), on any node. The worker
-	// session is theirs: when one landed between this tracker's read and write, take the session
-	// from the record, never from this copy, and write the owner's fields over the new sequence.
-	// An ended record, or a changed owner or term, is a real takeover.
+	// Worker heartbeats and a join's cancellation request are the supported writers alongside an
+	// operation's owner, and they write the durable record by its own compare-and-swap
+	// (applyWorker, cancelJoinRequest), on any node. The worker session and the request are theirs:
+	// when one landed between this tracker's read and write, take it from the record, never from
+	// this copy, and write the owner's fields over the new sequence. An ended record, or a changed
+	// owner or term, is a real takeover.
 	for attempt := 0; errors.Is(err, ErrStaleSequence) && attempt < 16; attempt++ {
 		stored, gerr := tr.s.ops().Get(context.WithoutCancel(tr.ctx), tr.op.ID)
 		if gerr != nil || stored == nil || stored.Node != tr.op.Node || stored.OwnerTerm != tr.op.OwnerTerm || stored.Terminal() {
@@ -465,6 +476,11 @@ func (tr *tracker) put() {
 		if stored.Worker != nil {
 			worker := *stored.Worker
 			tr.op.Worker = &worker
+		}
+		if stored.CancelRequest != nil {
+			req := *stored.CancelRequest
+			tr.op.CancelRequest = &req
+			tr.op.AllowedActions = []string{}
 		}
 		tr.op.Sequence = stored.Sequence + 1
 		err = tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
@@ -481,6 +497,14 @@ func (tr *tracker) put() {
 			tr.s.Log.Warn("operation record not written", "operation", tr.op.ID, "kind", tr.op.Kind, "err", err.Error())
 		}
 	}
+}
+
+// setMember puts a join's learner on its record, durably, before anything depends on it.
+func (tr *tracker) setMember(m *JoinMember) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.op.Member = m
+	tr.put()
 }
 
 func (tr *tracker) phase(p string) {
@@ -528,7 +552,8 @@ func (tr *tracker) finish(res any, err error) {
 	tr.op.Blockers, tr.op.BlockerCount, tr.op.AllowedActions = nil, 0, []string{}
 	switch {
 	case errors.Is(err, errCanceled):
-		// The record was ended by the cancellation; this tracker's write is refused as stale.
+		// The record was ended by the cancellation, and this tracker's write is refused as stale;
+		// or, for a join, this owner carried the cancellation out and ends the record itself.
 		tr.op.Status = StatusCancelled
 		tr.op.Error = &Error{Code: StatusCancelled, Message: err.Error()}
 	case errors.Is(err, errLost):
@@ -957,8 +982,20 @@ func (s *Server) launch(actor string, req OperationRequest, async bool, meta req
 		return start(s.placementOp(key), a, func(tr *tracker) (any, error) {
 			return s.runPlacementReadOnly(tr, key, a)
 		})
+	case OpControlJoin:
+		var a JoinRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if s.Members == nil {
+			return nil, nil, notFound("this server has no control-plane membership to join")
+		}
+		if err := checkJoin(&a); err != nil {
+			return nil, nil, err
+		}
+		return start(s.membersOp(), a, func(tr *tracker) (any, error) { return s.runJoin(tr, a) })
 	}
-	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only", req.Kind)
+	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only, control-join", req.Kind)
 }
 
 // serveOperation runs an action for its own route and answers with its outcome, as the route did
@@ -1090,7 +1127,7 @@ func (s *Server) FailOrphans(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Terminal() || (resumable(op.Kind) && op.Barrier != nil) {
+		if op.Node != s.node() || op.Terminal() || carriesOn(op) {
 			continue
 		}
 		orphan(op, s.now().UTC(), "the control node running this operation restarted before it finished; repeat the step to complete it")
@@ -1117,7 +1154,7 @@ func Orphan(op *Operation, now time.Time, why string) { orphan(op, now, why) }
 func orphan(op *Operation, now time.Time, why string) {
 	op.Sequence++
 	op.Updated = now
-	if resumable(op.Kind) && op.Barrier != nil {
+	if carriesOn(op) {
 		op.Status = StatusBlocked
 		op.Blockers = []Blocker{{Code: BlockerOwnerLost, Message: why}}
 		op.BlockerCount = 1

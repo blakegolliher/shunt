@@ -45,6 +45,15 @@ type BarrierState struct {
 	HeldAt      time.Time `json:"held_at,omitzero"`
 	DrainedAt   time.Time `json:"drained_at,omitzero"`
 	CommittedAt time.Time `json:"committed_at,omitzero"`
+	// Prior is the read-only switch a read-only change replaces, recorded with its intent before
+	// the hold: what a cancellation puts back (third review, R3-09). Absent on other barriers.
+	Prior *ReadOnlyPrior `json:"prior,omitempty"`
+}
+
+// ReadOnlyPrior is a read-only switch as it stood before a change.
+type ReadOnlyPrior struct {
+	ReadOnly bool `json:"read_only"`
+	Reject   bool `json:"reject,omitempty"`
 }
 
 // The actions a record accepts (Operation.AllowedActions).
@@ -81,6 +90,8 @@ type barrier struct {
 	// worker session needs none here: its operation reserves the placement, so no cutover or
 	// purge can start while one is unresolved.
 	extra func(ctx context.Context) ([]Blocker, error)
+	// prior, if set, reads the switch a read-only change replaces, recorded with the intent.
+	prior func() *ReadOnlyPrior
 }
 
 // runBarrier drives a barrier from wherever its record stands to its commit: the hold, the
@@ -89,6 +100,11 @@ func (s *Server) runBarrier(tr *tracker, b *barrier) error {
 	st := tr.barrierState()
 	if st == nil {
 		st = &BarrierState{ID: tr.id(), Scope: b.scope, Kind: b.kind}
+		if b.prior != nil {
+			// Read before the hold and recorded with the intent: a resumed owner or a cancellation
+			// restores what was there, never what it reads after the hold.
+			st.Prior = b.prior()
+		}
 		// The intent is durable before the directory write, so a new owner can resume it. Cancel
 		// is deliberately not offered until HoldVersion is durable too: otherwise cancellation
 		// could end the record while this owner was already writing a hold that nobody would own.
@@ -333,7 +349,11 @@ func (s *Server) publishBlockers() {
 	}
 	s.mu.Unlock()
 	for _, tr := range trackers {
-		for _, b := range tr.snapshot().Blockers {
+		op := tr.snapshot()
+		if op.Kind == OpControlJoin {
+			continue // a join holds no barrier; its phase is shunt_control_join_phase (H3)
+		}
+		for _, b := range op.Blockers {
 			counts[b.Code]++
 		}
 	}
@@ -357,11 +377,14 @@ func (s *Server) releaseHold(ctx context.Context, op *Operation, actor string) e
 	case OpRamp, OpMigrate:
 		tenant, bucket, _ := directory.SplitKey(op.Placement)
 		return s.Dir.SetState(ctx, tenant, bucket, directory.StateRamping, directory.Transition{Release: true, Barrier: id}, actor)
-	case OpPlacementReadOnly:
-		tenant, bucket, _ := directory.SplitKey(op.Placement)
-		return s.Dir.SetPlacementReadOnly(ctx, tenant, bucket, false, false, id, actor)
-	case OpClusterReadOnly:
-		return s.Dir.SetClusterReadOnly(ctx, op.Cluster, false, false, id, actor)
+	case OpPlacementReadOnly, OpClusterReadOnly:
+		// Back to the switch the change replaced, in the write that releases its hold: a repeated
+		// switch-on canceled leaves the scope read-only as it was (R3-09).
+		prior := ReadOnlyPrior{}
+		if op.Barrier.Prior != nil {
+			prior = *op.Barrier.Prior
+		}
+		return s.Dir.ReleaseReadOnly(ctx, op.Barrier.Scope, id, prior.ReadOnly, prior.Reject, actor)
 	case OpCutover, OpPurge:
 		return s.Dir.ClearBarrier(ctx, op.Barrier.Scope, id, actor)
 	}
@@ -379,6 +402,8 @@ var cancelPhases = []string{"", PhaseQueued, PhasePrecondition, PhaseDiff}
 // dispatch, each written to the record first) are ordered.
 func notCancellable(op *Operation, ownerGone bool) error {
 	switch {
+	case op.Kind == OpControlJoin:
+		return nil // until its node votes, which only the join's owner can tell (cancelJoin)
 	case op.Kind == OpMover:
 		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is a mover: it ends with its worker, and an expired worker session is resolved with `shunt operation resolve-worker %s --session <id> --attest <why>`", op.ID, op.ID)}
 	case !resumable(op.Kind):
@@ -428,6 +453,9 @@ func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	case op.Terminal():
 		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has ended %s", id, op.Status)})
+		return
+	case op.Kind == OpControlJoin:
+		s.cancelJoinRequest(w, r, op)
 		return
 	}
 	ownerGone, err := s.ownerGone(r.Context(), op)
@@ -619,8 +647,8 @@ func (s *Server) resumeOperation(w http.ResponseWriter, r *http.Request) {
 	case op.Terminal():
 		fail(w, refuse("operation %s has ended %s; a change is a new operation", id, op.Status))
 		return
-	case !resumable(op.Kind) || op.Barrier == nil:
-		fail(w, refuse("operation %s (%s) has no durable barrier to resume; repeat a short operation that lost its node", id, op.Kind))
+	case !carriesOn(op):
+		fail(w, refuse("operation %s (%s) has no durable state to resume from; repeat a short operation that lost its node", id, op.Kind))
 		return
 	}
 	if s.runs(id) {
@@ -667,6 +695,12 @@ func (s *Server) resumeOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 // resumable reports whether an operation of this kind can be carried on from its record.
+// carriesOn reports whether a record whose owner is gone is resumed rather than failed: a barrier
+// operation once its barrier is on the record, and a join, whose intent is on it from the start.
+func carriesOn(op *Operation) bool {
+	return (resumable(op.Kind) && op.Barrier != nil) || op.Kind == OpControlJoin
+}
+
 func resumable(kind string) bool {
 	switch kind {
 	case OpRamp, OpMigrate, OpPlacementReadOnly, OpClusterReadOnly, OpCutover, OpPurge:
@@ -715,6 +749,15 @@ func (s *Server) rerun(tr *tracker) (any, error) {
 			return nil, err
 		}
 		return s.runPurge(tr, op.Placement, a)
+	case OpControlJoin:
+		var a JoinRequest
+		if err := decodeArgs(op.Args, &a); err != nil {
+			return nil, err
+		}
+		if s.Members == nil {
+			return nil, refuse("operation %s is a control-plane join; this server has no membership to change", op.ID)
+		}
+		return s.runJoin(tr, a)
 	}
 	return nil, refuse("operation %s (%s) is not resumable", op.ID, op.Kind)
 }
@@ -729,7 +772,7 @@ func (s *Server) ResumeOwn(ctx context.Context) error {
 	}
 	var errs []error
 	for _, op := range ops {
-		if op.Node != s.node() || op.Terminal() || !resumable(op.Kind) || op.Barrier == nil || s.runs(op.ID) {
+		if op.Node != s.node() || op.Terminal() || !carriesOn(op) || s.runs(op.ID) {
 			continue
 		}
 		fromNode, fromTerm := op.Node, op.OwnerTerm

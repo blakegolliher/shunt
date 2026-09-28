@@ -53,6 +53,16 @@ func staleRead(stale bool, class migrate.OpClass, route migrate.Route) migrate.R
 
 // refuseWrite answers a write shunt will not route yet with 503 and Retry-After, which every SDK
 // retries (ADR-0016): a held ramp step, or a stale proxy.
+// refuseGate refuses a request its bucket's gate would not admit: closed by a barrier, or
+// superseded, the request's route older than the gate's last reopening (R3-01).
+func (h *Handler) refuseGate(w http.ResponseWriter, r *http.Request, o *outcome, bucket, barrier string) {
+	if barrier == admission.Superseded {
+		h.refuseWrite(w, r, o, bucket, "superseded", "This bucket's routing changed while the request was being prepared. Retry.")
+		return
+	}
+	h.refuseWrite(w, r, o, bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+}
+
 func (h *Handler) refuseWrite(w http.ResponseWriter, r *http.Request, o *outcome, bucket, reason, msg string) {
 	h.Metrics.RefusedWrites.WithLabelValues(directory.Key(o.tenant, bucket), reason).Inc()
 	w.Header().Set("Retry-After", "1")
@@ -149,7 +159,7 @@ func (h *Handler) createBucket(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	actor := "proxy:" + o.accessKey
 	dctx := context.WithoutCancel(ctx) // a claimed row must be released even if the client leaves
-	if tok, _, ok := h.Gates.Enter(directory.Key(o.tenant, bucket), admission.Mutations); ok {
+	if tok, _, ok := h.Gates.Enter(directory.Key(o.tenant, bucket), admission.Mutations, snap.Version()); ok {
 		o.tok = tok // a bucket that is being made carries no barrier yet; counted all the same
 	}
 

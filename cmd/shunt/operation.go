@@ -123,7 +123,8 @@ func newOperationCancel() *cobra.Command {
 			"(`shunt operation show` lists the allowed actions): its hold is released and its record ends\n" +
 			"canceled, with nothing changed. Once the change is committed, or a purge has begun deleting, it is\n" +
 			"in force and cancellation is refused (not_cancellable): a further change is a new operation\n" +
-			"(ADR-0021 D2).",
+			"(ADR-0021 D2). A control-plane join is canceled until its node is promoted: its owner removes the\n" +
+			"learner, and the command answers once it has (ADR-0021 D4).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			api, err := o.client()
@@ -137,7 +138,15 @@ func newOperationCancel() *cobra.Command {
 			if o.json {
 				return printJSON(cmd, op)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s canceled; nothing changed\n", op.ID)
+			switch {
+			case op.Status != control.StatusCancelled:
+				// A join's owner carries its cancellation out; the record is still unfinished.
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "cancellation of operation %s requested; it is %s. Follow it with `shunt operation wait %s`\n", op.ID, op.Status, op.ID)
+			case op.Kind == control.OpControlJoin && op.Error != nil:
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s canceled; %s\n", op.ID, op.Error.Message)
+			default:
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s canceled; nothing changed\n", op.ID)
+			}
 			return nil
 		},
 	}
