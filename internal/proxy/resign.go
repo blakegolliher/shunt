@@ -257,7 +257,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 
 	// A conditional write while the bucket's objects are split across two clusters is judged
 	// against both, not only the cluster this write lands on (ADR-0013).
-	act, code, msg := h.conditionalWrite(ctx, r, o, info, p, clusters, role, cl, backend, class)
+	act, code, msg := h.conditionalWrite(ctx, r, o, info, p, clusters, role, cl, backend)
 	if code != "" {
 		h.answer(w, r, o, code, msg)
 		return nil, false

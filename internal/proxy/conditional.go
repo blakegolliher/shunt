@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/blakegolliher/shunt/internal/directory"
-	"github.com/blakegolliher/shunt/internal/migrate"
 	"github.com/blakegolliher/shunt/internal/s3"
 	"github.com/blakegolliher/shunt/internal/sigv4"
 	"github.com/blakegolliher/shunt/internal/telemetry"
@@ -51,10 +50,15 @@ func hasWritePrecondition(h http.Header) bool {
 //     has a matching version, it is 412.
 //
 // A check that cannot be made fails closed with 503: guessing either way breaks the promise.
+//
+// Whether a write's preconditions are judged here is a matter of the operation, not of how it is
+// routed: CompleteMultipartUpload is routed as an upload, pinned by its uploadId to the cluster
+// holding its parts, and still commits the logical object the conditions are about (third review,
+// R3-06). role is the cluster it lands on, pinned or not.
 func (h *Handler) conditionalWrite(ctx context.Context, r *http.Request, o *outcome, info s3.RequestInfo, p *directory.Placement,
-	clusters *upstream.Set, role string, cl *upstream.Cluster, backend string, class migrate.OpClass,
+	clusters *upstream.Set, role string, cl *upstream.Cluster, backend string,
 ) (condAction, s3.Code, string) {
-	if class != migrate.ClassWrite || !hasWritePrecondition(r.Header) {
+	if !hasWritePrecondition(r.Header) {
 		return condAction{}, "", ""
 	}
 	if info.Op != s3.OpPutObject && info.Op != s3.OpCompleteMultipartUpload && info.Op != s3.OpCopyObject {

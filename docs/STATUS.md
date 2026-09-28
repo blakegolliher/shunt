@@ -33,7 +33,7 @@ on a proof that left out unfinished work, are fixed, and `make fleet` passed on 
 | R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestCompletionOutcomeIsTheWholeAnswer` (was `TestReviewIncompleteMultipartResponseMustRemainUncertain`), `TestLearnAnswerReadsTheRestAfterTheRelayStops` | fixed 2026-09-28 |
 | R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestOfflineRestartsKeepEveryPredecessor` (was `TestReviewOfflineRestartMustPreserveUnreportedIncarnations`), `TestPredecessorBacklogAndBound`, `TestFleetRecordsEveryPredecessor` | fixed 2026-09-28 |
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestDirectoryExportIsOneVersion` (was `TestReviewDirectoryExportMustUseOneVersion`), `TestStoreExportIsOneVersion` | fixed 2026-09-28 |
-| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` | open |
+| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestConditionalCompletionIsJudgedOnBothClusters` (was `TestReviewConditionalMultipartChecksOtherBackend`), `TestConditionalCompletionPinnedToTheSource`, `TestConditionalCompletionUncheckable` | fixed 2026-09-28 |
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` | open |
 | R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
 | R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
@@ -128,6 +128,19 @@ secret together while node a exports continuously, every export pairing each key
 secret. Negative controls: the lab path without the version check reproduces the review's version 7
 key with version 8 secret; `Export` reading the snapshot and the secrets one after another pairs
 versions wrongly in four runs of five.
+
+**R3-06 fixed (2026-09-28).** Whether a write's `If-None-Match`/`If-Match` is judged against both
+clusters of a moving bucket (ADR-0013) now depends on the operation (PutObject,
+CompleteMultipartUpload, CopyObject), not its routing class: a completion is routed as an upload,
+pinned by its uploadId to the cluster holding its parts, and still commits the logical object its
+conditions are about. The pinned cluster is where it lands; the other one is asked. As for a PUT, a
+completion on a cluster that ignores `If-None-Match: *` has its create-once judged by shunt in
+every state. Tests, while MIGRATING: create-once over a source-only object refused and nothing
+written (the review's case), create-once over nothing completing, update-if-current matching the
+source's version completing as create-only on the target, update-if-current naming another version
+refused; an upload pinned to the source refused when the key is on the target; a completion whose
+other-cluster HEAD fails refused with 503 and not sent. Exempting completions again fails four of
+the six.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
