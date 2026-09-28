@@ -150,19 +150,24 @@ func newStatus() *cobra.Command {
 				return printJSON(cmd, st)
 			}
 			out := cmd.OutOrStdout()
-			quorum := "quorum"
-			if !st.Cluster.HasQuorum {
-				quorum = "NO QUORUM: no change is possible until a majority of members is back"
+			voters, healthy := 0, 0
+			for _, m := range st.Members {
+				if m.Role == "voter" {
+					voters++
+				}
+				if m.Health == cp.HealthHealthy {
+					healthy++
+				}
 			}
-			_, _ = fmt.Fprintf(out, "node %s (shunt-control %s): %d of %d members started, %d needed for writes, %s\n",
-				st.Node, st.Version, st.Cluster.Started, len(st.Cluster.Members), st.Cluster.Quorum, quorum)
+			_, _ = fmt.Fprintf(out, "node %s (shunt-control %s): %d voting member(s), %d needed for writes; %d of %d member(s) healthy; %s\n",
+				st.Node, st.Version, voters, st.Cluster.Quorum, healthy, len(st.Members), quorumText(st.Quorum))
 			loaded := ""
 			if !st.DirectoryLoaded {
 				loaded = " (NOT LOADED on this node yet: waiting for quorum)"
 			}
 			_, _ = fmt.Fprintf(out, "directory version %d%s; etcd revision %d; database %s of %s in use, quota %s\n\n",
 				st.Directory, loaded, st.Cluster.Revision, size(st.Cluster.DBInUse), size(st.Cluster.DBBytes), size(st.Cluster.QuotaByte))
-			printMembers(out, st.Cluster.Members)
+			printMembers(out, st.Members)
 			_, _ = fmt.Fprintln(out)
 			if st.FleetError != "" {
 				_, _ = fmt.Fprintln(out, st.FleetError)
@@ -176,26 +181,40 @@ func newStatus() *cobra.Command {
 	return cmd
 }
 
-func printMembers(out io.Writer, ms []cp.MemberInfo) {
+// quorumText says quorum as the node last observed it (ADR-0021 D4, H3d): a leader in view is not
+// evidence of quorum, and an observation that is stale or missing reads unknown.
+func quorumText(q cp.QuorumObservation) string {
+	switch q.State {
+	case cp.QuorumReachable:
+		return fmt.Sprintf("quorum reachable (a linearizable read %s ago)", ago(q.AgeMS))
+	case cp.QuorumUnavailable:
+		return fmt.Sprintf("QUORUM UNAVAILABLE (%s, %s ago): no change is possible until a majority of voting members is back", q.ErrorCode, ago(q.AgeMS))
+	}
+	return "quorum unknown (no recent observation): no change is known to be possible"
+}
+
+func ago(ms int64) string { return (time.Duration(ms) * time.Millisecond).Round(time.Second).String() }
+
+// printMembers shows each member with its observed health: a member is healthy only when a control
+// node has lately reached it, not because it once started.
+func printMembers(out io.Writer, ms []cp.MemberHealth) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "MEMBER\tID\tPEER\tROLE\tSTATE")
+	_, _ = fmt.Fprintln(tw, "MEMBER\tID\tPEER\tROLE\tHEALTH\tOBSERVED\tREASON")
 	for i := range ms {
 		m := &ms[i]
-		role, state := "follower", "started"
+		role := m.Role
 		if m.Leader {
-			role = "leader"
-		}
-		if m.Learner {
-			role = "learner"
-		}
-		if !m.Started {
-			state = "added, not started"
+			role = "voter, leader"
 		}
 		name := m.Name
 		if name == "" {
 			name = "(unnamed)" // added, never started: remove it by id
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, m.ID, strings.Join(m.PeerURLs, ","), role, state)
+		observed := "-"
+		if !m.ObservedAt.IsZero() {
+			observed = ago(m.AgeMS) + " ago"
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, m.ID, strings.Join(m.PeerURL, ","), role, m.Health, observed, m.Reason)
 	}
 	_ = tw.Flush()
 }
@@ -250,9 +269,9 @@ func newMember() *cobra.Command {
 				return err
 			}
 			if o.json {
-				return printJSON(cmd, st.Cluster.Members)
+				return printJSON(cmd, st.Members)
 			}
-			printMembers(cmd.OutOrStdout(), st.Cluster.Members)
+			printMembers(cmd.OutOrStdout(), st.Members)
 			return nil
 		},
 	}

@@ -432,6 +432,11 @@
   },
   {
     "method": "GET",
+    "pattern": "/v1/control/local-status",
+    "mutation": false
+  },
+  {
+    "method": "GET",
     "pattern": "/v1/control/snapshot",
     "verbs": [
       "snapshot save"

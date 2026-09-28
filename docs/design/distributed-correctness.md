@@ -633,6 +633,20 @@ it resumable, not cancelable. Refused: the only voter, the answering node (`Memb
 etcd's quorum refusal (`ErrQuorumAtRisk`, definitive: nothing changed). `shunt-control member remove
 <name> | --id <id> [--dry-run]`; `member list` shows ids. The Control plane screen's removal is H3e's.
 
+**Landed (2026-09-28, H3d):** observed health. Each control node runs a sampler (`cp.Health`): every
+5 s with up to 1 s of jitter, within a 3 s deadline, five probes at a time, it probes every other
+member's `GET /v1/control/local-status` at the API URL the member registered once its store loaded
+(`/shunt/control-nodes/<id>`, read serializably), judges its own member from its own etcd, and reads
+quorum by a linearizable read through itself. Status serves the last samples and never probes, so
+the work does not grow with viewers. A member is healthy only when reached lately, answering as
+itself, with a leader in view; a member that never started is unknown, never healthy; any sample
+older than 15 s reads unknown. The membership is the node's own view, so status stays available
+without quorum, marked partial; `cluster.quorum` counts voters only and `has_quorum` is quorum's
+observed state. `GET /v1/control` adds `members[]` with health, `quorum{}`, `partial`,
+`membership_revision` and `active_membership_operation` (contracts §4; `identity`, `mode` and
+`recovery` wait for H4). `shunt-control status` and `member list`, and the Control plane screen,
+show health and quorum as observed. `shunt_control_health_observation_age_seconds` is implemented.
+
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability
 checks. Serialize membership intents durably; at most one unfinished membership

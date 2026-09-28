@@ -278,3 +278,18 @@ func firstOf(s []string) string {
 	}
 	return s[0]
 }
+
+// ActiveMembershipOperation is the id of the unfinished operation that holds the control plane's
+// membership (a join or a removal), or "" when none does or the records cannot be read.
+func (s *Server) ActiveMembershipOperation(ctx context.Context) string {
+	ops, err := s.ops().Evidence(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, op := range ops {
+		if !op.Terminal() && op.Scope != nil && op.Scope.Resource == MembersResource {
+			return op.ID
+		}
+	}
+	return ""
+}

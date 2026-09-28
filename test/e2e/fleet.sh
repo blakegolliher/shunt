@@ -155,9 +155,21 @@ say "1. Three control nodes, then two proxies that get everything from them"
 start_control 1 init
 start_control 2 join
 start_control 3 join
+# Formed: three voting members observed healthy and quorum reachable (ADR-0021 D4, H3d). A node
+# that joined is a learner until its join promotes it, and each node samples the others' health
+# every few seconds, so this waits for what status observes rather than reading it once.
+formed=0
+for _ in $(seq 1 60); do
+  if "$CONTROL" status --json > status-0.json 2>/dev/null &&
+     jq -e '([.members[] | select(.role == "voter" and .health == "healthy")] | length) == 3 and .quorum.state == "reachable" and .cluster.quorum == 2' status-0.json >/dev/null; then
+    formed=1
+    break
+  fi
+  sleep 1
+done
 "$CONTROL" status > status-0.txt || fail "shunt-control status"
 sed 's/^/     /' status-0.txt
-grep -q '3 of 3 members started, 2 needed for writes, quorum' status-0.txt || fail "the cluster did not form"
+[ "$formed" = 1 ] || fail "the cluster did not form: three healthy voting members and quorum reachable, observed"
 TOKEN=$(cat "$WORK/secrets/control.token")
 probe=$(jq -n --arg endpoint "127.0.0.1:3900" --arg access "$GARAGE_ACCESS_KEY" --arg secret "file:$WORK/secrets/garage.secret" \
   '{name:"garage",cluster:{type:"s3",scheme:"http",region:"garage",endpoints:[$endpoint],credentials:{access_key:$access,secret_ref:$secret},capabilities:{conditional_write:false}}}')
