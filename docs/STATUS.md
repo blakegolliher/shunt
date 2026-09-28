@@ -17,6 +17,45 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### Third correctness review (2026-09-26): ten open faults, fixed next
+
+An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three
+carried from its earlier review of `b01f65d`. Its ten diagnostic tests all fail on `151608d` (H3b)
+under `-race`, as on the reviewed commit; H3a and H3b touched none of the code they cite. Each test is
+committed with its fix, so the branch stays green. **Until R3-01 to
+R3-04 are fixed, H2's "passed" below does not hold:** a drain barrier can advance on a proof that
+leaves out unfinished work.
+
+| ID | Pri | | Fault | Test |
+|---|---|---|---|---|
+| R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestReviewOldBundleCannotEnterAfterBarrierCompletes` |
+| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestReviewOldScopeProgressMustNotAuthorizeNewScope` |
+| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestReviewIncompleteMultipartResponseMustRemainUncertain` |
+| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` |
+| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` |
+| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` |
+| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` |
+| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` |
+| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` |
+| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestReviewListingLookaheadFailureMustNotDeclareComplete` |
+
+Order of work (the review's): R3-01 to R3-04 first, since destructive routing changes trust their
+proofs; then R3-05 to R3-07 and R3-10; then R3-08 and R3-09; then H3c and H3d. Each fix lands with its
+review test moved into the package's own tests under a descriptive name, a negative control where the
+test alone does not show the guard is load-bearing, and the review's wider cases for it (R3-01:
+credential rotation, cutover, read-only and scoped moves, and a benchmark of admission; R3-03: early
+200, embedded error, truncated XML, timeout, client disconnect; R3-05: the production store under
+concurrent rotation; R3-07: quiet and verbose, mixed keys, per-key and whole-leg failure). Protocol
+changes (R3-01, R3-02, R3-04) update the durable schema, API, CLI and UI together. After the ten, the
+review asks for the same cases on the distributed store and its failure interleavings; passing these
+ten is not a safety proof.
+
+The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
+has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
+plane screen shows started as healthy (H3d; with H3b every join spends a moment as a learner). A
+snapshot restore keeps its application epoch (H4). Capacity at 1,000 proxies (docs/bench/h2.md)
+stays open under T19.
+
 ### Planned correctness work (2026-09-24; no runtime fixes shipped here)
 
 A review of `74bddd4f3d3a6621d118dbc2a99b6f35a52c6e03` identified gaps in snapshot
@@ -26,7 +65,7 @@ do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) pro
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
-H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25; H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
+H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25 (H2 is qualified by the third review's R3-01 to R3-04, above); H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
 that fails when its fix is reverted: T01 (monotonic member installs), T02 (a refused or
 uncommitted candidate changes no live secret, key or cluster, on the member, the control node
 and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease
