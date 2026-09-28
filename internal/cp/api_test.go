@@ -401,7 +401,9 @@ func TestControlAPIOnEtcdWithMembers(t *testing.T) {
 	if tr.Held || tr.To != directory.StateMigrating {
 		t.Fatalf("migrate start: %+v", tr)
 	}
-	a.must("POST", "/v1/placements/acme/data01/mover-progress", control.Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	snap := a.store.Snapshot() // the report is bound to the move it describes (R3-02)
+	a.must("POST", "/v1/placements/acme/data01/mover-progress", control.Progress{Identity: snap.Identity(), Generation: snap.Generation(directory.PlacementResource("acme/data01")),
+		Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
 	p2.reads.Store(3)
 	time.Sleep(150 * time.Millisecond)
 	go func() {
