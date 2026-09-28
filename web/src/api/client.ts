@@ -215,7 +215,8 @@ export interface Operation {
   allowed_actions?: string[]
   blockers?: Blocker[]
   blocker_count?: number
-  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number; dispatch_started?: boolean }
+  // barrier.prior is the read-only switch a read-only change replaces: what a cancel puts back (R3-09).
+  barrier?: { id: string; scope: string; kind: string; hold_version?: number; generation?: number; committed?: boolean; commit_version?: number; dispatch_started?: boolean; prior?: { read_only: boolean; reject?: boolean } }
   // worker is an external mover's session (`shunt migrate run`): an expired one is resolved by the
   // operator with an attestation (resolve-worker), which the session then keeps.
   worker?: WorkerSession

@@ -753,6 +753,15 @@ func (s *Store) ClearBarrier(ctx context.Context, resource, id, actor string) er
 	return s.mutate(ctx, actor, "clear-barrier", key, func(st *state) error { return st.file.ClearBarrier(tenant, bucket, id) })
 }
 
+// ReleaseReadOnly implements directory.Store.
+func (s *Store) ReleaseReadOnly(ctx context.Context, resource, id string, readOnly, reject bool, actor string) error {
+	key := strings.TrimPrefix(resource, "placement:")
+	if name, ok := strings.CutPrefix(resource, "cluster:"); ok {
+		key = "clusters/" + name
+	}
+	return s.mutate(ctx, actor, "release-read-only", key, func(st *state) error { return st.file.ReleaseReadOnly(resource, id, readOnly, reject) })
+}
+
 // SetPlacementWatch implements directory.Store.
 func (s *Store) SetPlacementWatch(ctx context.Context, tenant, bucket string, watch bool, actor string) error {
 	return s.mutate(ctx, actor, "placement-watch", directory.Key(tenant, bucket), func(st *state) error {

@@ -67,6 +67,10 @@ func (s *Server) runReadOnly(tr *tracker, target, scope string, req ReadOnlyRequ
 	// precondition would leave the operator-visible desired state false and provide no hold to
 	// resume after an owner loss (T08).
 	b := &barrier{scope: scope, kind: config.BarrierMutations,
+		prior: func() *ReadOnlyPrior {
+			ro, reject, _ := s.readOnlySwitch(scope)
+			return &ReadOnlyPrior{ReadOnly: ro, Reject: reject}
+		},
 		hold: func() (int64, error) {
 			if err := s.Dir.Sync(tr.ctx); err != nil {
 				return 0, err
@@ -105,13 +109,19 @@ func (s *Server) runReadOnly(tr *tracker, target, scope string, req ReadOnlyRequ
 
 // readOnlyOf reads a scope's read-only flag and barrier as they stand.
 func (s *Server) readOnlyOf(scope string) (readOnly bool, b *directory.Barrier) {
+	ro, _, b := s.readOnlySwitch(scope)
+	return ro, b
+}
+
+// readOnlySwitch reads a scope's read-only switch (flag and reject mode) and barrier as they stand.
+func (s *Server) readOnlySwitch(scope string) (readOnly, reject bool, b *directory.Barrier) {
 	f := s.Dir.Snapshot().File()
 	if name, ok := strings.CutPrefix(scope, "cluster:"); ok {
 		c := f.Clusters[name]
-		return c.ReadOnly, c.Barrier
+		return c.ReadOnly, c.RejectWrites, c.Barrier
 	}
 	p := f.Placements[strings.TrimPrefix(scope, "placement:")]
-	return p.ReadOnly, p.Barrier
+	return p.ReadOnly, p.RejectWrites, p.Barrier
 }
 
 // settleReadOnly waits for the version to reach every live member.

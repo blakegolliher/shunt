@@ -36,7 +36,7 @@ on a proof that left out unfinished work, are fixed, and `make fleet` passed on 
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestConditionalCompletionIsJudgedOnBothClusters` (was `TestReviewConditionalMultipartChecksOtherBackend`), `TestConditionalCompletionPinnedToTheSource`, `TestConditionalCompletionUncheckable` | fixed 2026-09-28 |
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestSpreadDeleteAnswersForEveryKey` (was `TestReviewSpreadDeleteMustReportSourceOwnedFailure`), `FuzzParseDeleteRequest` | fixed 2026-09-28 |
 | R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestCacheRecoversOnARefetch` (was `TestReviewRecoveredDiskMustRetryCurrentCacheVersion`), `TestCacheRecoversOnTheHeartbeat`, `TestCacheRetryBackoffAndCancellation` | fixed 2026-09-28 |
-| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
+| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestCanceledReadOnlyRestoresThePriorSwitch` (was `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly`) | fixed 2026-09-28 |
 | R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestMergedListingLookaheadFailureIsNotTheEnd` (was `TestReviewListingLookaheadFailureMustNotDeclareComplete`), `TestMergedListingAtAnExactPageBoundary` | fixed 2026-09-28 |
 
 Order of work (the review's): R3-01 to R3-04 first, since destructive routing changes trust their
@@ -176,6 +176,18 @@ and not before, with the heartbeat and a restart showing the version; the backof
 disk keeps failing; a newer version cancelling the retry; the review's refetch case. Removing the
 heartbeat retry fails every stage and the backoff test; removing the refetch write fails the
 review's case.
+
+**R3-09 fixed (2026-09-28).** A read-only change records the switch it replaces (read-only and
+reject mode) on its barrier, with its intent, before its hold is written, and a cancellation puts it
+back in the write that releases the hold (`ReleaseReadOnly`, on the file and etcd stores): a repeated
+switch-on canceled leaves the scope read-only, a reject-mode change goes back to the mode before it,
+and only a switch-on of a writable scope ends writable. The record says where to restore to, so a
+resumed owner or another node's cancellation restores the same; the canceled record's effect is
+none, and true. A repeated switch-on still holds and drains, re-proving quiescence, as the review's
+test expects. Tests: on a cluster and a placement, a repeated switch-on, retryable to reject, reject
+to retryable and writable to read-only, each canceled while held by a silent member, with the prior
+switch on the durable record before the cancel. Releasing to writable, as before, fails the six
+cases whose scope was read-only.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

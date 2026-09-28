@@ -445,7 +445,10 @@ its sequence, and the check is repeated inside that write: an owner that has sin
 commit or its destructive dispatch wins, and the cancellation answers 409 `not_cancellable`; an
 owner that comes later finds its record ended and stops before touching the directory or a backend.
 A different/newer hold is never released, and a committed read-only is never switched off (the
-release names its barrier). Allowed while the operation waits in its precondition (it has written
+release names its barrier). A canceled read-only change puts back the switch it replaced, read-only
+and reject mode as they were, in the write that releases its hold: the operation's barrier records
+it as `prior` (`{"read_only", "reject"}`) before the hold is written, so a repeated switch-on
+canceled leaves the scope read-only (third review, R3-09). Allowed while the operation waits in its precondition (it has written
 nothing yet), and once its hold is durable up to its commit. While a live owner is writing its hold
 or its commit it answers 409, retry or follow it; once the owner is gone, a hold whose version never
 became durable is released all the same. Should the owner's commit have reached the directory
