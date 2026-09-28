@@ -22,9 +22,9 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three
 carried from its earlier review of `b01f65d`. Its ten diagnostic tests all fail on `151608d` (H3b)
 under `-race`, as on the reviewed commit; H3a and H3b touched none of the code they cite. Each test is
-committed with its fix, so the branch stays green. **Until R3-01 to
-R3-04 are fixed, H2's "passed" below does not hold:** a drain barrier can advance on a proof that
-leaves out unfinished work.
+committed with its fix, so the branch stays green. R3-01 to R3-04, which let a drain barrier advance
+on a proof that left out unfinished work, are fixed, and `make fleet` passed on that build
+(2026-09-28): H2's acceptance stands again.
 
 | ID | Pri | | Fault | Test | State |
 |---|---|---|---|---|---|
@@ -32,7 +32,7 @@ leaves out unfinished work.
 | R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestOldMoveReportCannotAuthorizeCutover`, `TestMoverReportGoesStaleWithThePlacement` (was `TestReviewOldScopeProgressMustNotAuthorizeNewScope`) | fixed 2026-09-28 |
 | R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestCompletionOutcomeIsTheWholeAnswer` (was `TestReviewIncompleteMultipartResponseMustRemainUncertain`), `TestLearnAnswerReadsTheRestAfterTheRelayStops` | fixed 2026-09-28 |
 | R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestOfflineRestartsKeepEveryPredecessor` (was `TestReviewOfflineRestartMustPreserveUnreportedIncarnations`), `TestPredecessorBacklogAndBound`, `TestFleetRecordsEveryPredecessor` | fixed 2026-09-28 |
-| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` | open |
+| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestDirectoryExportIsOneVersion` (was `TestReviewDirectoryExportMustUseOneVersion`), `TestStoreExportIsOneVersion` | fixed 2026-09-28 |
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` | open |
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` | open |
 | R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
@@ -111,8 +111,23 @@ review's chain (A registered, B and C crashed offline, D retired offline) report
 heartbeat and nothing after the answer; a backlog of ten goes out eight then two; past 32 the start
 is refused and the marker untouched; on etcd, a heartbeat carrying three records all three, and its
 repeat changes nothing. Negative controls: a marker keeping only the last process, and a control
-plane recording only the first of the list, each fail. With R3-01 to R3-04 fixed, H2's
-qualification is lifted pending `make fleet` on the combined build.
+plane recording only the first of the list, each fail. `make fleet`
+passed on the R3-01 to R3-04 build.
+
+**R3-05 fixed (2026-09-28).** `GET /v1/directory` hands a member one version whole. The control
+plane's store publishes each installed version as one state holding its directory, client keys and
+cluster secrets, and now its snapshot too; `Store.Export` reads all of them from that one state, and
+shunt-control serves the export from it (`Server.Export`), as its embedded mover now takes its
+directory and secrets (`MoverWorker.Export`). A lab, whose directory and key files are separate,
+reads them one after another with the directory's version read again after them, repeats the reads
+when it moved, and answers a retryable 503 when it keeps moving: never a mixed pair. Tests: on the
+lab path, a rotation that lands between the reads answers the rotated version with its own secret,
+and a directory rotated on every read answers 503 (the review's test, whose hook rotates on every
+read, gets that 503 rather than a mixed pair); on etcd, a hundred rotations of an access key and its
+secret together while node a exports continuously, every export pairing each key with its own
+secret. Negative controls: the lab path without the version check reproduces the review's version 7
+key with version 8 secret; `Export` reading the snapshot and the secrets one after another pairs
+versions wrongly in four runs of five.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
@@ -129,7 +144,7 @@ do not cover those failures. [ADR-0021](adr/0021-distributed-correctness.md) pro
 five coordinated fixes; the [protocol design](design/distributed-correctness.md),
 [API/CLI/GUI contract](design/distributed-correctness-contracts.md), and
 [implementation/test plan](prompts/distributed-hardening.md) define their gates.
-H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25 (H2 is qualified by the third review's R3-01 to R3-04, above); H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
+H0 and H1 passed on 2026-09-24 and H2 on 2026-09-25 (qualified by the third review's R3-01 to R3-04 until their fixes, above, on 2026-09-28); H3–H5 are pending. Landed ahead of H0 on 2026-09-24, each with a regression test
 that fails when its fix is reverted: T01 (monotonic member installs), T02 (a refused or
 uncommitted candidate changes no live secret, key or cluster, on the member, the control node
 and the file backend), T03 (secret-only rotation re-signs over the same pool) and T07 (the lease

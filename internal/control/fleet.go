@@ -463,6 +463,37 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		Retire: g.Retire, PreviousRecorded: g.PreviousRecorded})
 }
 
+// Export is one directory version with the client keys and cluster secrets that go with it: what
+// GET /v1/directory hands a member, which installs and caches it as one bundle.
+type Export struct {
+	Snapshot    *directory.Snapshot
+	Credentials []sigv4.Credential
+	Secrets     map[string]string
+}
+
+// export reads one version whole (R3-05): from the store's one state when it can (Export), or else
+// the directory, the keys and the secrets one after another, with the directory's version read
+// again after them and the reads repeated when it moved, so a rotation that lands between them
+// cannot pair one version's routing with another's secrets.
+func (s *Server) export() (Export, error) {
+	if s.Export != nil {
+		return s.Export(), nil
+	}
+	for range 8 {
+		exp := Export{Snapshot: s.Dir.Snapshot()}
+		if s.Keys != nil {
+			exp.Credentials = s.Keys.All()
+		}
+		if s.ClusterSecrets != nil {
+			exp.Secrets = s.ClusterSecrets()
+		}
+		if s.Dir.Snapshot().Version() == exp.Snapshot.Version() {
+			return exp, nil
+		}
+	}
+	return Export{}, fmt.Errorf("%w: the directory kept changing while it was read; retry", ErrUnavailable)
+}
+
 // RetireRequest is POST /v1/fleet/{id}/retire. From a proxy, it reports that Incarnation has
 // stopped admitting and drained, with the outcomes it never learned; from an operator (no
 // incarnation), it asks the proxy to retire, which its next heartbeat answer tells it.
@@ -875,14 +906,18 @@ func (s *Server) directoryHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if snap.Version() > since {
-			payload := Directory{File: *snap.File(), Credentials: []Credential{}}
-			if s.Keys != nil {
-				for _, c := range s.Keys.All() {
-					payload.Credentials = append(payload.Credentials, Credential{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: c.Tenant, Buckets: c.Buckets})
-				}
+			exp, err := s.export()
+			if err != nil {
+				fail(w, err)
+				return
 			}
-			if s.ClusterSecrets != nil {
-				payload.Secrets = s.ClusterSecrets()
+			if err := checkLineage(exp.Snapshot, have, since); err != nil {
+				fail(w, err)
+				return
+			}
+			payload := Directory{File: *exp.Snapshot.File(), Credentials: make([]Credential, 0, len(exp.Credentials)), Secrets: exp.Secrets}
+			for _, c := range exp.Credentials {
+				payload.Credentials = append(payload.Credentials, Credential{AccessKey: c.AccessKey, Secret: c.Secret, Tenant: c.Tenant, Buckets: c.Buckets})
 			}
 			writeJSON(w, http.StatusOK, payload)
 			return

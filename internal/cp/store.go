@@ -74,6 +74,7 @@ type state struct {
 	file    *directory.File
 	creds   map[string]sigv4.Credential // access key → credential, secret in the clear
 	secrets map[string]string           // control:<cluster> → secret in the clear
+	snap    *directory.Snapshot         // file's snapshot, set when the state is installed
 }
 
 func (st *state) clone() *state {
@@ -339,8 +340,9 @@ func (s *Store) prepare(st *state, onWrite bool) (commit func(), err error) {
 }
 
 func (s *Store) install(st *state) {
-	s.cur.Store(st)
 	snap := directory.NewSnapshot(st.file)
+	st.snap = snap // before the state is published: Export reads both from it
+	s.cur.Store(st)
 	s.snap.Store(snap)
 	s.mu.Lock()
 	s.cond.Broadcast()
@@ -851,14 +853,27 @@ func (s *Store) Tenant(tenant string) []sigv4.Credential {
 }
 
 // All implements control.Keys.
-func (s *Store) All() []sigv4.Credential {
-	m := s.cur.Load().creds
+func (s *Store) All() []sigv4.Credential { return credsOf(s.cur.Load().creds) }
+
+func credsOf(m map[string]sigv4.Credential) []sigv4.Credential {
 	out := make([]sigv4.Credential, 0, len(m))
 	for _, c := range m {
 		out = append(out, c)
 	}
 	sortCreds(out)
 	return out
+}
+
+// Export is one installed version whole: its directory, client keys and cluster secrets, from the
+// one state that holds them, so a member never installs one version's routing with another's
+// secrets (third review, R3-05). Reading Snapshot, All and ClusterSecrets one after another can
+// straddle an install. Before Start has loaded the directory it is empty at version 0.
+func (s *Store) Export() control.Export {
+	st := s.cur.Load()
+	if st == nil || st.snap == nil {
+		return control.Export{Snapshot: s.Snapshot()}
+	}
+	return control.Export{Snapshot: st.snap, Credentials: credsOf(st.creds), Secrets: maps.Clone(st.secrets)}
 }
 
 func sortCreds(cs []sigv4.Credential) {

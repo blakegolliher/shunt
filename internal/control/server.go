@@ -53,6 +53,11 @@ type Server struct {
 	// ClusterSecrets resolves the cluster secret_refs only the control plane can (control:<name>),
 	// for GET /v1/directory and the mover. nil: every ref resolves on the reader's own host.
 	ClusterSecrets func() map[string]string
+	// Export, if set, is one version whole for GET /v1/directory: its directory, client keys and
+	// cluster secrets from one store state (third review, R3-05). nil: they are read separately
+	// and the directory's version checked around the reads, which is all a lab's separate
+	// directory and key files allow.
+	Export func() Export
 	// Fleet is the fleet table (ADR-0016). nil: NoFleet, a single-node lab. LeaseTTL is the grant
 	// every heartbeat answer carries, for the diagnostics.
 	Fleet    Fleet
