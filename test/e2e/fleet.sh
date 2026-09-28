@@ -3,8 +3,11 @@
 # (source) and MinIO (target). Nothing is shared between the proxies but the network (ADR-0015).
 # It checks, with real processes:
 #
-#   1. Three control nodes form a cluster; both proxies join the fleet through different nodes and
-#      get the directory, the client keys and the cluster secrets from the control plane.
+#   1. Three control nodes form a cluster (c3 as the Control plane screen's join wizard joins one: an
+#      intent over the API, then the node's own command with --resume; a fourth join, never started,
+#      is canceled and leaves the membership as it was); both proxies join the fleet through
+#      different nodes and get the directory, the client keys and the cluster secrets from the
+#      control plane.
 #   2. A client that writes the same keys alternately through A and B across every ramp step and
 #      migrate start never loses a write (the hold, ADR-0016): every key reads back, through both,
 #      as its last acknowledged write. Bucket creation through a proxy lands in the control plane.
@@ -29,6 +32,7 @@ A_LISTEN=127.0.0.1:8038; A_ADMIN=127.0.0.1:9938
 B_LISTEN=127.0.0.1:8048; B_ADMIN=127.0.0.1:9948
 C1_API=127.0.0.1:9951; C2_API=127.0.0.1:9952; C3_API=127.0.0.1:9953
 C1_PEER=127.0.0.1:9961; C2_PEER=127.0.0.1:9962; C3_PEER=127.0.0.1:9963
+C4_PEER=127.0.0.1:9964 # a join that is requested and canceled: nothing ever listens there
 while [ $# -gt 0 ]; do
   case "$1" in
     --work) WORK=$2; shift 2 ;;
@@ -116,11 +120,13 @@ for addr in $A_LISTEN $A_ADMIN $B_LISTEN $B_ADMIN $C1_API $C2_API $C3_API $C1_PE
 done
 wait_http() { for _ in $(seq 1 200); do curl -fsS "$1" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
 
-start_control() { # start_control <n> [init|join]
+start_control() { # start_control <n> [init|join|resume <operation>]
   local n=$1 mode=$2 api peer
   case $n in 1) api=$C1_API; peer=$C1_PEER ;; 2) api=$C2_API; peer=$C2_PEER ;; 3) api=$C3_API; peer=$C3_PEER ;; esac
   if [ "$mode" = init ]; then
     nohup "$CONTROL" init --name c$n --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$api" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 3s >> "c$n.log" 2>&1 &
+  elif [ "$mode" = resume ]; then # the command the join wizard shows: carry on the join the browser requested
+    nohup "$CONTROL" join --name c$n --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$api" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 3s --existing "http://$C1_API" --resume "$3" >> "c$n.log" 2>&1 &
   else
     nohup "$CONTROL" join --name c$n --data-dir "$WORK/c$n" --peer-url "http://$peer" --api "$api" --token-ref "file:$WORK/secrets/control.token" --lease-ttl 3s --existing "http://$C1_API" >> "c$n.log" 2>&1 &
   fi
@@ -151,10 +157,39 @@ done
 for b in fleet-a fleet-b; do on_garage s3api create-bucket --bucket $b >/dev/null; on_minio s3api create-bucket --bucket $b >/dev/null; done
 for i in 1 2 3; do printf 'seed %s' $i | on_garage s3 cp --quiet - s3://fleet-a/seed/$i; done
 
+TOKEN=$(cat "$WORK/secrets/control.token")
+# request_join <name> <peer> <key>: POST /v1/control/members as the join wizard does, into join-<name>.json.
+# One membership change runs at a time and a refused request leaves no record, so it is sent again,
+# with the same Idempotency-Key, while another change (the last node's promotion) finishes.
+request_join() {
+  local code
+  for _ in $(seq 1 120); do
+    code=$(curl -sS -o "join-$1.json" -w '%{http_code}' -X POST "http://$C1_API/v1/control/members" -H "Authorization: Bearer $TOKEN" \
+      -H "Idempotency-Key: $3" -H 'Content-Type: application/json' -d "{\"name\":\"$1\",\"peer_url\":\"http://$2\"}")
+    [ "$code" = 202 ] && return 0
+    [ "$code" = 409 ] && jq -e '.code == "operation_conflict"' "join-$1.json" >/dev/null || { cat "join-$1.json"; fail "the join intent for $1 answered HTTP $code"; }
+    sleep 0.5
+  done
+  fail "the join intent for $1 waited a minute for another membership change"
+}
+
 say "1. Three control nodes, then two proxies that get everything from them"
 start_control 1 init
 start_control 2 join
-start_control 3 join
+# c3 joins as the Control plane screen's join wizard joins a node (ADR-0021 D4, H3e): the join's
+# intent over the API, which adds c3 as a learner and answers its member ID but never the key; then
+# the command the screen shows, run on the new host with --resume, which fetches the bootstrap there.
+request_join c3 "$C3_PEER" fleet-join-c3
+JOIN3=$(jq -r '.id' join-c3.json); LEARNER3=$(jq -r '.member.id' join-c3.json)
+jq -e '.kind == "control-join" and (.member.id | length > 0) and (has("encryption_key") | not) and (tostring | contains("encryption_key") | not)' join-c3.json >/dev/null \
+  || { cat join-c3.json; fail "the join intent's answer has no learner, or carries the key"; }
+# Until c3 starts, its learner is unnamed, does not vote, and is not healthy: status exits 3, unknown.
+rc=0; "$CONTROL" status --json > status-learner.json 2>/dev/null || rc=$?
+jq -e --arg id "$LEARNER3" '[.members[] | select(.id == $id and .role == "learner" and .health == "unknown" and (.started | not))] | length == 1' status-learner.json >/dev/null \
+  || { cat status-learner.json; fail "the learner added for c3 is not listed unnamed, not voting and unknown"; }
+[ "$rc" = 3 ] || fail "shunt-control status with a learner never started exited $rc, want 3 (unknown)"
+note "c3's join was requested over the API: learner $LEARNER3 added, unnamed and unknown, and no key in the answer"
+start_control 3 resume "$JOIN3"
 # Formed: three voting members observed healthy and quorum reachable (ADR-0021 D4, H3d). A node
 # that joined is a learner until its join promotes it, and each node samples the others' health
 # every few seconds, so this waits for what status observes rather than reading it once.
@@ -167,10 +202,22 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-"$CONTROL" status > status-0.txt || fail "shunt-control status"
+rc=0; "$CONTROL" status > status-0.txt || rc=$?
 sed 's/^/     /' status-0.txt
 [ "$formed" = 1 ] || fail "the cluster did not form: three healthy voting members and quorum reachable, observed"
-TOKEN=$(cat "$WORK/secrets/control.token")
+[ "$rc" = 0 ] || fail "shunt-control status exited $rc on a cluster observed formed"
+[ "$(curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations/$JOIN3" | jq -r '.status')" = succeeded ] || fail "c3's join did not end succeeded"
+# A join requested and never started is canceled (T12 on real etcd): the cancel asks the join's
+# owner, which removes the learner by its ID; the record ends cancelled with nothing changed.
+request_join c4 "$C4_PEER" fleet-join-c4
+JOIN4=$(jq -r '.id' join-c4.json); LEARNER4=$(jq -r '.member.id' join-c4.json)
+accepted operation cancel "$JOIN4"
+for _ in $(seq 1 150); do [ "$(curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations/$JOIN4" | jq -r '.status')" = cancelled ] && break; sleep 0.2; done
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$C1_API/v1/operations/$JOIN4" | jq -e '.status == "cancelled" and .effect_state == "none"' >/dev/null \
+  || fail "the canceled join of c4 did not end cancelled with effect none"
+"$CONTROL" status --json | jq -e --arg id "$LEARNER4" '(.members | length) == 3 and ([.members[] | select(.id == $id)] | length) == 0 and (.active_membership_operation // "") == ""' >/dev/null \
+  || fail "the canceled join's learner $LEARNER4 is still a member, or a membership change is still active"
+note "a join requested and never started was canceled: learner $LEARNER4 removed, three members as before"
 probe=$(jq -n --arg endpoint "127.0.0.1:3900" --arg access "$GARAGE_ACCESS_KEY" --arg secret "file:$WORK/secrets/garage.secret" \
   '{name:"garage",cluster:{type:"s3",scheme:"http",region:"garage",endpoints:[$endpoint],credentials:{access_key:$access,secret_ref:$secret},capabilities:{conditional_write:false}}}')
 curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$probe" \
@@ -312,6 +359,19 @@ note "c2 down too: quorum lost (1 of 3)"
 sleep 5
 for p in $A_ADMIN $B_ADMIN; do curl -fsS "http://$p/-/fleet" | jq -e '.stale == true' >/dev/null || fail "a proxy is not stale with quorum lost"; done
 curl -fsS "http://$A_ADMIN/-/healthz" >/dev/null || fail "healthz failed while stale: a control-plane outage must not drain the fleet"
+# Status stays available without quorum, from c1's own view (ADR-0021 D4, T13): partial, quorum
+# unavailable by a linearizable read, every member listed, c2 and c3 unreachable, has_quorum false,
+# exit 1. (c1 reads unreachable too once its etcd has no leader in view.) The sampler observes every
+# 5 s, so this waits for its next cycle to see c2 gone.
+for _ in $(seq 1 40); do
+  rc=0; "$CONTROL" status --json > status-noquorum.json 2>/dev/null || rc=$?
+  jq -e '.partial and .quorum.state == "unavailable" and (.cluster.has_quorum | not) and (.members | length) == 3 and ([.members[] | select((.name == "c2" or .name == "c3") and .health == "unreachable")] | length) == 2' status-noquorum.json >/dev/null 2>&1 && break
+  sleep 0.5
+done
+jq -e '.partial and .quorum.state == "unavailable" and (.cluster.has_quorum | not) and (.members | length) == 3 and ([.members[] | select((.name == "c2" or .name == "c3") and .health == "unreachable")] | length) == 2' status-noquorum.json >/dev/null \
+  || { cat status-noquorum.json; fail "status without quorum is not partial with quorum unavailable and c2, c3 unreachable"; }
+[ "$rc" = 1 ] || fail "shunt-control status without quorum exited $rc, want 1"
+note "status without quorum answers from c1's view: partial, quorum $(jq -r '.quorum.error_code' status-noquorum.json), c2 and c3 unreachable (exit 1)"
 printf x > stale.body
 if AWS_MAX_ATTEMPTS=1 via "$B_LISTEN" s3api put-object --bucket fleet-a --key stale --body stale.body >/dev/null 2>stale.err; then fail "a stale proxy accepted a write to a moving bucket"; fi
 grep -q '503\|ServiceUnavailable' stale.err || fail "the stale refusal was not 503: $(cat stale.err)"

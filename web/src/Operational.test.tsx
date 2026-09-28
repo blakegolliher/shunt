@@ -31,17 +31,21 @@ function baseMock(directory: DirectoryStatus, mutate?: (url: string, init?: Requ
 beforeEach(() => sessionStorage.setItem('shunt.control.token', 'actor-token'))
 afterEach(() => { sessionStorage.clear(); vi.restoreAllMocks() })
 
-test('renders a filled join command and highlights the expected member', async () => {
+// The join drawer shows no command before the join is recorded: the command names the join's
+// operation (--resume), so a node started from it carries on that join rather than asking for its
+// own (ADR-0021 D4, H3e; the wizard's whole flow is in ControlPlane.test.tsx).
+test('offers the join command only once the join is recorded', async () => {
   const directory: DirectoryStatus = { version: 3, clusters: [], placements: [] }
   baseMock(directory)
   render(<StoreProvider><App /></StoreProvider>)
   await screen.findByText('Control members')
   fireEvent.click(screen.getByRole('button', { name: 'Add node' }))
+  fireEvent.change(screen.getByLabelText('New member name'), { target: { value: '' } })
+  expect(screen.getByRole('button', { name: 'Request join' })).toBeDisabled()
   fireEvent.change(screen.getByLabelText('New member name'), { target: { value: 'c2' } })
   fireEvent.change(screen.getByLabelText('Peer URL'), { target: { value: 'http://node2:2380' } })
-  expect(screen.getByText(/join --name c2/)).toHaveTextContent('--peer-url http://node2:2380 --api node2:9901')
-  fireEvent.click(screen.getByRole('button', { name: 'I ran this command' }))
-  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Request join' })).toBeEnabled()
+  expect(screen.queryByText(/shunt-control join/)).toBeNull()
 })
 
 test('requires a successful unchanged probe before saving a cluster', async () => {

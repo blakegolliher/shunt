@@ -647,6 +647,23 @@ observed state. `GET /v1/control` adds `members[]` with health, `quorum{}`, `par
 `recovery` wait for H4). `shunt-control status` and `member list`, and the Control plane screen,
 show health and quorum as observed. `shunt_control_health_observation_age_seconds` is implemented.
 
+**Landed (2026-09-28, H3e):** the operator surfaces. The Control plane screen's join wizard records
+the join's intent (`POST /v1/control/members`, one Idempotency-Key per intent, reused on a retry)
+and then shows the command the new host runs: the server's join line with `--resume <operation>`,
+so the node's own command fetches the bootstrap and the key never reaches the browser. The screen
+follows the membership change by its record (phase, blockers, the learner's ID, cancel and resume
+as the record allows them), announces its end only once the record has ended, and finds it again
+after a reload from `active_membership_operation`. Each member row has its role (a learner does not
+vote), its health, the phase of a join adding it, and Remove, except the answering node: the dry
+run shows the member by ID, the voters it leaves and the writes' quorum after, and Confirm sends
+its token; no second membership change can be started while one runs. `shunt-control status`
+exits 0 (quorum reachable, every member healthy), 1 (quorum unavailable or a member unreachable) or
+3 (nothing wrong observed, something not observed lately). `shunt_control_join_phase{phase}` is 1
+for the phase of the unfinished membership change, from each node's once-a-second sweep. `make
+fleet` joins c3 the wizard's way (intent over the API, then `join --resume`) and cancels a join
+that never started, on real processes. `shunt-control operation` sharing `shunt operation`'s client
+(contracts §2) is T17's, in H5; the join's cancel and resume are `shunt operation` meanwhile.
+
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability
 checks. Serialize membership intents durably; at most one unfinished membership

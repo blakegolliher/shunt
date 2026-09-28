@@ -97,3 +97,144 @@ test('shows each control member\'s observed health, never health from a name, an
   expect(screen.getByText(/^unreachable/)).toBeInTheDocument()
   expect(screen.getByText(/^unknown/)).toBeInTheDocument()
 })
+
+const joinTemplate = 'shunt-control join --name <name> --data-dir <data-dir> --peer-url http://<host>:2380 --api <host>:9901 --existing http://c1:9901'
+const threeMembers = {
+  ...control,
+  join: joinTemplate,
+  cluster: { ...control.cluster, quorum: 2 },
+  quorum: { state: 'reachable', observed_at: '2026-09-28T12:00:00Z', age_ms: 1000, observer: 'c1', method: 'linearizable_read' },
+  members: [
+    { id: '1', name: 'c1', role: 'voter', leader: true, peer_urls: ['http://peer-1'], started: true, health: 'healthy', observed_at: '2026-09-28T12:00:00Z', age_ms: 1000 },
+    { id: '2', name: 'c2', role: 'voter', peer_urls: ['http://peer-2'], started: true, health: 'healthy', observed_at: '2026-09-28T12:00:00Z', age_ms: 1000 },
+    { id: 'beef', role: 'learner', peer_urls: ['http://peer-9'], started: false, health: 'unknown', reason: 'added and never started: nothing to probe' },
+  ],
+}
+const joinOp = (status: string, extra: Record<string, unknown> = {}) => ({
+  id: 'join-1', kind: 'control-join', actor: 'token:abc', status, phase: 'learner_added', scope: { resource: 'control:members', generation: 1 },
+  member: { id: '8e9e05c52164694d', peer_url: 'http://10.0.0.4:2380' }, args: { name: 'c4', peer_url: 'http://10.0.0.4:2380' },
+  blockers: [{ code: 'member_not_started', message: 'waiting for c4 to fetch its bootstrap and start (`shunt-control join` on that host)' }], allowed_actions: ['cancel'], ...extra,
+})
+
+// T12 in the browser (H3e): the join wizard records the join's intent, keeping its Idempotency-Key
+// across a retry, and then shows the command the new host runs with --resume; the browser never asks
+// for the bootstrap, which carries the encryption key. It follows the learner's progress, and a
+// cancel is announced only when the record ends cancelled.
+test('joins a control member from the wizard: intent, the node\'s command, progress and cancel', async () => {
+  const posts: { body: unknown; key: string | null }[] = []
+  let cancelled = false
+  const urls: string[] = []
+  mock((url, init) => {
+    urls.push(url)
+    if (url.endsWith('/v1/control')) return Response.json(threeMembers)
+    if (url.endsWith('/v1/control/members') && init?.method === 'POST') {
+      posts.push({ body: JSON.parse(String(init.body)), key: new Headers(init.headers).get('Idempotency-Key') })
+      if (posts.length === 1) return Response.json({ code: 'unavailable', message: 'the answer was lost on the way' }, { status: 503 })
+      return Response.json(joinOp('blocked'), { status: 202 })
+    }
+    if (url.endsWith('/v1/operations/join-1/cancel')) { cancelled = true; return Response.json(joinOp('blocked', { cancel_request: { actor: 'token:abc', at: '2026-09-28T12:00:01Z' }, allowed_actions: [] }), { status: 202 }) }
+    if (url.endsWith('/v1/operations/join-1')) return Response.json(cancelled ? joinOp('cancelled', { effect_state: 'none', blockers: [], allowed_actions: [] }) : joinOp('blocked'))
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Add node' }))
+  fireEvent.change(screen.getByLabelText('New member name'), { target: { value: 'c4' } })
+  fireEvent.change(screen.getByLabelText('Peer URL'), { target: { value: 'http://10.0.0.4:2380' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Request join' }))
+  expect(await screen.findByText('the answer was lost on the way')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Request join' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(await within(dialog).findByText(/Run this exact command on the new host/)).toBeInTheDocument()
+  expect(within(dialog).getByText('shunt-control join --name c4 --data-dir <data-dir> --peer-url http://10.0.0.4:2380 --api 10.0.0.4:9901 --existing http://c1:9901 --resume join-1')).toBeInTheDocument()
+  expect(within(dialog).getByText(/waiting for c4 to fetch its bootstrap/)).toBeInTheDocument()
+  expect(posts).toHaveLength(2)
+  expect(posts[0].body).toEqual({ name: 'c4', peer_url: 'http://10.0.0.4:2380' })
+  expect(posts[0].key).toMatch(/^[0-9a-f]{32}$/)
+  expect(posts[1].key).toBe(posts[0].key)
+  expect(urls.some((u) => u.includes('/bootstrap'))).toBe(false)
+
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel join' }))
+  expect(await screen.findByText('control-join cancellation requested; the operation is blocked')).toBeInTheDocument()
+  expect(screen.queryByText(/Join of c4 cancelled/)).toBeNull()
+  expect(await screen.findAllByText('Join of c4 cancelled; the membership is as it was', {}, { timeout: 4000 })).not.toHaveLength(0)
+})
+
+// A removal names the member by ID from a dry run: the answering node offers none; an unnamed
+// learner is removed by its ID with the dry run's token, and what the removal leaves is shown first.
+test('removes an unnamed learner by its ID after a dry run, and never offers to remove this node', async () => {
+  let removed: { url: string; body: unknown } | null = null
+  mock((url, init) => {
+    if (url.endsWith('/v1/control')) return Response.json(threeMembers)
+    if (url.endsWith('/v1/control/members/by-id/beef?dry_run=1') && init?.method === 'DELETE') return Response.json({ allowed: true, member: { id: 'beef', peer_urls: ['http://peer-9'], role: 'learner', started: false }, voters_after: 2, token: 'tok-beef', expires_at: '2026-09-28T12:10:00Z' })
+    if (url.endsWith('/v1/control/members/by-id/beef') && init?.method === 'DELETE') { removed = { url, body: JSON.parse(String(init.body)) }; return Response.json({ member_id: 'beef', voters: 2, operation: 'rm-1' }) }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  expect(screen.getByText('this node')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Remove member c1' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Remove member c2' })).toBeEnabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Remove member beef' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByText('Remove (unnamed) (beef)')).toBeInTheDocument()
+  expect(within(dialog).getByText(/a learner does not vote: 2 voting member\(s\) either way/)).toBeInTheDocument()
+  expect(within(dialog).getByText(/names member beef and the member list as it is now/)).toBeInTheDocument()
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }))
+  expect(await screen.findByText('member beef removed; 2 voting member(s) left')).toBeInTheDocument()
+  expect(removed).toEqual({ url: expect.stringMatching(/\/v1\/control\/members\/by-id\/beef$/), body: { token: 'tok-beef' } })
+})
+
+// A refused removal says why and cannot be confirmed; one the server answers 202 is followed by its
+// record, and every Remove waits while it runs.
+test('shows a refused removal, and follows an accepted one until it ends', async () => {
+  let ended = false
+  const removing = (status: string) => ({ id: 'rm-2', kind: 'control-remove', actor: 'token:abc', status, phase: 'member_remove', scope: { resource: 'control:members', generation: 2 }, args: { id: '2' }, result: status === 'succeeded' ? { member_id: '2', name: 'c2', voters: 1 } : undefined, allowed_actions: [] })
+  mock((url, init) => {
+    if (url.endsWith('/v1/control')) return Response.json(threeMembers)
+    if (url.endsWith('/v1/control/members/by-id/1?dry_run=1')) return Response.json({ allowed: false, reason: 'refused: member 1 (c1) is the control node answering this request', member: { id: '1', name: 'c1', peer_urls: ['http://peer-1'], role: 'voter', started: true }, voters_after: 1 })
+    if (url.endsWith('/v1/control/members/by-id/2?dry_run=1')) return Response.json({ allowed: true, member: { id: '2', name: 'c2', peer_urls: ['http://peer-2'], role: 'voter', started: true }, voters_after: 1, warning: 'one voting member left: the control plane has no redundancy; join two more control nodes', token: 'tok-2' })
+    if (url.endsWith('/v1/control/members/by-id/2') && init?.method === 'DELETE') return Response.json(removing('running'), { status: 202 })
+    if (url.endsWith('/v1/operations/rm-2')) { const op = removing(ended ? 'succeeded' : 'running'); ended = true; return Response.json(op) }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  await screen.findByText('Control members')
+  fireEvent.click(screen.getByRole('button', { name: 'Remove member c2' }))
+  let dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByText(/one voting member left/)).toBeInTheDocument()
+  expect(within(dialog).getByText(/1 voting member\(s\); writes need 1/)).toBeInTheDocument()
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }))
+  const section = await screen.findByRole('region', { name: 'Membership change' })
+  expect(within(section).getByText('Removal of member 2')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Remove member beef' })).toBeDisabled()
+  expect(await within(section).findByText('member c2 removed', {}, { timeout: 4000 })).toBeInTheDocument()
+  expect(await screen.findAllByText('member c2 removed')).toHaveLength(2) // the section and its toast
+
+  fireEvent.click(within(section).getByRole('button', { name: 'Dismiss' }))
+  // c1 is this node here, so ask as if from another node's view: the server's refusal is shown.
+  mock((url) => {
+    if (url.endsWith('/v1/control')) return Response.json({ ...threeMembers, node: 'c9' })
+    if (url.endsWith('/v1/control/members/by-id/1?dry_run=1')) return Response.json({ allowed: false, reason: 'refused: member 1 (c1) is the control node answering this request', member: { id: '1', name: 'c1', peer_urls: ['http://peer-1'], role: 'voter', started: true }, voters_after: 1 })
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Remove member c1' }))
+  dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByRole('alert')).toHaveTextContent('is the control node answering this request')
+  expect(within(dialog).getByRole('button', { name: 'Confirm' })).toBeDisabled()
+})
+
+// After a reload the screen finds the membership change from the control node's status, not from
+// anything the browser kept: its progress, the new host's command and its cancel are there, and no
+// other membership change can be started beside it.
+test('follows the active membership change after a reload', async () => {
+  mock((url) => {
+    if (url.endsWith('/v1/control')) return Response.json({ ...threeMembers, active_membership_operation: 'join-1' })
+    if (url.endsWith('/v1/operations/join-1')) return Response.json(joinOp('blocked'))
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  const section = await screen.findByRole('region', { name: 'Membership change' })
+  expect(await within(section).findByText(/--resume join-1$/)).toBeInTheDocument()
+  expect(within(section).getByRole('button', { name: 'Cancel join' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Remove member c2' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Add node' }))
+  expect(screen.getByRole('button', { name: 'Request join' })).toBeDisabled()
+  expect(screen.getByText('A membership change is in progress; one runs at a time.')).toBeInTheDocument()
+})

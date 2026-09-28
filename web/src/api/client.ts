@@ -265,6 +265,8 @@ export interface Operation {
   // cancel_request is a cancellation asked of a control-plane join, which the join's owner carries
   // out (ADR-0021 D4): the record stays unfinished until the learner is removed.
   cancel_request?: { actor: string; at: string }
+  // member is the learner a control-plane join added, on its record before anything depends on it.
+  member?: { id: string; peer_url: string }
   args?: Record<string, unknown>
   owner_term?: number
   phase?: string
@@ -296,6 +298,30 @@ export function blockerText(blockers: Blocker[] | undefined): string {
 export function unfinished(op: Pick<Operation, 'status'> | null | undefined): boolean {
   return op?.status === 'pending' || op?.status === 'running' || op?.status === 'blocked'
 }
+
+// A control-plane join requested from the browser (ADR-0021 D4, H3e): the browser writes the join's
+// intent and follows its operation; the joining node's own command fetches the bootstrap, so the
+// data-encryption key never reaches the browser.
+export interface JoinRequest { name: string; peer_url: string }
+
+// joinCommand is the command the new host runs for a join: the server's join line with the node's
+// name, peer URL and host filled in, and, once the join's operation exists, --resume naming it, so
+// the node carries on that join instead of asking for another.
+export function joinCommand(template: string, name: string, peerURL: string, operation?: string): string {
+  let line = template.replace('<name>', name || '<name>')
+  if (peerURL) {
+    line = line.replace('http://<host>:2380', peerURL)
+    try { line = line.replaceAll('<host>', new URL(peerURL).hostname) } catch { /* keep the server placeholder */ }
+  }
+  return operation ? `${line} --resume ${operation}` : line
+}
+
+// MemberView is a control member as a removal's dry run names it; MemberRemoveDryRun is that dry run:
+// what the removal leaves, and the token, bound to the member ID and the whole member list, that
+// the removal must carry.
+export interface MemberView { id: string; name?: string; peer_urls: string[]; role: 'voter' | 'learner'; started: boolean }
+export interface MemberRemoveDryRun { allowed: boolean; reason?: string; member: MemberView; voters_after: number; warning?: string; token?: string; expires_at?: string }
+export interface MemberRemoveResult { member_id: string; name?: string; voters: number; warning?: string; operation?: string }
 
 export interface RemoveDryRun { allowed: boolean; reason?: string; name: string; references: string[]; secret_files: number; token?: string; expires_at?: string }
 export interface PurgeDryRun {
@@ -445,6 +471,13 @@ export const clearTarget = (token: string, tenant: string, bucket: string) => re
 export const setClusterReadOnly = (token: string, name: string, readOnly: boolean, reject = false) => request<Operation>(`${apiRoot}/operations`, token, json({ kind: 'cluster-read-only', cluster: name, args: { read_only: readOnly, reject } }))
 export const setBucketWatch = (token: string, tenant: string, bucket: string, watch: boolean) => request(`${apiRoot}/placements/${encodeURIComponent(tenant)}/${encodeURIComponent(bucket)}/watch`, token, json({ watch }))
 export const setPlacementReadOnly = (token: string, tenant: string, bucket: string, readOnly: boolean, reject = false) => request<Operation>(`${apiRoot}/operations`, token, json({ kind: 'placement-read-only', placement: `${tenant}/${bucket}`, args: { read_only: readOnly, reject } }))
+// requestJoin carries the wizard's own Idempotency-Key, so a retry of the same join answers the
+// same operation rather than asking for a second learner.
+export const requestJoin = (token: string, body: JoinRequest, key: string) => request<Operation>(`${apiRoot}/control/members`, token, { ...json(body), headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key } })
+export const removeMemberDryRun = (token: string, id: string) => request<MemberRemoveDryRun>(`${apiRoot}/control/members/by-id/${encodeURIComponent(id)}?dry_run=1`, token, { method: 'DELETE' })
+// removeMember answers the result once the removal ended within the server's wait, else the
+// operation record (202) to follow.
+export const removeMember = (token: string, id: string, confirmation: string) => request<MemberRemoveResult | Operation>(`${apiRoot}/control/members/by-id/${encodeURIComponent(id)}`, token, { ...json({ token: confirmation }), method: 'DELETE' })
 export const resumeOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/resume`, token, json({}))
 export const cancelOperation = (token: string, id: string) => request<Operation>(`${apiRoot}/operations/${encodeURIComponent(id)}/cancel`, token, json({}))
 // resolveWorker reconciles an external mover whose worker session expired: the operator attests

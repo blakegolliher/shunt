@@ -45,8 +45,15 @@ shunt-control join --name c2 --data-dir /var/lib/shunt-control --peer-url http:/
   --api c2:9901 --token-ref file:/etc/shunt/control.token --plaintext --existing http://c1:9901
 ```
 
+The Control plane screen joins a node the same way, from the other end: **Add node** takes the new
+member's name and peer URL and records the join (the learner is added then), and shows the command
+to run on the new host, which is the line above with `--resume <operation-id>` added. The node's own
+command fetches the bootstrap, so the data-encryption key never passes through the browser. The
+screen follows the join through its phases (`learner_added` until the node starts, `catching_up`
+until it is promoted) and finds it again after a reload.
+
 A join can be canceled until its node votes: `shunt operation cancel <id>` (or Cancel on the join
-in the Operations screen). The control node running the join removes its learner by member ID and
+in the Control plane or Operations screen). The control node running the join removes its learner by member ID and
 the record ends `cancelled`; the joining node, if it started, stops with the reason and the data
 directory to remove before joining again. A cancellation that arrives after the promotion removes
 nothing and is refused (`not_cancellable`): the node votes, and removing it is `shunt-control member
@@ -55,21 +62,29 @@ remove`, which changes the quorum.
 Both commands are also how a node is restarted: on a data directory that already holds a member
 they start it again and change nothing, so the same line is the node's service definition
 (`ExecStart=` in systemd). Joining takes a few seconds; `shunt-control status` shows the members,
-the leader, and whether there is quorum:
+each with its health as the node last observed it, the leader, and quorum as last observed:
 
 ```
-node c1 (shunt-control v0.x): 3 of 3 members started, 2 needed for writes, quorum
+node c1 (shunt-control v0.x): 3 voting member(s), 2 needed for writes; 3 of 3 member(s) healthy; quorum reachable (a linearizable read 2s ago)
 directory version 12; etcd revision 40; database 84.0 KiB of 120.0 KiB in use, quota 2.0 GiB
 
-MEMBER  PEER            ROLE      STATE
-c1      http://c1:2380  leader    started
-c2      http://c2:2380  follower  started
-c3      http://c3:2380  follower  started
+MEMBER  ID                PEER            ROLE           HEALTH   OBSERVED  REASON
+c1      324ee1e6885d57d7  http://c1:2380  voter, leader  healthy  2s ago
+c2      c2bdf2532c1860e1  http://c2:2380  voter          healthy  2s ago
+c3      6ca249abe8cd1072  http://c3:2380  voter          healthy  2s ago
 
 PROXY    STATE  APPLIED  LAST HEARTBEAT
 proxy-a  live   12       0s ago
 proxy-b  live   12       1s ago
 ```
+
+A member is healthy only when a node reached its control API lately (every 5 s) and found it
+running as that member with a leader in view; one that was never started, or not observed for 15 s,
+is `unknown`, never healthy (ADR-0021 D4). Learners do not vote and do not count toward the writes'
+quorum. `status` exits 0 when quorum is reachable and every member healthy, 1 when quorum was
+observed unavailable or a member unreachable, and 3 when nothing was observed wrong but something was
+not observed lately (for example, while a joining node has not started yet); `--json` prints the
+answer either way.
 
 The `shunt` operator verbs point `--api` (or `SHUNT_API`) at any node; `shunt-control`'s own verbs
 take `--api` (or `SHUNT_CONTROL_API`) the same way, and both read the token from `--token-ref` or
@@ -91,7 +106,9 @@ membership changed in between; `--dry-run` stops after the first step. A member 
 never started (a join that was canceled or failed before its node ran) has no name: `shunt-control
 member list` shows its id, and `member remove --id <id>` removes it. The only voting member cannot be
 removed, nor the node you send the command to (use `--api` of another). Removing a voter warns when
-two or one are left: two voters need both for every write.
+two or one are left: two voters need both for every write. The Control plane screen's **Remove** on a
+member's row does the same: the dry run shows the member by id, its role and the quorum it leaves,
+and Confirm sends the removal with that dry run's confirmation.
 
 A node that is only restarting keeps its data directory and needs neither.
 
@@ -130,8 +147,11 @@ does not know, so it would be refused until the node is upgraded.
 ## Metrics
 
 Every node serves `/-/metrics` on its API listener: `shunt_fleet_members{state="live"|"silent"}`,
-`shunt_fleet_fence_wait_seconds`, and the request metrics of the API itself. Alert on
-`shunt_fleet_members{state="silent"} > 0`, `shunt_fleet_unresolved_incarnations > 0`,
-`shunt_operations{status="blocked"} > 0`, and on quorum loss (`status` says `NO QUORUM`); the
+`shunt_fleet_fence_wait_seconds`, `shunt_control_health_observation_age_seconds{member}`,
+`shunt_control_join_phase{phase}` (1 for the phase of an unfinished join or member removal), and the
+request metrics of the API itself. Alert on `shunt_fleet_members{state="silent"} > 0`,
+`shunt_fleet_unresolved_incarnations > 0`, `shunt_operations{status="blocked"} > 0`, a
+`shunt_control_join_phase` held at 1 past a window, and on quorum loss (`status` says `QUORUM
+UNAVAILABLE` and exits 1); the
 runbooks are docs/runbooks/quorum-loss.md, docs/runbooks/lagging-proxy.md,
 docs/runbooks/crashed-proxy.md and docs/runbooks/blocked-operation.md.
