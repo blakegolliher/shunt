@@ -34,7 +34,7 @@ on a proof that left out unfinished work, are fixed, and `make fleet` passed on 
 | R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestOfflineRestartsKeepEveryPredecessor` (was `TestReviewOfflineRestartMustPreserveUnreportedIncarnations`), `TestPredecessorBacklogAndBound`, `TestFleetRecordsEveryPredecessor` | fixed 2026-09-28 |
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestDirectoryExportIsOneVersion` (was `TestReviewDirectoryExportMustUseOneVersion`), `TestStoreExportIsOneVersion` | fixed 2026-09-28 |
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestConditionalCompletionIsJudgedOnBothClusters` (was `TestReviewConditionalMultipartChecksOtherBackend`), `TestConditionalCompletionPinnedToTheSource`, `TestConditionalCompletionUncheckable` | fixed 2026-09-28 |
-| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` | open |
+| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestSpreadDeleteAnswersForEveryKey` (was `TestReviewSpreadDeleteMustReportSourceOwnedFailure`), `FuzzParseDeleteRequest` | fixed 2026-09-28 |
 | R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
 | R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
 | R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestReviewListingLookaheadFailureMustNotDeclareComplete` | open |
@@ -141,6 +141,18 @@ source's version completing as create-only on the target, update-if-current nami
 refused; an upload pinned to the source refused when the key is on the target; a completion whose
 other-cluster HEAD fails refused with 503 and not sent. Exempting completions again fails four of
 the six.
+
+**R3-07 fixed (2026-09-28).** A spread bucket's DeleteObjects answers every key from the leg that
+owns it, and a key the move's source still owns (outside the move's scope or range) has no other
+answer: when the source leg fails whole, each such key the request names gets an `InternalError`
+entry, which quiet mode keeps, and a source delete that may have landed makes the mutation's outcome
+uncertain. For a key in the move the source is a redundant copy, and its failure stays a logged
+diagnostic (`shunt_migration_dual_delete_total{outcome="source_failed"}`), as before. The request's
+keys are read from the body already bounded at 1 MiB (`parseDeleteRequest`, with its fuzz target).
+Tests: the source leg failing whole, quiet (the review's case) and verbose; per-key errors from the
+source, where the source-owned key carries its error and the in-move key does not; the source's
+connection ending after the request, where the owned key is an error and the mutation uncertain.
+Removing the per-key answer fails the three whole-leg cases.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

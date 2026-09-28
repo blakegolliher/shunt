@@ -73,8 +73,11 @@ type fakeS3 struct {
 	deleteStatus  int                 // > 0: every object DELETE fails with this status
 	// deleteObjectsStatus > 0: every DeleteObjects fails whole with this status.
 	deleteObjectsStatus int
-	mtime               map[string]time.Time // bucket/key -> when the object was last written
-	layout              map[string][][]byte  // bucket/key -> the parts it was written as, for a multipart object
+	// deleteKeyErrors: DeleteObjects answers these keys with this error code, quiet or not, and
+	// keeps them.
+	deleteKeyErrors map[string]string
+	mtime           map[string]time.Time // bucket/key -> when the object was last written
+	layout          map[string][][]byte  // bucket/key -> the parts it was written as, for a multipart object
 }
 
 // etagAt is the ETag the fake serves for one object: a multipart object carries the "-N" suffix S3
@@ -373,6 +376,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`))
 		for _, o := range req.Objects {
+			if code := f.deleteKeyErrors[o.Key]; code != "" {
+				fmt.Fprintf(w, `<Error><Key>%s</Key><Code>%s</Code><Message>refused</Message></Error>`, esc(o.Key), code)
+				continue
+			}
 			delete(objs, o.Key)
 			f.wrote(bucket, o.Key)
 			if !req.Quiet {

@@ -234,3 +234,30 @@ func FuzzParseDeleteResult(f *testing.F) {
 		}
 	})
 }
+
+// FuzzParseDeleteRequest: the objects a DeleteObjects body names (R3-07) are read without a panic,
+// and a body that parses re-encodes to one that names the same objects.
+func FuzzParseDeleteRequest(f *testing.F) {
+	f.Add([]byte(`<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet><Object><Key>a</Key></Object><Object><Key>b/c</Key><VersionId>v1</VersionId></Object></Delete>`))
+	f.Add([]byte(`<Delete><Object><Key></Key></Object></Delete>`))
+	f.Add([]byte(`<DeleteResult/>`))
+	f.Fuzz(func(t *testing.T, body []byte) {
+		req, err := parseDeleteRequest(body)
+		if err != nil {
+			return
+		}
+		out, err := xml.Marshal(req)
+		if err != nil {
+			return // a key with a character XML 1.0 cannot carry
+		}
+		again, err := parseDeleteRequest(out)
+		if err != nil || len(again.Objects) != len(req.Objects) {
+			t.Fatalf("re-encoded Delete does not parse the same: %v\n%s", err, out)
+		}
+		for i := range req.Objects {
+			if again.Objects[i] != req.Objects[i] {
+				t.Fatalf("object %d: %+v, then %+v", i, req.Objects[i], again.Objects[i])
+			}
+		}
+	})
+}
