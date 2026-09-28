@@ -65,9 +65,9 @@ type proxyRecord struct {
 // cached is what this node last read of a member record: its revision, for the heartbeat's
 // compare, and the incarnation it recorded, so the common heartbeat is one transaction.
 type cached struct {
-	rev    int64
-	rec    memberRecord
-	prevID string // the previous incarnation a heartbeat carried and this record holds
+	rev     int64
+	rec     memberRecord
+	prevIDs string // the previous incarnations a heartbeat carried and this record holds, comma-joined
 }
 
 // Fleet implements control.Fleet on etcd.
@@ -118,8 +118,9 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 	}
 	rec, _ := json.Marshal(proxyRecord{Heartbeat: hb, Seen: f.now().UTC(), Lease: int64(lease)})
 	put := clientv3.OpPut(kProxies+id, string(rec), clientv3.WithLease(lease))
+	prevIDs := previousIDs(hb.Previous)
 	unchanged := known && c.rec.Current != nil && c.rec.Current.ID == hb.Incarnation && c.rec.Current.State == control.IncarnationActive &&
-		(hb.Previous == nil || c.prevID == hb.Previous.ID)
+		(len(hb.Previous) == 0 || c.prevIDs == prevIDs)
 	if unchanged {
 		resp, err := f.cli.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(kMembers+id), "=", c.rev)).Then(put).Commit()
 		if err != nil {
@@ -129,12 +130,12 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 			f.mu.Lock()
 			f.leases[id] = lease
 			f.mu.Unlock()
-			return control.Grant{LeaseTTL: f.leaseTTL, Retire: c.rec.RetireRequested, PreviousRecorded: hb.Previous != nil}, nil
+			return control.Grant{LeaseTTL: f.leaseTTL, Retire: c.rec.RetireRequested, PreviousRecorded: len(hb.Previous) > 0}, nil
 		}
 	}
 	// The record is new, or changed since this node read it, or the heartbeat changes it.
 	var forgotten []string
-	if hb.Previous != nil {
+	if len(hb.Previous) > 0 {
 		var ferr error
 		if forgotten, ferr = f.forgottenIncarnations(ctx, id); ferr != nil {
 			return control.Grant{}, ferr
@@ -150,7 +151,10 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 		// plane was unreachable (internal/member/incarnation.go), and is then retired here, not
 		// taken for a crash below. Only a clean marker with nothing uncertain retires it; an
 		// unclean one, or one with uncertain work, stays unresolved with its counts.
-		if p := hb.Previous; p != nil && p.ID != hb.Incarnation {
+		for _, p := range hb.Previous {
+			if p.ID == hb.Incarnation {
+				continue
+			}
 			clean := p.State == control.IncarnationRetired && p.Uncertain == 0
 			ended := p.Ended
 			if ended.IsZero() {
@@ -186,7 +190,10 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 		}
 		// A previous incarnation that forget proved ended (the proxy was forgotten, then started
 		// again on the same cache) is not evidence of anything still running.
-		if p := hb.Previous; p != nil && !rec.knows(p.ID) && !slices.Contains(forgotten, p.ID) {
+		for _, p := range hb.Previous {
+			if rec.knows(p.ID) || slices.Contains(forgotten, p.ID) {
+				continue
+			}
 			// Evidence only the proxy held: a process that ended while the control plane was
 			// unreachable. A clean retirement needs no record; an unclean one is unresolved.
 			if p.State == control.IncarnationUnclean || p.Uncertain > 0 {
@@ -199,7 +206,7 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 				}
 			}
 		}
-		grant = control.Grant{LeaseTTL: f.leaseTTL, Retire: rec.RetireRequested, PreviousRecorded: hb.Previous != nil}
+		grant = control.Grant{LeaseTTL: f.leaseTTL, Retire: rec.RetireRequested, PreviousRecorded: len(hb.Previous) > 0}
 		return nil
 	}, put)
 	if err != nil {
@@ -207,13 +214,23 @@ func (f *Fleet) Heartbeat(ctx context.Context, id string, hb control.Heartbeat) 
 	}
 	f.mu.Lock()
 	f.leases[id] = lease
-	if hb.Previous != nil {
+	if len(hb.Previous) > 0 {
 		c := f.known[id]
-		c.prevID = hb.Previous.ID
+		c.prevIDs = prevIDs
 		f.known[id] = c
 	}
 	f.mu.Unlock()
 	return grant, nil
+}
+
+// previousIDs is the ids of a heartbeat's previous incarnations, in order: what a repeat of the same
+// report is recognized by.
+func previousIDs(prev []control.Incarnation) string {
+	ids := make([]string, len(prev))
+	for i, p := range prev {
+		ids[i] = p.ID
+	}
+	return strings.Join(ids, ",")
 }
 
 // knows reports whether the record holds incarnation id anywhere.

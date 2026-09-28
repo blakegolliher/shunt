@@ -176,7 +176,7 @@ func TestFleetIncarnations(t *testing.T) {
 	}
 	// The next process reports what its marker said of a predecessor the control plane never saw.
 	prev := &control.Incarnation{ID: inc3, State: control.IncarnationUnclean, Uncertain: 1, Started: time.Now().Add(-time.Hour)}
-	g, err := fa.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: prev})
+	g, err := fa.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: []control.Incarnation{*prev}})
 	if err != nil || !g.PreviousRecorded {
 		t.Fatalf("a heartbeat with a previous incarnation: %+v %v", g, err)
 	}
@@ -184,7 +184,7 @@ func TestFleetIncarnations(t *testing.T) {
 	if len(m.Unresolved) != 1 || m.Unresolved[0].ID != inc3 || m.Unresolved[0].Uncertain != 1 {
 		t.Fatalf("the previous incarnation the proxy reported: %+v", m)
 	}
-	if g, err := fb.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 2, Incarnation: inc4, Previous: prev}); err != nil || !g.PreviousRecorded {
+	if g, err := fb.Heartbeat(ctx, "p1", control.Heartbeat{Seq: 2, Incarnation: inc4, Previous: []control.Incarnation{*prev}}); err != nil || !g.PreviousRecorded {
 		t.Fatalf("the previous incarnation reported again: %+v %v", g, err)
 	}
 	if m := members(t, fa)["p1"]; len(m.Unresolved) != 1 {
@@ -248,7 +248,7 @@ func TestFleetCleanRetirementFromMarker(t *testing.T) {
 	}
 	// inc1 drained and wrote its retired marker; its Retire call never reached the control plane.
 	prev := &control.Incarnation{ID: inc1, State: control.IncarnationRetired, Started: time.Now().Add(-time.Hour), Ended: time.Now().Add(-time.Minute)}
-	g, err := f.Heartbeat(ctx, "p5", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: prev})
+	g, err := f.Heartbeat(ctx, "p5", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: []control.Incarnation{*prev}})
 	if err != nil || !g.PreviousRecorded {
 		t.Fatalf("the restarted process's first heartbeat: %+v %v", g, err)
 	}
@@ -268,7 +268,7 @@ func TestFleetCleanRetirementFromMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	unsure := &control.Incarnation{ID: inc3, State: control.IncarnationRetired, Uncertain: 2}
-	if _, err := f.Heartbeat(ctx, "p6", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: unsure}); err != nil {
+	if _, err := f.Heartbeat(ctx, "p6", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: []control.Incarnation{*unsure}}); err != nil {
 		t.Fatal(err)
 	}
 	m = members(t, f)["p6"]
@@ -299,7 +299,7 @@ func TestFleetForgottenIncarnationStaysEnded(t *testing.T) {
 	}
 	// The same cache starts a new process, registering through the other node.
 	killed := &control.Incarnation{ID: inc1, State: control.IncarnationUnclean, Started: time.Now().Add(-time.Hour)}
-	if _, err := fb.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: killed}); err != nil {
+	if _, err := fb.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc2, Previous: []control.Incarnation{*killed}}); err != nil {
 		t.Fatal(err)
 	}
 	if m := members(t, fa)["p7"]; len(m.Unresolved) != 0 || m.Incarnation == nil || m.Incarnation.ID != inc2 {
@@ -314,10 +314,44 @@ func TestFleetForgottenIncarnationStaysEnded(t *testing.T) {
 		t.Fatal(err)
 	}
 	unseen := &control.Incarnation{ID: inc3, State: control.IncarnationUnclean}
-	if _, err := fa.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: unseen}); err != nil {
+	if _, err := fa.Heartbeat(ctx, "p7", control.Heartbeat{Seq: 1, Incarnation: inc4, Previous: []control.Incarnation{*unseen}}); err != nil {
 		t.Fatal(err)
 	}
 	if m := members(t, fb)["p7"]; len(m.Unresolved) != 1 || m.Unresolved[0].ID != inc3 {
 		t.Fatalf("an unproven previous after a forget: %+v", m)
+	}
+}
+
+// A heartbeat reports the whole chain of processes the control plane never heard of (third review,
+// R3-04): inc1 registered, then inc2 and inc3 started and crashed while the control plane was down,
+// and inc4 reports all three. inc1, the record's current, ends unclean; inc2 and inc3 are recorded
+// unresolved, inc3 with its unknown outcome; a repeat of the same report changes nothing. Negative
+// control: recording only the first of the list leaves inc2 and inc3 unknown.
+func TestFleetRecordsEveryPredecessor(t *testing.T) {
+	tc := startCluster(t, 1)
+	ctx := context.Background()
+	f := NewFleet(tc.nodes[0].Client(), time.Second)
+	f.DropMargin = 500 * time.Millisecond
+	if _, err := f.Heartbeat(ctx, "p8", control.Heartbeat{Seq: 1, Incarnation: inc1}); err != nil {
+		t.Fatal(err)
+	}
+	chain := []control.Incarnation{
+		{ID: inc1, State: control.IncarnationUnclean},
+		{ID: inc2, State: control.IncarnationUnclean},
+		{ID: inc3, State: control.IncarnationUnclean, Uncertain: 2},
+	}
+	for seq := int64(1); seq <= 2; seq++ { // the second is a repeat: the answer to the first was lost
+		g, err := f.Heartbeat(ctx, "p8", control.Heartbeat{Seq: seq, Incarnation: inc4, Previous: chain})
+		if err != nil || !g.PreviousRecorded {
+			t.Fatalf("heartbeat %d with three predecessors: %+v %v", seq, g, err)
+		}
+		m := members(t, f)["p8"]
+		unresolved := map[string]int64{}
+		for _, inc := range m.Unresolved {
+			unresolved[inc.ID] = inc.Uncertain
+		}
+		if m.Incarnation == nil || m.Incarnation.ID != inc4 || len(unresolved) != 3 || unresolved[inc3] != 2 {
+			t.Fatalf("after heartbeat %d: current %+v, unresolved %+v", seq, m.Incarnation, m.Unresolved)
+		}
 	}
 }

@@ -128,14 +128,16 @@ type Heartbeat struct {
 	// it has installed one.
 	Identity directory.Identity `json:"identity,omitzero"`
 	Started  time.Time          `json:"started"`
-	// Incarnation is this process's id. Previous is the process before it on this proxy, as the
-	// proxy's own marker recorded its end (retired, or unclean: it never got to retire), sent
-	// until the control plane says it has recorded it (HeartbeatAnswer.PreviousRecorded): a
-	// process that crashed while the control plane was unreachable is evidence only the proxy
-	// holds. Uncertain is how many backend outcomes this process has never learned.
-	Incarnation string       `json:"incarnation"`
-	Previous    *Incarnation `json:"previous,omitempty"`
-	Uncertain   int64        `json:"uncertain,omitempty"`
+	// Incarnation is this process's id. Previous are the processes before it on this proxy that
+	// the control plane has not recorded, oldest first, as the proxy's own marker recorded their
+	// ends (retired, or unclean: they never got to retire), sent until the control plane says it
+	// has recorded them (HeartbeatAnswer.PreviousRecorded): processes that started and crashed
+	// while the control plane was unreachable are evidence only the proxy holds, however many
+	// restarts they took (at most MaxUnresolvedIncarnations; third review, R3-04). Uncertain is
+	// how many backend outcomes this process has never learned.
+	Incarnation string        `json:"incarnation"`
+	Previous    []Incarnation `json:"previous,omitempty"`
+	Uncertain   int64         `json:"uncertain,omitempty"`
 	// Seq counts this member's heartbeats since it started, so a caller can tell which reports
 	// were assembled after a point in time.
 	Seq int64 `json:"seq"`
@@ -421,9 +423,16 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("incarnation %q: want 32 lowercase hex characters", hb.Incarnation))
 		return
 	}
-	if hb.Previous != nil && (!ValidIncarnation(hb.Previous.ID) || hb.Previous.ID == hb.Incarnation || (hb.Previous.State != IncarnationRetired && hb.Previous.State != IncarnationUnclean) || hb.Previous.Uncertain < 0) {
-		writeError(w, http.StatusBadRequest, "bad_request", "previous: want another incarnation's id, its state retired or unclean, and a non-negative uncertain count")
+	if len(hb.Previous) > MaxUnresolvedIncarnations {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("previous: at most %d incarnations", MaxUnresolvedIncarnations))
 		return
+	}
+	for i, p := range hb.Previous {
+		if !ValidIncarnation(p.ID) || p.ID == hb.Incarnation || (p.State != IncarnationRetired && p.State != IncarnationUnclean) || p.Uncertain < 0 ||
+			slices.ContainsFunc(hb.Previous[:i], func(q Incarnation) bool { return q.ID == p.ID }) {
+			writeError(w, http.StatusBadRequest, "bad_request", "previous: want other incarnations' ids, once each, their state retired or unclean, and non-negative uncertain counts")
+			return
+		}
 	}
 	if hb.Uncertain < 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", "uncertain: want a non-negative count")

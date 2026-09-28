@@ -76,12 +76,21 @@ func (c *Client) Load() error {
 	// The incarnation marker (ADR-0021 D2): what the previous process left, then this one's, on
 	// disk before anything is served. A marker that cannot be written keeps the proxy from
 	// starting: a process whose end no one could learn of must not serve.
-	c.previous = c.readPrevious()
-	if p := c.previous; p != nil && (p.State == control.IncarnationUnclean || p.Uncertain > 0) {
-		c.log.Warn("the previous process of this proxy did not retire cleanly; the control plane is told, and every barrier waits on it until an operator resolves it",
-			"incarnation", p.ID, "state", p.State, "uncertain", p.Uncertain)
+	predecessors, err := c.readPredecessors()
+	if err != nil {
+		return err
 	}
-	if err := c.mark(control.IncarnationActive, 0); err != nil {
+	for _, p := range predecessors {
+		if p.State == control.IncarnationUnclean || p.Uncertain > 0 {
+			c.log.Warn("an earlier process of this proxy did not retire cleanly; the control plane is told, and every barrier waits on it until an operator resolves it",
+				"incarnation", p.ID, "state", p.State, "uncertain", p.Uncertain)
+		}
+	}
+	c.marking.Lock()
+	c.predecessors, c.markState, c.markUncertain, c.registered = predecessors, control.IncarnationActive, 0, false
+	err = c.writeMarker()
+	c.marking.Unlock()
+	if err != nil {
 		return fmt.Errorf("incarnation marker: %w", err)
 	}
 	f, err := os.Open(c.cacheFile())

@@ -31,7 +31,7 @@ leaves out unfinished work.
 | R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestOldRouteCannotCrossABarrier` (was `TestReviewOldBundleCannotEnterAfterBarrierCompletes`) | fixed 2026-09-28 |
 | R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestOldMoveReportCannotAuthorizeCutover`, `TestMoverReportGoesStaleWithThePlacement` (was `TestReviewOldScopeProgressMustNotAuthorizeNewScope`) | fixed 2026-09-28 |
 | R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestCompletionOutcomeIsTheWholeAnswer` (was `TestReviewIncompleteMultipartResponseMustRemainUncertain`), `TestLearnAnswerReadsTheRestAfterTheRelayStops` | fixed 2026-09-28 |
-| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` | open |
+| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestOfflineRestartsKeepEveryPredecessor` (was `TestReviewOfflineRestartMustPreserveUnreportedIncarnations`), `TestPredecessorBacklogAndBound`, `TestFleetRecordsEveryPredecessor` | fixed 2026-09-28 |
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` | open |
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` | open |
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` | open |
@@ -98,6 +98,21 @@ client gone before a result that then arrives (definitive); an abandoned GET (no
 the drain unit-tested, since at the handler level the XML rewriter has read the whole answer before
 its write to a departed client fails. Removing the verdict, the drain or the closing-element check
 each fails its tests.
+
+**R3-04 fixed (2026-09-28).** A proxy's incarnation marker keeps every earlier process the control
+plane has not recorded (schema 2, `predecessors`, oldest first), carries them into each new marker
+before the process serves, and drops them only when a heartbeat answer says they are recorded. The
+heartbeat's `previous` is now a list: the oldest eight, then the rest once those are recorded, and
+the control plane records each (an unclean one unresolved, a clean one discharging what it had).
+A process that retired cleanly and was never registered is not carried: the control plane never
+knew it and nothing of it is uncertain. The marker keeps at most 32; a process that would hold more
+does not start, leaving the marker as it was. `/-/fleet` lists them as `unrecorded`. Tests: the
+review's chain (A registered, B and C crashed offline, D retired offline) reports A, B and C in one
+heartbeat and nothing after the answer; a backlog of ten goes out eight then two; past 32 the start
+is refused and the marker untouched; on etcd, a heartbeat carrying three records all three, and its
+repeat changes nothing. Negative controls: a marker keeping only the last process, and a control
+plane recording only the first of the list, each fail. With R3-01 to R3-04 fixed, H2's
+qualification is lifted pending `make fleet` on the combined build.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

@@ -113,7 +113,7 @@ func newFakeControl(t *testing.T) *fakeControl {
 			_ = json.NewEncoder(w).Encode(control.Error{Code: control.CodeEpochMismatch, Message: "another epoch", CurrentIdentity: &cur})
 			return
 		}
-		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second, PreviousRecorded: hb.Previous != nil}
+		a := control.HeartbeatAnswer{Seq: hb.Seq, Identity: cur, Version: v, LeaseTTL: time.Second, PreviousRecorded: len(hb.Previous) > 0}
 		if edit != nil {
 			edit(&a)
 		}

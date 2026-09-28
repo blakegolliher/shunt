@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,9 +113,16 @@ type Client struct {
 	// The incarnation protocol (incarnation.go). Gates, if set, is the proxy's admission
 	// accounting, whose uncertain count the heartbeat carries. OnRetire, if set, is called once
 	// when the control plane asks this proxy to retire; the caller drains and calls Retire.
-	incarnation  string
-	previous     *control.Incarnation
-	previousDone atomic.Bool
+	incarnation string
+	// marking serializes marker writes and guards what the marker says: this process's state and
+	// uncertain count, whether a heartbeat of it has been answered (registered), and the earlier
+	// processes of this proxy the control plane has not yet recorded (predecessors, oldest first:
+	// evidence only this proxy holds, kept on disk until the control plane records it; R3-04).
+	marking       sync.Mutex
+	markState     string
+	markUncertain int64
+	registered    bool
+	predecessors  []control.Incarnation
 	// retired is set once Retire has begun: the process has stopped admitting and drained, and a
 	// heartbeat would only put its lease key back and show a retired proxy live, delaying forget.
 	retired    atomic.Bool
@@ -458,7 +466,7 @@ func (c *Client) beat(ctx context.Context) error {
 	snap := c.serving()
 	hb := control.Heartbeat{Protocol: control.Protocol, Identity: snap.Identity(), Started: c.started, Seq: seq, Applied: snap.Version(),
 		Durable: c.durable.Load(), Host: c.cfg.Host, Version: c.cfg.Version, Secrets: secretGenerations(snap),
-		Incarnation: c.incarnation, Previous: c.previousToReport(), Uncertain: c.Gates.Uncertain()}
+		Incarnation: c.incarnation, Previous: c.predecessorsToReport(), Uncertain: c.Gates.Uncertain()}
 	if c.SecretsHeld != nil {
 		hb.SecretsHeld = c.SecretsHeld()
 	}
@@ -502,9 +510,7 @@ func (c *Client) beat(ctx context.Context) error {
 	var ans control.HeartbeatAnswer
 	_, err := c.call(bctx, http.MethodPost, "/v1/fleet/"+c.cfg.ProxyID+"/heartbeat", hb, &ans)
 	if err == nil {
-		if ans.PreviousRecorded && hb.Previous != nil {
-			c.previousDone.Store(true)
-		}
+		c.answered(hb.Previous, ans.PreviousRecorded)
 		if ans.Retire && c.OnRetire != nil {
 			c.retireOnce.Do(func() {
 				c.log.Info("the control plane asked this proxy to retire; draining", "proxy", c.cfg.ProxyID)
@@ -722,6 +728,9 @@ type Status struct {
 	// (ADR-0021 D2).
 	Incarnation string `json:"incarnation"`
 	Uncertain   int64  `json:"uncertain"`
+	// Unrecorded are the earlier processes of this proxy the control plane has not recorded yet,
+	// oldest first: evidence only this proxy's marker holds (R3-04), sent in its heartbeats.
+	Unrecorded []control.Incarnation `json:"unrecorded,omitempty"`
 	// The lease as granted (T07): the heartbeat it answered, the TTL the control plane granted
 	// (the lease runs for the shorter of it and control.lease_ttl, from the heartbeat's send
 	// time), and why the last heartbeat granted none, when it did not.
@@ -743,6 +752,9 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if why := c.cacheErr.Load(); why != nil {
 		st.CacheError = *why
 	}
+	c.marking.Lock()
+	st.Unrecorded = slices.Clone(c.predecessors)
+	c.marking.Unlock()
 	now := c.Now()
 	if ack := c.lastAck.Load(); ack != nil {
 		st.LastAck = now.Sub(*ack).Round(time.Millisecond).String()
