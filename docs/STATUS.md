@@ -24,7 +24,17 @@ carried from its earlier review of `b01f65d`. Its ten diagnostic tests all fail 
 under `-race`, as on the reviewed commit; H3a and H3b touched none of the code they cite. Each test is
 committed with its fix, so the branch stays green. R3-01 to R3-04, which let a drain barrier advance
 on a proof that left out unfinished work, are fixed, and `make fleet` passed on that build
-(2026-09-28): H2's acceptance stands again.
+(2026-09-28): H2's acceptance stands again. **All ten are fixed as of `f4b554b` (2026-09-28)**, each
+with the review's case kept as a named regression test, the wider cases it asked for, and a negative
+control. On that build: the race suite over every package, lint, fuzz on the new parser, the UI tests
+and lint, `make walkthrough` (60,478 operations, 0 errors) and `make fleet` passed. The first fleet
+run, started right after the walkthrough, stopped on its telemetry cross-check (fleet p99 13.3 % from
+the client's, limit 10 %, 0 client errors); run alone it passed at 5.6 %, as earlier runs did (3–7 %).
+Two proxy tests failed once each under the full suite's load and not in isolation:
+`TestResignTrailerChecksumMismatch` (0 failures in 200 isolated runs; an ordering race in the test
+between the fake backend's answer and the decoder's trailer check) and the probabilistic negative
+control `TestFleetRangeMoveWithoutTheFence` (no violation found in one loaded run). Neither is from
+this work; both are recorded here to be looked at.
 
 | ID | Pri | | Fault | Test | State |
 |---|---|---|---|---|---|
