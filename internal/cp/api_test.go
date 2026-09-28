@@ -218,7 +218,7 @@ func (m *member) beat() {
 	snap := m.node.store.Snapshot()
 	if m.follow.Load() {
 		closures, _ := admission.Barriers(snap)
-		m.gates.Apply(closures, false)
+		m.gates.Apply(closures, 0, false)
 		m.applied.Store(snap.Version())
 	}
 	acks := m.gates.Acks(snap)

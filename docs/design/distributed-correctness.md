@@ -348,6 +348,13 @@ ended. ADR-0021, "Decisions taken 2026-09-25", has each with its regression test
 
 ### Local admission
 
+**Amended (2026-09-28, third review R3-01):** gate closure and the check/increment interlock was
+not enough: a request could take its bundle before a hold, wait out the whole barrier between its
+bundle and its gate, and enter the reopened gate by the route the barrier replaced. A placement's
+gates now record the directory version they last reopened at (one version per placement), and a
+request routing by an older bundle is refused as superseded before dispatch; it retries on the
+current bundle. No request body is consumed before the refusal.
+
 Maintain bounded counters/gates per configured placement and in-use generation,
 with cluster gates for maintenance. No object-key map. The request acquires its
 bundle, resolves all involved scopes, and enters their gates in canonical order.

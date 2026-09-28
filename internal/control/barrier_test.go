@@ -306,7 +306,7 @@ func TestLocalBarrierResumesAfterOwnerLoss(t *testing.T) {
 	previousInstall := rg.dir.OnInstall
 	rg.dir.OnInstall = func(snap *directory.Snapshot) {
 		closures, _ := admission.Barriers(snap)
-		gates.Apply(closures, false)
+		gates.Apply(closures, 0, false)
 		previousInstall(snap)
 	}
 	rg.ctl.LocalGates = gates
@@ -314,7 +314,7 @@ func TestLocalBarrierResumesAfterOwnerLoss(t *testing.T) {
 	rg.ctl.Ctx = ctx
 	sleep, wakeOwner := wakingSleep()
 	rg.ctl.Sleep, rg.ctl.FencePoll = sleep, 5*time.Millisecond
-	token, _, ok := gates.Enter("acme/data01", admission.Mutations)
+	token, _, ok := gates.Enter("acme/data01", admission.Mutations, 0)
 	if !ok {
 		t.Fatal("the local mutation was not admitted before the hold")
 	}
@@ -492,13 +492,13 @@ func TestPurgeSourceBarrierDrainsLocalSourceWork(t *testing.T) {
 	previousInstall := rg.dir.OnInstall
 	rg.dir.OnInstall = func(snap *directory.Snapshot) {
 		closures, _ := admission.Barriers(snap)
-		gates.Apply(closures, false)
+		gates.Apply(closures, 0, false)
 		previousInstall(snap)
 	}
 	rg.ctl.LocalGates = gates
 	sleep, wake := wakingSleep()
 	rg.ctl.Sleep = sleep
-	token, _, ok := gates.Enter("acme/data01", admission.Source)
+	token, _, ok := gates.Enter("acme/data01", admission.Source, 0)
 	if !ok {
 		t.Fatal("source work was not admitted before the purge hold")
 	}
@@ -628,13 +628,13 @@ func TestLocalBarrierReportsUnknownBackendOutcome(t *testing.T) {
 	previousInstall := rg.dir.OnInstall
 	rg.dir.OnInstall = func(snap *directory.Snapshot) {
 		closures, _ := admission.Barriers(snap)
-		gates.Apply(closures, false)
+		gates.Apply(closures, 0, false)
 		previousInstall(snap)
 	}
 	rg.ctl.LocalGates = gates
 	sleep, wake := wakingSleep()
 	rg.ctl.Sleep = sleep
-	token, _, _ := gates.Enter("acme/data01", admission.Mutations)
+	token, _, _ := gates.Enter("acme/data01", admission.Mutations, 0)
 	token.Release(gates, admission.Uncertain)
 	var started Operation
 	if code, raw := rg.call(http.MethodPost, "/v1/operations", OperationRequest{Kind: OpRamp, Placement: "acme/data01", Args: json.RawMessage(`{"ratio":0.5,"wait":"0s"}`)}, &started); code != http.StatusAccepted {

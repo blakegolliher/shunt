@@ -202,19 +202,26 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 	// (purge-source): a read or listing goes on without it, and a delete that needs it pauses.
 	bucketKey := directory.Key(o.tenant, info.Bucket)
 	if mutating {
-		tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
+		tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations, snap.Version())
 		if !admitted {
 			if h.Log != nil {
 				h.Log.Debug("mutation refused at the gate", "request_id", o.rid, "bucket", bucketKey, "barrier", barrier)
 			}
-			h.refuseWrite(w, r, o, info.Bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+			h.refuseGate(w, r, o, info.Bucket, barrier)
 			return nil, false
 		}
 		o.tok = tok
 	}
 	if route.Fallback || route.Both || route.Merge {
 		if !sourceClosed {
-			src, _, admitted := h.Gates.Enter(bucketKey, admission.Source)
+			src, barrier, admitted := h.Gates.Enter(bucketKey, admission.Source, snap.Version())
+			if barrier == admission.Superseded {
+				// Not the source closing: this request's route predates a barrier since then.
+				o.tok.Release(h.Gates, admission.Definitive)
+				o.tok = admission.Token{}
+				h.refuseGate(w, r, o, info.Bucket, barrier)
+				return nil, false
+			}
 			o.src, sourceClosed = src, !admitted
 		}
 		if sourceClosed {
@@ -287,7 +294,7 @@ func (h *Handler) prepareResign(ctx context.Context, w http.ResponseWriter, r *h
 			// no backend can do this copy, so shunt streams it (ADR-0014). A copy that reads a
 			// moving bucket's source depends on it, and stops when the source is on its way out.
 			if plan.sourceKey != "" {
-				src, _, ok := h.Gates.Enter(plan.sourceKey, admission.Source)
+				src, _, ok := h.Gates.Enter(plan.sourceKey, admission.Source, snap.Version())
 				if !ok {
 					h.answer(w, r, o, s3.ServiceUnavailable, "The source bucket of this copy is being changed. Retry shortly.")
 					return nil, false

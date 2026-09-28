@@ -193,13 +193,13 @@ func TestCancelCannotReleaseHoldUnderPurgeDispatch(t *testing.T) {
 	previousInstall := rg.dir.OnInstall
 	rg.dir.OnInstall = func(snap *directory.Snapshot) {
 		closures, _ := admission.Barriers(snap)
-		gates.Apply(closures, false)
+		gates.Apply(closures, 0, false)
 		previousInstall(snap)
 	}
 	rg.ctl.LocalGates = gates
 	sleep, wake := wakingSleep()
 	rg.ctl.Sleep, rg.ctl.FencePoll = sleep, 5*time.Millisecond
-	token, _, ok := gates.Enter("acme/data01", admission.Source)
+	token, _, ok := gates.Enter("acme/data01", admission.Source, 0)
 	if !ok {
 		t.Fatal("source work was not admitted before the purge hold")
 	}

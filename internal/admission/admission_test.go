@@ -13,18 +13,18 @@ import (
 // counted until it is released; an uncertain release stays counted for good.
 func TestGateCloseAndDrain(t *testing.T) {
 	g := New()
-	tok, _, ok := g.Enter("acme/data", Mutations)
+	tok, _, ok := g.Enter("acme/data", Mutations, 0)
 	if !ok {
 		t.Fatal("an open gate refused")
 	}
 	g.Close("acme/data", Mutations, "op-1")
-	if _, barrier, ok := g.Enter("acme/data", Mutations); ok || barrier != "op-1" {
+	if _, barrier, ok := g.Enter("acme/data", Mutations, 0); ok || barrier != "op-1" {
 		t.Fatalf("a closed gate admitted: ok=%v barrier=%q", ok, barrier)
 	}
-	if _, _, ok := g.Enter("acme/data", Source); !ok {
+	if _, _, ok := g.Enter("acme/data", Source, 0); !ok {
 		t.Fatal("closing mutations closed the source gate too")
 	}
-	if _, _, ok := g.Enter("acme/other", Mutations); !ok {
+	if _, _, ok := g.Enter("acme/other", Mutations, 0); !ok {
 		t.Fatal("closing one placement closed another")
 	}
 	st := g.State("acme/data")
@@ -35,8 +35,8 @@ func TestGateCloseAndDrain(t *testing.T) {
 	if st := g.State("acme/data"); st.Inflight[Mutations] != 0 || st.Uncertain[Mutations] != 0 {
 		t.Fatalf("state after a definitive release: %+v", st)
 	}
-	g.Open("acme/data", Mutations)
-	tok, _, _ = g.Enter("acme/data", Mutations)
+	g.Open("acme/data", Mutations, 0)
+	tok, _, _ = g.Enter("acme/data", Mutations, 0)
 	tok.Release(g, Uncertain)
 	if st := g.State("acme/data"); st.Inflight[Mutations] != 0 || st.Uncertain[Mutations] != 1 || g.Uncertain() != 1 {
 		t.Fatalf("state after an uncertain release: %+v total %d", st, g.Uncertain())
@@ -44,10 +44,59 @@ func TestGateCloseAndDrain(t *testing.T) {
 	// The zero token and nil gates are no-ops.
 	Token{}.Release(g, Uncertain)
 	var none *Gates
-	if _, _, ok := none.Enter("x", Mutations); !ok || none.Uncertain() != 0 {
+	if _, _, ok := none.Enter("x", Mutations, 0); !ok || none.Uncertain() != 0 {
 		t.Fatal("nil gates must admit and count nothing")
 	}
-	none.Apply(Closures{"x": {}}, false)
+	none.Apply(Closures{"x": {}}, 0, false)
+}
+
+// A gate that reopens remembers the version it reopened at (third review, R3-01): a request that
+// took its bundle before the barrier and reaches the gate after the barrier has closed and reopened
+// it is refused as Superseded, through either of the placement's gates, while one routing by the
+// reopening version or later enters. A version that only closes, another placement, and a later
+// open at an older version change nothing.
+func TestReopenedGateRefusesAnOlderRoute(t *testing.T) {
+	g := New()
+	g.Apply(Closures{}, 4, false) // version 4: no barrier
+	if _, _, ok := g.Enter("acme/data", Mutations, 4); !ok {
+		t.Fatal("an open gate refused the current route")
+	}
+	g.Apply(Closures{"acme/data": {Mutations: "op-1"}}, 5, false) // the hold
+	if _, barrier, ok := g.Enter("acme/data", Mutations, 4); ok || barrier != "op-1" {
+		t.Fatalf("a held gate: ok=%v barrier=%q", ok, barrier)
+	}
+	g.Apply(Closures{}, 6, false) // the commit reopens it
+	if _, barrier, ok := g.Enter("acme/data", Mutations, 4); ok || barrier != Superseded {
+		t.Fatalf("a request routing by version 4 after the gate reopened at 6: ok=%v barrier=%q", ok, barrier)
+	}
+	if _, barrier, ok := g.Enter("acme/data", Mutations, 5); ok || barrier != Superseded {
+		t.Fatalf("a request routing by the hold's version after the reopening: ok=%v barrier=%q", ok, barrier)
+	}
+	tok, _, ok := g.Enter("acme/data", Mutations, 6)
+	if !ok {
+		t.Fatal("a request routing by the reopening version was refused")
+	}
+	tok.Release(g, Definitive)
+	// The barrier changed the placement's route: an older route is superseded through its source gate
+	// too, which never closed.
+	if _, barrier, ok := g.Enter("acme/data", Source, 4); ok || barrier != Superseded {
+		t.Fatalf("the source gate of a placement whose mutations gate reopened: ok=%v barrier=%q", ok, barrier)
+	}
+	if _, _, ok := g.Enter("acme/data", Source, 6); !ok {
+		t.Fatal("the source gate refused the current route")
+	}
+	if _, _, ok := g.Enter("acme/other", Mutations, 4); !ok {
+		t.Fatal("reopening one placement superseded another")
+	}
+	g.Apply(Closures{}, 3, false) // an older version applied late cannot lower the bar
+	if _, _, ok := g.Enter("acme/data", Mutations, 5); ok {
+		t.Fatal("an older apply lowered the reopening version")
+	}
+	g.Close("acme/data", Mutations, "op-2")
+	g.Open("acme/data", Mutations, 9)
+	if _, barrier, ok := g.Enter("acme/data", Mutations, 8); ok || barrier != Superseded {
+		t.Fatalf("Open at 9, a request at 8: ok=%v barrier=%q", ok, barrier)
+	}
 }
 
 // Apply closes what the closures list and opens the rest, except while sticky, when a closed gate
@@ -56,18 +105,18 @@ func TestApply(t *testing.T) {
 	g := New()
 	g.Close("a", Mutations, "op-1")
 	g.Close("b", Source, "op-2")
-	g.Apply(Closures{"a": {Mutations: "op-1"}, "c": {Mutations: "op-3"}}, false)
+	g.Apply(Closures{"a": {Mutations: "op-1"}, "c": {Mutations: "op-3"}}, 0, false)
 	if st := g.State("b"); st.Closed[Source] != "" {
 		t.Fatal("a gate the closures do not list stayed closed")
 	}
 	if st := g.State("c"); st.Closed[Mutations] != "op-3" {
 		t.Fatal("a listed gate was not closed")
 	}
-	g.Apply(Closures{}, true)
+	g.Apply(Closures{}, 0, true)
 	if st := g.State("a"); st.Closed[Mutations] != "op-1" {
 		t.Fatal("a sticky apply opened a closed gate")
 	}
-	g.Apply(Closures{}, false)
+	g.Apply(Closures{}, 0, false)
 	if st := g.State("a"); st.Closed[Mutations] != "" {
 		t.Fatal("a plain apply left a gate closed")
 	}
@@ -114,16 +163,16 @@ func TestBarriersAndAcks(t *testing.T) {
 		t.Errorf("the cluster barrier closes %v, want three placements", placements["op-c"])
 	}
 	g := New()
-	g.Apply(closures, false)
-	tok, _, _ := g.Enter("acme/on-c", Mutations) // taken before the close would be counted; here the gate is closed, so refused
+	g.Apply(closures, 0, false)
+	tok, _, _ := g.Enter("acme/on-c", Mutations, 0) // taken before the close would be counted; here the gate is closed, so refused
 	if tok.g != nil {
 		t.Fatal("a closed gate handed out a token")
 	}
-	g.Open("acme/spread", Mutations)
-	tok, _, _ = g.Enter("acme/spread", Mutations)
+	g.Open("acme/spread", Mutations, 0)
+	tok, _, _ = g.Enter("acme/spread", Mutations, 0)
 	g.Close("acme/spread", Mutations, "op-c")
-	g.Open("acme/purge", Source)
-	src, _, ok := g.Enter("acme/purge", Source)
+	g.Open("acme/purge", Source, 0)
+	src, _, ok := g.Enter("acme/purge", Source, 0)
 	if !ok {
 		t.Fatal("the source gate refused after being opened")
 	}
@@ -164,7 +213,7 @@ func TestCloseEnterRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 200 {
-				if tok, _, ok := g.Enter("k", Mutations); ok {
+				if tok, _, ok := g.Enter("k", Mutations, 0); ok {
 					mu.Lock()
 					held = append(held, tok)
 					mu.Unlock()
@@ -179,7 +228,7 @@ func TestCloseEnterRace(t *testing.T) {
 			if i%2 == 0 {
 				g.Close("k", Mutations, "b")
 			} else {
-				g.Open("k", Mutations)
+				g.Open("k", Mutations, 0)
 			}
 		}
 	}()
@@ -202,7 +251,7 @@ func BenchmarkEnterRelease(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			tok, _, _ := g.Enter("acme/data", Mutations)
+			tok, _, _ := g.Enter("acme/data", Mutations, 0)
 			tok.Release(g, Definitive)
 		}
 	})

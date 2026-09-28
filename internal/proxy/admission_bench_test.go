@@ -91,8 +91,8 @@ func holdRig(b *testing.B, be *httptest.Server, v holdVariant) (*Handler, *admis
 	rt, gates := followWithGates(b, dir, mapStore{clientAK: {AccessKey: clientAK, Secret: clientSecret, Tenant: "t"}}, set)
 	if v.uncertainY {
 		// A write to Y whose outcome was never learned, taken before the hold closed its gate.
-		gates.Open("t/yyy", admission.Mutations)
-		tok, _, _ := gates.Enter("t/yyy", admission.Mutations)
+		gates.Open("t/yyy", admission.Mutations, 0)
+		tok, _, _ := gates.Enter("t/yyy", admission.Mutations, 0)
 		tok.Release(gates, admission.Uncertain)
 		gates.Close("t/yyy", admission.Mutations, yBarrier)
 		if gates.Uncertain() != 1 {

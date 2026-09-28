@@ -10,7 +10,11 @@
 // map lookup and one short critical section per mutation; reads of a placement that is not moving
 // take nothing. Closing a gate and taking a token share the gate's lock, so a request that took
 // its bundle before a barrier was installed is refused when it reaches the gate after, and one
-// that entered before is counted until it ends. No lock is held across backend I/O.
+// that entered before is counted until it ends. A gate that reopens remembers the directory version
+// it reopened at, and a request routing by an older version is refused too: it took its bundle
+// before the barrier, waited out the whole barrier between its bundle and the gate, and would
+// otherwise write by the route the barrier replaced (third review, R3-01). No lock is held across
+// backend I/O.
 package admission
 
 import (
@@ -67,6 +71,11 @@ const (
 	Uncertain
 )
 
+// Superseded is the barrier Enter names when it refuses a request whose routing is older than the
+// gate's last reopening: no barrier closes the gate now, but one closed and reopened it since the
+// request took its bundle.
+const Superseded = "(superseded)"
+
 // Closed is what closes each of a placement's gates: the barrier id, or "" for open.
 type Closed [kinds]string
 
@@ -74,8 +83,13 @@ type Closed [kinds]string
 type Closures map[string]Closed
 
 type gate struct {
-	mu        sync.Mutex
-	closed    Closed
+	mu     sync.Mutex
+	closed Closed
+	// from is the directory version the placement's gates last reopened at: a request routing by an
+	// older version is refused, through either gate, since the barrier that closed one changed the
+	// placement's route. One field, not one per kind, keeps a gate in its allocation size class:
+	// a proxy has one per placement it has served.
+	from      int64
 	inflight  [kinds]int64
 	uncertain [kinds]int64
 }
@@ -126,9 +140,11 @@ type Token struct {
 	kind Kind
 }
 
-// Enter takes a token for kind on the placement key. It refuses, naming the barrier, when the
-// gate is closed. A nil Gates admits everything and counts nothing.
-func (g *Gates) Enter(key string, kind Kind) (t Token, barrier string, ok bool) {
+// Enter takes a token for kind on the placement key, for a request routing by directory version.
+// It refuses, naming the barrier, when the gate is closed, and with Superseded when either of the
+// placement's gates reopened at a later version than the request's. A nil Gates admits everything and counts
+// nothing.
+func (g *Gates) Enter(key string, kind Kind, version int64) (t Token, barrier string, ok bool) {
 	if g == nil {
 		return Token{}, "", true
 	}
@@ -137,6 +153,10 @@ func (g *Gates) Enter(key string, kind Kind) (t Token, barrier string, ok bool) 
 	if b := gt.closed[kind]; b != "" {
 		gt.mu.Unlock()
 		return Token{}, b, false
+	}
+	if version < gt.from {
+		gt.mu.Unlock()
+		return Token{}, Superseded, false
 	}
 	gt.inflight[kind]++
 	gt.mu.Unlock()
@@ -167,22 +187,31 @@ func (g *Gates) Close(key string, kind Kind, barrier string) {
 	gt.mu.Unlock()
 }
 
-// Open opens kind on key.
-func (g *Gates) Open(key string, kind Kind) {
+// Open opens kind on key at directory version: requests routing by an older version stay refused.
+func (g *Gates) Open(key string, kind Kind, version int64) {
 	if v, ok := g.m.Load(key); ok {
 		gt := v.(*gate) //nolint:errcheck // the map holds only *gate
 		gt.mu.Lock()
-		gt.closed[kind] = ""
+		gt.set(kind, "", version)
 		gt.mu.Unlock()
 	}
 }
 
-// Apply makes the gates match closures: every gate named is closed as listed, and every other
-// gate is opened, unless sticky, when a gate that is closed stays closed. A proxy applies the
-// closures of each installed directory version; sticky while its requests still use an older
-// version (install backpressure), since a gate opened for a version no request routes by yet
-// would let a request on the old version write by the old rule.
-func (g *Gates) Apply(closures Closures, sticky bool) {
+// set closes kind with barrier, or opens it ("") at version; gt.mu is held. Reopening records the
+// version, so a request that took its bundle before the barrier cannot enter after it.
+func (gt *gate) set(kind Kind, barrier string, version int64) {
+	if gt.closed[kind] != "" && barrier == "" && version > gt.from {
+		gt.from = version
+	}
+	gt.closed[kind] = barrier
+}
+
+// Apply makes the gates match closures, derived from directory version: every gate named is closed
+// as listed, and every other gate is opened at version, unless sticky, when a gate that is closed
+// stays closed. A proxy applies the closures of each installed directory version; sticky while its
+// requests still use an older version (install backpressure), since a gate opened for a version no
+// request routes by yet would let a request on the old version write by the old rule.
+func (g *Gates) Apply(closures Closures, version int64, sticky bool) {
 	if g == nil {
 		return
 	}
@@ -191,7 +220,7 @@ func (g *Gates) Apply(closures Closures, sticky bool) {
 		gt.mu.Lock()
 		for k := range kinds {
 			if c[k] != "" || !sticky {
-				gt.closed[k] = c[k]
+				gt.set(k, c[k], version)
 			}
 		}
 		gt.mu.Unlock()
@@ -205,7 +234,9 @@ func (g *Gates) Apply(closures Closures, sticky bool) {
 		}
 		gt := v.(*gate) //nolint:errcheck // the map holds only *gate
 		gt.mu.Lock()
-		gt.closed = Closed{}
+		for kind := range kinds {
+			gt.set(kind, "", version)
+		}
 		gt.mu.Unlock()
 		return true
 	})

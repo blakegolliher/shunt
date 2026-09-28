@@ -136,14 +136,18 @@ func (h *Handler) spreadDeleteObjects(ctx context.Context, w http.ResponseWriter
 	// The bucket's gates, as for any delete (ADR-0021 D2): a mutation token, and, while a move is
 	// under way, a source token; a closed source gate pauses the delete (the DELETE rule).
 	bucketKey := directory.Key(o.tenant, bucket)
-	tok, _, admitted := h.Gates.Enter(bucketKey, admission.Mutations)
+	tok, barrier, admitted := h.Gates.Enter(bucketKey, admission.Mutations, rt.snap.Version())
 	if !admitted {
-		h.refuseWrite(w, r, o, bucket, "barrier", "This bucket's writes pause while a change to it reaches every proxy. Retry shortly.")
+		h.refuseGate(w, r, o, bucket, barrier)
 		return
 	}
 	o.tok = tok
 	if p.Move != nil {
-		src, _, ok := h.Gates.Enter(bucketKey, admission.Source)
+		src, barrier, ok := h.Gates.Enter(bucketKey, admission.Source, rt.snap.Version())
+		if barrier == admission.Superseded {
+			h.refuseGate(w, r, o, bucket, barrier)
+			return
+		}
 		if !ok || (p.Barrier != nil && p.Barrier.Kind == config.BarrierSource) {
 			src.Release(h.Gates, admission.Definitive)
 			h.refuseWrite(w, r, o, bucket, "source_closed", "This bucket's deletes pause while its migration source is removed. Retry shortly.")

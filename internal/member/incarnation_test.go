@@ -58,7 +58,7 @@ func TestIncarnationMarkerAndRetirement(t *testing.T) {
 
 	// A retirement with a lost reply is retried until it lands.
 	c.Gates = admission.New()
-	tok, _, _ := c.Gates.Enter("acme/data", admission.Mutations)
+	tok, _, _ := c.Gates.Enter("acme/data", admission.Mutations, 0)
 	tok.Release(c.Gates, admission.Uncertain)
 	f.retireFails.Store(true)
 	go func() {
@@ -189,7 +189,7 @@ func TestHeartbeatCarriesBarrierAcks(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Gates.Close("acme/data", admission.Mutations, "op-7")
-	tok, _, _ := c.Gates.Enter("acme/data", admission.Source)
+	tok, _, _ := c.Gates.Enter("acme/data", admission.Source, 0)
 	if err := c.beat(ctx); err != nil {
 		t.Fatal(err)
 	}

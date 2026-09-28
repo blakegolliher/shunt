@@ -26,18 +26,18 @@ committed with its fix, so the branch stays green. **Until R3-01 to
 R3-04 are fixed, H2's "passed" below does not hold:** a drain barrier can advance on a proof that
 leaves out unfinished work.
 
-| ID | Pri | | Fault | Test |
-|---|---|---|---|---|
-| R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestReviewOldBundleCannotEnterAfterBarrierCompletes` |
-| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestReviewOldScopeProgressMustNotAuthorizeNewScope` |
-| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestReviewIncompleteMultipartResponseMustRemainUncertain` |
-| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` |
-| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` |
-| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` |
-| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` |
-| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` |
-| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` |
-| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestReviewListingLookaheadFailureMustNotDeclareComplete` |
+| ID | Pri | | Fault | Test | State |
+|---|---|---|---|---|---|
+| R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestOldRouteCannotCrossABarrier` (was `TestReviewOldBundleCannotEnterAfterBarrierCompletes`) | fixed 2026-09-28 |
+| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestReviewOldScopeProgressMustNotAuthorizeNewScope` | open |
+| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestReviewIncompleteMultipartResponseMustRemainUncertain` | open |
+| R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` | open |
+| R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` | open |
+| R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` | open |
+| R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestReviewSpreadDeleteMustReportSourceOwnedFailure` | open |
+| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
+| R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
+| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestReviewListingLookaheadFailureMustNotDeclareComplete` | open |
 
 Order of work (the review's): R3-01 to R3-04 first, since destructive routing changes trust their
 proofs; then R3-05 to R3-07 and R3-10; then R3-08 and R3-09; then H3c and H3d. Each fix lands with its
@@ -49,6 +49,24 @@ concurrent rotation; R3-07: quiet and verbose, mixed keys, per-key and whole-leg
 changes (R3-01, R3-02, R3-04) update the durable schema, API, CLI and UI together. After the ten, the
 review asks for the same cases on the distributed store and its failure interleavings; passing these
 ten is not a safety proof.
+
+**R3-01 fixed (2026-09-28).** A placement's gates remember the directory version they last reopened
+at, and `Enter` takes the request's bundle version and refuses one routing by an older version
+(`admission.Superseded`): a request that took its bundle before a barrier and reaches the gate after
+the barrier has closed and reopened it is answered 503 + Retry-After and counted
+`shunt_migration_refused_writes_total{reason="superseded"}`, and its retry routes by the current
+bundle. The version is kept per placement, not per gate kind (either barrier changed the placement's
+route), which keeps a gate in its 80-byte allocation class: one field per kind grew it to the 96-byte
+class and cost the 10,000-placement admission benchmark +13.7 % (p=0.003); per placement it is
+unchanged (EnterRelease 134.3 → 134.3 ns, EnterReleaseSpread 9.9 → 8.7 ns within ±10 %, closed gate
+87 → 88 ns; interleaved runs, n=12). `TestOldRouteCannotCrossABarrier` runs a whole barrier while a
+request holds its pre-barrier bundle: a scoped ramp step (the review's case), a cluster read-only
+change (the write would reach a now read-only cluster), purge-source's source barrier (a CUTOVER
+delete's source leg), and a spread bucket's DeleteObjects across a read-only change; all four fail
+with the version check removed. Credential rotation has no drain barrier to cross: a rotation is
+a plain directory write, reported installed per member, and a request that took the old bundle signs
+with the old secret until it ends (H1b). The design's credential revocation barrier, which would
+drain those, is not built.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
