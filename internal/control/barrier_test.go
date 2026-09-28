@@ -389,9 +389,9 @@ func TestCutoverBarrierBlocksOpenSourceMultipartUpload(t *testing.T) {
 	rg := newRig(t)
 	rg.prepare()
 	rg.must(http.MethodPost, "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
-	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{
 		Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true,
-	}, nil)
+	}), nil)
 
 	req, err := http.NewRequest(http.MethodPost, rg.vast01.srv.URL+"/data01/large?uploads", nil)
 	if err != nil {
@@ -434,9 +434,9 @@ func TestCutoverWindowKeepsWritesFlowing(t *testing.T) {
 	rg.must(http.MethodPost, "/v1/placements/acme/data01/migrate", MigrateRequest{}, nil)
 	rg.vast02.put(t, "data01-001", "a", "one")
 	rg.vast02.put(t, "data01-001", "dir/b", "two")
-	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{
 		Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 2, Done: true, Converged: true,
-	}, nil)
+	}), nil)
 	var mu sync.Mutex
 	var heldDuringWindow []bool
 	rg.ctl.Sleep = func(_ context.Context, d time.Duration) error {
@@ -610,7 +610,7 @@ func TestPurgeRecheckRefusalBeforeDispatchIsCancellable(t *testing.T) {
 		}
 	}
 	// The bucket is free: the mover can run on it again.
-	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 3, Done: true, Converged: true}, nil)
+	rg.must(http.MethodPost, "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 3, Done: true, Converged: true}), nil)
 	var again PurgeDryRun
 	rg.must(http.MethodPost, "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &again)
 	if again.Allowed || len(again.Missing) != 1 || again.Missing[0] != "late" {

@@ -173,6 +173,10 @@ export interface MoverRange {
 }
 
 export interface MoverProgress {
+  // identity and generation bind the report to the move it describes; the server shows a MIGRATING
+  // bucket's report only for its current generation (R3-02).
+  identity?: { cluster_id: string; epoch: string }
+  generation?: number
   source: string
   primary: string
   pass: number

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -179,7 +180,14 @@ func runMover(cmd *cobra.Command, api *apiClient, dir *directory.File, secrets m
 		Out:    cmd.OutOrStdout(),
 		ErrOut: cmd.ErrOrStderr(),
 	}, func(p mover.Progress) {
-		progress := control.Progress{Source: p.Source, Primary: p.Primary, Pass: p.Pass, Copied: p.Copied,
+		// A report is bound to the move its session planned from (R3-02); a dry run has no session
+		// and copies nothing, so it reports nothing that could count as convergence.
+		i := slices.IndexFunc(sessions, func(s externalMoverSession) bool { return s.key == p.Key })
+		if i < 0 {
+			return
+		}
+		progress := control.Progress{Identity: sessions[i].identity, Generation: sessions[i].generation,
+			Source: p.Source, Primary: p.Primary, Pass: p.Pass, Copied: p.Copied,
 			Skipped: p.Skipped, Vanished: p.Vanished, Failed: p.Failed, Bytes: p.Bytes,
 			LastKey: p.LastKey, Done: p.Done, Converged: p.Converged}
 		path, _ := placementPath(p.Key)

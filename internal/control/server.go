@@ -591,8 +591,13 @@ func (s *Server) placementStatus(key string, pl directory.Placement) PlacementSt
 			}
 		}
 	}
+	// A report shows only the move it describes (R3-02): while the bucket is MIGRATING, one from
+	// another generation of the placement is an earlier move's, or from before a later change, and
+	// is not shown as this move's convergence. After cutover the report that authorized it stays.
+	snap := s.Dir.Snapshot()
+	gen := snap.Generation(directory.PlacementResource(key))
 	s.mu.Lock()
-	if pr, ok := s.progress[key]; ok {
+	if pr, ok := s.progress[key]; ok && pr.Identity == snap.Identity() && (p.State != directory.StateMigrating || pr.Generation == gen) {
 		ps.Mover = &pr
 	}
 	s.mu.Unlock()

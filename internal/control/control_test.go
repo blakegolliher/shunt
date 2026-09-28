@@ -336,14 +336,14 @@ func TestWalkthroughThroughTheAPI(t *testing.T) {
 		t.Fatalf("migrate: %+v", tr)
 	}
 	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{}, "no mover has reported")
-	rg.refused("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast02", Primary: "vast01"}, "moves vast01 → vast02")
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Copied: 2, Done: true, Converged: true}, nil)
+	rg.refused("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast02", Primary: "vast01"}), "moves vast01 → vast02")
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Copied: 2, Done: true, Converged: true}), nil)
 	rg.refused("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{}, "has not converged")
 
 	// The mover's second pass copies nothing: converged. The cutover window sees a fallback read.
 	rg.vast02.put(t, "data01-001", "a", "one")
 	var pr Progress
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 1, Done: true, Converged: true}, &pr)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 2, Skipped: 1, Done: true, Converged: true}), &pr)
 	if !pr.Converged {
 		t.Fatalf("a completed pass copying nothing is converged: %+v", pr)
 	}
@@ -1214,7 +1214,7 @@ func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
 		t.Fatalf("status during the move: %+v move %+v legs %+v", ps, ps.Move, ps.Legs)
 	}
 	rg.must("POST", "/v1/placements/acme/data01/migrate", MigrateRequest{}, &tr)
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}), nil)
 	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
 
@@ -1258,7 +1258,7 @@ func TestMoveHalfABucketThroughTheAPI(t *testing.T) {
 	for _, k := range out {
 		rg.vast02.put(t, "data01-b", k, "v")
 	}
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}), nil)
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{DryRun: true}, &dry)
 	rg.must("POST", "/v1/placements/acme/data01/purge-source", PurgeRequest{Token: dry.Token}, &pg)
@@ -1298,7 +1298,7 @@ func TestMoveToAnotherBucketOnTheSameClusterThroughTheAPI(t *testing.T) {
 	for _, k := range []string{"a", "b", "c"} {
 		rg.vast01.put(t, "data01-final", k, "v") // the mover's work
 	}
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast01", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast01", Pass: 1, Done: true, Converged: true}), nil)
 	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
 	var dry PurgeDryRun
@@ -1370,7 +1370,7 @@ func TestConsolidateASpreadBucketThroughTheAPI(t *testing.T) {
 		for _, k := range keys[leg] {
 			rg.vast02.put(t, "sp-final", k, "v") // the mover's work
 		}
-		rg.must("POST", "/v1/placements/acme/spd/mover-progress", Progress{Source: leg, Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+		rg.must("POST", "/v1/placements/acme/spd/mover-progress", rg.current("acme/spd", Progress{Source: leg, Primary: "vast02", Pass: 1, Done: true, Converged: true}), nil)
 		rg.must("POST", "/v1/placements/acme/spd/cutover", CutoverRequest{Window: "1s"}, &tr)
 		var dry PurgeDryRun
 		rg.must("POST", "/v1/placements/acme/spd/purge-source", PurgeRequest{DryRun: true}, &dry)
@@ -1496,7 +1496,7 @@ func TestScopedMoveThroughTheAPI(t *testing.T) {
 	for _, k := range archive {
 		rg.vast02.put(t, "data01-arch", k, "v") // the mover's work
 	}
-	rg.must("POST", "/v1/placements/acme/data01/mover-progress", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}, nil)
+	rg.must("POST", "/v1/placements/acme/data01/mover-progress", rg.current("acme/data01", Progress{Source: "vast01", Primary: "vast02", Pass: 1, Done: true, Converged: true}), nil)
 	rg.ctl.Sleep = func(context.Context, time.Duration) error { return nil }
 	rg.must("POST", "/v1/placements/acme/data01/cutover", CutoverRequest{Window: "1s"}, &tr)
 	rg.refused("POST", "/v1/placements/acme/data01/finish", nil, "keeps other keys of the bucket")
@@ -1619,4 +1619,12 @@ func TestRotateCredentials(t *testing.T) {
 	if len(ops.Operations) == 0 || ops.Operations[0].Kind != OpClusterRotate || ops.Operations[0].Status != StatusSucceeded {
 		t.Fatalf("operation record: %+v", ops.Operations)
 	}
+}
+
+// current stamps a mover report with the directory's identity and key's current generation, as a
+// mover planning from the current directory does (third review, R3-02).
+func (rg *rig) current(key string, p Progress) Progress {
+	f := rg.dir.Snapshot().File()
+	p.Identity, p.Generation = f.Identity, f.Generation(directory.PlacementResource(key))
+	return p
 }

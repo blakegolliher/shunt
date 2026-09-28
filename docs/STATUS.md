@@ -29,7 +29,7 @@ leaves out unfinished work.
 | ID | Pri | | Fault | Test | State |
 |---|---|---|---|---|---|
 | R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestOldRouteCannotCrossABarrier` (was `TestReviewOldBundleCannotEnterAfterBarrierCompletes`) | fixed 2026-09-28 |
-| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestReviewOldScopeProgressMustNotAuthorizeNewScope` | open |
+| R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestOldMoveReportCannotAuthorizeCutover`, `TestMoverReportGoesStaleWithThePlacement` (was `TestReviewOldScopeProgressMustNotAuthorizeNewScope`) | fixed 2026-09-28 |
 | R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestReviewIncompleteMultipartResponseMustRemainUncertain` | open |
 | R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` | open |
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` | open |
@@ -67,6 +67,22 @@ with the version check removed. Credential rotation has no drain barrier to cros
 a plain directory write, reported installed per member, and a request that took the old bundle signs
 with the old secret until it ends (H1b). The design's credential revocation barrier, which would
 drain those, is not built.
+
+**R3-02 fixed (2026-09-28).** A mover's progress report carries the directory identity and the
+placement generation its mover planned from: its worker session's for `shunt migrate run`, its mover
+operation's reserved generation for the control node's own mover. A report without them answers
+400; one for another lineage or generation is refused as superseded, which is what a replayed or late
+report of an earlier move of the bucket is, since every later move or change writes the placement.
+Cutover counts a converged report only for the placement's current generation, and a MIGRATING
+bucket's view shows only such a report. Between cutover's check and its commit the evidence cannot
+change: the operation reserves the placement, so no mover operation can run, and its hold moves the
+generation, so every earlier report is refused from then on. A `--dry-run` pass reports nothing
+(it copied nothing, and a pass that copies nothing reads as converged). No protocol-1 mover is
+deployed, so unbound reports are refused rather than accepted for compatibility. Tests: the review's
+two scoped moves (the replay refused, cutover refused, and the data/ move's own report cutting it
+over) and a report that goes stale when the placement changes after the last pass; removing the
+ingestion check or cutover's check each fails its test. `make walkthrough` passed (60,315 operations,
+0 errors) with the CLI mover's bound reports.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

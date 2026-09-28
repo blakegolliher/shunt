@@ -165,8 +165,13 @@ func (s *Server) runMover(tr *tracker, key string, req MoverRequest) (MoverResul
 	if req.External {
 		return s.runExternalMover(tr, key, req)
 	}
+	op := tr.snapshot()
 	return s.Mover(tr.ctx, key, req, func(p Progress) {
 		p.UpdatedAt = s.now().UTC()
+		p.Identity = op.Identity // the move this mover operation reserved (R3-02)
+		if op.Scope != nil {
+			p.Generation = op.Scope.Generation
+		}
 		if len(p.Ranges) == 0 {
 			p.Ranges = []MoverRange{{Name: "all keys", Cursor: p.LastKey,
 				Done: int64(p.Copied + p.Skipped + p.Vanished + p.Failed), Complete: p.Done}}

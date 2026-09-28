@@ -251,9 +251,9 @@ A fenced change (see [The fleet](#the-fleet)); held when the ramp is below 1. En
 
 ### `POST /v1/placements/{tenant}/{bucket}/mover-progress`
 
-`{"source", "primary", "pass", "copied", "skipped", "vanished", "failed", "bytes", "last_key", "done", "converged"}`
+`{"identity", "generation", "source", "primary", "pass", "copied", "skipped", "vanished", "failed", "bytes", "last_key", "done", "converged"}`
 
-Sent by `shunt migrate run` every 1,000 objects and at the end of each pass. Refused if `source` and `primary` do not match the placement. Only counts and the cursor key are stored, in memory.
+Sent by `shunt migrate run` every 1,000 objects and at the end of each pass (a `--dry-run` sends none). `identity` and `generation` are the directory lineage and the placement generation the mover planned from, its worker session's: a report without them answers 400, one for another lineage or generation is refused as superseded (a replayed or late report of an earlier move, or one from before a later change to the placement; third review, R3-02), and one whose `source` and `primary` do not match the placement is refused. Only counts, the cursor key and that binding are stored, in memory. Cutover counts a converged report only for the placement's current generation, and a placement's view shows a MIGRATING bucket's report only for its current generation.
 
 Before copying, the CLI creates an external `mover` operation with a random session id and sends
 `POST /v1/operations/{id}/worker-heartbeat`. The heartbeat carries `session`, directory `identity`,
