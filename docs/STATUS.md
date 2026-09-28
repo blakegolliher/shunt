@@ -37,7 +37,7 @@ on a proof that left out unfinished work, are fixed, and `make fleet` passed on 
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestSpreadDeleteAnswersForEveryKey` (was `TestReviewSpreadDeleteMustReportSourceOwnedFailure`), `FuzzParseDeleteRequest` | fixed 2026-09-28 |
 | R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
 | R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
-| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestReviewListingLookaheadFailureMustNotDeclareComplete` | open |
+| R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestMergedListingLookaheadFailureIsNotTheEnd` (was `TestReviewListingLookaheadFailureMustNotDeclareComplete`), `TestMergedListingAtAnExactPageBoundary` | fixed 2026-09-28 |
 
 Order of work (the review's): R3-01 to R3-04 first, since destructive routing changes trust their
 proofs; then R3-05 to R3-07 and R3-10; then R3-08 and R3-09; then H3c and H3d. Each fix lands with its
@@ -153,6 +153,17 @@ Tests: the source leg failing whole, quiet (the review's case) and verbose; per-
 source, where the source-owned key carries its error and the in-move key does not; the source's
 connection ending after the request, where the owned key is an error and the mutation uncertain.
 Removing the per-key answer fails the three whole-leg cases.
+
+**R3-10 fixed (2026-09-28).** A migrating bucket's merged listing peeks each side once after filling
+a page, to learn whether it is truncated; a peek that fails is now answered as the failure, as a
+failed page inside the merge already was, instead of reading as the end of that side. The client
+retries the page and loses nothing; memory stays one page per side. A spread bucket's listing
+(ADR-0019) already failed on a failed peek. Tests: 1,001 keys with the second page failing on the
+source (the review's case) or on the primary, with and without a delimiter, each refused rather
+than answered complete, and paging through all 1,001 once the side answers again; exactly one page
+of keys, where no peek is made, answered complete. Ignoring the peek's error again fails all four
+failure cases with 1,000 of 1,001 keys. ListObjects v1 on a migrating bucket still goes to the
+primary alone (a POC-4 limit, unchanged).
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

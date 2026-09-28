@@ -148,9 +148,20 @@ func (h *Handler) mergeListing(ctx context.Context, w http.ResponseWriter, r *ht
 		emitted = append(emitted, take)
 	}
 
-	// Truncated only if one side really has more; peeking costs at most one page per side.
-	ph, _ := head(ps)
-	sh, _ := head(ss)
+	// Truncated only if one side really has more; peeking costs at most one page per side. A peek
+	// that fails says nothing about whether a side has more, and answering it as the end would tell
+	// the client the listing is complete when it is not: the page is answered as the failure, as a
+	// failed page inside it is, and the client retries it (third review, R3-10).
+	ph, err := head(ps)
+	if err != nil {
+		h.upstreamError(w, r, o, err)
+		return
+	}
+	sh, err := head(ss)
+	if err != nil {
+		h.upstreamError(w, r, o, err)
+		return
+	}
 	if ps.missing && ss.missing {
 		h.answer(w, r, o, s3.NoSuchBucket, "")
 		return
