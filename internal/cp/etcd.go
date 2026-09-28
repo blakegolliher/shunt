@@ -312,7 +312,12 @@ func (n *Node) RemoveMember(ctx context.Context, id uint64) error {
 		if err == nil {
 			return nil
 		}
-		if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
+		switch {
+		case strings.Contains(err.Error(), "unhealthy cluster") && time.Now().After(deadline):
+			// etcd's strict reconfiguration check: the members left could not keep quorum with the
+			// ones that are down. It refused before changing anything.
+			return fmt.Errorf("etcd member remove: %w (%w)", control.ErrQuorumAtRisk, err)
+		case !strings.Contains(err.Error(), "unhealthy cluster"):
 			return fmt.Errorf("etcd member remove: %w", err)
 		}
 		select {
@@ -373,6 +378,9 @@ func (n *Node) Promote(ctx context.Context, id uint64) error {
 	}
 	return fmt.Errorf("etcd member promote: %w", err)
 }
+
+// ID is this member's etcd member ID.
+func (n *Node) ID() uint64 { return uint64(n.e.Server.MemberID()) }
 
 // learner reports whether this member is a learner, from its own view of the membership.
 func (n *Node) learner() bool {

@@ -256,7 +256,18 @@ membership and a real-etcd cancel of a started and an unstarted learner, with ne
 voter check, the peer-URL reconciliation, and self-promotion restored each fail their test); race suite,
 lint, the UI gates and `make fleet` passed on the H3b build, the fleet's two joins promoted by their
 operations. Joins no longer count in `shunt_barrier_blockers`, whose catalogued codes they are not.
-H3c (removal by ID), H3d (observed health) and H3e (CLI/UI, acceptance) remain. New endpoints/commands in those documents are design
+H3c (2026-09-28) removes a control-plane member by its etcd ID: the name route looks a name up once,
+a dry run answers the member, the voters left and a token bound to the ID and the whole member list,
+and the removal runs as a `control-remove` operation on the same `control:members` reservation as
+joins, recording its intent before it is sent and reconciling a lost answer by ID. The only voter,
+the answering node and a removal etcd refuses for quorum are refused; two or one voters left warn.
+`shunt-control member remove <name> | --id <id> [--dry-run]`, and `member list` shows ids and
+`(unnamed)` for a member that never started. Tests: by name and by id (an unnamed learner), the token
+refusing a reused name and a changed membership, the refusals, a lost answer, etcd's quorum refusal,
+resume after owner loss (removed already: nothing sent; still there: sent once), a removal beside a
+join refused on its scope, a real-etcd run from three voters to one, and the CLI; binding the token to
+the ID alone, or dropping the lost-answer reconciliation, each fails its test. The Control plane
+screen's removal is H3e's. H3d (observed health) and H3e (CLI/UI, acceptance) remain. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 

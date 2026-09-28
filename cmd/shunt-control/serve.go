@@ -288,7 +288,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	}()
 	defer store.Close()
 	defer ops.Close()
-	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Key: cipher.Key}
+	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Self: node.ID, Key: cipher.Key}
 	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o), Control: ctl}
 
 	adm := admin.New(metrics.Registry, telemetry.NewSlowRing(1, time.Hour))

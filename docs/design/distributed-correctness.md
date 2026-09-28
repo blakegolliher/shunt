@@ -622,6 +622,17 @@ negative controls for the voter check and the peer-URL reconciliation; a real-et
 started and of an unstarted learner, whose check that a held-back learner is never promoted fails
 with self-promotion restored.
 
+**Landed (2026-09-28, H3c):** removal by ID. `DELETE /v1/control/members/by-id/{id}` (and the name
+route, which looks the name up once to the one member holding it) runs a `control-remove` operation
+reserving `control:members`, so it never runs beside a join or another removal. Its dry run answers
+the member (id, name, role, started), the voters left, a warning at two or one, and a token bound to
+the member ID and the whole member list: a removal is refused once the membership changed, and a
+name reused by a replacement never removes the replacement. The record says `member_remove`, with
+the member, before the removal is sent; a lost answer is reconciled by ID, and an owner's loss leaves
+it resumable, not cancelable. Refused: the only voter, the answering node (`Membership.Self`), and
+etcd's quorum refusal (`ErrQuorumAtRisk`, definitive: nothing changed). `shunt-control member remove
+<name> | --id <id> [--dry-run]`; `member list` shows ids. The Control plane screen's removal is H3e's.
+
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability
 checks. Serialize membership intents durably; at most one unfinished membership

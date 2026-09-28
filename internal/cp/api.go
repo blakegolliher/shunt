@@ -65,7 +65,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/control/status", a.status)
 	mux.HandleFunc("POST /v1/control/members", a.Control.ServeJoin)
 	mux.HandleFunc("POST /v1/control/joins/{id}/bootstrap", a.Control.ServeJoinBootstrap)
-	mux.HandleFunc("DELETE /v1/control/members/{name}", a.removeMember)
+	mux.HandleFunc("DELETE /v1/control/members/{name}", a.Control.ServeMemberRemove)
+	mux.HandleFunc("DELETE /v1/control/members/by-id/{id}", a.Control.ServeMemberRemove)
 	mux.HandleFunc("GET /v1/control/snapshot", a.snapshot)
 	mux.HandleFunc("POST /v1/control/defrag", a.defrag)
 	return mux
@@ -82,6 +83,7 @@ func Routes() []control.Route {
 		{Method: "POST", Pattern: "/v1/control/members", Verbs: []string{"join"}, Mutation: true},
 		{Method: "POST", Pattern: "/v1/control/joins/{id}/bootstrap", Verbs: []string{"join"}, Mutation: true},
 		{Method: "DELETE", Pattern: "/v1/control/members/{name}", Verbs: []string{"member remove"}, Mutation: true},
+		{Method: "DELETE", Pattern: "/v1/control/members/by-id/{id}", Verbs: []string{"member remove --id"}, Mutation: true},
 		{Method: "GET", Pattern: "/v1/control/snapshot", Verbs: []string{"snapshot save"}},
 		{Method: "POST", Pattern: "/v1/control/defrag", Verbs: []string{"defrag"}, Mutation: true},
 	}
@@ -142,16 +144,6 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		ans.Fleet = fleet
 	}
 	writeJSON(w, http.StatusOK, ans)
-}
-
-func (a *API) removeMember(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	if err := a.Node.MemberRemove(ctx, r.PathValue("name")); err != nil {
-		writeError(w, http.StatusConflict, "refused", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"removed": r.PathValue("name")})
 }
 
 func (a *API) snapshot(w http.ResponseWriter, r *http.Request) {

@@ -350,8 +350,8 @@ func (s *Server) publishBlockers() {
 	s.mu.Unlock()
 	for _, tr := range trackers {
 		op := tr.snapshot()
-		if op.Kind == OpControlJoin {
-			continue // a join holds no barrier; its phase is shunt_control_join_phase (H3)
+		if op.Kind == OpControlJoin || op.Kind == OpControlRemove {
+			continue // a membership change holds no barrier; its phase is shunt_control_join_phase (H3)
 		}
 		for _, b := range op.Blockers {
 			counts[b.Code]++
@@ -404,6 +404,8 @@ func notCancellable(op *Operation, ownerGone bool) error {
 	switch {
 	case op.Kind == OpControlJoin:
 		return nil // until its node votes, which only the join's owner can tell (cancelJoin)
+	case op.Kind == OpControlRemove:
+		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s removes a control-plane member; a removal is sent at once and cannot be taken back: to keep the node, join it again", op.ID)}
 	case op.Kind == OpMover:
 		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is a mover: it ends with its worker, and an expired worker session is resolved with `shunt operation resolve-worker %s --session <id> --attest <why>`", op.ID, op.ID)}
 	case !resumable(op.Kind):
@@ -698,7 +700,7 @@ func (s *Server) resumeOperation(w http.ResponseWriter, r *http.Request) {
 // carriesOn reports whether a record whose owner is gone is resumed rather than failed: a barrier
 // operation once its barrier is on the record, and a join, whose intent is on it from the start.
 func carriesOn(op *Operation) bool {
-	return (resumable(op.Kind) && op.Barrier != nil) || op.Kind == OpControlJoin
+	return (resumable(op.Kind) && op.Barrier != nil) || op.Kind == OpControlJoin || op.Kind == OpControlRemove
 }
 
 func resumable(kind string) bool {
@@ -758,6 +760,15 @@ func (s *Server) rerun(tr *tracker) (any, error) {
 			return nil, refuse("operation %s is a control-plane join; this server has no membership to change", op.ID)
 		}
 		return s.runJoin(tr, a)
+	case OpControlRemove:
+		var a MemberRemoveRequest
+		if err := decodeArgs(op.Args, &a); err != nil {
+			return nil, err
+		}
+		if s.Members == nil {
+			return nil, refuse("operation %s is a control-plane member removal; this server has no membership to change", op.ID)
+		}
+		return s.runMemberRemove(tr, a)
 	}
 	return nil, refuse("operation %s (%s) is not resumable", op.ID, op.Kind)
 }

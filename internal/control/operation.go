@@ -994,6 +994,18 @@ func (s *Server) launch(actor string, req OperationRequest, async bool, meta req
 			return nil, nil, err
 		}
 		return start(s.membersOp(), a, func(tr *tracker) (any, error) { return s.runJoin(tr, a) })
+	case OpControlRemove:
+		var a MemberRemoveRequest
+		if err := decodeArgs(req.Args, &a); err != nil {
+			return nil, nil, err
+		}
+		if s.Members == nil {
+			return nil, nil, notFound("this server has no control-plane membership")
+		}
+		if _, err := parseMemberID(a.ID); err != nil {
+			return nil, nil, err
+		}
+		return start(s.membersOp(), a, func(tr *tracker) (any, error) { return s.runMemberRemove(tr, a) })
 	}
 	return nil, nil, bad("kind %q: want one of ramp, migrate, mover, cutover, purge-source, finish, cluster-remove, cluster-read-only, placement-read-only, control-join", req.Kind)
 }
