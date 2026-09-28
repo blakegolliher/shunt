@@ -154,7 +154,8 @@ type Operation struct {
 	BlockerCount   int             `json:"blocker_count,omitempty"`
 	Barrier        *BarrierState   `json:"barrier,omitempty"`
 	Worker         *WorkerSession  `json:"worker,omitempty"`
-	Member         *JoinMember     `json:"member,omitempty"` // a join's learner, once added
+	Member         *JoinMember     `json:"member,omitempty"`         // a join's learner, once added
+	CancelRequest  *CancelRequest  `json:"cancel_request,omitempty"` // a cancellation asked of a join, which its owner carries out
 	Phase          string          `json:"phase,omitempty"`
 	WaitingOn      []string        `json:"waiting_on,omitempty"`
 	Silent         []string        `json:"silent,omitempty"`
@@ -189,6 +190,10 @@ func (op *Operation) clone() *Operation {
 	if op.Worker != nil {
 		w := *op.Worker
 		c.Worker = &w
+	}
+	if op.CancelRequest != nil {
+		r := *op.CancelRequest
+		c.CancelRequest = &r
 	}
 	if op.Error != nil {
 		e := *op.Error
@@ -456,11 +461,12 @@ func (tr *tracker) put() {
 	tr.op.Updated = tr.s.now().UTC()
 	tr.op.Sequence++
 	err := tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
-	// Worker heartbeats are the one supported writer alongside an operation's owner, and they
-	// write the durable record by its own compare-and-swap (applyWorker), on any node. The worker
-	// session is theirs: when one landed between this tracker's read and write, take the session
-	// from the record, never from this copy, and write the owner's fields over the new sequence.
-	// An ended record, or a changed owner or term, is a real takeover.
+	// Worker heartbeats and a join's cancellation request are the supported writers alongside an
+	// operation's owner, and they write the durable record by its own compare-and-swap
+	// (applyWorker, cancelJoinRequest), on any node. The worker session and the request are theirs:
+	// when one landed between this tracker's read and write, take it from the record, never from
+	// this copy, and write the owner's fields over the new sequence. An ended record, or a changed
+	// owner or term, is a real takeover.
 	for attempt := 0; errors.Is(err, ErrStaleSequence) && attempt < 16; attempt++ {
 		stored, gerr := tr.s.ops().Get(context.WithoutCancel(tr.ctx), tr.op.ID)
 		if gerr != nil || stored == nil || stored.Node != tr.op.Node || stored.OwnerTerm != tr.op.OwnerTerm || stored.Terminal() {
@@ -470,6 +476,11 @@ func (tr *tracker) put() {
 		if stored.Worker != nil {
 			worker := *stored.Worker
 			tr.op.Worker = &worker
+		}
+		if stored.CancelRequest != nil {
+			req := *stored.CancelRequest
+			tr.op.CancelRequest = &req
+			tr.op.AllowedActions = []string{}
 		}
 		tr.op.Sequence = stored.Sequence + 1
 		err = tr.s.ops().Update(context.WithoutCancel(tr.ctx), tr.op.clone())
@@ -541,7 +552,8 @@ func (tr *tracker) finish(res any, err error) {
 	tr.op.Blockers, tr.op.BlockerCount, tr.op.AllowedActions = nil, 0, []string{}
 	switch {
 	case errors.Is(err, errCanceled):
-		// The record was ended by the cancellation; this tracker's write is refused as stale.
+		// The record was ended by the cancellation, and this tracker's write is refused as stale;
+		// or, for a join, this owner carried the cancellation out and ends the record itself.
 		tr.op.Status = StatusCancelled
 		tr.op.Error = &Error{Code: StatusCancelled, Message: err.Error()}
 	case errors.Is(err, errLost):

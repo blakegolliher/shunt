@@ -2,6 +2,7 @@ package cp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/blakegolliher/shunt/internal/control"
 )
 
 // testCluster starts n embedded members on free loopback ports, the first alone and the rest
@@ -44,8 +47,10 @@ func startCluster(t testing.TB, n int) *testCluster {
 		port := freePort(t)
 		peer := fmt.Sprintf("http://127.0.0.1:%d", port)
 		cfg := NodeConfig{Name: name, DataDir: dir, PeerURL: peer, Log: log}
+		var id uint64
 		if i > 0 {
-			cfg.InitialCluster, cfg.Existing = addLearner(ctx, t, tc.nodes[0], name, peer), true
+			id, cfg.InitialCluster = addLearner(ctx, t, tc.nodes[0], name, peer)
+			cfg.Existing = true
 		}
 		node, err := Start(ctx, cfg)
 		if err != nil {
@@ -54,6 +59,9 @@ func startCluster(t testing.TB, n int) *testCluster {
 		tc.nodes, tc.dirs, tc.ports = append(tc.nodes, node), append(tc.dirs, dir), append(tc.ports, port)
 		if err := node.WaitReady(ctx); err != nil {
 			t.Fatalf("%s: %v", name, err)
+		}
+		if i > 0 {
+			promote(ctx, t, tc.nodes[0], id)
 		}
 	}
 	t.Cleanup(func() {
@@ -66,9 +74,9 @@ func startCluster(t testing.TB, n int) *testCluster {
 	return tc
 }
 
-// addLearner adds a learner at peer through node and returns the initial cluster it starts with,
-// as a join's bootstrap gives it.
-func addLearner(ctx context.Context, t testing.TB, node *Node, name, peer string) string {
+// addLearner adds a learner at peer through node and returns its ID and the initial cluster it
+// starts with, as a join's bootstrap gives it.
+func addLearner(ctx context.Context, t testing.TB, node *Node, name, peer string) (uint64, string) {
 	t.Helper()
 	id, err := node.AddLearner(ctx, peer)
 	if err != nil {
@@ -88,7 +96,26 @@ func addLearner(ctx context.Context, t testing.TB, node *Node, name, peer string
 			parts = append(parts, mn+"="+u)
 		}
 	}
-	return strings.Join(parts, ",")
+	return id, strings.Join(parts, ",")
+}
+
+// promote promotes learner id through node once it has caught up, as a join's operation does.
+func promote(ctx context.Context, t testing.TB, node *Node, id uint64) {
+	t.Helper()
+	for {
+		err := node.Promote(ctx, id)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, control.ErrLearnerNotReady) {
+			t.Fatalf("promoting %x: %v", id, err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("promoting %x: %v", id, err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // restart stops node i and starts it again on the same data directory and port.
@@ -115,8 +142,8 @@ func TestClusterFormsJoinsAndReports(t *testing.T) {
 	if len(st.Members) != 3 || st.Started != 3 || st.Quorum != 2 || !st.HasQuorum || st.Leader == "" {
 		t.Fatalf("status: %+v", st)
 	}
-	// A member joins as a learner, so its join leaves the quorum as it was, and promotes itself
-	// once it has caught up: every member of a formed cluster votes.
+	// A member joins as a learner, so its join leaves the quorum as it was, and is promoted once it
+	// has caught up: every member of a formed cluster votes.
 	for _, m := range st.Members {
 		if m.Learner {
 			t.Errorf("%s is still a learner after its join", m.Name)

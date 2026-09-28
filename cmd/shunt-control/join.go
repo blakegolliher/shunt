@@ -26,7 +26,10 @@ import (
 // interrupted anywhere is resumed by running the same command again: prepared (the request id is
 // chosen and saved before the cluster is asked), requested (the cluster has the join's operation
 // and its learner), bootstrap_saved (the member list and the key are on disk; etcd starts from
-// them). The cluster side is an operation record that follows the node until it votes.
+// them), promoted (the join ended succeeded: the node votes, and a restart no longer asks the
+// cluster about its join). The cluster side is an operation record that follows the node until it
+// votes; the node follows the record back (followJoin), since the operation, not the node, promotes
+// it, and a canceled join removes it.
 
 const joinFile = "join.json"
 
@@ -35,6 +38,7 @@ const (
 	joinPrepared       = "prepared"
 	joinRequested      = "requested"
 	joinBootstrapSaved = "bootstrap_saved"
+	joinPromoted       = "promoted"
 )
 
 // joinState is join.json. The data-encryption key is never in it: it has its own 0600 file.
@@ -256,6 +260,64 @@ func fetchBootstrap(ctx context.Context, c *apiClient, st *joinState) (control.B
 		case <-ctx.Done():
 			return b, ctx.Err()
 		case <-time.After(time.Second):
+		}
+	}
+}
+
+// joinFollowPoll is how often a joined node reads its join's operation until the join ends.
+var joinFollowPoll = 2 * time.Second
+
+// joinOperation reads the join's operation record.
+func joinOperation(ctx context.Context, c *apiClient, id string) (control.Operation, error) {
+	var op control.Operation
+	err := c.call(ctx, http.MethodGet, "/v1/operations/"+url.PathEscape(id), nil, &op)
+	return op, err
+}
+
+// endedJoin is what a node stops with when its join ended other than succeeded: a canceled join
+// removed its learner, so the data directory holds a member the cluster no longer has.
+func endedJoin(op control.Operation, dataDir string) error {
+	how := op.Status
+	if op.Error != nil {
+		how += ": " + op.Error.Message
+	}
+	return fmt.Errorf("join %s ended %s; this node is not a member of the cluster: remove %s and join again", op.ID, how, dataDir)
+}
+
+// followJoin follows a started node's join until it ends. It resumes a join whose owner is gone on
+// the node it joined through, marks join.json promoted when the join succeeds, and returns
+// endedJoin when the join was canceled or failed. An unreachable cluster is read again later.
+func followJoin(ctx context.Context, c *apiClient, dataDir string, st *joinState, log *slog.Logger) error {
+	t := time.NewTicker(joinFollowPoll)
+	defer t.Stop()
+	for {
+		op, err := joinOperation(ctx, c, st.Operation)
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				log.Warn("join's operation unreadable; reading it again", "operation", st.Operation, "via", st.Existing, "err", err.Error())
+			}
+		case op.Status == control.StatusSucceeded:
+			st.Phase = joinPromoted
+			if serr := saveJoin(dataDir, st); serr != nil {
+				return serr
+			}
+			log.Info("join succeeded: this node is a voting member", "operation", op.ID)
+			return nil
+		case op.Terminal():
+			return endedJoin(op, dataDir)
+		case slices.Contains(op.AllowedActions, control.ActionResume):
+			var resumed control.Operation
+			if rerr := c.call(ctx, http.MethodPost, "/v1/operations/"+url.PathEscape(op.ID)+"/resume", nil, &resumed); rerr != nil {
+				log.Warn("join's owner is gone and resuming it failed; trying again", "operation", op.ID, "err", rerr.Error())
+			} else {
+				log.Info("join's owner is gone; resumed it", "operation", op.ID, "owner", resumed.Node)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
 		}
 	}
 }

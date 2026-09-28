@@ -57,8 +57,18 @@ traffic by backend (`shunt watch`). H1 passed on 2026-09-24: H1a (the runtime bu
 reconciles a lost add answer by peer URL, follows the node to its promotion and resumes after owner loss;
 the key moves to a no-store bootstrap route, and the joining node resumes from an fsynced `join.json`
 (`join --resume`). A node joined right behind another waits for it rather than fail. `make fleet` passed
-on the H3a build. H3b (cancel), H3c (removal by ID), H3d (observed health) and H3e (CLI/UI, acceptance)
-remain. New endpoints/commands in those documents are design
+on the H3a build. H3b (2026-09-28) makes a join cancelable until its node votes: the join's operation,
+not the node, now promotes the learner, and a cancellation is a request on the record that the join's
+owner carries out between two membership changes, removing the learner by its member ID (found by peer
+URL first when the add's answer was lost); one that arrives after the promotion removes nothing and
+answers `not_cancellable`. A join whose owner is lost offers cancel beside resume. The joined node
+follows its join: it resumes one whose owner is lost, records `promoted` in `join.json`, and stops,
+naming the data directory to remove, when the join is canceled. Four cancellation tests over a fake
+membership and a real-etcd cancel of a started and an unstarted learner, with negative controls (the
+voter check, the peer-URL reconciliation, and self-promotion restored each fail their test); race suite,
+lint, the UI gates and `make fleet` passed on the H3b build, the fleet's two joins promoted by their
+operations. Joins no longer count in `shunt_barrier_blockers`, whose catalogued codes they are not.
+H3c (removal by ID), H3d (observed health) and H3e (CLI/UI, acceptance) remain. New endpoints/commands in those documents are design
 targets, not available features. Embedded-etcd restore/join tests must run on a
 runner that permits Unix sockets; they were not validated in the review sandbox.
 
@@ -73,9 +83,11 @@ runner that permits Unix sockets; they were not validated in the review sandbox.
   ended record take only an exact repeat, so a late heartbeat cannot undo an attested resolution.
   The regression runs on two nodes over embedded etcd and on a shared store, and fails on
   `9761192`. The Operations screen keeps an attestation with the record it was typed for, clears
-  it on success and keeps it on a failed request. `make walkthrough` stops at `ramp 1.0` on
+  it on success and keeps it on a failed request. `make walkthrough` stopped at `ramp 1.0` on
   `backend_outcome_unknown` on this build and on `9761192` alike (process-lifetime uncertain
-  counts, H2f); `make fleet` was not run, its ports being held by a running `make demo-ui`.
+  counts); H2f fixed that, and the walkthrough is green on the H3a build (`e4c89dc`, 2026-09-28:
+  61,014 verify operations, 0 errors). `make fleet` was not run for this fix, its ports being held
+  by a running `make demo-ui`.
 
 ### Previously recorded implementation work
 

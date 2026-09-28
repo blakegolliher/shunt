@@ -215,6 +215,9 @@ export interface Operation {
   // worker is an external mover's session (`shunt migrate run`): an expired one is resolved by the
   // operator with an attestation (resolve-worker), which the session then keeps.
   worker?: WorkerSession
+  // cancel_request is a cancellation asked of a control-plane join, which the join's owner carries
+  // out (ADR-0021 D4): the record stays unfinished until the learner is removed.
+  cancel_request?: { actor: string; at: string }
   args?: Record<string, unknown>
   owner_term?: number
   phase?: string
@@ -224,6 +227,12 @@ export interface Operation {
   version?: number
   result?: unknown
   error?: { code: string; message: string }
+}
+
+// cancelOutcome says what a cancel request's answer means: a join answers 202 with its record still
+// unfinished while its owner removes the learner, so success is only a record that ended cancelled.
+export function cancelOutcome(op: Operation): string {
+  return op.status === 'cancelled' ? `${op.kind} cancelled; nothing changed` : `${op.kind} cancellation requested; the operation is ${op.status}`
 }
 
 export interface WorkerSession { id: string; state: 'active' | 'completed' | 'unresolved'; sequence: number; inflight?: number; uncertain?: number; last_seen?: string; error?: string; resolved_by?: string; attestation?: string }

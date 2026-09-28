@@ -159,18 +159,10 @@ func Start(ctx context.Context, cfg NodeConfig) (*Node, error) {
 		}
 	}
 	n := &Node{cfg: cfg, e: e, cli: v3client.New(e.Server), socket: socket, rmSock: rmSock}
-	if cfg.Existing {
-		if err := n.promote(ctx); err != nil {
-			if !restart {
-				n.Close()
-				return nil, err
-			}
-			// A learner restarting (it stopped between its join and its promotion) may find no
-			// leader to promote it yet; it runs as a learner, and its next start tries again.
-			if cfg.Log != nil {
-				cfg.Log.Warn("etcd member is still a learner: not promoted to a voting member yet", "name", cfg.Name, "err", err)
-			}
-		}
+	if n.learner() && cfg.Log != nil {
+		// The join's operation promotes it once it has caught up (ADR-0021 D4): a member never
+		// promotes itself, so a cancellation of its join cannot race a promotion.
+		cfg.Log.Info("etcd member runs as a learner: its join promotes it to a voting member once it has caught up", "name", cfg.Name)
 	}
 	if cfg.Log != nil {
 		cfg.Log.Info("etcd member ready", "name", cfg.Name, "peer", cfg.PeerURL, "data_dir", cfg.DataDir, "members", len(e.Server.Cluster().Members()))
@@ -304,24 +296,31 @@ func (n *Node) MemberRemove(ctx context.Context, name string) error {
 	}
 	for _, m := range ml.Members {
 		if m.Name == name {
-			deadline := time.Now().Add(30 * time.Second)
-			for {
-				_, err := n.cli.MemberRemove(ctx, m.ID)
-				if err == nil {
-					return nil
-				}
-				if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
-					return fmt.Errorf("etcd member remove: %w", err)
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(500 * time.Millisecond):
-				}
-			}
+			return n.RemoveMember(ctx, m.ID)
 		}
 	}
 	return fmt.Errorf("no member named %s", name)
+}
+
+// RemoveMember removes member id. etcd refuses a membership change while a member it has is not yet
+// caught up ("unhealthy cluster"), which is the normal state for a few seconds after a join, so it
+// retries that for a while.
+func (n *Node) RemoveMember(ctx context.Context, id uint64) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, err := n.cli.MemberRemove(ctx, id)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "unhealthy cluster") || time.Now().After(deadline) {
+			return fmt.Errorf("etcd member remove: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // Snapshot streams a point-in-time snapshot of the store to w: `shunt-control snapshot save`.
@@ -361,38 +360,29 @@ func Restore(snapshotPath, dataDir, name, peerURL string) error {
 	return nil
 }
 
-// promote makes this member a voter once it has caught up with the leader, which etcd requires
-// ("can only promote a learner member which is in sync with leader"); a member that votes already
-// is left as it is. The request goes to the leader through this member's own server.
-func (n *Node) promote(ctx context.Context) error {
+// Promote makes learner id a voter: one request, which a join's operation repeats until it lands.
+// etcd refuses a learner that has not caught up with the leader ("can only promote a learner member
+// which is in sync with leader"); that refusal is control.ErrLearnerNotReady, and changes nothing.
+func (n *Node) Promote(ctx context.Context, id uint64) error {
+	_, err := n.cli.MemberPromote(ctx, id)
+	switch {
+	case err == nil:
+		return nil
+	case strings.Contains(err.Error(), "in sync with leader"):
+		return fmt.Errorf("etcd member promote: %w (%w)", control.ErrLearnerNotReady, err)
+	}
+	return fmt.Errorf("etcd member promote: %w", err)
+}
+
+// learner reports whether this member is a learner, from its own view of the membership.
+func (n *Node) learner() bool {
 	id := n.e.Server.MemberID()
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		learner := false
-		for _, m := range n.e.Server.Cluster().Members() {
-			if m.ID == id {
-				learner = m.IsLearner
-			}
-		}
-		if !learner {
-			return nil
-		}
-		_, err := n.cli.MemberPromote(ctx, uint64(id))
-		if err == nil {
-			if n.cfg.Log != nil {
-				n.cfg.Log.Info("etcd member promoted to a voting member", "name", n.cfg.Name)
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("etcd: promoting %s to a voting member: %w", n.cfg.Name, err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+	for _, m := range n.e.Server.Cluster().Members() {
+		if m.ID == id {
+			return m.IsLearner
 		}
 	}
+	return false
 }
 
 // WaitReady blocks until the member has a leader, or ctx ends: after a restart, before serving.

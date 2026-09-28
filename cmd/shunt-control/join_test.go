@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/blakegolliher/shunt/internal/control"
 	"github.com/blakegolliher/shunt/internal/cp"
@@ -29,6 +30,8 @@ type stubCluster struct {
 	busy        int // this many join requests answer operation_conflict first
 	key         []byte
 	lastRequest control.JoinRequest
+	ops         []control.Operation // GET /v1/operations/{id} answers these in turn, then the last
+	resumes     int
 }
 
 func (s *stubCluster) handler(t *testing.T) http.Handler {
@@ -67,6 +70,22 @@ func (s *stubCluster) handler(t *testing.T) http.Handler {
 		}
 		_ = json.NewEncoder(w).Encode(control.Bootstrap{Operation: "1700000000000-j0in01", MemberID: "a1", Name: "c2",
 			InitialCluster: "c1=http://127.0.0.1:9961,c2=http://127.0.0.1:9962", EncryptionKey: s.key})
+	})
+	mux.HandleFunc("GET /v1/operations/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		op := s.ops[0]
+		if len(s.ops) > 1 {
+			s.ops = s.ops[1:]
+		}
+		_ = json.NewEncoder(w).Encode(op)
+	})
+	mux.HandleFunc("POST /v1/operations/{id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.resumes++
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(control.Operation{ID: r.PathValue("id"), Kind: control.OpControlJoin, Node: "c1", Status: control.StatusRunning})
 	})
 	return mux
 }
@@ -191,5 +210,50 @@ func TestJoinWaitsForAnotherMembershipChange(t *testing.T) {
 	defer stub.mu.Unlock()
 	if len(stub.joins) != 3 || stub.joins[0] != stub.joins[1] || stub.joins[1] != stub.joins[2] || stub.joins[0] == "" {
 		t.Fatalf("join requests: %q; want three with one Idempotency-Key", stub.joins)
+	}
+}
+
+// A started node follows its join (H3b): it resumes a join whose owner is gone, and marks join.json
+// promoted once the join succeeds, so a restart no longer asks the cluster. A canceled join stops the
+// node with the join's reason and what to do.
+func TestJoinedNodeFollowsItsJoin(t *testing.T) {
+	joinFollowPoll = 5 * time.Millisecond
+	t.Cleanup(func() { joinFollowPoll = 2 * time.Second })
+	id := "1700000000000-j0in01"
+	stub := &stubCluster{ops: []control.Operation{
+		{ID: id, Kind: control.OpControlJoin, Status: control.StatusBlocked, AllowedActions: []string{control.ActionResume, control.ActionCancel},
+			Blockers: []control.Blocker{{Code: control.BlockerOwnerLost}}},
+		{ID: id, Kind: control.OpControlJoin, Status: control.StatusBlocked, Phase: control.PhaseCatchingUp},
+		{ID: id, Kind: control.OpControlJoin, Status: control.StatusSucceeded},
+	}}
+	srv := httptest.NewServer(stub.handler(t))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	st := &joinState{Version: 1, Name: "c2", PeerURL: "http://127.0.0.1:9962", Existing: srv.URL, Operation: id, Phase: joinBootstrapSaved}
+	if err := saveJoin(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.DiscardHandler)
+	if err := followJoin(context.Background(), &apiClient{base: srv.URL}, dir, st, log); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := loadJoin(dir); got == nil || got.Phase != joinPromoted {
+		t.Fatalf("join.json after the join succeeded: %+v", got)
+	}
+	stub.mu.Lock()
+	resumes := stub.resumes
+	stub.mu.Unlock()
+	if resumes != 1 {
+		t.Fatalf("resumes of a join whose owner was gone: %d, want 1", resumes)
+	}
+
+	canceled := &stubCluster{ops: []control.Operation{{ID: id, Kind: control.OpControlJoin, Status: control.StatusCancelled,
+		Error: &control.Error{Code: control.StatusCancelled, Message: "canceled by token:ab; learner a1 was removed"}}}}
+	srv2 := httptest.NewServer(canceled.handler(t))
+	t.Cleanup(srv2.Close)
+	st.Phase = joinBootstrapSaved
+	err := followJoin(context.Background(), &apiClient{base: srv2.URL}, dir, st, log)
+	if err == nil || !strings.Contains(err.Error(), "ended cancelled: canceled by token:ab") || !strings.Contains(err.Error(), "remove "+dir) { //nolint:misspell // the status as the contract spells it
+		t.Fatalf("a canceled join: %v", err)
 	}
 }

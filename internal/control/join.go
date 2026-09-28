@@ -26,6 +26,12 @@ import (
 // route; the key is never on the record, in an event, or in a URL. The operation follows the node
 // until etcd has promoted it to a voter, and carries on, from any control node, if its owner is
 // lost.
+//
+// The operation, not the joining node, promotes the learner, and a cancellation is a request on the
+// record that the operation's owner carries out (H3b). So one process at a time changes the
+// membership for a join, in order: a cancellation that lands before the promotion removes the
+// learner, by the exact member ID on the record; one that lands after it finds a voter and removes
+// nothing, since removing a voter is a separate, quorum-checked change.
 
 // OpControlJoin is the kind of a join's record.
 const OpControlJoin = "control-join"
@@ -35,16 +41,34 @@ const MembersResource = "control:members"
 
 // Join phases, after the queued phase every operation has.
 const (
-	PhaseLearnerAdd   = "learner_add"   // the learner is being added: an unanswered add is reconciled, never repeated blind
-	PhaseLearnerAdded = "learner_added" // the learner is in the member list, its ID on the record; the node has not started
-	PhaseCatchingUp   = "catching_up"   // the node runs as a learner, catching up with the leader
+	PhaseLearnerAdd    = "learner_add"    // the learner is being added: an unanswered add is reconciled, never repeated blind
+	PhaseLearnerAdded  = "learner_added"  // the learner is in the member list, its ID on the record; the node has not started
+	PhaseCatchingUp    = "catching_up"    // the node runs as a learner; it is promoted once it has caught up with the leader
+	PhaseLearnerRemove = "learner_remove" // a canceled join's learner is being removed: an unanswered remove is reconciled by ID
 )
 
 // Join blocker codes.
 const (
 	BlockerMemberNotStarted  = "member_not_started"  // the joining node has not fetched its bootstrap and started
 	BlockerLearnerCatchingUp = "learner_catching_up" // the node runs, but is not yet promoted to a voter
+	BlockerMembershipUnknown = "membership_unknown"  // a membership change did not answer; the join waits before it acts on the member again
 )
+
+// ErrLearnerNotReady is etcd's refusal to promote a learner that has not caught up with the leader.
+var ErrLearnerNotReady = errors.New("the learner has not caught up with the leader yet")
+
+// promoteSettle is how long a join waits, after a promotion whose answer was lost, before it may
+// remove the learner: a membership change etcd accepted is applied within its request timeout, so
+// by then the member list says whether the promotion landed. An owner lost mid-promotion is taken
+// over only after its liveness lapses, which is longer.
+const promoteSettle = 10 * time.Second
+
+// CancelRequest is a cancellation asked of a join. The join's owner carries it out, since only
+// the owner changes the membership for its join.
+type CancelRequest struct {
+	Actor string    `json:"actor"`
+	At    time.Time `json:"at"`
+}
 
 // EtcdMember is one control-plane member as the join sees it.
 type EtcdMember struct {
@@ -61,6 +85,11 @@ type Membership struct {
 	List func(ctx context.Context) ([]EtcdMember, error)
 	// AddLearner adds a non-voting member at peerURL and returns its ID.
 	AddLearner func(ctx context.Context, peerURL string) (uint64, error)
+	// Promote makes learner id a voter; etcd's refusal of one that has not caught up is
+	// ErrLearnerNotReady.
+	Promote func(ctx context.Context, id uint64) error
+	// Remove removes member id: a canceled join's learner.
+	Remove func(ctx context.Context, id uint64) error
 	// Key is the data-encryption key a joining node needs; it leaves only through the bootstrap.
 	Key func() []byte
 }
@@ -265,6 +294,10 @@ func (s *Server) ServeJoinBootstrap(w http.ResponseWriter, r *http.Request) {
 	case op.Member == nil && op.Terminal():
 		fail(w, refuse("join %s ended %s before its learner was added: start a new join", op.ID, op.Status))
 		return
+	case op.Terminal() && op.Status != StatusSucceeded:
+		// A canceled join's learner is removed; a failed one's may be. Neither may start.
+		fail(w, refuse("join %s ended %s: start a new join on an empty data directory", op.ID, op.Status))
+		return
 	case op.Member == nil:
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusConflict, "not_ready", fmt.Sprintf("join %s has not added its learner yet (phase %s); retry", op.ID, op.Phase))
@@ -307,18 +340,34 @@ func initialCluster(ms []EtcdMember, joinID, name string) (string, error) {
 	return strings.Join(parts, ","), nil
 }
 
-// runJoin adds the learner and follows the node until it votes. It runs from wherever the record
-// stands, so a resumed join carries on: a record in learner_add without a member reconciles the
-// member list before it adds anything.
+// runJoin adds the learner, follows the node until it has started and caught up, and promotes it.
+// It runs from wherever the record stands, so a resumed join carries on: a record in learner_add
+// without a member reconciles the member list before it adds anything. A cancellation asked of the
+// join is carried out here, between two membership changes, never beside one.
 func (s *Server) runJoin(tr *tracker, a JoinRequest) (any, error) {
+	var promoteLost time.Time // when a promotion last went unanswered
 	for {
 		if err := tr.check(); err != nil {
 			return nil, err
+		}
+		cancel := s.joinCancelRequest(tr)
+		if cancel == nil {
+			tr.allow([]string{ActionCancel})
 		}
 		op := tr.snapshot()
 		ms, err := s.Members.List(tr.ctx)
 		if err != nil {
 			tr.blocked([]Blocker{{Code: BlockerQuorumUnavailable, Message: "the member list cannot be read: " + err.Error()}})
+			if serr := s.sleep(tr.ctx, s.joinPoll()); serr != nil {
+				return nil, fmt.Errorf("%w: %w", ErrUnavailable, serr)
+			}
+			continue
+		}
+		if cancel != nil {
+			res, done, err := s.cancelJoin(tr, op, a, ms, cancel, promoteLost)
+			if done || err != nil {
+				return res, err
+			}
 			if serr := s.sleep(tr.ctx, s.joinPoll()); serr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrUnavailable, serr)
 			}
@@ -342,25 +391,203 @@ func (s *Server) runJoin(tr *tracker, a JoinRequest) (any, error) {
 			blockers = []Blocker{{Code: BlockerMemberNotStarted, Message: fmt.Sprintf("waiting for %s to fetch its bootstrap and start (`shunt-control join` on that host)", a.Name)}}
 		case m.Learner:
 			tr.phase(PhaseCatchingUp)
-			blockers = []Blocker{{Code: BlockerLearnerCatchingUp, Message: fmt.Sprintf("%s runs as a learner and promotes itself once it has caught up with the leader", a.Name)}}
+			if err := tr.check(); err != nil {
+				return nil, err
+			}
+			perr := s.Members.Promote(tr.ctx, m.ID)
+			switch {
+			case perr == nil:
+				s.info(tr.actor, "control node promoted to a voting member", "operation", op.ID, "name", m.Name, "member", op.Member.ID)
+				continue
+			case errors.Is(perr, ErrLearnerNotReady):
+				blockers = []Blocker{{Code: BlockerLearnerCatchingUp, Message: fmt.Sprintf("%s runs as a learner and is promoted once it has caught up with the leader", a.Name)}}
+			default:
+				// The promotion may have landed with its answer lost: the next round's member list
+				// says, and a cancellation waits for it to settle.
+				promoteLost = s.now()
+				blockers = []Blocker{{Code: BlockerMembershipUnknown, Message: "promoting " + a.Name + " did not answer: " + perr.Error()}}
+			}
 		default:
-			voters := 0
-			for _, x := range ms {
-				if !x.Learner {
-					voters++
-				}
-			}
-			res := JoinResult{MemberID: op.Member.ID, Name: m.Name, Voters: voters}
-			if voters == 2 {
-				res.Warning = "two voting members: writes need both, so losing either stops them; join a third control node"
-			}
 			tr.blocked(nil)
-			return res, nil
+			return joinResult(ms, op.Member.ID, m.Name), nil
 		}
 		tr.blocked(blockers)
 		if serr := s.sleep(tr.ctx, s.joinPoll()); serr != nil {
 			return nil, fmt.Errorf("%w: %w", ErrUnavailable, serr)
 		}
+	}
+}
+
+// joinResult is a join's result once its member votes.
+func joinResult(ms []EtcdMember, id, name string) JoinResult {
+	voters := 0
+	for _, x := range ms {
+		if !x.Learner {
+			voters++
+		}
+	}
+	res := JoinResult{MemberID: id, Name: name, Voters: voters}
+	if voters == 2 {
+		res.Warning = "two voting members: writes need both, so losing either stops them; join a third control node"
+	}
+	return res
+}
+
+// joinCancelRequest is the cancellation asked of the join, if any: on this tracker's copy, or on
+// the stored record, where the cancel route writes it without taking the record from its owner.
+func (s *Server) joinCancelRequest(tr *tracker) *CancelRequest {
+	if req := tr.snapshot().CancelRequest; req != nil {
+		return req
+	}
+	stored, err := s.ops().Get(tr.ctx, tr.id())
+	if err != nil || stored == nil || stored.CancelRequest == nil {
+		return nil // unreadable is not a request; the next round reads again
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if stored.Node != tr.op.Node || stored.OwnerTerm != tr.op.OwnerTerm {
+		return nil // taken over: the next write finds out
+	}
+	req := *stored.CancelRequest
+	tr.op.CancelRequest, tr.op.AllowedActions = &req, []string{}
+	return &req
+}
+
+// cancelJoin carries out a cancellation asked of the join, from the member list ms: it removes the
+// join's learner, by the exact ID on the record, and ends canceled. A learner whose add answer was
+// lost is found by the join's peer URL and put on the record first. A member that votes already was
+// promoted before the cancellation reached the join: nothing is removed, and the join ends
+// succeeded. done is false while it waits (a remove that did not answer, a promotion settling).
+func (s *Server) cancelJoin(tr *tracker, op Operation, a JoinRequest, ms []EtcdMember, req *CancelRequest, promoteLost time.Time) (res any, done bool, err error) {
+	var mine *EtcdMember
+	for i := range ms {
+		switch {
+		case op.Member != nil && memberHex(ms[i].ID) == op.Member.ID:
+			mine = &ms[i]
+		case op.Member == nil && op.Phase == PhaseLearnerAdd && ms[i].hasPeer(a.PeerURL):
+			// This join's add, landed with its answer lost: no other join can have added this peer URL
+			// while this one holds the membership, and addLearner refused one that had it before.
+			mine = &ms[i]
+			tr.setMember(&JoinMember{ID: memberHex(mine.ID), PeerURL: a.PeerURL})
+		}
+	}
+	switch {
+	case mine == nil && op.Member != nil && op.Phase == PhaseLearnerRemove:
+		// Removed by an earlier round, whose answer was lost.
+		return nil, true, fmt.Errorf("%w: canceled by %s; learner %s was removed", errCanceled, req.Actor, op.Member.ID)
+	case mine == nil && op.Member != nil:
+		return nil, true, fmt.Errorf("%w: canceled by %s; learner %s had already left the member list", errCanceled, req.Actor, op.Member.ID)
+	case mine == nil:
+		return nil, true, fmt.Errorf("%w: canceled by %s before a learner was added", errCanceled, req.Actor)
+	case !mine.Learner:
+		s.info(req.Actor, "join cancellation came after the promotion; nothing removed", "operation", op.ID, "name", mine.Name, "member", memberHex(mine.ID))
+		res := joinResult(ms, memberHex(mine.ID), mine.Name)
+		res.Warning = strings.TrimSpace(fmt.Sprintf("%s was promoted to a voting member before %s's cancellation reached the join, and votes; removing a voter is `shunt-control member remove`. %s", firstNonEmpty(mine.Name, a.Name), req.Actor, res.Warning))
+		tr.blocked(nil)
+		return res, true, nil
+	case !promoteLost.IsZero() && s.now().Sub(promoteLost) < promoteSettle:
+		tr.blocked([]Blocker{{Code: BlockerMembershipUnknown, Message: "a promotion that did not answer may still land; the learner is removed once it has settled"}})
+		return nil, false, nil
+	}
+	tr.phase(PhaseLearnerRemove)
+	if err := tr.check(); err != nil {
+		return nil, true, err
+	}
+	if rerr := s.Members.Remove(tr.ctx, mine.ID); rerr != nil {
+		// The remove may have landed with its answer lost: the next round lists the members, and a
+		// learner no longer in it is gone.
+		tr.blocked([]Blocker{{Code: BlockerMembershipUnknown, Message: fmt.Sprintf("removing learner %s did not answer: %s", memberHex(mine.ID), rerr.Error())}})
+		return nil, false, nil
+	}
+	s.info(req.Actor, "join canceled; its learner removed", "operation", op.ID, "name", a.Name, "member", memberHex(mine.ID))
+	return nil, true, fmt.Errorf("%w: canceled by %s; learner %s was removed", errCanceled, req.Actor, memberHex(mine.ID))
+}
+
+// cancelJoinRequest is POST /v1/operations/{id}/cancel on an unfinished join. The cancellation is a
+// request written on the record; the join's owner carries it out between two membership changes
+// (cancelJoin). A join whose owner is gone is taken over by this node, which carries it out. The
+// route answers once the join has ended: 200 canceled, or 409 not_cancellable when its node was
+// promoted first; and 202 with the record while the owner is still at it (a remove waiting on
+// quorum), the request durable either way.
+func (s *Server) cancelJoinRequest(w http.ResponseWriter, r *http.Request, op *Operation) {
+	if s.Members == nil {
+		fail(w, refuse("operation %s is a control-plane join; this server has no membership to change", op.ID))
+		return
+	}
+	ctx := context.WithoutCancel(r.Context())
+	ownerGone, err := s.ownerGone(r.Context(), op)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if op.CancelRequest == nil || ownerGone {
+		req := &CancelRequest{Actor: actor(r), At: s.now().UTC()}
+		fromNode, fromTerm := op.Node, op.OwnerTerm
+		taken, wrote, uerr := s.updateRecord(ctx, op.ID, func(cur *Operation) error {
+			if cur.Node != fromNode || cur.OwnerTerm != fromTerm {
+				return refuse("operation %s was taken over by control node %s at owner term %d; retry the cancellation", op.ID, cur.Node, cur.OwnerTerm)
+			}
+			if cur.CancelRequest == nil {
+				cur.CancelRequest = req
+			}
+			cur.AllowedActions = []string{}
+			if ownerGone {
+				cur.Node, cur.OwnerTerm, cur.Status = s.node(), cur.OwnerTerm+1, StatusRunning
+				cur.Blockers, cur.BlockerCount = nil, 0
+			}
+			return nil
+		})
+		switch {
+		case uerr != nil:
+			fail(w, uerr)
+			return
+		case !wrote:
+			s.answerJoinCancel(w, taken)
+			return
+		}
+		s.info(actor(r), "join cancellation requested", "operation", op.ID, "owner", taken.Node)
+		if ownerGone {
+			tr := s.trackerFor(taken, actor(r))
+			s.operate(tr, func(tr *tracker) (any, error) { return s.rerun(tr) })
+		}
+	}
+	deadline := s.now().Add(30 * time.Second)
+	for {
+		cur, gerr := s.ops().Get(r.Context(), op.ID)
+		switch {
+		case gerr != nil:
+			fail(w, gerr)
+			return
+		case cur == nil:
+			fail(w, notFound("no operation %s", op.ID))
+			return
+		case cur.Terminal():
+			s.answerJoinCancel(w, cur)
+			return
+		case !s.now().Before(deadline):
+			w.Header().Set("Location", "/v1/operations/"+cur.ID)
+			writeJSON(w, http.StatusAccepted, cur.Public())
+			return
+		}
+		if serr := s.sleep(r.Context(), s.fencePoll()); serr != nil {
+			return // the client left; the request is on the record
+		}
+	}
+}
+
+// answerJoinCancel answers a cancellation with the join's end.
+func (s *Server) answerJoinCancel(w http.ResponseWriter, op *Operation) {
+	switch op.Status {
+	case StatusCancelled:
+		writeJSON(w, http.StatusOK, op.Public())
+	case StatusSucceeded:
+		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("join %s ended succeeded: its node was promoted to a voting member before the cancellation reached it; removing a voter is `shunt-control member remove`", op.ID)})
+	default:
+		msg := fmt.Sprintf("join %s has ended %s", op.ID, op.Status)
+		if op.Error != nil {
+			msg += ": " + op.Error.Message
+		}
+		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: msg})
 	}
 }
 

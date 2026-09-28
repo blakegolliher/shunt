@@ -333,7 +333,11 @@ func (s *Server) publishBlockers() {
 	}
 	s.mu.Unlock()
 	for _, tr := range trackers {
-		for _, b := range tr.snapshot().Blockers {
+		op := tr.snapshot()
+		if op.Kind == OpControlJoin {
+			continue // a join holds no barrier; its phase is shunt_control_join_phase (H3)
+		}
+		for _, b := range op.Blockers {
 			counts[b.Code]++
 		}
 	}
@@ -379,6 +383,8 @@ var cancelPhases = []string{"", PhaseQueued, PhasePrecondition, PhaseDiff}
 // dispatch, each written to the record first) are ordered.
 func notCancellable(op *Operation, ownerGone bool) error {
 	switch {
+	case op.Kind == OpControlJoin:
+		return nil // until its node votes, which only the join's owner can tell (cancelJoin)
 	case op.Kind == OpMover:
 		return &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s is a mover: it ends with its worker, and an expired worker session is resolved with `shunt operation resolve-worker %s --session <id> --attest <why>`", op.ID, op.ID)}
 	case !resumable(op.Kind):
@@ -428,6 +434,9 @@ func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	case op.Terminal():
 		fail(w, &codedError{status: http.StatusConflict, code: CodeNotCancellable, msg: fmt.Sprintf("operation %s has ended %s", id, op.Status)})
+		return
+	case op.Kind == OpControlJoin:
+		s.cancelJoinRequest(w, r, op)
 		return
 	}
 	ownerGone, err := s.ownerGone(r.Context(), op)

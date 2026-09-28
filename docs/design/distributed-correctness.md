@@ -567,8 +567,8 @@ not from the live store before or after the streaming snapshot call.
 
 ### Join and remove
 
-**Landed (2026-09-23, on `1-to-n-bucket-support`):** a joining node is now added
-with `MemberAddAsLearner` and promotes itself with `MemberPromote` once etcd
+**Landed (2026-09-23, on `1-to-n-bucket-support`; the self-promotion replaced by H3b):** a
+joining node is now added with `MemberAddAsLearner` and promotes itself with `MemberPromote` once etcd
 reports it caught up, retrying while it is not (`internal/cp/etcd.go`, `promote`);
 a learner that restarts before promotion tries again and runs as a learner with a
 warning if it cannot. This removed the intermittent `internal/cp` test failure
@@ -587,6 +587,27 @@ resumable. The key moves to `POST /v1/control/joins/{id}/bootstrap` (no-store; o
 record, event or URL). The joining node keeps `join.json` in its data directory,
 fsynced before each step, and resumes from it; `--resume <id>` carries on a join whose
 file was lost. Cancel and removal by ID (H3b, H3c) and observed health (H3d) remain.
+
+**Landed (2026-09-28, H3b):** cancel. The join's operation, not the joining node, promotes the
+learner (`Membership.Promote`; etcd's refusal of a learner that has not caught up is
+`ErrLearnerNotReady`), so one process at a time changes the membership for a join. A cancellation
+is a `cancel_request` written on the record without taking it from its owner; the owner reads it
+at the top of every round, between two membership changes, and removes the learner by the member
+ID on the record (phase `learner_remove`, the ID found by peer URL first when the add's answer was
+lost), then ends `cancelled` with effect `none`. A request that lands while the owner is promoting
+finds a voter and removes nothing: the join ends succeeded and the cancel answers `not_cancellable`.
+After a promotion that did not answer, a removal waits `promoteSettle` (10 s) for the member list to
+settle. A join whose owner is gone offers cancel beside resume, and the node the cancellation
+reaches takes the record over under a new owner term to carry it out. The bootstrap of a canceled
+or failed join is refused. The joined node follows its join (`followJoin`): it resumes one whose
+owner is lost on the node it joined through, records `promoted` in `join.json` once the join
+succeeds (a restart then asks the cluster nothing), and stops, naming the data directory to remove,
+when the join was canceled; a node restarted after its join was canceled does not start. Tests:
+cancel before the promotion (waiting for the node, and catching up), cancel racing the promotion,
+cancel with a lost add answer, cancel with the owner lost, each over a fake membership, with
+negative controls for the voter check and the peer-URL reconciliation; a real-etcd cancel of a
+started and of an unstarted learner, whose check that a held-back learner is never promoted fails
+with self-promotion restored.
 
 Use the existing etcd client learner API; do not expose etcd client ports to
 proxies or browsers. Before a membership mutation, require quorum and capability

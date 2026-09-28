@@ -106,12 +106,13 @@ func newJoin() *cobra.Command {
 		Use:   "join",
 		Short: "Start a control node that joins a running cluster (also how it is restarted)",
 		Long: "Asks the node at --existing to add this one as a learner, fetches the cluster's members and its\n" +
-			"data-encryption key, and runs; the node promotes itself to a voter once it has caught up. The join is\n" +
+			"data-encryption key, and runs; the join promotes it to a voter once it has caught up. The join is\n" +
 			"an operation on the cluster (`shunt operation show <id>`), and this node records its progress in\n" +
 			"--data-dir/join.json: a join interrupted anywhere resumes when the same command runs again. --resume\n" +
-			"<operation> carries on a join whose join.json was lost. On a data directory that already holds a\n" +
-			"member, join just starts it again. Replacing a failed node is `shunt-control member remove <name>` on\n" +
-			"a live node, then join with the same name on a fresh data directory.",
+			"<operation> carries on a join whose join.json was lost. Until it votes, the join can be canceled\n" +
+			"(`shunt operation cancel <id>`), which removes the learner and stops this node. On a data directory\n" +
+			"that already holds a member, join just starts it again. Replacing a failed node is `shunt-control\n" +
+			"member remove <name>` on a live node, then join with the same name on a fresh data directory.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runNode(cmd, &o, existing, resume)
@@ -160,7 +161,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	switch {
 	case initialized(o.dataDir):
 		// A restart: the member is on disk, and so is the key. A node that joined may still be a
-		// learner, and promotes itself.
+		// learner; its join's operation promotes it.
 		k, kerr := cp.LoadOrCreateKey(o.dataDir, false)
 		if kerr != nil {
 			return kerr
@@ -183,6 +184,22 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 		}
 		key = k
 		log.Info("forming a new cluster", "name", o.name)
+	}
+	// A node whose join has not ended follows it (followJoin); one whose join was canceled while it
+	// was stopped does not start a member the cluster has removed.
+	var follow *joinState
+	var joinAPI *apiClient
+	if joined, err = loadJoin(o.dataDir); err != nil {
+		return err
+	}
+	if joined != nil && joined.Operation != "" && joined.Phase != joinPromoted {
+		follow, joinAPI = joined, &apiClient{base: strings.TrimRight(joined.Existing, "/"), token: token}
+		qctx, qcancel := context.WithTimeout(ctx, 5*time.Second)
+		op, qerr := joinOperation(qctx, joinAPI, follow.Operation)
+		qcancel()
+		if qerr == nil && op.Terminal() && op.Status != control.StatusSucceeded {
+			return endedJoin(op, o.dataDir)
+		}
 	}
 	cipher, err := cp.NewCipher(key)
 	if err != nil {
@@ -271,7 +288,7 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	}()
 	defer store.Close()
 	defer ops.Close()
-	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Key: cipher.Key}
+	ctl.Members = &control.Membership{List: node.ListMembers, AddLearner: node.AddLearner, Promote: node.Promote, Remove: node.RemoveMember, Key: cipher.Key}
 	api := &cp.API{Node: node, Store: store, Fleet: fleet, Cipher: cipher, Version: version, Join: joinLine(o), Control: ctl}
 
 	adm := admin.New(metrics.Registry, telemetry.NewSlowRing(1, time.Hour))
@@ -281,6 +298,11 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 	go func() { errCh <- srv.ListenAndServe() }()
 	log.Info("shunt-control serving", "api", o.api, "directory_version", store.Version(), "lease_ttl", o.leaseTTL.String())
 
+	var joinEnd chan error
+	if follow != nil {
+		joinEnd = make(chan error, 1)
+		go func() { joinEnd <- followJoin(ctx, joinAPI, o.dataDir, follow, log) }()
+	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -288,6 +310,13 @@ func runNode(cmd *cobra.Command, o *nodeOptions, existing, resume string) error 
 		case <-ctx.Done():
 			log.Info("signal received, stopping")
 			return shutdown(srv)
+		case err := <-joinEnd:
+			joinEnd = nil
+			if err != nil {
+				log.Error("stopping: the join did not make this node a member", "err", err.Error())
+				_ = shutdown(srv) //nolint:errcheck // the join's end is the error to report
+				return err
+			}
 		case err := <-errCh:
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
