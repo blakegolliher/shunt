@@ -225,7 +225,9 @@ fleet protocol, proxy ID, identity, version, SHA-256 of the directory as written
 temporary file, fsyncs it, renames it and fsyncs the directory, after the install lock is let go.
 Writes are serialized and a version older than one already attempted is skipped, so the cache only
 moves forward. A failure at any stage keeps the in-memory version and the last durable file (no
-temporary file stays), counts `shunt_directory_cache_failures_total{stage}`, and is reported:
+temporary file stays), counts `shunt_directory_cache_failures_total{stage}` (and, since the third review's R3-08, keeps
+the version as a candidate the heartbeat writes again after a backoff, or a refetch at once), and is
+reported:
 `/-/fleet` shows `durable` and `cache_error`, the heartbeat carries `durable`, and the Control
 plane screen's proxy table shows Durable beside Applied. A cache that is torn, altered, oversized
 (64 MiB, checked before decoding), of another schema or protocol, another proxy's, or without

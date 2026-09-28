@@ -101,6 +101,7 @@ type Client struct {
 	// durably (renamed and its directory synced), and cacheErr why the newest attempt failed.
 	caching  sync.Mutex
 	cached   int64
+	retry    *cacheRetry // guarded by caching
 	durable  atomic.Int64
 	cacheErr atomic.Pointer[string]
 	ops      cacheOps
@@ -199,7 +200,13 @@ func (c *Client) cacheFile() string { return filepath.Join(c.cfg.CacheDir, "dire
 // serialized, so the installed version, and the cache, only move forward. The cache is written
 // after the install lock is let go, so a slow disk never holds up the next install.
 func (c *Client) install(d *control.Directory, cache bool) (installed bool, err error) {
-	if installed, err = c.apply(d); installed && cache {
+	installed, err = c.apply(d)
+	switch {
+	case installed && cache:
+		c.persist(d)
+	case err == nil && cache && d.Version == c.Snapshot().Version() && d.Version > c.durable.Load():
+		// The installed version again, fetched afresh, while its cache write has not succeeded:
+		// write it now rather than wait for the retry's backoff (R3-08).
 		c.persist(d)
 	}
 	return installed, err
@@ -461,6 +468,7 @@ func (c *Client) beat(ctx context.Context) error {
 	if c.retired.Load() {
 		return nil
 	}
+	c.retryCache() // a failed cache write is retried here, so the heartbeat reports what it made durable
 	seq := c.seq.Add(1)
 	sent := c.Now()
 	snap := c.serving()

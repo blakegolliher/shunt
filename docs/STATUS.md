@@ -35,7 +35,7 @@ on a proof that left out unfinished work, are fixed, and `make fleet` passed on 
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestDirectoryExportIsOneVersion` (was `TestReviewDirectoryExportMustUseOneVersion`), `TestStoreExportIsOneVersion` | fixed 2026-09-28 |
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestConditionalCompletionIsJudgedOnBothClusters` (was `TestReviewConditionalMultipartChecksOtherBackend`), `TestConditionalCompletionPinnedToTheSource`, `TestConditionalCompletionUncheckable` | fixed 2026-09-28 |
 | R3-07 | P1 | new | DeleteObjects during a scoped or ranged move drops every error from the move's source leg, including for keys that leg still owns | `TestSpreadDeleteAnswersForEveryKey` (was `TestReviewSpreadDeleteMustReportSourceOwnedFailure`), `FuzzParseDeleteRequest` | fixed 2026-09-28 |
-| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestReviewRecoveredDiskMustRetryCurrentCacheVersion` | open |
+| R3-08 | P2 | new | A failed cache write is never retried for the same version, so durable lags applied until a new version or a restart | `TestCacheRecoversOnARefetch` (was `TestReviewRecoveredDiskMustRetryCurrentCacheVersion`), `TestCacheRecoversOnTheHeartbeat`, `TestCacheRetryBackoffAndCancellation` | fixed 2026-09-28 |
 | R3-09 | P2 | new | Cancelling a repeated read-only enable writes read-only false, making an already read-only resource writable | `TestReviewCancelRepeatedReadOnlyMustKeepPriorReadOnly` | open |
 | R3-10 | P2 | carried | A failed lookahead page in a merged listing reads as the end: 200 with `IsTruncated=false` and a key missing | `TestMergedListingLookaheadFailureIsNotTheEnd` (was `TestReviewListingLookaheadFailureMustNotDeclareComplete`), `TestMergedListingAtAnExactPageBoundary` | fixed 2026-09-28 |
 
@@ -164,6 +164,18 @@ than answered complete, and paging through all 1,001 once the side answers again
 of keys, where no peek is made, answered complete. Ignoring the peek's error again fails all four
 failure cases with 1,000 of 1,001 keys. ListObjects v1 on a migrating bucket still goes to the
 primary alone (a POC-4 limit, unchanged).
+
+**R3-08 fixed (2026-09-28).** A cache write that fails keeps its directory as the candidate to write
+again: the heartbeat retries it (off the request path) once a backoff has run out, starting at the
+heartbeat interval and doubling to 30 s, and a full refetch of the installed version writes it at
+once. A newer version written meanwhile cancels the retry, and the cache never moves back. So a disk
+that recovers makes the installed version durable, clears `cache_error`, and the next heartbeat
+reports it, without a new directory version or a restart: a barrier waiting on it unblocks. Tests:
+each stage (write, fsync, rename, directory sync) recovered on the heartbeat once the backoff ran out
+and not before, with the heartbeat and a restart showing the version; the backoff doubling while the
+disk keeps failing; a newer version cancelling the retry; the review's refetch case. Removing the
+heartbeat retry fails every stage and the backoff test; removing the refetch write fails the
+review's case.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control
