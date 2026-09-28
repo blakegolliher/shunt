@@ -30,7 +30,7 @@ leaves out unfinished work.
 |---|---|---|---|---|---|
 | R3-01 | P1 | new | A request holding an old runtime bundle enters after a drain barrier reopens and writes by the old route (`admission.Gates.Enter` checks only that the gate is open, not the request's generation) | `TestOldRouteCannotCrossABarrier` (was `TestReviewOldBundleCannotEnterAfterBarrierCompletes`) | fixed 2026-09-28 |
 | R3-02 | P1 | carried | A stale mover progress report (cluster names only, no move identity, scope, range or generation) authorizes cutover of another scope | `TestOldMoveReportCannotAuthorizeCutover`, `TestMoverReportGoesStaleWithThePlacement` (was `TestReviewOldScopeProgressMustNotAuthorizeNewScope`) | fixed 2026-09-28 |
-| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestReviewIncompleteMultipartResponseMustRemainUncertain` | open |
+| R3-03 | P1 | new | A response body lost after 200 headers (CompleteMultipartUpload's early 200) is released as definitive, not uncertain | `TestCompletionOutcomeIsTheWholeAnswer` (was `TestReviewIncompleteMultipartResponseMustRemainUncertain`), `TestLearnAnswerReadsTheRestAfterTheRelayStops` | fixed 2026-09-28 |
 | R3-04 | P1 | new | Repeated offline restarts overwrite the incarnation marker, losing unreported predecessors and their unknown outcomes | `TestReviewOfflineRestartMustPreserveUnreportedIncarnations` | open |
 | R3-05 | P1 | new | `GET /v1/directory` reads the snapshot, client keys and cluster secrets separately: version 7's access key with version 8's secret | `TestReviewDirectoryExportMustUseOneVersion` | open |
 | R3-06 | P1 | carried | Conditional CompleteMultipartUpload is `ClassUpload`, so `conditionalWrite` never checks the other backend; `If-None-Match: *` overwrites a source-only object | `TestReviewConditionalMultipartChecksOtherBackend` | open |
@@ -83,6 +83,21 @@ two scoped moves (the replay refused, cutover refused, and the data/ move's own 
 over) and a report that goes stale when the placement changes after the last pass; removing the
 ingestion check or cutover's check each fails its test. `make walkthrough` passed (60,315 operations,
 0 errors) with the CLI mover's bound reports.
+
+**R3-03 fixed (2026-09-28).** A mutation's outcome is its backend's whole answer, not its status
+line. Its response body is watched as it is relayed: read to its end, and, for an operation whose 200
+can come before it has finished (CompleteMultipartUpload, CopyObject, UploadPartCopy), through the
+close of its result or `<Error>` element, judged from the body's last 64 bytes. A relay that stopped
+early (the client left, the upstream failed, a deadline fired) reads the rest of the answer first,
+bounded at 1 MiB and under the request's own deadlines, since a mutation's request does not end
+with its client; an answer never read whole releases the token uncertain, which the heartbeat
+carries as `backend_outcome_unknown`. Reads are not watched. Tests: an early 200 then the result, or
+then an error (definitive); a result cut short at a clean end of stream, no result before the
+deadline (the review's case), and a client gone while the backend never finishes (uncertain); a
+client gone before a result that then arrives (definitive); an abandoned GET (nothing uncertain);
+the drain unit-tested, since at the handler level the XML rewriter has read the whole answer before
+its write to a departed client fails. Removing the verdict, the drain or the closing-element check
+each fails its tests.
 
 The review's notes on H3–H5 stand. `shunt-control status` still calls a member started because it
 has a name, counts learners in quorum, and takes `has_quorum` from the local leader, and the Control

@@ -373,7 +373,11 @@ token; dual deletes and compensation retain their tokens through all effects.
 
 Keep a mutation token until backend work has a definitive completed outcome,
 including response-body parsing where a successful HTTP status can carry an S3
-error. A definitive rejection with no outstanding effect can drain. A response
+error. (**Landed 2026-09-28, third review R3-03:** H2 released the token on a relay
+that failed after the status line; a mutation's response body is now watched to its
+end, and a result body through the close of its result or error element, with the
+rest of an interrupted answer read, bounded, before the verdict. The watch keeps the
+body's last 64 bytes; nothing of the body is buffered for forwarding.) A definitive rejection with no outstanding effect can drain. A response
 lost after dispatch, partial compensation, or cancellation with an unknown
 backend outcome marks that scope/generation `uncertain`. Local handler exit does
 not erase it. Request-local classification may distinguish a proven pre-dispatch

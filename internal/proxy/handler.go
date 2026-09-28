@@ -424,6 +424,10 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	defer h.pool.put(buf)
 	dst := &deadlineWriter{w: w, rc: rc, idle: h.IdleTimeout}
 	src := &progressReader{r: resp.Body, wd: wd}
+	if migrate.Mutates(o.info.Op, r.Method) {
+		// A mutation's outcome is its backend's whole answer, not its status line (R3-03).
+		src.ans = &answerWatch{result: resp.StatusCode == http.StatusOK && resultInBody(o.info.Op)}
+	}
 
 	if p.ed != nil && h.shouldRewrite(r, o, resp) {
 		h.relayRewritten(w, o, p, resp, dst, src, *buf)
@@ -434,6 +438,7 @@ func (h *Handler) relay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	_, copyErr := io.CopyBuffer(dst, src, *buf)
 	o.bytesOut = dst.n
 	o.tLast = time.Now()
+	h.learnAnswer(o, src)
 	if copyErr != nil {
 		// Upstream died or the client stopped reading: never let net/http finish the response
 		// as if it were complete (ADR-0003). finish() runs in the deferred chain.
@@ -467,6 +472,7 @@ func (h *Handler) relayRewritten(w http.ResponseWriter, o *outcome, p *prepared,
 	h.scratch.put(scratch)
 	o.bytesOut = dst.n
 	o.tLast = time.Now()
+	h.learnAnswer(o, src)
 	if overflows > 0 && h.Log != nil {
 		h.Log.Warn("response rewrite forwarded elements verbatim (text over the cap, or markup inside); a backend name may have reached the client",
 			"request_id", o.rid, "op", o.info.Op.String(), "cluster", o.cluster, "elements", overflows)
@@ -477,6 +483,35 @@ func (h *Handler) relayRewritten(w http.ResponseWriter, o *outcome, p *prepared,
 			return // the whole upstream body was read; the client stopped reading
 		}
 		panic(http.ErrAbortHandler)
+	}
+}
+
+// maxAnswerDrain bounds what learnAnswer reads of a mutation's answer after its relay stopped: a
+// mutation's answer is an empty body or a small result document.
+const maxAnswerDrain = 1 << 20
+
+// resultInBody reports whether op's 200 can come before the backend has finished, with the outcome,
+// success or an error, in the body (AWS: CompleteMultipartUpload, CopyObject, UploadPartCopy).
+func resultInBody(op s3.Op) bool {
+	return op == s3.OpCompleteMultipartUpload || op == s3.OpCopyObject || op == s3.OpUploadPartCopy
+}
+
+// learnAnswer settles a mutation's outcome once its response relay has ended (third review, R3-03).
+// A backend has answered only when its body has been read whole: to its end, and, for an operation
+// whose 200 carries its result, through the close of its result or error element. A relay that
+// stopped early (the client left, the upstream connection failed, a deadline fired) reads the rest
+// first, bounded and under the request's own deadlines, since a mutation's request does not end with
+// its client. An answer never read whole leaves the outcome uncertain: the backend may still be
+// completing the upload, and a barrier must not count it as drained.
+func (h *Handler) learnAnswer(o *outcome, src *progressReader) {
+	if src.ans == nil {
+		return
+	}
+	if !src.ans.eof {
+		_, _ = io.Copy(io.Discard, io.LimitReader(src, maxAnswerDrain)) //nolint:errcheck // what it read is what counts
+	}
+	if !src.ans.whole() {
+		o.uncertain = true
 	}
 }
 
