@@ -17,6 +17,41 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### Moving part of a spread bucket to a new cluster, from the UI and the CLI (2026-09-29)
+
+A manual pass found the path hard to find: Move keys opened on a cluster that already held a leg,
+which hides the new leg's bucket name; the name field did not say the bucket is created, or that an
+existing one must be empty; and Adopt or create, given a spread bucket's name, said Move keys adds a
+bucket but offered no way there. From the CLI, moving half of a leg needed its hash bounds worked out
+by hand (`--range`). Now a move may name a share of a leg: `share` on ramp and migrate start,
+`--share` on the CLI (`shunt ramp <bucket> --leg <id> --share 0.5 --to <cluster> --name <bucket>
+--create`), and the control plane works out the range (`directory.LeadingShare`, the UI's formula,
+checked against its answers). The screen sends the leg and share instead of computing the range,
+opens Move keys on a cluster the bucket has no leg on, says what happens to the new leg's bucket,
+shows the same move as a `shunt ramp` line, and Adopt or create hands a spread bucket to Move keys
+with the cluster and bucket name typed there. ADR-0018 N3c records it. Tests: the range a share
+resolves to, repeating or changing it on a later step, the refusals, a plain bucket's share; the CLI
+through a real control API; the drawer's default, request and command line, and the handoff.
+Dropping the share's resolution or its later-step check, the old default, or the handoff button
+each fails its test.
+
+The next pass found two more. A spread bucket had no Expand, the verb an operator reaches for: it
+has one now, on its row and on an idle Migrations screen, opening the same drawer said as growing
+the bucket. And a move whose destination was a bucket adopted as a client bucket of its own was
+refused only at the directory write: its first step had already probed that bucket (a
+`.shunt-probe-` object written and deleted in another client bucket's backend) and recorded the
+cluster's measured capabilities, so the operation ended failed with effect committed; expand had
+the same flaw, with its canary. Expand and a first step that names its destination now refuse a
+bucket another placement uses before any request reaches it (`directory.File.BucketUser`), and
+expand's generated name skips a spread bucket's legs, which it did not see. Tests: expand, a
+spread bucket's move and a plain first step each refused with no request to the bucket, no
+directory write and no capabilities recorded, and the generated name; the Expand button and its
+routing from Migrations. Without the early checks the fake backend sees the probe and canary
+objects and the directory version moves; the old generated name picks the leg's bucket.
+
+The operator's manual pass of both changes, on `ce29c43`, finished on 2026-09-30 with nothing
+further found.
+
 ### Third correctness review (2026-09-26): ten open faults, fixed next
 
 An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three

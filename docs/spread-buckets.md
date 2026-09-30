@@ -74,17 +74,35 @@ shunt cutover acme/data
 shunt purge-source acme/data            # deletes only the moved range's keys from the source leg
 ```
 
-`--leg <id>` instead of `--range` moves the first range that leg owns. The destination is the leg
-on `--to` holding the bucket `--name` names, or a new leg. A new bucket on the source's own cluster
-is a new leg there (the rename case). The ratio is a share of the range.
+The destination bucket must be one no other client bucket uses: naming a bucket adopted as a client
+bucket of its own is refused before anything is sent to it. A bucket made for the move (in the
+cluster's console, when its key may not create buckets) is named here, not adopted.
+
+`--leg <id>` instead of `--range` moves the first range that leg owns, and `--share` with it a
+leading share of that range, so no hash bounds need working out. `shunt status <bucket>` lists the
+legs, their ids and shares. The destination is the leg on `--to` holding the bucket `--name` names,
+or a new leg; `--create` creates that bucket if it does not exist, and one that exists must be
+empty. A new bucket on the source's own cluster is a new leg there (the rename case). The ratio is a
+share of the range.
+
+```sh
+# half of leg cluster-a's keys to a cluster the bucket has no leg on, into a new bucket there
+shunt status acme/wide                            # the legs: cluster-a 50%, cluster-b 50%
+shunt ramp acme/wide --leg cluster-a --share 0.5 --to cluster-c --name wide --create --ratio 0.25
+shunt ramp acme/wide --ratio 1                    # then migrate start, migrate run, cutover, purge-source
+```
 
 `purge-source` compares and deletes the range alone, and deletes the source bucket once its leg owns
 nothing. `migrate finish` (forget without deleting) is refused while the source leg keeps other
 keys: the moved copies left there would be strays.
 
-UI: **Move keys** on a spread bucket (a share of one leg's range, to any cluster or a new bucket
-beside it); the first step of an expanded bucket on Migrations can move part of the key space; and
-**Expand** can pick the bucket's own cluster, which starts a move to a new bucket there.
+UI: **Expand** and **Move keys** on a spread bucket (a share of one leg's range, to any cluster or a
+new bucket beside it; Expand opens the same drawer, said as growing the bucket, as does Expand on an
+idle Migrations screen). It opens on a cluster the bucket has no leg on, asks for the new leg's bucket name there
+(the client bucket's name if left empty), and shows the same move as a `shunt ramp` line. **Adopt or
+create** with a spread bucket's name offers Move keys to the cluster and bucket name picked there.
+The first step of an expanded bucket on Migrations can move part of the key space; and **Expand**
+can pick the bucket's own cluster, which starts a move to a new bucket there.
 
 ## Consolidate
 

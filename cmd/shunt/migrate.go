@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -652,6 +653,9 @@ func newRamp() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := checkShare(req.Share, rg); err != nil {
+				return err
+			}
 			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpRamp, req, wait)
@@ -667,16 +671,30 @@ func newRamp() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket this cluster serves")
 	f.DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the step and have it; exit 3 if it is still running then")
-	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope, &req.Share)
 	return cmd
 }
 
 // addMoveFlags adds the flags that make a first step move part of a bucket (ADR-0018 N3).
-func addMoveFlags(cmd *cobra.Command, rangeText, leg, scope *string) {
+func addMoveFlags(cmd *cobra.Command, rangeText, leg, scope *string, share *float64) {
 	f := cmd.Flags()
+	f.Float64Var(share, "share", 0, "with --leg: move the leading share (0..1] of that leg's range, such as 0.5 for half of it (`shunt status <bucket>` lists the legs and their shares); on a plain bucket, of all its keys")
 	f.StringVar(scope, "scope", "", "move keys of this prefix rule (shunt expand --carve made it); --range and --leg are read in its table, and a rule one leg owns moves whole (ADR-0020)")
 	f.StringVar(rangeText, "range", "", "move only the keys whose hash is in `from-to` (16 hex digits each, inclusive), out of the one leg that owns them")
 	f.StringVar(leg, "leg", "", "move the keys of this leg of a spread bucket (its first range; repeat per range); consolidating a bucket is this, once per other leg")
+}
+
+// checkShare refuses what the control plane would refuse of --share, before asking it.
+func checkShare(share float64, rg *directory.HashRange) error {
+	switch {
+	case share == 0:
+		return nil
+	case math.IsNaN(share) || share < 0 || share > 1:
+		return fmt.Errorf("--share %v is outside 0..1", share)
+	case rg != nil:
+		return errors.New("--share is a share of a leg's range; --range names the keys already, so give one or the other")
+	}
+	return nil
 }
 
 // parseRange reads --range: two 16-hex-digit hash bounds joined by '-', or nothing.
@@ -724,6 +742,9 @@ func newMigrateStart() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := checkShare(req.Share, rg); err != nil {
+				return err
+			}
 			req.Range, req.Wait = rg, wait.String()
 			return forEach(cmd, o, args, from, func(api *apiClient, key string) error {
 				return transition(cmd, api, o, key, control.OpMigrate, req, wait)
@@ -739,7 +760,7 @@ func newMigrateStart() *cobra.Command {
 	f.BoolVar(&req.Create, "create", false, "create the bucket on --to if it does not exist")
 	f.StringVar(&from, "from", "", "instead of one bucket: every bucket moving off, or served by, this cluster")
 	f.DurationVar(&wait, "wait", 30*time.Second, "how long to wait for every proxy to drain the step and have it; exit 3 if it is still running then")
-	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope)
+	addMoveFlags(cmd, &rangeText, &req.Leg, &req.Scope, &req.Share)
 	return cmd
 }
 

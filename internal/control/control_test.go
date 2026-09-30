@@ -46,7 +46,8 @@ type fakeCluster struct {
 	noCreate  bool               // CreateBucket answers 403 AccessDenied, as VAST does for a key without the permission
 	owned     bool               // CreateBucket of an existing bucket answers 409 BucketAlreadyOwnedByYou, as MinIO does
 	listMu    sync.Mutex
-	listed    []string // the prefix of every ListObjectsV2 and ListMultipartUploads request, in order
+	listed    []string              // the prefix of every ListObjectsV2 and ListMultipartUploads request, in order
+	onRequest func(r *http.Request) // when set, called with every request before it is served
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -54,6 +55,9 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	fc := &fakeCluster{be: s3mem.New(), versioned: map[string]bool{}}
 	fake := gofakes3.New(fc.be, gofakes3.WithTimeSkewLimit(0)).Server()
 	fc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fc.onRequest != nil {
+			fc.onRequest(r)
+		}
 		if fc.server != "" && r.Method == http.MethodGet && r.URL.Path == "/" && fc.reject == "" {
 			w.Header().Set("Server", fc.server) // gofakes3 would answer as AmazonS3
 			_, _ = w.Write([]byte(`<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>`))

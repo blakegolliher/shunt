@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { fullRange, leadingShare } from '../hashRange'
 import {
   cancelOperation,
   getMoverLedger,
@@ -68,8 +67,8 @@ function appliedRatio(view: { state: string; ratio?: number }) {
   return view.state === 'RAMPING' ? view.ratio ?? 0 : 0
 }
 
-// A bucket that is not migrating, and what would start one: Expand for a plain bucket, Move keys or
-// Consolidate for one spread over legs.
+// A bucket that is not migrating, and what would start one: Expand for any bucket (for one spread
+// over legs, a move of part of a leg to a new cluster), Move keys or Consolidate for a spread one.
 function StartMigration({ placements, onPrepare }: { placements: PlacementStatus[]; onPrepare: (key: string, action: 'expand' | 'move' | 'consolidate') => void }) {
   if (placements.length === 0) return <p className="text-sm text-muted">No other buckets.</p>
   return <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="text-xs uppercase tracking-wider text-muted"><tr><th className="pb-3">Bucket</th><th className="pb-3">State</th><th className="pb-3">Where</th><th className="pb-3 text-right">Start</th></tr></thead>
@@ -78,7 +77,7 @@ function StartMigration({ placements, onPrepare }: { placements: PlacementStatus
       return <tr key={p.key}><td className="py-3 font-semibold text-ember-300">{p.key}</td><td className="py-3"><StateBadge state={p.state} /></td>
         <td className="py-3 text-muted">{spread ? `spread: ${p.legs?.map((l) => l.cluster).join(' + ')}` : p.primary}</td>
         <td className="py-3 text-right">{p.state !== 'ACTIVE' ? <span className="text-xs text-muted">busy</span> : spread
-          ? <><button type="button" aria-label={`Move keys of ${p.key}`} onClick={() => onPrepare(p.key, 'move')} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Move keys</button><button type="button" aria-label={`Consolidate ${p.key}`} onClick={() => onPrepare(p.key, 'consolidate')} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Consolidate</button></>
+          ? <><button type="button" aria-label={`Expand ${p.key}`} onClick={() => onPrepare(p.key, 'expand')} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Expand</button><button type="button" aria-label={`Move keys of ${p.key}`} onClick={() => onPrepare(p.key, 'move')} className="mr-2 rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Move keys</button><button type="button" aria-label={`Consolidate ${p.key}`} onClick={() => onPrepare(p.key, 'consolidate')} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Consolidate</button></>
           : <button type="button" aria-label={`Expand ${p.key}`} onClick={() => onPrepare(p.key, 'expand')} className="rounded-lg border border-ember-500 px-3 py-1.5 text-xs font-semibold">Expand to another cluster</button>}</td></tr>
     })}</tbody></table></div>
 }
@@ -202,7 +201,7 @@ export function Migrations({ selected, onSelect, onPrepare }: { selected: string
   const progress = operation?.progress
 
   const firstStep = detail.state === 'ACTIVE' && !detail.legs?.length
-  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s', ...(firstStep && moveShare < 1 ? { range: leadingShare(fullRange, moveShare) } : {}) })
+  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s', ...(firstStep && moveShare < 1 ? { share: moveShare } : {}) })
   const dryRunPurge = async () => {
     const [tenant, bucket] = splitKey(key)
     setBusy(true)

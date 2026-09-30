@@ -228,6 +228,13 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   per-key rule changes, so the fleet property test's range and same-cluster runs cover it; naming a
   leg is how its range is chosen, not a new kind of move. A leg owning several ranges moves them one
   move at a time.
+- **A move may name a share of it** (2026-09-29: `Transition.Share`, `share` on ramp and migrate,
+  `--share` on the CLI): the leading share (0..1] of the range the leg or scope names, or of a plain
+  bucket's key space, counted in ten-thousandths (`directory.LeadingShare`). The UI worked that range
+  out in the browser and the CLI had only `--range`, so moving half of a leg from the CLI meant
+  computing hash bounds by hand; now both send the leg and the share and the control plane resolves
+  the range once. A later step may repeat the share only as the first step resolved it. It is how
+  the range is chosen, as `leg` is; the move is unchanged.
 - **Consolidating** a spread bucket is that move once per other leg, into the leg kept (or a new
   bucket, as any move's destination). Each purge deletes a source leg's bucket once it owns
   nothing, and the last move settles the bucket to plain. **Step-out** then treats it as any plain
@@ -245,7 +252,8 @@ one leg per cluster. `Apply` and `SetTarget` refuse it, so nothing moves it unti
   a live leg a listing can see that object for the few milliseconds it exists.
 - **Split** needs no action of its own: a move may take any range inside one leg's ownership, and
   the owners table is cut where the move's range ends.
-- **CLI:** `shunt ramp` and `shunt migrate start` take `--range <from>-<to>` and `--leg`; the result
+- **CLI:** `shunt ramp` and `shunt migrate start` take `--range <from>-<to>`, `--leg` and (2026-09-29)
+  `--share`; the result
   says which range moves. **UI:** a spread bucket has **Consolidate** (pick the leg to keep; it
   lists the moves left and starts the next) and **Retire idle leg**.
 - **Proof:** a directory test consolidates three legs into one and retires a released destination;

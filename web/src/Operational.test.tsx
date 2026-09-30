@@ -252,7 +252,7 @@ test('creates a bucket spread across clusters and shows its legs', async () => {
   expect(await screen.findByText('Bucket acme/wide created, spread over 2 clusters')).toBeInTheDocument()
   expect(sent).toEqual({ cluster: 'source', name: 'wide', legs: [{ cluster: 'source', name: 'wide' }, { cluster: 'target', name: 'wide' }] })
   expect(await screen.findByText('spread: source + target')).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: 'Expand acme/wide' })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Expand acme/wide' })).toBeInTheDocument() // a spread bucket expands by a move (Buckets.test.tsx)
   fireEvent.click(screen.getByText('spread: source + target'))
   expect(await screen.findAllByText('wide · 50% of keys', { exact: false })).toHaveLength(2)
 })
@@ -277,7 +277,7 @@ test('moves part of a spread bucket leg to another cluster', async () => {
   expect(screen.getByText('Into its leg\'s bucket', { exact: false })).toHaveTextContent('wide')
   fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
   await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
-    args: { to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, ratio: 0.01, create: true, wait: '30s' } }))
+    args: { to: 'target', leg: 'source', share: 0.5, ratio: 0.01, create: true, wait: '30s' } })) // the control plane works the range out
 })
 
 test('consolidates a spread bucket one leg at a time and retires an idle leg', async () => {

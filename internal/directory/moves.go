@@ -51,6 +51,9 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 	if t.Scope != "" && t.Scope != m.Scope {
 		return fail("a move of the keys under %q is in progress; finish it before moving another prefix's", m.Scope)
 	}
+	if t.Share != 0 && !sameShare(p, m, t.Share) {
+		return fail("a move of range %s is in progress; a later step may repeat only the share its first step gave", rangeText(m.Range))
+	}
 	if m.Scope != "" && len(t.Prefixes) > 0 {
 		return fail("a move within a prefix rule ramps by ratio only (ADR-0020)")
 	}
@@ -58,7 +61,7 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 	if t.Target != "" && t.Target != v.ClusterOf(v.Primary) {
 		return fail("the move goes to %s; a later step may only repeat that target", v.ClusterOf(v.Primary))
 	}
-	t.Range, t.Leg, t.Scope, t.Target, t.Name = nil, "", "", "", ""
+	t.Range, t.Leg, t.Scope, t.Target, t.Name, t.Share = nil, "", "", "", "", 0
 	nv, err := Apply(v, t)
 	if err != nil {
 		return p, err
@@ -88,6 +91,18 @@ func applyMove(p Placement, t Transition) (Placement, error) {
 		np.Move.Ramp.Range = &rg
 	}
 	return np, nil
+}
+
+// sameShare reports whether share, repeated on a later step of move m, names the keys m moves: the
+// leading share of the range of m's source leg that holds m's range.
+func sameShare(p Placement, m Move, share float64) bool {
+	table, _ := p.scopeTable(m.Scope)
+	for _, o := range table {
+		if o.Leg == m.From && o.From <= m.Range.From && m.Range.To <= o.To {
+			return LeadingShare(HashRange{From: o.From, To: o.To}, share) == m.Range
+		}
+	}
+	return false
 }
 
 // startMove is the first step of a move: from a plain bucket, whose primary becomes the leg owning
@@ -157,6 +172,11 @@ func startMove(p Placement, t Transition) (Placement, error) {
 			return fail("leg %s owns no keys%s; there is nothing of it to move", t.Leg, scopeText(t.Scope))
 		}
 	}
+	if t.Share > 0 && t.Share < 1 { // the leading share of the range the leg or scope holds
+		rg := LeadingShare(*t.Range, t.Share)
+		t.Range = &rg
+	}
+	t.Share = 0 // resolved into the range: the step below applies to the two roles, not a share
 	rg := *t.Range
 	src := ""
 	for _, o := range table {

@@ -316,6 +316,12 @@ func holdText(h *directory.RampHold) string {
 	}
 }
 
+// sharedBucket refuses a bucket another client bucket owns as a destination: placements never share
+// a backend bucket, since each would see the other's objects.
+func sharedBucket(cluster, name, other, what string) error {
+	return refuse("bucket %s on %s is client bucket %s's backend bucket, and two client buckets never share one (each would see the other's objects); %s", name, cluster, other, what)
+}
+
 // withDefaultName fills the backend name a first step gets when neither expand nor the request
 // named one, as transition does.
 func withDefaultName(key string, p directory.Placement, t directory.Transition) directory.Transition {
@@ -376,11 +382,16 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 	ctx, cancel := context.WithTimeout(tr.ctx, backendTimeout)
 	defer cancel()
 	if p.State == directory.StateActive {
+		name := np.Names[np.Primary]
+		// Before any request reaches the destination: a bucket another client bucket owns is never
+		// created, probed or measured as this one's (the directory would refuse it only at the write).
+		if other := f.BucketUser(dstCluster, name, key); other != "" {
+			return TransitionResult{}, sharedBucket(dstCluster, name, other, "name a bucket no other bucket uses (--name); the step creates it with --create")
+		}
 		target, err := s.backendFor(dstCluster)
 		if err != nil {
 			return TransitionResult{}, err
 		}
-		name := np.Names[np.Primary]
 		exists, err := target.bucketExists(ctx, name)
 		switch {
 		case err != nil:
@@ -598,6 +609,12 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("%q is not a valid bucket name", req.Name))
 		return
 	}
+	// Before any request reaches the target: a bucket another client bucket owns is never probed,
+	// written or recorded as this one's.
+	if other := f.BucketUser(req.To, req.Name, key); other != "" {
+		fail(w, sharedBucket(req.To, req.Name, other, "name another (--name), or leave the name out for a generated one"))
+		return
+	}
 	tb, err := s.backendFor(req.To)
 	if err != nil {
 		fail(w, err)
@@ -759,18 +776,12 @@ func (s *Server) changePrefixes(w http.ResponseWriter, r *http.Request, prefix, 
 
 // nextName is base-NNN with the lowest NNN no placement uses on cluster.
 func nextName(f *directory.File, cluster, base string) string {
-	used := map[string]bool{}
-	for k := range f.Placements {
-		if n, ok := f.Placements[k].Names[cluster]; ok {
-			used[n] = true
-		}
-	}
 	for n := 1; ; n++ {
 		name := fmt.Sprintf("%s-%03d", base, n)
 		if len(name) > 63 {
 			name = fmt.Sprintf("%s-%03d", strings.TrimRight(base[:63-4], ".-"), n)
 		}
-		if !used[name] {
+		if f.BucketUser(cluster, name, "") == "" { // a plain bucket's names and a spread one's legs
 			return name
 		}
 	}
@@ -876,9 +887,12 @@ type RampRequest struct {
 	Leg string `json:"leg,omitempty"`
 	// Scope, leaving ACTIVE, is the prefix rule whose keys move; Range and Leg are read in its table
 	// (ADR-0020).
-	Scope  string `json:"scope,omitempty"`
-	Create bool   `json:"create,omitempty"`
-	Wait   string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
+	Scope string `json:"scope,omitempty"`
+	// Share, leaving ACTIVE, moves the leading share (0..1] of the range Leg or Scope names, or of a
+	// plain bucket's key space (directory.LeadingShare).
+	Share  float64 `json:"share,omitempty"`
+	Create bool    `json:"create,omitempty"`
+	Wait   string  `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
@@ -894,7 +908,7 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, false, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg, Scope: req.Scope, Share: req.Share}, req.Create, false, wait)
 	if err != nil {
 		return res, err
 	}
@@ -910,6 +924,7 @@ type MigrateRequest struct {
 	Range                 *directory.HashRange `json:"range,omitempty"` // leaving ACTIVE: move only these keys (ADR-0018 N3)
 	Leg                   string               `json:"leg,omitempty"`   // leaving ACTIVE: move this leg's first range (N3c)
 	Scope                 string               `json:"scope,omitempty"` // leaving ACTIVE: the prefix rule whose keys move (ADR-0020)
+	Share                 float64              `json:"share,omitempty"` // leaving ACTIVE: the leading share of that range (directory.LeadingShare)
 	Create                bool                 `json:"create,omitempty"`
 	AcceptLostWriteWindow bool                 `json:"accept_lost_write_window,omitempty"`
 	Wait                  string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
@@ -928,7 +943,7 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg, Scope: req.Scope, Share: req.Share}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		return res, err
 	}

@@ -14,10 +14,10 @@ afterEach(() => { sessionStorage.clear(); vi.restoreAllMocks() })
 test('changes a tenant default from the cluster that blocks removal', async () => {
   sessionStorage.setItem('shunt.control.token', 't')
   const posted: string[] = []
-  const clusters = [cluster('minio-b', ['tenants.default.default_cluster']), cluster('var204', ['placements.default/data02'])]
+  const clusters = [cluster('minio-b', ['tenants.default.default_cluster']), cluster('vast02', ['placements.default/data02'])]
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = String(input)
-    if (init?.method === 'POST') { posted.push(`${url} ${String(init.body)}`); return Response.json({ tenant: 'default', default_cluster: 'var204', version: 9 }) }
+    if (init?.method === 'POST') { posted.push(`${url} ${String(init.body)}`); return Response.json({ tenant: 'default', default_cluster: 'vast02', version: 9 }) }
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
     if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 8, clusters, placements: [] })
@@ -33,22 +33,22 @@ test('changes a tenant default from the cluster that blocks removal', async () =
   fireEvent.click(await screen.findByRole('button', { name: 'Clusters' }))
   fireEvent.click(await screen.findByText('minio-b'))
   expect(await screen.findByText(/New buckets of tenant default are created on minio-b/)).toBeInTheDocument()
-  expect(screen.getByLabelText('New default cluster for tenant default')).toHaveValue('var204')
+  expect(screen.getByLabelText('New default cluster for tenant default')).toHaveValue('vast02')
   fireEvent.click(screen.getByRole('button', { name: "Make it tenant default's default" }))
-  await screen.findByText("var204 is now tenant default's default cluster")
-  expect(posted).toEqual(['/v1/tenants/default/default-cluster {"cluster":"var204"}'])
+  await screen.findByText("vast02 is now tenant default's default cluster")
+  expect(posted).toEqual(['/v1/tenants/default/default-cluster {"cluster":"vast02"}'])
 })
 
 // The cluster detail shows where a secret rotation stands across the fleet.
 test('shows a secret rotation installing across the fleet', async () => {
   sessionStorage.setItem('shunt.control.token', 't')
-  const clusters = [cluster('var204', ['placements.default/data02'])]
+  const clusters = [cluster('vast02', ['placements.default/data02'])]
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = String(input)
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
     if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 8, clusters, placements: [] })
-    if (url.includes('/v1/clusters/var204/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
+    if (url.includes('/v1/clusters/vast02/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
       probe: { reachable: true, latency_ms: 1, checked_at: '2026-09-24T12:00:00Z' }, secret: { generation: '12', installed: ['proxy-a'], pending: ['proxy-b'], silent: [] } })
     if (url.includes('/v1/telemetry/series')) return Response.json({ points: [] })
     if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
@@ -56,7 +56,7 @@ test('shows a secret rotation installing across the fleet', async () => {
   })
   render(<StoreProvider><App /></StoreProvider>)
   fireEvent.click(await screen.findByRole('button', { name: 'Clusters' }))
-  fireEvent.click(await screen.findByText('var204'))
+  fireEvent.click(await screen.findByText('vast02'))
   expect(await screen.findByText(/Rotation installing: 1 proxy still on an older secret/)).toBeInTheDocument()
   expect(screen.getByText('generation 12')).toBeInTheDocument()
   expect(screen.getByText('proxy-b')).toBeInTheDocument()
@@ -67,14 +67,14 @@ test('shows a secret rotation installing across the fleet', async () => {
 test('rotates a cluster secret from its detail', async () => {
   sessionStorage.setItem('shunt.control.token', 't')
   const posted: string[] = []
-  const clusters = [cluster('var204', ['placements.default/data02'])]
+  const clusters = [cluster('vast02', ['placements.default/data02'])]
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = String(input)
-    if (init?.method === 'POST') { posted.push(`${url} ${String(init.body)}`); return Response.json({ name: 'var204', version: 13, generation: '13', cluster: clusters[0] }) }
+    if (init?.method === 'POST') { posted.push(`${url} ${String(init.body)}`); return Response.json({ name: 'vast02', version: 13, generation: '13', cluster: clusters[0] }) }
     if (url.endsWith('/v1/control')) return Response.json(control)
     if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
     if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 8, clusters, placements: [] })
-    if (url.includes('/v1/clusters/var204/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
+    if (url.includes('/v1/clusters/vast02/view')) return Response.json({ ...clusters[0], capabilities: { conditional_write: { value: true, known: true }, conditional_delete: { value: false, known: true } },
       probe: { reachable: true, latency_ms: 1, checked_at: '2026-09-24T12:00:00Z' } })
     if (url.includes('/v1/telemetry/series')) return Response.json({ points: [] })
     if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
@@ -82,12 +82,12 @@ test('rotates a cluster secret from its detail', async () => {
   })
   render(<StoreProvider><App /></StoreProvider>)
   fireEvent.click(await screen.findByRole('button', { name: 'Clusters' }))
-  fireEvent.click(await screen.findByText('var204'))
+  fireEvent.click(await screen.findByText('vast02'))
   const rotate = await screen.findByRole('button', { name: 'Rotate credentials' })
   expect(rotate).toBeDisabled()
   fireEvent.change(screen.getByLabelText('New secret key'), { target: { value: 'new-secret' } })
   fireEvent.click(rotate)
-  await screen.findByText('Credentials of var204 rotated')
+  await screen.findByText('Credentials of vast02 rotated')
   expect(await screen.findByText(/Secret generation 13 is installing/)).toBeInTheDocument()
-  expect(posted).toEqual(['/v1/clusters/var204/credentials {"secret":"new-secret"}'])
+  expect(posted).toEqual(['/v1/clusters/vast02/credentials {"secret":"new-secret"}'])
 })

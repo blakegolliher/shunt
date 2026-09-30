@@ -507,6 +507,38 @@ func TestSpreadBucketThroughTheCLI(t *testing.T) {
 	}
 }
 
+// Half of one leg to a new bucket, through the CLI, as the UI's Move keys does it: --leg names the
+// leg shunt status lists, --share the leading share of its range, --name and --create the new leg's
+// bucket, which the first step creates. The control plane works the range out; the CLI refuses a
+// share outside 0..1, or beside --range, before asking it.
+func TestMoveAShareOfALegThroughTheCLI(t *testing.T) {
+	rg := newAPIRig(t)
+	rg.addCluster(t, "vast01", rg.ep01)
+	rg.addCluster(t, "vast02", rg.ep02)
+	rg.must(t, "adopt", "vast01", "acme/data01", "--spread", "vast02:data01", "--create")
+	for _, bad := range [][]string{{"--share", "1.5"}, {"--share", "0.5", "--range", "0000000000000000-3fffffffffffffff"}} {
+		args := append([]string{"ramp", "acme/data01", "--leg", "vast01", "--to", "vast02", "--name", "data01-c", "--create", "--ratio", "0.25"}, bad...)
+		if out, err := rg.cli(t, args...); err == nil || !strings.Contains(out, "--share") {
+			t.Fatalf("shunt %s: %v %s", strings.Join(bad, " "), err, out)
+		}
+	}
+	rg.must(t, "ramp", "acme/data01", "--leg", "vast01", "--share", "0.5", "--to", "vast02", "--name", "data01-c", "--create", "--ratio", "0.25")
+	if ok, _ := rg.vast02.BucketExists("data01-c"); !ok {
+		t.Fatal("the new leg's bucket was not created")
+	}
+	out := rg.must(t, "status", "acme/data01")
+	for _, want := range []string{"vast02/data01-c", "out to vast02-2: 0000000000000000-3ffffffffffffffe (25.0% of keys)"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status during the move of half of leg vast01 lacks %q:\n%s", want, out)
+		}
+	}
+	// A later step may repeat the command line with its ratio raised; another share is refused.
+	rg.must(t, "ramp", "acme/data01", "--leg", "vast01", "--share", "0.5", "--ratio", "0.5")
+	if out, err := rg.cli(t, "ramp", "acme/data01", "--leg", "vast01", "--share", "0.25", "--ratio", "1"); err == nil || !strings.Contains(out, "may repeat only the share") {
+		t.Fatalf("another share on a later step: %v %s", err, out)
+	}
+}
+
 // Prefix rules through the CLI (ADR-0020 P1): expand --carve and --merge, and status's scope rows.
 func TestCarveAndMergeThroughTheCLI(t *testing.T) {
 	rg := newAPIRig(t)

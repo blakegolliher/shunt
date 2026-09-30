@@ -122,8 +122,8 @@ test('the ramp slider keeps its setting across live reloads', async () => {
   expect(screen.getByRole('button', { name: 'Apply ramp' })).toBeDisabled()
 })
 
-// The first step of an expanded bucket can move part of it: a leading share of the key space
-// (ADR-0018 N3); during a move the screen says which part moves.
+// The first step of an expanded bucket can move part of it: a leading share of the key space, sent
+// as a share (ADR-0018 N3); during a move the screen says which part moves.
 test('starts a move of part of the bucket and shows which part moves', async () => {
   const view = expandedView()
   let args: unknown
@@ -138,7 +138,7 @@ test('starts a move of part of the bucket and shows which part moves', async () 
   fireEvent.change(screen.getByLabelText('Share of keys to move'), { target: { value: '0.25' } })
   fireEvent.click(screen.getByRole('button', { name: '50%' }))
   fireEvent.click(screen.getByRole('button', { name: 'Apply ramp' }))
-  await waitFor(() => expect(args).toEqual({ ratio: 0.5, prefixes: [], wait: '30s', range: { from: '0000000000000000', to: '3fffffffffffffff' } }))
+  await waitFor(() => expect(args).toEqual({ ratio: 0.5, prefixes: [], wait: '30s', share: 0.25 })) // the control plane works the range out
   vi.restoreAllMocks()
 
   const moving: PlacementView = { ...expandedView(), state: 'RAMPING', primary: 'target', source: 'source', target: undefined, ratio: 0.5,
