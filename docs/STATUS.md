@@ -49,6 +49,9 @@ directory write and no capabilities recorded, and the generated name; the Expand
 routing from Migrations. Without the early checks the fake backend sees the probe and canary
 objects and the directory version moves; the old generated name picks the leg's bucket.
 
+The operator's manual pass of both changes, on `ce29c43`, finished on 2026-09-30 with nothing
+further found.
+
 ### Third correctness review (2026-09-26): ten open faults, fixed next
 
 An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three
