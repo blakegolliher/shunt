@@ -583,7 +583,27 @@ func TestFleetRangeMoveWithoutTheFence(t *testing.T) {
 	fleetWithoutTheFence(t, &directory.HashRange{From: 0, To: 1<<63 - 1}, false, false)
 }
 
+// fleetControlRuns bounds the negative control's runs. One run gives B's 60 ms lag seven windows
+// in about two seconds of traffic, and on a busy machine it can miss all of them: during the race
+// suite a range move's control found none in 2,573 operations (2026-09-30), and under -race on two
+// CPUs 9 of 20 range and scoped runs found none, where under -race on an idle machine every run
+// made 3,500–5,100 operations and found 1–19 violations. So the control runs again, on a new
+// control plane and proxies, until a run finds a violation, and fails only if none of eight does.
+const fleetControlRuns = 8
+
 func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange, sameCluster, scoped bool) {
+	for i := 1; i <= fleetControlRuns; i++ {
+		var found int
+		t.Run(fmt.Sprintf("run%d", i), func(t *testing.T) { found = fleetWithoutTheFenceOnce(t, rg, sameCluster, scoped) })
+		if found > 0 || t.Failed() {
+			return
+		}
+	}
+	t.Fatalf("no violation without the fence in %d runs: the fleet property test cannot see the hazard it guards against", fleetControlRuns)
+}
+
+// fleetWithoutTheFenceOnce is one run of the negative control; it returns the violations found.
+func fleetWithoutTheFenceOnce(t *testing.T, rg *directory.HashRange, sameCluster, scoped bool) int {
 	fr := newFleetRun(t, 60*time.Millisecond)
 	if sameCluster {
 		fr.sameClusterTarget(t)
@@ -619,9 +639,7 @@ func fleetWithoutTheFence(t *testing.T, rg *directory.HashRange, sameCluster, sc
 	})
 	v := fr.violations()
 	t.Logf("%d client operations; %d violations without the fence, first: %v", fr.ops.Load(), len(v), first(v))
-	if len(v) == 0 {
-		t.Fatal("no violation without the fence: the fleet property test cannot see the hazard it guards against")
-	}
+	return len(v)
 }
 
 // cuttable fails every request from proxy B while cut is set: that member partitioned from its
