@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { fullRange, leadingShare } from '../hashRange'
 import {
   cancelOperation,
   getMoverLedger,
@@ -202,7 +201,7 @@ export function Migrations({ selected, onSelect, onPrepare }: { selected: string
   const progress = operation?.progress
 
   const firstStep = detail.state === 'ACTIVE' && !detail.legs?.length
-  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s', ...(firstStep && moveShare < 1 ? { range: leadingShare(fullRange, moveShare) } : {}) })
+  const applyRamp = () => run('ramp', { ratio, prefixes: prefixesList, wait: '30s', ...(firstStep && moveShare < 1 ? { share: moveShare } : {}) })
   const dryRunPurge = async () => {
     const [tenant, bucket] = splitKey(key)
     setBusy(true)

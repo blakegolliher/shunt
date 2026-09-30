@@ -8,7 +8,6 @@ import { Drawer } from '../components/Drawer'
 import { FenceStatus } from '../components/FenceStatus'
 import { StateBadge } from '../components/StateBadge'
 import { useStore } from '../store'
-import { leadingShare } from '../hashRange'
 import { OwnershipBar } from '../components/OwnershipBar'
 
 const inputClass = 'mt-2 w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-paper'
@@ -84,19 +83,30 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
   const movingBucket = placements.find((item) => item.key === moving)
   const sourceLeg = movingBucket?.legs?.find((l) => l.id === moveLeg)
   const destLeg = movingBucket?.legs?.find((l) => l.cluster === moveTo && l.id !== moveLeg) // a leg to move into; none: a new one
-  const openMove = (placement: PlacementStatus) => {
+  // openMove opens Move keys on a spread bucket. Its default destination is a cluster the bucket has
+  // no leg on, since moving keys there is how a cluster is added to it; to and name come from the
+  // add drawer when the operator started there.
+  const openMove = (placement: PlacementStatus, to?: string, name?: string) => {
     const legs = placement.legs?.filter((l) => l.ranges.length > 0) ?? []
     const from = legs[0]
-    setMoveLeg(from?.id ?? ''); setMoveShare(0.5); setMoveRatio(0.01); setMoveName('')
-    setMoveTo(clusters.find((c) => c.name !== from?.cluster)?.name ?? from?.cluster ?? ''); setMoving(placement.key)
+    const fresh = clusters.find((c) => !placement.legs?.some((l) => l.cluster === c.name))
+    setMoveLeg(from?.id ?? ''); setMoveShare(0.5); setMoveRatio(0.01); setMoveName(name ?? '')
+    setMoveTo(to || (fresh?.name ?? clusters.find((c) => c.name !== from?.cluster)?.name ?? from?.cluster ?? '')); setMoving(placement.key)
+  }
+  // The move names its leg and share; the control plane works the hash range out, as it does for
+  // `shunt ramp --leg --share`, so the screen and the CLI move the same keys.
+  const moveArgs = () => {
+    const [, b] = splitKey(movingBucket?.key ?? '')
+    return { to: moveTo, ...(destLeg ? {} : { name: moveName.trim() || b }), leg: sourceLeg?.id ?? '', share: moveShare, ratio: moveRatio, create: true }
+  }
+  const moveCommand = () => {
+    const a = moveArgs()
+    return `shunt ramp ${movingBucket?.key ?? ''} --leg ${a.leg} --share ${a.share} --to ${a.to}${'name' in a ? ` --name ${a.name} --create` : ''} --ratio ${a.ratio}`
   }
   const startMove = async () => {
     if (!movingBucket || !sourceLeg) return
-    const range = leadingShare(sourceLeg.ranges[0], moveShare)
     const key = movingBucket.key
-    const [, b] = splitKey(key)
-    const args = { to: moveTo, ...(destLeg ? {} : { name: moveName.trim() || b }), range, ratio: moveRatio, create: true, wait: '30s' }
-    if (await act(() => startOperation(token, 'ramp', key, args), `${key}: moving ${Math.round(moveShare * 100)}% of leg ${sourceLeg.id} to ${moveTo}`)) { setMoving(null); onMigrate(key) }
+    if (await act(() => startOperation(token, 'ramp', key, { ...moveArgs(), wait: '30s' }), `${key}: moving ${Math.round(moveShare * 100)}% of leg ${sourceLeg.id} to ${moveTo}`)) { setMoving(null); onMigrate(key) }
   }
   const consolidatingBucket = placements.find((item) => item.key === consolidating)
   const kept = consolidatingBucket?.legs?.find((l) => l.id === keepLeg)
@@ -182,7 +192,7 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
         {existing && <div role="status" className="rounded-lg border border-ember-500 bg-ink-950 p-4 text-sm">
           <p><span className="font-mono text-paper">{existing.key}</span> already exists: {existing.legs?.length ? <>{existing.state}, spread over {existing.legs.map((l) => l.cluster).join(' + ')}</> : <>{existing.state} on {existing.primary} as <span className="font-mono">{existing.names?.[existing.primary]}</span></>}. Clients keep one name per bucket, so adding a cluster to it is Expand, not {mode === 'adopt' ? 'Adopt' : 'Create'}.</p>
           {existing.legs?.length
-            ? <p className="mt-2 text-muted">It is spread over {existing.legs.length} backend buckets: Move keys adds one by moving part of a leg to it, and Consolidate brings it back to one.</p>
+            ? <><p className="mt-2 text-muted">It is spread over {existing.legs.length} backend buckets: Move keys adds one by moving part of a leg to it, and Consolidate brings it back to one.</p>{existing.state === 'ACTIVE' ? <button type="button" onClick={() => { const found = existing; const to = selectedCluster; const name = backend.trim(); resetAdd(); openMove(found, to, name) }} className="mt-3 rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white">Move keys of {splitKey(existing.key)[1]} to {selectedCluster}</button> : <button type="button" onClick={() => { const key = existing.key; resetAdd(); onMigrate(key) }} className="mt-3 rounded-lg border border-ember-500 px-4 py-2 font-semibold">Continue its move</button>}</>
             : expandable(existing)
             ? <button type="button" onClick={() => { const found = existing; const to = selectedCluster !== existing.primary ? selectedCluster : clusters.find((item) => item.name !== existing.primary)?.name; const name = backend.trim(); resetAdd(); openExpand(found, to, name) }} className="mt-3 rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white">Expand {splitKey(existing.key)[1]} to {selectedCluster !== existing.primary ? selectedCluster : clusters.find((item) => item.name !== existing.primary)?.name}</button>
             : existing.target || existing.state !== 'ACTIVE'
@@ -204,8 +214,9 @@ export function Buckets({ onMigrate, request }: { onMigrate: (key: string) => vo
         <label className="text-sm font-medium">Share of its keys to move: {Math.round(moveShare * 100)}%<input aria-label="Share of the leg's keys" type="range" min="0.01" max="1" step="0.01" value={moveShare} onChange={(event) => setMoveShare(Number(event.target.value))} className="mt-2 w-full accent-ember-500" /></label>
         {sourceLeg && sourceLeg.ranges.length > 1 && <p className="text-xs text-muted">This leg owns {sourceLeg.ranges.length} ranges; the share is of its first.</p>}
         <label className="text-sm font-medium">To cluster<select value={moveTo} onChange={(event) => setMoveTo(event.target.value)} className={inputClass}>{clusters.map((c) => <option key={c.name} value={c.name}>{c.name}{c.name === sourceLeg?.cluster ? ' (a new bucket beside it)' : movingBucket.legs?.some((l) => l.cluster === c.name) ? ' (a leg already)' : ''}</option>)}</select></label>
-        {destLeg ? <p className="text-sm text-muted">Into its leg's bucket <span className="font-mono text-paper">{destLeg.bucket}</span>.</p> : <label className="text-sm font-medium">New leg's bucket name<input value={moveName} onChange={(event) => setMoveName(event.target.value)} className={`${inputClass} font-mono`} placeholder={splitKey(movingBucket.key)[1]} autoComplete="off" /></label>}
+        {destLeg ? <p className="text-sm text-muted">Into its leg's bucket <span className="font-mono text-paper">{destLeg.bucket}</span>.</p> : <div><label className="text-sm font-medium">New leg's bucket name on {moveTo}<input value={moveName} onChange={(event) => setMoveName(event.target.value)} className={`${inputClass} font-mono`} placeholder={splitKey(movingBucket.key)[1]} autoComplete="off" /></label><p className="mt-1 text-xs text-muted">Leave empty for <span className="font-mono text-paper">{splitKey(movingBucket.key)[1]}</span>. The first step creates it on {moveTo} if it does not exist, which {moveTo}'s key must be allowed to do; a bucket of that name that exists there already must be empty, or the move is refused.</p></div>}
         <div><p className="text-sm font-medium">First step: writes of the moving keys to the new leg</p><div className="mt-2 flex flex-wrap gap-2">{[0.01, 0.25, 0.5, 1].map((r) => <button key={r} type="button" onClick={() => setMoveRatio(r)} className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${moveRatio === r ? 'border-ember-400 bg-ember-600 text-white' : 'border-ink-700 text-muted'}`}>{r * 100}%</button>)}</div></div>
+        {sourceLeg && moveTo && <div><p className="text-xs text-muted">The same from the CLI:</p><CopyLine value={moveCommand()} /></div>}
         <button type="button" disabled={busy || !sourceLeg || !moveTo || (!destLeg && moveTo === sourceLeg.cluster && !moveName.trim())} onClick={() => void startMove()} className="w-full rounded-lg bg-ember-600 px-4 py-2 font-semibold text-white disabled:opacity-50">Start the move and continue to Migrations</button>
       </div>}
     </Drawer>

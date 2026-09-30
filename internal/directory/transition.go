@@ -2,6 +2,7 @@ package directory
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -44,6 +45,11 @@ type Transition struct {
 	// Scope, leaving ACTIVE, is the prefix rule whose keys move (ADR-0020); "" the keys no rule
 	// claims. Range and Leg are then read in that rule's table.
 	Scope string
+	// Share, leaving ACTIVE, moves only the leading share (0..1] of the range Leg or Scope resolves
+	// to, or of a plain bucket's whole key space: LeadingShare. It is how the UI and the CLI ask for
+	// "half of leg minio-a" without either working out the hash range. A later step may repeat it
+	// only as the first step resolved it. 0 is the whole range.
+	Share float64
 }
 
 // TransitionError is an illegal or malformed state change. It names both states.
@@ -83,6 +89,20 @@ func next(state string) []string {
 func Apply(p Placement, t Transition) (Placement, error) {
 	fail := func(format string, args ...any) (Placement, error) {
 		return p, &TransitionError{From: p.State, To: t.To, Reason: fmt.Sprintf(format, args...)}
+	}
+	if t.Share != 0 {
+		switch {
+		case math.IsNaN(t.Share) || t.Share < 0 || t.Share > 1:
+			return fail("share %v is outside 0..1", t.Share)
+		case t.Range != nil:
+			return fail("a range names the keys to move already; a share is of the range a leg holds")
+		case !p.Spread() && p.State != StateActive:
+			return fail("a share names part of a bucket to move, on the move's first step")
+		case !p.Spread():
+			// A plain bucket's one leg holds every key: the share is of the whole key space.
+			rg := LeadingShare(FullRange, t.Share)
+			t.Range, t.Share = &rg, 0
+		}
 	}
 	if !p.Spread() && p.State == StateActive && t.Target != "" && t.Target == p.Primary && t.Name != "" && t.Name != p.Names[p.Primary] {
 		// Another bucket on the same cluster: a move of every key, since a plain migration's two

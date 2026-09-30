@@ -94,3 +94,60 @@ test('lists the buckets on an idle Migrations screen and opens the matching draw
   fireEvent.click(screen.getByRole('button', { name: 'Expand default/ui-demo' }))
   expect(await screen.findByText('Expand default/ui-demo')).toBeInTheDocument()
 })
+
+// Moving part of a spread bucket to a cluster it has no leg on (ADR-0018 N3): the drawer starts on
+// that cluster and asks for the new leg's bucket, saying it is created if missing and must be empty
+// if not; the move names its leg and share, which the control plane turns into the hash range, and
+// the drawer shows the same move as a `shunt ramp` line. From Adopt or create, naming the spread
+// bucket offers Move keys to the cluster picked there, with the bucket name typed there.
+function spreadMock(onCall?: (url: string, init?: RequestInit) => Response | undefined) {
+  sessionStorage.setItem('shunt.control.token', 't')
+  const cluster = (name: string, type = 'minio') => ({ name, type, scheme: 'http', region: 'us-east-1', endpoints: [`${name}:9000`], access_key: 'AK', secret_ref: `control:${name}`,
+    conditional_write: true, conditional_delete: false, references: [], read_only: false, reject_writes: false })
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = String(input)
+    const answered = onCall?.(url, init)
+    if (answered) return answered
+    if (url.endsWith('/v1/control')) return Response.json(control)
+    if (url.endsWith('/v1/fleet')) return Response.json({ version: 3, members: [] })
+    if (url.endsWith('/v1/status?all=1')) return Response.json({ version: 5, clusters: [cluster('minio-a'), cluster('minio-b'), cluster('vast-c', 'vast')], placements: [spread, single] })
+    if (url.endsWith('/v1/events')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+    return Response.json({ message: `unhandled ${url}` }, { status: 404 })
+  })
+}
+
+test('moves half of a leg to a cluster the bucket has no leg on, naming the new leg\'s bucket', async () => {
+  let sent: { kind?: string; placement?: string; args?: Record<string, unknown> } = {}
+  spreadMock((url, init) => {
+    if (url.endsWith('/v1/operations') && init?.method === 'POST') {
+      sent = JSON.parse(String(init.body)) as typeof sent
+      return Response.json({ id: 'op-move', kind: 'ramp', placement: 'default/data01', actor: 'token:t', status: 'succeeded', phase: 'done', version: 6 })
+    }
+  })
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Move keys of default/data01' }))
+  expect(screen.getByLabelText('To cluster')).toHaveValue('vast-c')
+  expect(screen.getByLabelText(/New leg's bucket name on vast-c/)).toHaveValue('')
+  expect(screen.getByText(/The first step creates it on vast-c if it does not exist/)).toHaveTextContent('must be empty, or the move is refused')
+  expect(screen.getByText('shunt ramp default/data01 --leg minio-b --share 0.5 --to vast-c --name data01 --create --ratio 0.01')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
+  await vi.waitFor(() => expect(sent.kind).toBe('ramp'))
+  expect(sent.placement).toBe('default/data01')
+  expect(sent.args).toEqual({ to: 'vast-c', name: 'data01', leg: 'minio-b', share: 0.5, ratio: 0.01, create: true, wait: '30s' })
+})
+
+test('from Adopt or create, a spread bucket offers Move keys to the cluster picked there', async () => {
+  spreadMock()
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Adopt or create' }))
+  fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'data01' } })
+  fireEvent.change(screen.getByLabelText(/^Cluster/), { target: { value: 'vast-c' } })
+  fireEvent.change(screen.getByLabelText(/Backend bucket name/), { target: { value: 'data01-v' } })
+  fireEvent.click(await screen.findByRole('button', { name: 'Move keys of data01 to vast-c' }))
+  expect(await screen.findByText('Move keys of default/data01')).toBeInTheDocument()
+  expect(screen.getByLabelText('To cluster')).toHaveValue('vast-c')
+  expect(screen.getByLabelText(/New leg's bucket name on vast-c/)).toHaveValue('data01-v')
+  expect(screen.getByText(/--to vast-c --name data01-v --create/)).toBeInTheDocument()
+})

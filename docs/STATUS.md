@@ -17,6 +17,24 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### Moving part of a spread bucket to a new cluster, from the UI and the CLI (2026-09-29)
+
+A manual pass found the path hard to find: Move keys opened on a cluster that already held a leg,
+which hides the new leg's bucket name; the name field did not say the bucket is created, or that an
+existing one must be empty; and Adopt or create, given a spread bucket's name, said Move keys adds a
+bucket but offered no way there. From the CLI, moving half of a leg needed its hash bounds worked out
+by hand (`--range`). Now a move may name a share of a leg: `share` on ramp and migrate start,
+`--share` on the CLI (`shunt ramp <bucket> --leg <id> --share 0.5 --to <cluster> --name <bucket>
+--create`), and the control plane works out the range (`directory.LeadingShare`, the UI's formula,
+checked against its answers). The screen sends the leg and share instead of computing the range,
+opens Move keys on a cluster the bucket has no leg on, says what happens to the new leg's bucket,
+shows the same move as a `shunt ramp` line, and Adopt or create hands a spread bucket to Move keys
+with the cluster and bucket name typed there. ADR-0018 N3c records it. Tests: the range a share
+resolves to, repeating or changing it on a later step, the refusals, a plain bucket's share; the CLI
+through a real control API; the drawer's default, request and command line, and the handoff.
+Dropping the share's resolution or its later-step check, the old default, or the handoff button
+each fails its test.
+
 ### Third correctness review (2026-09-26): ten open faults, fixed next
 
 An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three

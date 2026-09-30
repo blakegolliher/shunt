@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/bits"
 	"regexp"
 	"slices"
 	"strconv"
@@ -55,6 +56,29 @@ type HashRange struct {
 
 // FullRange is the whole key hash space.
 var FullRange = HashRange{From: 0, To: math.MaxUint64}
+
+// LeadingShare is the first share (0..1] of r, from its start: the keys a move of that share takes.
+// The share counts in ten-thousandths, at least one, so 50 % of a range is the same keys wherever it
+// is asked for; 1 or more is the whole range.
+func LeadingShare(r HashRange, share float64) HashRange {
+	if share >= 1 || r.From > r.To {
+		return r
+	}
+	k := uint64(max(1, math.Round(share*10000)))
+	if k >= 10000 { // a share that rounds to all of it (0.99996) is the whole range
+		return r
+	}
+	// The width, r.To-r.From+1, is up to 2^64: the product with k is 128-bit, and its quotient by
+	// 10,000 is under 2^64 because k is less than 10,000.
+	hi, lo := bits.Mul64(uint64(r.To-r.From), k)
+	lo, carry := bits.Add64(lo, k, 0)
+	hi += carry
+	q, _ := bits.Div64(hi, lo, 10000)
+	if q == 0 {
+		return HashRange{From: r.From, To: r.From}
+	}
+	return HashRange{From: r.From, To: r.From + Hash(q-1)}
+}
 
 // Owner says which leg holds the keys whose hash falls in [From, To].
 type Owner struct {

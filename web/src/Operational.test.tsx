@@ -277,7 +277,7 @@ test('moves part of a spread bucket leg to another cluster', async () => {
   expect(screen.getByText('Into its leg\'s bucket', { exact: false })).toHaveTextContent('wide')
   fireEvent.click(screen.getByRole('button', { name: 'Start the move and continue to Migrations' }))
   await waitFor(() => expect(started).toEqual({ kind: 'ramp', placement: 'acme/wide',
-    args: { to: 'target', range: { from: '0000000000000000', to: '3fffffffffffffff' }, ratio: 0.01, create: true, wait: '30s' } }))
+    args: { to: 'target', leg: 'source', share: 0.5, ratio: 0.01, create: true, wait: '30s' } })) // the control plane works the range out
 })
 
 test('consolidates a spread bucket one leg at a time and retires an idle leg', async () => {

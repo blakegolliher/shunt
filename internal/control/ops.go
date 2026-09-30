@@ -876,9 +876,12 @@ type RampRequest struct {
 	Leg string `json:"leg,omitempty"`
 	// Scope, leaving ACTIVE, is the prefix rule whose keys move; Range and Leg are read in its table
 	// (ADR-0020).
-	Scope  string `json:"scope,omitempty"`
-	Create bool   `json:"create,omitempty"`
-	Wait   string `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
+	Scope string `json:"scope,omitempty"`
+	// Share, leaving ACTIVE, moves the leading share (0..1] of the range Leg or Scope names, or of a
+	// plain bucket's key space (directory.LeadingShare).
+	Share  float64 `json:"share,omitempty"`
+	Create bool    `json:"create,omitempty"`
+	Wait   string  `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
 }
 
 func (s *Server) ramp(w http.ResponseWriter, r *http.Request) {
@@ -894,7 +897,7 @@ func (s *Server) runRamp(tr *tracker, key string, req RampRequest) (TransitionRe
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, false, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateRamping, Target: req.To, Name: req.Name, Ratio: req.Ratio, Prefixes: req.Prefixes, Range: req.Range, Leg: req.Leg, Scope: req.Scope, Share: req.Share}, req.Create, false, wait)
 	if err != nil {
 		return res, err
 	}
@@ -910,6 +913,7 @@ type MigrateRequest struct {
 	Range                 *directory.HashRange `json:"range,omitempty"` // leaving ACTIVE: move only these keys (ADR-0018 N3)
 	Leg                   string               `json:"leg,omitempty"`   // leaving ACTIVE: move this leg's first range (N3c)
 	Scope                 string               `json:"scope,omitempty"` // leaving ACTIVE: the prefix rule whose keys move (ADR-0020)
+	Share                 float64              `json:"share,omitempty"` // leaving ACTIVE: the leading share of that range (directory.LeadingShare)
 	Create                bool                 `json:"create,omitempty"`
 	AcceptLostWriteWindow bool                 `json:"accept_lost_write_window,omitempty"`
 	Wait                  string               `json:"wait,omitempty"` // how long to wait for the fleet; default 30s
@@ -928,7 +932,7 @@ func (s *Server) runMigrate(tr *tracker, key string, req MigrateRequest) (Transi
 	if err != nil {
 		return TransitionResult{}, err
 	}
-	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg, Scope: req.Scope}, req.Create, req.AcceptLostWriteWindow, wait)
+	res, err := s.fencedStep(tr, key, directory.Transition{To: directory.StateMigrating, Target: req.To, Name: req.Name, Range: req.Range, Leg: req.Leg, Scope: req.Scope, Share: req.Share}, req.Create, req.AcceptLostWriteWindow, wait)
 	if err != nil {
 		return res, err
 	}
