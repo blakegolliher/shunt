@@ -137,7 +137,7 @@ test('moves half of a leg to a cluster the bucket has no leg on, naming the new 
   expect(sent.args).toEqual({ to: 'vast-c', name: 'data01', leg: 'minio-b', share: 0.5, ratio: 0.01, create: true, wait: '30s' })
 })
 
-test('from Adopt or create, a spread bucket offers Move keys to the cluster picked there', async () => {
+test('from Adopt or create, a spread bucket offers to expand to the cluster picked there', async () => {
   spreadMock()
   render(<StoreProvider><App /></StoreProvider>)
   fireEvent.click(await screen.findByRole('button', { name: 'Buckets' }))
@@ -145,9 +145,28 @@ test('from Adopt or create, a spread bucket offers Move keys to the cluster pick
   fireEvent.change(screen.getByLabelText('Client bucket'), { target: { value: 'data01' } })
   fireEvent.change(screen.getByLabelText(/^Cluster/), { target: { value: 'vast-c' } })
   fireEvent.change(screen.getByLabelText(/Backend bucket name/), { target: { value: 'data01-v' } })
-  fireEvent.click(await screen.findByRole('button', { name: 'Move keys of data01 to vast-c' }))
-  expect(await screen.findByText('Move keys of default/data01')).toBeInTheDocument()
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand data01 to vast-c' }))
+  expect(await screen.findByText('Expand default/data01 to another cluster')).toBeInTheDocument()
   expect(screen.getByLabelText('To cluster')).toHaveValue('vast-c')
   expect(screen.getByLabelText(/New leg's bucket name on vast-c/)).toHaveValue('data01-v')
   expect(screen.getByText(/--to vast-c --name data01-v --create/)).toBeInTheDocument()
 })
+
+// A spread bucket has Expand too, as a plain one does (found in a manual pass, 2026-09-29: the
+// operator looked for Expand, and a spread bucket offered only Move keys): on its row and on an idle
+// Migrations screen it opens the move drawer as expanding the bucket, on the cluster it has no leg on.
+test('expands a spread bucket from its row and from Migrations', async () => {
+  spreadMock()
+  render(<StoreProvider><App /></StoreProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Buckets' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand default/data01' }))
+  expect(await screen.findByText('Expand default/data01 to another cluster')).toBeInTheDocument()
+  expect(screen.getByText(/data01 is spread over 2 backend buckets, so it expands by a move/)).toBeInTheDocument()
+  expect(screen.getByLabelText('To cluster')).toHaveValue('vast-c')
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Migrations' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand default/data01' }))
+  expect(await screen.findByText('Expand default/data01 to another cluster')).toBeInTheDocument()
+  expect(screen.getByLabelText('To cluster')).toHaveValue('vast-c')
+})
+

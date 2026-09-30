@@ -376,3 +376,27 @@ func (f *File) ensureMaps() {
 
 // Clone returns a deep copy.
 func (f *File) Clone() *File { return f.clone() }
+
+// BucketUser is the placement, other than except, that uses backend bucket name on cluster, or ""
+// when none does. A placement's buckets are its names, or its legs when it is spread; placements
+// never share one (Validate). Operations ask this before they touch a bucket they would make a
+// placement's, so a bucket another client bucket owns is refused before any request reaches it.
+func (f *File) BucketUser(cluster, name, except string) string {
+	if name == "" {
+		return ""
+	}
+	for k, p := range f.Placements {
+		if k == except {
+			continue
+		}
+		if p.Names[cluster] == name {
+			return k
+		}
+		for _, l := range p.Legs {
+			if l.Cluster == cluster && l.Bucket == name {
+				return k
+			}
+		}
+	}
+	return ""
+}

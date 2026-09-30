@@ -316,6 +316,12 @@ func holdText(h *directory.RampHold) string {
 	}
 }
 
+// sharedBucket refuses a bucket another client bucket owns as a destination: placements never share
+// a backend bucket, since each would see the other's objects.
+func sharedBucket(cluster, name, other, what string) error {
+	return refuse("bucket %s on %s is client bucket %s's backend bucket, and two client buckets never share one (each would see the other's objects); %s", name, cluster, other, what)
+}
+
 // withDefaultName fills the backend name a first step gets when neither expand nor the request
 // named one, as transition does.
 func withDefaultName(key string, p directory.Placement, t directory.Transition) directory.Transition {
@@ -376,11 +382,16 @@ func (s *Server) transition(tr *tracker, key string, p directory.Placement, f *d
 	ctx, cancel := context.WithTimeout(tr.ctx, backendTimeout)
 	defer cancel()
 	if p.State == directory.StateActive {
+		name := np.Names[np.Primary]
+		// Before any request reaches the destination: a bucket another client bucket owns is never
+		// created, probed or measured as this one's (the directory would refuse it only at the write).
+		if other := f.BucketUser(dstCluster, name, key); other != "" {
+			return TransitionResult{}, sharedBucket(dstCluster, name, other, "name a bucket no other bucket uses (--name); the step creates it with --create")
+		}
 		target, err := s.backendFor(dstCluster)
 		if err != nil {
 			return TransitionResult{}, err
 		}
-		name := np.Names[np.Primary]
 		exists, err := target.bucketExists(ctx, name)
 		switch {
 		case err != nil:
@@ -598,6 +609,12 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("%q is not a valid bucket name", req.Name))
 		return
 	}
+	// Before any request reaches the target: a bucket another client bucket owns is never probed,
+	// written or recorded as this one's.
+	if other := f.BucketUser(req.To, req.Name, key); other != "" {
+		fail(w, sharedBucket(req.To, req.Name, other, "name another (--name), or leave the name out for a generated one"))
+		return
+	}
 	tb, err := s.backendFor(req.To)
 	if err != nil {
 		fail(w, err)
@@ -759,18 +776,12 @@ func (s *Server) changePrefixes(w http.ResponseWriter, r *http.Request, prefix, 
 
 // nextName is base-NNN with the lowest NNN no placement uses on cluster.
 func nextName(f *directory.File, cluster, base string) string {
-	used := map[string]bool{}
-	for k := range f.Placements {
-		if n, ok := f.Placements[k].Names[cluster]; ok {
-			used[n] = true
-		}
-	}
 	for n := 1; ; n++ {
 		name := fmt.Sprintf("%s-%03d", base, n)
 		if len(name) > 63 {
 			name = fmt.Sprintf("%s-%03d", strings.TrimRight(base[:63-4], ".-"), n)
 		}
-		if !used[name] {
+		if f.BucketUser(cluster, name, "") == "" { // a plain bucket's names and a spread one's legs
 			return name
 		}
 	}

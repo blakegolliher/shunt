@@ -252,7 +252,7 @@ test('creates a bucket spread across clusters and shows its legs', async () => {
   expect(await screen.findByText('Bucket acme/wide created, spread over 2 clusters')).toBeInTheDocument()
   expect(sent).toEqual({ cluster: 'source', name: 'wide', legs: [{ cluster: 'source', name: 'wide' }, { cluster: 'target', name: 'wide' }] })
   expect(await screen.findByText('spread: source + target')).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: 'Expand acme/wide' })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Expand acme/wide' })).toBeInTheDocument() // a spread bucket expands by a move (Buckets.test.tsx)
   fireEvent.click(screen.getByText('spread: source + target'))
   expect(await screen.findAllByText('wide · 50% of keys', { exact: false })).toHaveLength(2)
 })

@@ -187,9 +187,10 @@ CreateBucket flow and does not duplicate the backend request.
 
 ### `POST /v1/placements/{tenant}/{bucket}/expand`
 
-`{"to": "vast02", "name": "data01-001", "create": false, "accept_existing_objects": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest unused number.
+`{"to": "vast02", "name": "data01-001", "create": false, "accept_existing_objects": false}`, where `name` defaults to `<primary backend name>-NNN`, the lowest number no placement uses there (a plain bucket's names and a spread bucket's legs).
 
 Prepares the target while the placement stays `ACTIVE`, in this order:
+0. Refuses (409 `refused`) a target bucket another placement uses, before any request reaches the target: two client buckets never share a backend bucket, since each would see the other's objects. A first step of `ramp` or `migrate` that names its own destination (`to` and `name`, a move of part of a bucket included) refuses the same, the same way, before it creates, probes or measures anything there.
 1. Refuses if either bucket was ever versioned.
 2. Verifies the target bucket exists, or creates it with `create`. An existing bucket must be empty: a one-key listing that finds an object refuses, naming the key, because the bucket's objects would join the moving bucket (in its listings, in target-first reads of a shared key, and ahead of the mover's `If-None-Match` copy, so a stale object would win at cutover). `accept_existing_objects` states they are this bucket's objects, copied ahead (by backend replication, for instance), and skips the check. A first `ramp` or `migrate` step that names its own target with `to` is checked the same way.
 3. Runs a canary PUT, GET and DELETE of `.shunt-canary-<hex>`.

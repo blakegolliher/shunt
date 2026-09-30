@@ -35,6 +35,20 @@ through a real control API; the drawer's default, request and command line, and 
 Dropping the share's resolution or its later-step check, the old default, or the handoff button
 each fails its test.
 
+The next pass found two more. A spread bucket had no Expand, the verb an operator reaches for: it
+has one now, on its row and on an idle Migrations screen, opening the same drawer said as growing
+the bucket. And a move whose destination was a bucket adopted as a client bucket of its own was
+refused only at the directory write: its first step had already probed that bucket (a
+`.shunt-probe-` object written and deleted in another client bucket's backend) and recorded the
+cluster's measured capabilities, so the operation ended failed with effect committed; expand had
+the same flaw, with its canary. Expand and a first step that names its destination now refuse a
+bucket another placement uses before any request reaches it (`directory.File.BucketUser`), and
+expand's generated name skips a spread bucket's legs, which it did not see. Tests: expand, a
+spread bucket's move and a plain first step each refused with no request to the bucket, no
+directory write and no capabilities recorded, and the generated name; the Expand button and its
+routing from Migrations. Without the early checks the fake backend sees the probe and canary
+objects and the directory version moves; the old generated name picks the leg's bucket.
+
 ### Third correctness review (2026-09-26): ten open faults, fixed next
 
 An outside review of `186b045` (master after PR #4, H2) reproduced ten faults, seven new and three
