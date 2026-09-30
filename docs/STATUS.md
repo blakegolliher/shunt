@@ -17,6 +17,19 @@ After POC-4: G1 (simplicity) and G4 (licenses) once, then resume the full order 
 
 ## The `distributed` branch
 
+### The fleet negative control runs until it sees the hazard (2026-09-30)
+
+Master's `all` job failed after PR #8 (run 36759852862 on `6222f16`, the tree PR #8's run had
+passed): under `-race`, `TestFleetRangeMoveWithoutTheFence` found no violation without the fence,
+the miss recorded on 2026-09-28 below. It failed the same way in a local race suite (2,573 client
+operations, 0 violations). One run gives B's 60 ms lag seven windows in about two seconds of
+traffic, and with fewer operations per window it can miss them all. Measured under `-race`: on an
+idle machine all 48 runs of the four controls found 1–19 violations; on two CPUs 9 of 20 range and
+scoped runs found none. The control now runs again, each run a subtest on a new control plane and
+proxies, until one finds a violation, and fails only if eight runs find none; the hazard, the lag
+and the steps are unchanged. On two CPUs all 20 controls then passed (19 of their 39 runs found
+none; the longest needed 7). With every run's count forced to zero, the control fails after eight.
+
 ### Moving part of a spread bucket to a new cluster, from the UI and the CLI (2026-09-29)
 
 A manual pass found the path hard to find: Move keys opened on a cluster that already held a leg,
@@ -69,7 +82,7 @@ Two proxy tests failed once each under the full suite's load and not in isolatio
 `TestResignTrailerChecksumMismatch` (0 failures in 200 isolated runs; an ordering race in the test
 between the fake backend's answer and the decoder's trailer check) and the probabilistic negative
 control `TestFleetRangeMoveWithoutTheFence` (no violation found in one loaded run). Neither is from
-this work; both are recorded here to be looked at.
+this work; both are recorded here to be looked at. (The negative control: fixed 2026-09-30, above.)
 
 | ID | Pri | | Fault | Test | State |
 |---|---|---|---|---|---|
